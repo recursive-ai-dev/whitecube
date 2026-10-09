@@ -1,0 +1,184 @@
+#!/usr/bin/python3 -I
+"""whitecube-install: one front door for the three install paths (user desktop, network/system, extras).
+
+  whitecube-install                         show what would change, everywhere (dry run, no root)
+  whitecube-install --apply                 as you: build if needed, then the user install (backs up first)
+  sudo whitecube-install --system --apply   as root: network files via net/apply.sh (backs up first)
+        [--with-hardening] [--with-sudoers] [--with-cairo]     opt-in extras, each backed up
+  whitecube-install --rollback-user         restore the files the last user install replaced
+  sudo whitecube-install --rollback-system /var/backups/whitecube/net-STAMP
+
+It never restarts the compositor, the bar or any service: it prints what to run. Never installs
+packages. Every step that changes files makes a backup first and says where it is.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+PROJECT = Path(__file__).resolve().parent
+BINARIES = ('whitecube', 'cube-ca', 'cube-settings', 'cube-status')
+EXTRAS = {
+    'hardening': ('net/whitecube-network.hardening.conf', '/etc/systemd/system/whitecube-network.service.d/hardening.conf', 0o644),
+    'sudoers': ('sudoers-whitecube-settings.hardened', '/etc/sudoers.d/whitecube-settings', 0o440),
+}
+
+
+def sources_newer_than_build(project=PROJECT):
+    """True when a binary is missing or any C source / header / BUILD.sh is newer than the oldest binary."""
+    built = [project / 'build' / name for name in BINARIES]
+    if not all(path.is_file() for path in built):
+        return True
+    oldest = min(path.stat().st_mtime for path in built)
+    inputs = [*project.glob('*.c'), *project.glob('*.h'), project / 'BUILD.sh']
+    return any(path.stat().st_mtime > oldest for path in inputs)
+
+
+def run(argv, **kw):
+    return subprocess.run(argv, **kw)
+
+
+def plan(project=PROJECT, runner=run):
+    """The dry run: what each path would do. Returns a printable list of lines."""
+    lines = []
+    lines.append(f'build: {"needed (missing or older than sources): ./BUILD.sh" if sources_newer_than_build(project) else "up to date"}')
+    done = runner([sys.executable, '-I', str(project / 'INSTALL-USER.py')], capture_output=True, text=True)
+    try:
+        lines.append('user install would write: ' + ', '.join(Path(p).name for p in json.loads(done.stdout)['destinations']))
+    except (ValueError, KeyError):
+        lines.append('user install: not ready (' + (done.stderr.strip().splitlines() or ['build first'])[-1] + ')')
+    done = runner(['bash', str(project / 'net/apply.sh')], capture_output=True, text=True)
+    changed = [l.split()[1] for l in done.stdout.splitlines() if l.strip().startswith(('changed', 'new'))]
+    lines.append('system install would change: ' + (', '.join(changed) if changed else 'nothing (already installed)'))
+    for name, (src, dst, _) in EXTRAS.items():
+        have = hashlib.sha256((project / src).read_bytes()).hexdigest() if (project / src).is_file() else None
+        now = None
+        try:
+            now = hashlib.sha256(Path(dst).read_bytes()).hexdigest()
+        except OSError:
+            pass
+        lines.append(f'extra --with-{name}: {"installed" if have and have == now else "not installed (opt-in)"}')
+    cairo = project / 'build-cairo/stage'
+    lines.append(f'extra --with-cairo: {"staged, ready" if cairo.is_dir() else "not staged (run tools/build-xfree-cairo.sh)"}')
+    return lines
+
+
+def user_install(project=PROJECT, runner=run):
+    if os.geteuid() == 0:
+        raise SystemExit('run the user install as your own account, without sudo')
+    if sources_newer_than_build(project):
+        print('building (writes only build/)...')
+        if runner(['bash', str(project / 'BUILD.sh')]).returncode:
+            raise SystemExit('build failed; nothing was installed')
+    done = runner([sys.executable, '-I', str(project / 'INSTALL-USER.py'), '--apply'])
+    if done.returncode:
+        raise SystemExit('user install failed; it rolled itself back')
+    print('\nUser files installed. Log out and back in to activate (Alt+Shift+Esc).')
+    print('Undo: whitecube-install --rollback-user')
+    print('Next, for the network/system part (needs root):')
+    print(f'  sudo {project}/whitecube-install --system --apply')
+
+
+def rollback_user(project=PROJECT):
+    manifest_path = Path.home() / '.local/state/whitecube/privacy-install.json'
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, ValueError):
+        raise SystemExit('no user install record found; nothing to roll back')
+    for record in reversed(manifest['files']):
+        target = Path(record['path'])
+        if target.is_symlink():
+            raise SystemExit(f'refusing to touch a symlink: {target}')
+        if record['before'] and Path(record['before']).is_file():
+            before = Path(record['before'])
+            shutil.copy2(before, target)
+            print(f'restored {target}')
+        elif not record['before'] and target.exists():
+            target.unlink()
+            print(f'removed {target} (it did not exist before)')
+    print('Rolled back. Log out and back in to activate.')
+
+
+def backup_extra(destination, stamp, root=Path('/')):
+    """Copies an existing file aside (0700 directory) before an extra overwrites it. Returns the backup path or None."""
+    if not destination.exists():
+        return None
+    folder = root / 'var/backups/whitecube' / f'extras-{stamp}'
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = folder / str(destination).lstrip('/').replace('/', '__')
+    shutil.copy2(destination, target)
+    return target
+
+
+def system_install(project=PROJECT, runner=run, with_=(), root=Path('/'), stamp=None):
+    if os.geteuid() != 0:
+        raise SystemExit('the system install needs root: sudo whitecube-install --system --apply')
+    stamp = stamp or time.strftime('%Y%m%d-%H%M%S')
+    if runner(['bash', str(project / 'net/apply.sh'), '--apply']).returncode:
+        raise SystemExit('net/apply.sh failed; see its message (nothing else was done)')
+    for name in with_:
+        if name == 'cairo':
+            stage = project / 'build-cairo/stage/usr/local'
+            if not stage.is_dir():
+                raise SystemExit('no staged cairo: run tools/build-xfree-cairo.sh first')
+            runner(['cp', '-a', f'{stage}/.', str(root / 'usr/local') + '/'], check=True)
+            runner(['ldconfig'])
+            print('installed the X-free cairo into /usr/local (undo: remove /usr/local/lib/x86_64-linux-gnu/libcairo* then ldconfig)')
+            continue
+        src, dst, mode = EXTRAS[name]
+        source, destination = project / src, root / dst.lstrip('/')
+        if name == 'sudoers' and runner(['visudo', '-c', '-f', str(source)], capture_output=True).returncode:
+            raise SystemExit('the sudoers file does not parse; not installing it')
+        saved = backup_extra(destination, stamp, root)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + f'.new-{os.getpid()}')
+        shutil.copyfile(source, temporary)
+        os.chown(temporary, 0, 0)
+        os.chmod(temporary, mode)
+        os.replace(temporary, destination)
+        print(f'installed {destination}' + (f' (previous copy: {saved})' if saved else ' (new file)'))
+    print('\nNothing was restarted. When Wi-Fi may drop for ~20 s:')
+    print('  sudo systemctl daemon-reload && sudo systemctl restart whitecube-network.service')
+    print('  journalctl -u whitecube-network.service -f      # expect wifi_state ... COMPLETED')
+    print('  whitecube-doctor                                  # confirms the result')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--system', action='store_true')
+    parser.add_argument('--with-hardening', action='store_true')
+    parser.add_argument('--with-sudoers', action='store_true')
+    parser.add_argument('--with-cairo', action='store_true')
+    parser.add_argument('--rollback-user', action='store_true')
+    parser.add_argument('--rollback-system', metavar='BACKUP_DIR')
+    args = parser.parse_args(argv)
+    extras = [name for name in ('hardening', 'sudoers', 'cairo') if getattr(args, f'with_{name}')]
+    if args.rollback_user:
+        return rollback_user()
+    if args.rollback_system:
+        if os.geteuid() != 0:
+            raise SystemExit('rolling back system files needs root')
+        return sys.exit(run(['bash', str(PROJECT / 'net/apply.sh'), '--rollback', args.rollback_system]).returncode)
+    if extras and not args.system:
+        parser.error('--with-* extras belong to the system install: add --system')
+    if args.system:
+        if not args.apply:
+            print('\n'.join(plan()))
+            print('\nDry run. Add --apply (as root) to install.')
+            return
+        return system_install(with_=extras)
+    if args.apply:
+        return user_install()
+    print('\n'.join(plan()))
+    print('\nDry run. Apply: whitecube-install --apply   then   sudo whitecube-install --system --apply')
+
+
+if __name__ == '__main__':
+    main()

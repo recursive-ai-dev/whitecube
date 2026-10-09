@@ -192,3 +192,15 @@ controller, competing network managers, wpa_supplicant leftovers, installed-vs-s
 over-broad passwordless sudo, each with the fix command. Tests: python3 -I test-doctor.py.
 `tools/clean.sh [--apply]` removes __pycache__ and build/. `tools/install-hooks.sh` enables the
 pre-commit hook that runs the pure-Python suites (git config core.hooksPath tools/hooks).
+
+## Installing
+`whitecube-install` is the one front door (dry run by default, no sudo of its own):
+  whitecube-install                          plan for everything
+  whitecube-install --apply                  build if stale, then the user install (INSTALL-USER.py, backed up)
+  sudo whitecube-install --system --apply [--with-hardening] [--with-sudoers] [--with-cairo]
+  whitecube-install --rollback-user          /  sudo whitecube-install --rollback-system <backup dir>
+It never restarts the compositor/bar/services; it prints the commands. Extras are staged files
+(sudoers-whitecube-settings.hardened, net/whitecube-network.hardening.conf, build-cairo/stage) and are
+backed up to /var/backups/whitecube/extras-STAMP before being replaced.
+SANITIZE=1 ./BUILD.sh builds and tests under ASan/UBSan in build-asan/; REQUIRE_XFREE=1 makes X11
+linkage fatal. tools/clean.sh removes only regenerable build products, never rollback archives.
