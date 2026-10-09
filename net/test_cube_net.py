@@ -918,6 +918,26 @@ class HelperTests(unittest.TestCase):
             helper.firewall_set("deny-incoming")
         self.assertEqual(run.call_count, 2)
 
+    def test_adding_a_network_tells_the_running_station_to_reload(self):
+        calls = []
+        module = types.SimpleNamespace(profile_lock=contextlib.nullcontext, load_profiles=lambda: [("Old", "00" * 32)],
+                                       write_profiles=lambda profiles: calls.append(("write", [s for s, _ in profiles])),
+                                       control_call=lambda *a: calls.append(("control",) + a), profile_id=lambda ssid: "0" * 16)
+        with mock.patch.object(helper, "cube_net_module", return_value=module), mock.patch.object(helper, "emit"), \
+                mock.patch.object(helper.sys, "stdin", io.StringIO("New\npassphrase1\n")):
+            helper.net_add()
+        self.assertEqual(calls, [("write", ["Old", "New"]), ("control", "reload")])
+
+    def test_a_stopped_service_does_not_make_adding_a_network_fail(self):
+        def down(*a):
+            raise RuntimeError("Start the configured whitecube-network service")
+        module = types.SimpleNamespace(profile_lock=contextlib.nullcontext, load_profiles=lambda: [], write_profiles=lambda p: None,
+                                       control_call=down, profile_id=lambda ssid: "0" * 16)
+        with mock.patch.object(helper, "cube_net_module", return_value=module), mock.patch.object(helper, "emit") as emit, \
+                mock.patch.object(helper.sys, "stdin", io.StringIO("New\npassphrase1\n")):
+            helper.net_add()
+        emit.assert_called_once()
+
     def test_net_page_reads_the_names_the_controller_actually_publishes(self):
         status = {"present": True, "interface": {"interface": "wlan0"}, "association_state": "COMPLETED",
                   "diagnostic_summary": "Association, IPv4 lease/route, a resolver query and a bound TCP probe passed.",

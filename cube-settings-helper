@@ -390,6 +390,10 @@ def net_add():
     with module.profile_lock():
         existing = [p for p in module.load_profiles() if p[0] != ssid]
         module.write_profiles(existing + [(ssid, secret)])
+    try:
+        module.control_call("reload")       # the running station learns the new network now, not at the next Connect
+    except RuntimeError:
+        pass                                # service stopped: it reads the file when it starts
     emit("ok", "net-add", module.profile_id(ssid))
 
 
