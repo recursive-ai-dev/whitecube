@@ -144,6 +144,19 @@ class OtherChecks(Fixture):
         self.put("sudoers-whitecube-settings", "%sudo ALL=(root) /usr/local/libexec/x\n", self.project)
         self.assertEqual(doctor.check_sudoers(self.env)[0]["level"], "ok")
 
+    def test_x11_libraries_in_installed_binaries_are_flagged_with_the_fix(self):
+        for name in ("whitecube", "cube-status"):
+            self.put(f".local/bin/{name}", "", self.home)
+        for text, level in (("libxcb.so.1 => /lib/libxcb.so.1\n", "WARN"), ("libwayland-client.so.0 => /lib/x\n", "ok")):
+            with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout=text)):
+                found = doctor.check_xfree(self.env)[0]
+            self.assertEqual(found["level"], level)
+        with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout="libX11.so.6 => /lib/x\n")):
+            self.assertIn("build-xfree-cairo.sh", doctor.check_xfree(self.env)[0]["fix"])
+
+    def test_no_installed_binaries_means_nothing_to_flag(self):
+        self.assertEqual(doctor.check_xfree(self.env)[0]["level"], "ok")
+
     def test_x11_in_the_environment_is_flagged(self):
         with mock.patch.dict(doctor.os.environ, {"DISPLAY": ":0"}):
             self.assertEqual(doctor.check_session(self.env)[0]["level"], "WARN")

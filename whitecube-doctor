@@ -176,6 +176,25 @@ def check_sudoers(env):
     return [finding('info', 'passwordless sudo', 'sudoers rule file not found')]
 
 
+def check_xfree(env):
+    """libX11/libxcb in the installed desktop binaries means the distro cairo is in use (policy: X-free)."""
+    linked = []
+    for name in ('whitecube', 'cube-ca', 'cube-settings', 'cube-status'):
+        binary = env.home / '.local/bin' / name
+        if not binary.is_file():
+            continue
+        try:
+            done = subprocess.run(['/usr/bin/ldd', str(binary)], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if re.search(r'libX11|libxcb', done.stdout):
+            linked.append(name)
+    if linked:
+        return [finding('WARN', 'x11 libraries', 'linked into ' + ', '.join(linked) + ' through the distro cairo',
+                        f'{env.project}/tools/build-xfree-cairo.sh   (then the sudo cp it prints; no rebuild needed)')]
+    return [finding('ok', 'x11 libraries', 'none linked into the installed desktop binaries')]
+
+
 def check_session(env):
     runtime = os.environ.get('XDG_RUNTIME_DIR')
     out = []
@@ -190,7 +209,7 @@ def run_checks(env):
     net = load_cube_net(env)
     results = []
     for check in (lambda: check_firewall(env), lambda: check_network(env, net), lambda: check_competitors(env, net),
-                  lambda: check_wpa_leftovers(env), lambda: check_drift(env), lambda: check_sudoers(env), lambda: check_session(env)):
+                  lambda: check_wpa_leftovers(env), lambda: check_drift(env), lambda: check_sudoers(env), lambda: check_xfree(env), lambda: check_session(env)):
         try:
             results.extend(check())
         except Exception as error:  # one broken check must not hide the others

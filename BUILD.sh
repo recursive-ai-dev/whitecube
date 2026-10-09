@@ -46,6 +46,20 @@ read -r -a settings_flags <<< "$(pkg --cflags --libs wayland-client wayland-curs
 "$cc" "${flags[@]}" cube-ca.c wlr-layer-shell-protocol.c xdg-shell-protocol.c -o $out/cube-ca "${client_flags[@]}" -lm
 "$cc" "${flags[@]}" cube-settings.c xdg-shell-protocol.c wlr-output-management-protocol.c -o $out/cube-settings "${settings_flags[@]}" -lm
 "$cc" "${flags[@]}" cube-status.c wlr-layer-shell-protocol.c xdg-shell-protocol.c -o $out/cube-status "${settings_flags[@]}" -lm
+# X-free policy (MAINTENANCE.md): report libX11/libxcb reaching our binaries through the distro cairo.
+# REQUIRE_XFREE=1 makes it fatal. Fix: tools/build-xfree-cairo.sh stages an X-free cairo (no root needed to build).
+if [[ -z $sysroot ]]; then
+  xlinked=()
+  for bin in whitecube cube-ca cube-settings cube-status; do
+    if ldd "$out/$bin" | grep -qi -E 'libX11|libxcb'; then xlinked+=("$bin"); fi
+  done
+  if (( ${#xlinked[@]} )); then
+    echo "WARNING: X11/XCB libraries are linked into: ${xlinked[*]} (see tools/build-xfree-cairo.sh)" >&2
+    [[ -z ${REQUIRE_XFREE:-} ]] || { echo "REQUIRE_XFREE is set: failing" >&2; exit 1; }
+  else
+    echo "X-free: no libX11/libxcb in our binaries"
+  fi
+fi
 python3 workspace-test.py > $out/workspace-test.c
 "$cc" "${flags[@]}" $out/workspace-test.c -o $out/workspace-test
 "$cc" "${flags[@]}" desktop-state-test.c -o $out/desktop-state-test
