@@ -1,0 +1,18 @@
+#!/bin/sh
+# whitecube-next-wallpaper: cycle swaybg through cube-space wallpapers.
+# Bound to Alt+n in whitecube.
+set -e
+DIR="/usr/share/whitecube/wallpapers/cube-space"
+STATE="${XDG_RUNTIME_DIR:-/tmp}/whitecube-wallpaper.idx"
+[ -d "$DIR" ] || DIR="/usr/share/whitecube/wallpapers"
+FILES=$(ls "$DIR"/*.jpg 2>/dev/null) || exit 0
+N=$(echo "$FILES" | wc -l)
+IDX=0
+[ -f "$STATE" ] && IDX=$(cat "$STATE" 2>/dev/null || echo 0)
+IDX=$(( (IDX + 1) % N ))
+echo "$IDX" > "$STATE"
+WALL=$(echo "$FILES" | sed -n "$((IDX+1))p")
+pkill -x swaybg 2>/dev/null || true
+sleep 0.3
+swaybg -i "$WALL" -m fill >/tmp/swaybg.log 2>&1 &
+echo "wallpaper: $WALL"

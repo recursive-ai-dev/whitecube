@@ -1,0 +1,69 @@
+#!/usr/bin/python3 -I
+"""dhcpcd hook: write router DNS to /run/whitecube-net/resolv.conf (no resolved, no dbus).
+
+/etc/resolv.conf is a symlink to that file, so DNS exists only while the
+dongle holds a lease. dhcpcd runs this as root with the lease in its environment.
+
+Only plain unicast IPv4 resolvers are accepted: a DHCP server cannot point name
+lookups at loopback, multicast, link-local or reserved addresses. If a new lease
+(BOUND/REBOOT) offers nothing usable, the previous network's resolvers are removed
+rather than kept; a RENEW/REBIND that omits DNS leaves the working file alone.
+Search domains and hostnames offered by the server are never applied.
+"""
+import ipaddress
+import os
+import re
+import sys
+from pathlib import Path
+
+RESOLV = Path("/run/whitecube-net/resolv.conf")
+UP = {"BOUND", "RENEW", "REBIND", "REBOOT", "INFORM"}
+FRESH = {"BOUND", "REBOOT"}   # a new or re-validated lease; RENEW/REBIND ACKs may omit options mid-lease
+DOWN = {"EXPIRE", "FAIL", "STOP", "STOPPED", "NOCARRIER", "DEPARTED", "RELEASE"}
+
+
+def usable(text):
+    try:
+        address = ipaddress.IPv4Address(text)
+    except ValueError:
+        return None
+    if address.is_unspecified or address.is_loopback or address.is_multicast or address.is_link_local \
+            or address.is_reserved:
+        return None
+    return str(address)
+
+
+def write_atomic(path, body):
+    temporary = path.with_suffix(".tmp")
+    temporary.unlink(missing_ok=True)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as stream:
+        os.fchmod(fd, 0o644)  # os.open's mode is masked by umask (the service runs with UMask=0077)
+        stream.write(body)
+    os.replace(temporary, path)
+
+
+def main(environ=os.environ, resolv=RESOLV):
+    interface = environ.get("interface", "")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
+        sys.exit("Invalid interface")
+    reason = environ.get("reason", "")
+    if reason in UP:
+        servers = []
+        for item in environ.get("new_domain_name_servers", "").split():
+            address = usable(item)
+            if address and address not in servers:
+                servers.append(address)
+        if servers:
+            # timeout/attempts keep a dead first resolver from stalling every lookup for ten seconds.
+            body = f"# {interface} via dhcpcd (cube-net-dns)\noptions timeout:2 attempts:2\n"
+            body += "".join(f"nameserver {server}\n" for server in servers[:3])
+            write_atomic(resolv, body)
+        elif reason in FRESH:
+            resolv.unlink(missing_ok=True)
+    elif reason in DOWN:
+        resolv.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

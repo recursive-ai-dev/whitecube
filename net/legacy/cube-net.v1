@@ -1,0 +1,859 @@
+#!/usr/bin/env python3
+"""A small, dongle-specific controller using existing WPA and DHCP binaries.
+
+status/check are read-only and do not require root. run is a service entrypoint.
+Credentials are only accepted from a terminal or an explicitly requested local
+profile import; they never appear in arguments, logs or JSON status.
+"""
+import argparse
+import configparser
+from contextlib import contextmanager
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+DEFAULT_DEVICE = {"usb_id": "2001:3329", "mac": "88:76:b9:f2:9d:29", "driver": "rtw88_8822cu"}
+CONFIG_DIR = Path("/etc/whitecube/network")
+RUNTIME_DIR = Path("/run/whitecube-net")
+RECOVERY_DELAYS = (5, 15, 30)
+PROBE_INTERVAL = 15
+
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def device_config(root=Path("/")):
+    path = root / "etc/whitecube/network/device.json"
+    config = json.loads(read(path)) if path.is_file() else DEFAULT_DEVICE.copy()
+    if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", config.get("usb_id", "")):
+        raise ValueError("Invalid configured USB ID")
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", config.get("mac", "")):
+        raise ValueError("Invalid configured MAC")
+    if config.get("driver") != "rtw88_8822cu":
+        raise ValueError("This controller expects the audited rtw88_8822cu driver")
+    if any(config.get(key) != value for key, value in DEFAULT_DEVICE.items()):
+        raise ValueError('This Whitecube build is scoped to USB 2001:3329, MAC 88:76:b9:f2:9d:29 and rtw88_8822cu.')
+    return config
+
+
+def interfaces(sysfs=Path("/sys")):
+    result = []
+    for link in sorted((sysfs / "class/net").glob("*")):
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", link.name):
+            continue
+        dev = (link / "device").resolve()
+        usb_id = ""
+        for parent in [dev, *dev.parents]:
+            vendor, product = read(parent / "idVendor"), read(parent / "idProduct")
+            if vendor and product:
+                usb_id = f"{vendor}:{product}".lower()
+                break
+        result.append({
+            "interface": link.name,
+            "usb_id": usb_id,
+            "mac": read(link / "address").lower(),
+            # Module name: Linux 6.12 registers this USB driver as rtw_8822cu, newer kernels as rtw88_8822cu.
+            "driver": ((link / "device/driver/module").resolve().name if (link / "device/driver/module").exists()
+                       else (link / "device/driver").resolve().name if (link / "device/driver").exists() else ""),
+            "operstate": read(link / "operstate"),
+            "carrier": read(link / "carrier") == "1",
+            "rx_bytes": int(read(link / "statistics/rx_bytes") or 0),
+            "tx_bytes": int(read(link / "statistics/tx_bytes") or 0),
+        })
+    return result
+
+
+def matches(interface, device):
+    return all(interface.get(key) == device[key] for key in ("usb_id", "mac", "driver"))
+
+
+def usb_devices(sysfs=Path('/sys')):
+    return [path for path in (sysfs / 'bus/usb/devices').glob('*')
+            if (read(path / 'idVendor') + ':' + read(path / 'idProduct')).lower() == DEFAULT_DEVICE['usb_id']]
+
+
+def diagnostic(config, seen, runtime, usb_present=False):
+    exact = [item for item in seen if matches(item, config)]
+    same_usb = [item for item in seen if item.get('usb_id') == config['usb_id']]
+    def result(code, summary, actions):
+        return {'diagnostic_code': code, 'diagnostic_summary': summary, 'recovery_actions': actions}
+    if not exact:
+        if not same_usb and not usb_present:
+            return result('missing-dongle', 'The scoped USB dongle is absent.',
+                          ['Reconnect USB 2001:3329 directly, then run cube-net status.'])
+        if any(item.get('mac') == config['mac'] and item.get('driver') != config['driver'] for item in same_usb) or not same_usb:
+            return result('driver-problem', 'USB 2001:3329 is present but the audited driver has no matching interface.',
+                          ['Run cube-net check and inspect journalctl -k for rtw88_8822cu or firmware errors.',
+                           'Inspect existing blacklists; do not restore deleted modules or unmask services automatically.'])
+        return result('identity-mismatch', 'The USB device does not match the scoped MAC/driver identity.',
+                      ['Use the dongle with MAC 88:76:b9:f2:9d:29; this controller will not manage another device.'])
+    if len(exact) != 1:
+        return result('identity-ambiguous', 'More than one interface matches the scoped identity.', ['Inspect cube-net status before starting a controller.'])
+    if runtime.get('recovery_exhausted'):
+        return result('recovery-paused', 'Automatic reconnect reached its three-attempt limit and association is paused.',
+                      ['Review signal, saved profile and service journal, then run sudo cube-net reconnect.',
+                       'Select a different saved profile with sudo cube-net manage.'])
+    state = runtime.get('association_state', 'unknown')
+    if state in ('unknown', 'stale', 'stopped', 'failed', 'controller-unavailable', 'waiting-for-dongle'):
+        return result('controller-unavailable', 'Fresh association status is unavailable.',
+                      ['Inspect systemctl status whitecube-network.service and journalctl -u whitecube-network.service.',
+                       'After configuring a profile, start the scoped service deliberately; existing managers must not compete.'])
+    if state != 'COMPLETED':
+        return result('association-failed', 'Wi-Fi association has not completed.',
+                      ['Check signal and scan with sudo cube-net scan.', 'Review the saved WPA2 profile with sudo cube-net manage.'])
+    if not runtime.get('checks_epoch') or time.time() - runtime['checks_epoch'] > 45:
+        return result('checks-pending', 'Association completed; fresh DHCP, DNS and connectivity checks are pending.', ['Wait for the next bounded diagnostic probe, then run cube-net status.'])
+    if not runtime.get('ipv4_address') or not runtime.get('default_route'):
+        return result('dhcp-failed', 'Wi-Fi associated but no usable IPv4 lease and default route are available.',
+                      ['Inspect journalctl -u whitecube-network.service for DHCP errors.', 'Check that the router offers IPv4 DHCP, then run sudo cube-net reconnect.'])
+    if runtime.get('dns_ok') is False:
+        return result('dns-failed', 'The dongle has IPv4 connectivity settings but its DNS query failed.',
+                      ['Inspect /run/whitecube-net/resolv.conf and the router DNS settings.', 'Retry with sudo cube-net reconnect after correcting DNS.'])
+    if runtime.get('connectivity_ok') is False:
+        return result('connectivity-lost', 'The scoped connection could not reach the bounded Internet probe.',
+                      ['Check the router uplink or captive portal; inspect the interface default route.', 'Run sudo cube-net reconnect after reviewing the cause.'])
+    if runtime.get('dns_ok') is True and runtime.get('connectivity_ok') is True:
+        return result('online', 'Association, IPv4 lease/route, interface DNS and a bound TCP probe passed.', [])
+    return result('checks-pending', 'Some diagnostic checks are unavailable; Internet access is not established.', ['Inspect cube-net check and the service journal.'])
+
+
+def connection_probe(iface):
+    """Small bounded probes, explicitly routed through the selected dongle."""
+    value = {'ipv4_address': None, 'default_route': None, 'dns_ok': None,
+             'connectivity_ok': None, 'checks_epoch': time.time()}
+    try:
+        addresses = subprocess.run(['/usr/sbin/ip', '-j', '-4', 'address', 'show', 'dev', iface],
+                                   capture_output=True, text=True, timeout=3)
+        for item in json.loads(addresses.stdout):
+            for address in item.get('addr_info', []):
+                if address.get('family') == 'inet' and address.get('scope') == 'global':
+                    value['ipv4_address'] = address.get('local')
+        routes = subprocess.run(['/usr/sbin/ip', '-j', '-4', 'route', 'show', 'default', 'dev', iface],
+                                capture_output=True, text=True, timeout=3)
+        routes = json.loads(routes.stdout)
+        value['default_route'] = next((route.get('gateway') or 'direct' for route in routes if route.get('dev') == iface), None)
+        if not value['ipv4_address'] or not value['default_route']:
+            return value
+        try:
+            # /etc/resolv.conf -> RUNTIME_DIR/resolv.conf, written by cube-net-dns.
+            dns = subprocess.run(['/usr/bin/getent', 'ahostsv4', 'deb.debian.org'],
+                                 capture_output=True, text=True, timeout=3)
+            value['dns_ok'] = dns.returncode == 0
+        except subprocess.TimeoutExpired:
+            value['dns_ok'] = False
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.settimeout(2)
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode('ascii') + b'\0')
+            try:
+                probe.connect(('1.1.1.1', 443))
+                value['connectivity_ok'] = True
+            except OSError:
+                value['connectivity_ok'] = False
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        pass
+    return value
+
+
+def status(root=Path("/"), sysfs=Path("/sys")):
+    config = device_config(root)
+    seen = interfaces(sysfs)
+    selected = [item for item in seen if matches(item, config)]
+    runtime = public_runtime(root)
+    if len(selected) == 1 and root == Path('/'):
+        signal_dbm = wireless_signal(selected[0]['interface'])
+        if signal_dbm is not None:
+            runtime['signal_dbm'] = signal_dbm
+    return {
+        "controller": "whitecube-network", "device": config,
+        "present": len(selected) == 1,
+        "interface": selected[0] if len(selected) == 1 else None,
+        "credentials_configured": (root / "etc/whitecube/network/wpa.conf").is_file(),
+        "matching_usb_devices": len([item for item in seen if item["usb_id"] == config["usb_id"]]),
+        "profiles": public_profiles(root),
+        **runtime,
+        **diagnostic(config, seen, runtime, bool(usb_devices(sysfs))),
+        "note": "Probes test deb.debian.org DNS and bound TCP 1.1.1.1:443; filtering can cause a failed probe without a broken LAN.",
+    }
+
+
+def audit(root):
+    kernels = []
+    module_base = root / "lib/modules"
+    for kernel in sorted(module_base.glob("*")):
+        entry = {"kernel": kernel.name}
+        lines = read(kernel / "modules.dep").splitlines()
+        line = next((line for line in lines if line.split(":", 1)[0].endswith("/rtw88_8822cu.ko.xz") or line.split(":", 1)[0].endswith("/rtw88_8822cu.ko")), "")
+        files = line.replace(":", "").split()
+        entry["module_files"] = [{"path": name, "present": (kernel / name).is_file()} for name in files]
+        entry["usb_alias_present"] = any("usb:v2001p3329" in line and line.endswith(" rtw88_8822cu") for line in read(kernel / "modules.alias").splitlines())
+        entry["ready"] = bool(files) and all(item["present"] for item in entry["module_files"]) and entry["usb_alias_present"]
+        kernels.append(entry)
+    firmware = root / "lib/firmware/rtw88/rtw8822c_fw.bin"
+    binaries = {name: (root / path).is_file() for name, path in {
+        "wpa_supplicant": "usr/sbin/wpa_supplicant", "wpa_cli": "usr/sbin/wpa_cli",
+        "dhcpcd": "usr/sbin/dhcpcd", "getent": "usr/bin/getent",
+    }.items()}
+    masks = []
+    for name in ["systemd-networkd.service", "systemd-networkd.socket", "wpa_supplicant@.service", "network-pre.target"]:
+        p = root / "etc/systemd/system" / name
+        if p.is_symlink() and str(p.readlink()) == "/dev/null":
+            masks.append(name)
+    return {"root": str(root), "kernels": kernels, "firmware_present": firmware.is_file(), "binaries": binaries,
+            "existing_masks_preserved": masks,
+            "dependencies_ready": bool(kernels) and all(k["ready"] for k in kernels) and firmware.is_file() and all(binaries.values()),
+            "policy": "No packages or modules installed, loaded, restored, removed or unmasked."}
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise RuntimeError("This command requires root; status and check are available without root.")
+
+
+def protected(path, allow_absent=False):
+    path = Path(path)
+    for part in [*reversed(path.parents), path]:
+        try:
+            metadata = part.lstat()
+        except FileNotFoundError:
+            if allow_absent:
+                continue
+            raise RuntimeError('Required protected network path is missing.')
+        if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError('Network control paths must be root-owned, without symlinks or group/world write access.')
+    return path
+
+
+def atomic_write(path, content, mode):
+    protected(path, allow_absent=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '-')
+    temporary = Path(temporary)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def profile_id(ssid):
+    return hashlib.sha256(ssid.encode('utf-8')).hexdigest()[:16]
+
+
+def load_profiles():
+    require_root()
+    path = CONFIG_DIR / 'wpa.conf'
+    if not path.exists() and not path.is_symlink():
+        return []
+    protected(path)
+    if not path.is_file() or path.stat().st_mode & 0o077 or path.stat().st_size > 1024**2:
+        raise RuntimeError('WPA profiles require a protected regular file with mode 0600.')
+    content = path.read_text()
+    profiles = []
+    blocks = re.findall(r'network\s*=\s*\{([^{}]*)\}', content)
+    remainder = re.sub(r'network\s*=\s*\{[^{}]*\}', '', content)
+    for line in remainder.splitlines():
+        if line.strip() not in ('', 'ctrl_interface=/run/whitecube-net/wpa', 'update_config=0'):
+            raise RuntimeError('Unsupported WPA configuration; preserve and migrate it manually before editing.')
+    for block in blocks:
+        values = {}
+        for line in block.splitlines():
+            key, sep, value = line.strip().partition('=')
+            if not line.strip():
+                continue
+            if not sep or key in values or key not in ('ssid', 'psk', 'key_mgmt', 'proto'):
+                raise RuntimeError('Unsupported WPA profile; refusing to discard configuration.')
+            values[key] = value
+        if (values.get('key_mgmt') != 'WPA-PSK' or values.get('proto') != 'RSN'
+                or not re.fullmatch(r'(?:[a-fA-F0-9]{2}){1,32}', values.get('ssid', ''))
+                or not re.fullmatch(r'[a-fA-F0-9]{64}', values.get('psk', ''))):
+            raise RuntimeError('Unsupported WPA profile; refusing to discard configuration.')
+        try:
+            ssid = bytes.fromhex(values['ssid']).decode('utf-8')
+        except UnicodeError:
+            raise RuntimeError('Unsupported binary SSID; refusing to change profiles.')
+        profiles.append((ssid, values['psk']))
+    return profiles
+
+
+def public_profiles(root=Path('/')):
+    path = root / 'etc/whitecube/network/profiles.json'
+    if not path.exists():
+        path = root / 'run/whitecube-net/profiles.json'
+        if not path.exists():
+            return []
+    try:
+        protected(path)
+        if path.stat().st_size > 65536:
+            return []
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            return []
+        return [{'id': item['id'], 'ssid': item['ssid']} for item in data
+                if isinstance(item, dict) and isinstance(item.get('ssid'), str)
+                and item.get('id') == profile_id(item['ssid'])]
+    except (OSError, ValueError, RuntimeError):
+        return []
+
+
+def write_profiles(profiles):
+    require_root()
+    protected(CONFIG_DIR, allow_absent=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+    path = CONFIG_DIR / "wpa.conf"
+    protected(path, allow_absent=True)
+    config = ["ctrl_interface=/run/whitecube-net/wpa", "update_config=0", ""]
+    seen = set()
+    for ssid, secret in profiles:
+        encoded = ssid.encode("utf-8")
+        if not 1 <= len(encoded) <= 32:
+            raise ValueError("SSID must be 1 to 32 UTF-8 bytes")
+        if ssid in seen:
+            raise ValueError('Duplicate SSID; remove its existing profile before adding a replacement.')
+        seen.add(ssid)
+        if re.fullmatch(r"[A-Fa-f0-9]{64}", secret):
+            psk = secret.lower()
+        elif 8 <= len(secret.encode("utf-8")) <= 63:
+            psk = hashlib.pbkdf2_hmac("sha1", secret.encode("utf-8"), encoded, 4096, 32).hex()
+        else:
+            raise ValueError("WPA2 passphrase must be 8 to 63 UTF-8 bytes (or 64 hex digits)")
+        config.extend(["network={", f"    ssid={encoded.hex()}", f"    psk={psk}", "    key_mgmt=WPA-PSK", "    proto=RSN", "}", ""])
+    if path.exists():
+        backup = CONFIG_DIR / f"wpa.conf.backup-{time.time_ns()}"
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(path.read_bytes())
+            out.flush()
+            os.fsync(out.fileno())
+    atomic_write(path, '\n'.join(config), 0o600)
+    atomic_write(CONFIG_DIR / 'profiles.json', json.dumps([
+        {'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in profiles], ensure_ascii=True), 0o644)
+    print(f"Saved {len(profiles)} WPA2 personal profile(s). Choose Connect to apply; credential backups remain mode 0600.")
+
+
+def import_nm():
+    require_root()
+    profiles = []
+    skipped = 0
+    for path in sorted(Path("/etc/NetworkManager/system-connections").glob("*")):
+        if not path.is_file():
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(path)
+            wifi = next((s for s in ("wifi", "802-11-wireless") if parser.has_section(s)), "wifi")
+            security = next((s for s in ("wifi-security", "802-11-wireless-security") if parser.has_section(s)), "wifi-security")
+            if parser.get(security, "key-mgmt", fallback="") != "wpa-psk":
+                skipped += 1
+                continue
+            ssid = parser.get(wifi, "ssid", fallback="")
+            psk = parser.get(security, "psk", fallback="")
+            # Escaped/binary keyfile values need NM's parser; do not guess.
+            if not ssid or not psk or "\\" in ssid or "\\" in psk or re.fullmatch(r"(?:\d+;)+", ssid):
+                skipped += 1
+                continue
+            profiles.append((ssid, psk))
+        except (OSError, configparser.Error):
+            skipped += 1
+    if not profiles:
+        raise RuntimeError("No supported saved WPA2 personal profiles found. Run cube-net setup interactively.")
+    existing = load_profiles()
+    known = {ssid for ssid, _ in existing}
+    write_profiles(existing + [(ssid, psk) for ssid, psk in profiles if ssid not in known])
+    print(f"Skipped {skipped} unsupported profile(s); original files were preserved.")
+
+
+@contextmanager
+def profile_lock():
+    require_root()
+    protected(CONFIG_DIR, allow_absent=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+    path = CONFIG_DIR / '.profiles.lock'
+    protected(path, allow_absent=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def wireless_signal(iface, proc=Path('/proc/net/wireless')):
+    for line in read(proc).splitlines():
+        name, sep, fields = line.partition(':')
+        if sep and name.strip() == iface:
+            try:
+                level = float(fields.split()[2].rstrip('.'))
+                if -130 <= level <= 0:
+                    return level
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def public_runtime(root=Path('/')):
+    result = {'association_state': 'unknown', 'signal_dbm': None, 'reconnect_count': 0,
+              'service_restart_count': 0, 'last_error': None, 'updated_utc': None,
+              'ipv4_address': None, 'default_route': None, 'dns_ok': None, 'connectivity_ok': None,
+              'checks_epoch': None, 'recovery_attempts': 0, 'recovery_exhausted': False, 'ssid': None}
+    path = root / 'run/whitecube-net/status.json'
+    try:
+        protected(path)
+        if path.stat().st_size > 16384:
+            return result
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return result
+        for key in result:
+            value = raw.get(key)
+            if key in ('reconnect_count', 'service_restart_count', 'recovery_attempts'):
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
+                    result[key] = value
+            elif key in ('dns_ok', 'connectivity_ok', 'recovery_exhausted'):
+                if isinstance(value, bool) or value is None and key != 'recovery_exhausted':
+                    result[key] = value
+            elif key == 'checks_epoch':
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= time.time() + 5:
+                    result[key] = value
+            elif key == 'signal_dbm':
+                if isinstance(value, (int, float)) and -130 <= value <= 0:
+                    result[key] = value
+            elif value is None or isinstance(value, str) and len(value) < 256:
+                result[key] = value
+        if isinstance(raw.get('updated_epoch'), (int, float)) and time.time() - raw['updated_epoch'] > 15:
+            result['association_state'] = 'stale'
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return result
+
+
+def publish_runtime(data):
+    value = dict(data, updated_epoch=time.time(), updated_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    atomic_write(RUNTIME_DIR / 'status.json', json.dumps(value, ensure_ascii=True), 0o644)
+
+
+def reset_recovery_request():
+    # A root-only controller action resets its bounded budget. No credentials.
+    path = RUNTIME_DIR / 'recovery.request'
+    protected(path, allow_absent=True)
+    atomic_write(path, str(time.time_ns()), 0o644)
+
+
+def reconnect():
+    iface = require_controller()
+    if wpa_command(iface, 'reassociate') != 'OK':
+        raise RuntimeError('Scoped WPA controller rejected reconnection.')
+    reset_recovery_request()
+    print(json.dumps({'state': 'reconnecting', 'max_attempts': len(RECOVERY_DELAYS),
+                      'detail': 'Reconnection budget reset for the exact scoped dongle.'}))
+
+
+def recovery_step(runtime, elapsed, since_attempt):
+    """Pure bounded retry decision used by the service and regression tests."""
+    if runtime.get('recovery_exhausted') or elapsed < 30:
+        return None
+    attempts = runtime.get('recovery_attempts', 0)
+    if attempts >= len(RECOVERY_DELAYS):
+        if since_attempt >= 30:
+            runtime['recovery_exhausted'] = True
+            return 'disconnect'
+        return None
+    if since_attempt >= RECOVERY_DELAYS[attempts]:
+        runtime['recovery_attempts'] = attempts + 1
+        return 'reassociate'
+    return None
+
+
+def selected_interface():
+    config = device_config()
+    candidates = [item for item in interfaces() if matches(item, config)]
+    if len(candidates) != 1:
+        raise RuntimeError('The configured USB, MAC and driver must identify exactly one attached dongle.')
+    return candidates[0]['interface']
+
+
+def wpa_command(iface, *command):
+    # All commands are fixed tokens or decimal network indices, never SSID shell text.
+    result = subprocess.run(['/usr/sbin/wpa_cli', '-p', str(RUNTIME_DIR / 'wpa'), '-i', iface, *command],
+                            capture_output=True, text=True, timeout=5)
+    output = result.stdout.strip()
+    if result.returncode or output.startswith(('FAIL', 'UNKNOWN COMMAND', 'Could not connect')):
+        raise RuntimeError('Whitecube WPA controller is unavailable or rejected the requested operation.')
+    return output
+
+
+def require_controller():
+    require_root()
+    iface = selected_interface()
+    protected(RUNTIME_DIR / 'wpa', allow_absent=False)
+    if wpa_command(iface, 'ping') != 'PONG':
+        raise RuntimeError('Start the configured whitecube-network service before managing this connection.')
+    return iface
+
+
+def scan_networks():
+    iface = require_controller()
+    if wpa_command(iface, 'scan') != 'OK':
+        raise RuntimeError('The dongle did not accept a scan.')
+    time.sleep(2)
+    result = []
+    for line in wpa_command(iface, 'scan_results').splitlines()[1:]:
+        fields = line.split('\t', 4)
+        if len(fields) != 5 or not re.fullmatch(r'(?:[a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}', fields[0]):
+            continue
+        try:
+            frequency, level = int(fields[1]), int(fields[2])
+        except ValueError:
+            continue
+        result.append({'bssid': fields[0], 'frequency_mhz': frequency, 'signal_dbm': level,
+                       'security': fields[3], 'ssid': fields[4]})
+    return {'interface': iface, 'networks': result,
+            'note': 'Latest controller scan results; a slow scan may still be completing. SSIDs use WPA display escaping.'}
+
+
+def wpa_ssid_hex(value):
+    if re.fullmatch(r'(?:[a-fA-F0-9]{2}){1,32}', value):
+        return value.lower()
+    if not value.startswith('"') or not value.endswith('"'):
+        raise RuntimeError('Unsupported SSID response from WPA controller.')
+    encoded = bytearray()
+    inner = value[1:-1]
+    index = 0
+    while index < len(inner):
+        if inner[index] != '\\':
+            encoded.extend(inner[index].encode('utf-8'))
+            index += 1
+        elif inner[index:index + 2] == '\\x' and re.fullmatch(r'[a-fA-F0-9]{2}', inner[index + 2:index + 4]):
+            encoded.append(int(inner[index + 2:index + 4], 16))
+            index += 4
+        elif index + 1 < len(inner) and inner[index + 1] in ('\\', '"', 'n', 'r', 't', 'e'):
+            char = {'n': '\n', 'r': '\r', 't': '\t', 'e': '\x1b'}.get(inner[index + 1], inner[index + 1])
+            encoded.extend(char.encode('utf-8'))
+            index += 2
+        else:
+            raise RuntimeError('Unsupported escaped SSID response.')
+    return encoded.hex()
+
+
+def connect_profile(identifier):
+    if not re.fullmatch(r'[a-f0-9]{16}', identifier):
+        raise ValueError('Invalid saved profile ID.')
+    selected = [ssid for ssid, _ in load_profiles() if profile_id(ssid) == identifier]
+    if len(selected) != 1:
+        raise ValueError('Saved profile does not exist or is ambiguous.')
+    iface = require_controller()
+    if wpa_command(iface, 'reconfigure') != 'OK':
+        raise RuntimeError('WPA profile reload failed.')
+    matching = []
+    for line in wpa_command(iface, 'list_networks').splitlines()[1:]:
+        network_id = line.split('\t', 1)[0]
+        if not re.fullmatch(r'[0-9]{1,10}', network_id):
+            continue
+        if wpa_ssid_hex(wpa_command(iface, 'get_network', network_id, 'ssid')) == selected[0].encode('utf-8').hex():
+            matching.append(network_id)
+    if len(matching) != 1:
+        raise RuntimeError('Saved SSID does not map to exactly one running WPA profile.')
+    if wpa_command(iface, 'select_network', matching[0]) != 'OK':
+        raise RuntimeError('WPA rejected connection selection.')
+    reset_recovery_request()
+    print(json.dumps({'selected_profile': identifier, 'state': 'connecting',
+                      'detail': 'Selection accepted; association and DHCP completion are reported by status.'}))
+
+
+def add_profile():
+    require_root()
+    if not sys.stdin.isatty():
+        raise RuntimeError('Run add in a terminal; passwords are never accepted as arguments.')
+    existing = load_profiles()
+    ssid = input('Wi-Fi SSID: ')
+    secret = getpass.getpass('WPA2 passphrase: ')
+    if secret != getpass.getpass('Confirm passphrase: '):
+        raise ValueError('Passphrases do not match')
+    write_profiles(existing + [(ssid, secret)])
+
+
+def remove_profile(identifier):
+    if not re.fullmatch(r'[a-f0-9]{16}', identifier):
+        raise ValueError('Invalid saved profile ID.')
+    existing = load_profiles()
+    filtered = [(ssid, secret) for ssid, secret in existing if profile_id(ssid) != identifier]
+    if len(filtered) != len(existing) - 1:
+        raise ValueError('Saved profile does not exist or is ambiguous.')
+    write_profiles(filtered)
+    try:
+        iface = require_controller()
+        if wpa_command(iface, 'reconfigure') != 'OK':
+            raise RuntimeError('WPA reload failed.')
+    except RuntimeError:
+        print('Profile removed from disk; running controller reload unavailable. Restart it or choose Connect to apply.')
+
+
+def manage():
+    require_root()
+    if not sys.stdin.isatty():
+        raise RuntimeError('Run manage in an interactive terminal.')
+    while True:
+        print('\nWhitecube Wi-Fi: [l] saved profiles, [s] scan, [c] connect, [a] add, [r] remove, [q] quit')
+        choice = input('Choice: ').strip().lower()
+        if choice == 'q':
+            return
+        if choice == 'l':
+            print(json.dumps([{'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in load_profiles()], ensure_ascii=True, indent=2))
+        elif choice == 's':
+            print(json.dumps(scan_networks(), ensure_ascii=True, indent=2))
+        elif choice in ('a', 'r', 'c'):
+            with profile_lock():
+                if choice == 'a':
+                    add_profile()
+                elif choice == 'r':
+                    remove_profile(input('Exact profile ID to remove: ').strip())
+                else:
+                    connect_profile(input('Profile ID: ').strip())
+
+
+def competing_processes(iface, proc=Path("/proc")):
+    """Report conflicts; never terminate processes owned by another controller."""
+    found = []
+    for path in proc.glob("[0-9]*/cmdline"):
+        try:
+            args = path.read_bytes().split(b"\0")
+        except OSError:
+            continue
+        decoded = [arg.decode(errors="replace") for arg in args if arg]
+        if not decoded:
+            continue
+        command = Path(decoded[0]).name
+        if command in {"NetworkManager", "iwd", "dhcpcd"}:
+            found.append(command)
+        elif command == "wpa_supplicant" and any(arg == f"-i{iface}" or (arg == "-i" and i + 1 < len(decoded) and decoded[i + 1] == iface) for i, arg in enumerate(decoded)):
+            found.append(command)
+    return sorted(set(found))
+
+
+def run_service():
+    require_root()
+    config = device_config()
+    for path in [CONFIG_DIR / "device.json", CONFIG_DIR / "wpa.conf", CONFIG_DIR / "dhcpcd.conf"]:
+        protected(path)
+        metadata = path.stat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError(f"{path} must be root-owned and not writable by other users")
+    if (CONFIG_DIR / "wpa.conf").stat().st_mode & 0o077:
+        raise RuntimeError("wpa.conf must have mode 0600")
+    protected(RUNTIME_DIR, allow_absent=True)
+    RUNTIME_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    RUNTIME_DIR.chmod(0o755)
+    control = RUNTIME_DIR / 'wpa'
+    protected(control, allow_absent=True)
+    control.mkdir(mode=0o700, exist_ok=True)
+    control.chmod(0o700)
+    protected(RUNTIME_DIR / 'controller.lock', allow_absent=True)
+    lock = (RUNTIME_DIR / "controller.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Support profiles created before public metadata was introduced. Service
+    # ProtectSystem=full keeps /etc read-only, so publish this fallback in /run.
+    try:
+        profiles = load_profiles()
+        atomic_write(RUNTIME_DIR / 'profiles.json', json.dumps([
+            {'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in profiles], ensure_ascii=True), 0o644)
+    except RuntimeError:
+        pass  # Handwritten WPA extensions remain usable but are not rewritten.
+    runtime = public_runtime()
+    previous_state = runtime['association_state']
+    runtime.update(association_state='waiting-for-dongle', signal_dbm=None, ssid=None,
+                   service_restart_count=runtime['service_restart_count'] + (1 if runtime['updated_utc'] else 0),
+                   last_error=None, recovery_attempts=0, recovery_exhausted=False,
+                   ipv4_address=None, default_route=None, dns_ok=None, connectivity_ok=None, checks_epoch=None)
+    publish_runtime(runtime)
+    ever_connected = previous_state == 'COMPLETED' or runtime['reconnect_count'] > 0
+    disconnected_since = time.monotonic()
+    last_attempt = disconnected_since
+    failure_since = disconnected_since
+    last_probe = 0
+    request = read(RUNTIME_DIR / 'recovery.request')
+    stopping = False
+    children = []
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    iface = None
+    try:
+        print("Waiting for the configured USB dongle", flush=True)
+        while not stopping:
+            candidates = [item for item in interfaces() if matches(item, config)]
+            if len(candidates) > 1:
+                raise RuntimeError("Device identity is ambiguous")
+            if candidates:
+                iface = candidates[0]["interface"]
+                break
+            publish_runtime(runtime)
+            time.sleep(1)
+        if stopping:
+            return
+        conflicts = competing_processes(iface)
+        # A D-Bus-created WPA interface has no -i argv; check its control socket.
+        check = subprocess.run(["/usr/sbin/wpa_cli", "-p", "/run/wpa_supplicant", "-i", iface, "ping"], capture_output=True, text=True, timeout=4)
+        if "PONG" in check.stdout:
+            conflicts.append("existing WPA control socket")
+        if conflicts:
+            raise RuntimeError("Refusing to compete with existing controller(s): " + ", ".join(conflicts))
+        print(f"Managing {iface} with existing {config['driver']} modules", flush=True)
+        children.append(subprocess.Popen(["/usr/sbin/wpa_supplicant", "-D", "nl80211", "-i", iface, "-c", str(CONFIG_DIR / "wpa.conf")]))
+        children.append(subprocess.Popen(["/usr/sbin/dhcpcd", "-4", "-B", "-f", str(CONFIG_DIR / "dhcpcd.conf"), "-c", "/usr/local/libexec/cube-net-dns", iface]))
+        while not stopping:
+            if any(child.poll() is not None for child in children):
+                raise RuntimeError("A network child process exited; the service will retry")
+            if not any(item["interface"] == iface and matches(item, config) for item in interfaces()):
+                raise RuntimeError("Configured dongle removed or identity changed")
+            try:
+                current_request = read(RUNTIME_DIR / 'recovery.request')
+                if current_request != request:
+                    request = current_request
+                    runtime.update(recovery_attempts=0, recovery_exhausted=False)
+                    failure_since = last_attempt = time.monotonic()
+                    last_probe = 0
+                values = dict(line.split('=', 1) for line in wpa_command(iface, 'status').splitlines() if '=' in line)
+                state = values.get('wpa_state', 'unknown')
+                if state not in ('DISCONNECTED', 'INACTIVE', 'INTERFACE_DISABLED', 'SCANNING', 'AUTHENTICATING',
+                                  'ASSOCIATING', 'ASSOCIATED', '4WAY_HANDSHAKE', 'GROUP_HANDSHAKE', 'COMPLETED'):
+                    state = 'unknown'
+                if state == 'COMPLETED':
+                    if runtime['association_state'] != 'COMPLETED' and ever_connected:
+                        runtime['reconnect_count'] += 1
+                    ever_connected = True
+                    runtime['last_error'] = None
+                    disconnected_since = time.monotonic()
+                elif ever_connected:
+                    runtime['last_error'] = 'Association lost; waiting for reconnection.'
+                elif time.monotonic() - disconnected_since > 30:
+                    runtime['last_error'] = 'Association has not completed for 30 seconds; check signal and saved profile.'
+                runtime['association_state'] = state
+                # Shown by the cube-status bar; wpa_cli prints non-ASCII bytes as \xNN escapes.
+                runtime['ssid'] = values.get('ssid', '')[:64] or None if state == 'COMPLETED' else None
+                runtime['signal_dbm'] = wireless_signal(iface)
+                try:
+                    poll = dict(line.split('=', 1) for line in wpa_command(iface, 'signal_poll').splitlines() if '=' in line)
+                    rssi = int(poll.get('RSSI', '999'))
+                    if -130 <= rssi <= 0:
+                        runtime['signal_dbm'] = rssi
+                except (RuntimeError, ValueError):
+                    pass
+                if state == 'COMPLETED' and time.monotonic() - last_probe >= PROBE_INTERVAL:
+                    runtime.update(connection_probe(iface))
+                    last_probe = time.monotonic()
+                diagnosis = diagnostic(config, interfaces(), runtime, True)
+                if diagnosis['diagnostic_code'] in ('online', 'checks-pending'):
+                    failure_since = last_attempt = time.monotonic()
+                    if diagnosis['diagnostic_code'] == 'online':
+                        runtime.update(recovery_attempts=0, recovery_exhausted=False)
+                else:
+                    action = recovery_step(runtime, time.monotonic() - failure_since,
+                                           time.monotonic() - last_attempt)
+                    if action:
+                        wpa_command(iface, action)
+                        last_attempt = time.monotonic()
+                        if action == 'disconnect':
+                            runtime['last_error'] = 'Automatic reconnection paused after three attempts; review status and run sudo cube-net reconnect.'
+            except (RuntimeError, subprocess.SubprocessError):
+                runtime.update(association_state='controller-unavailable', last_error='WPA status is unavailable.')
+            publish_runtime(runtime)
+            time.sleep(1)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        runtime.update(association_state='failed', signal_dbm=None,
+                       last_error='Connection controller stopped after a device, process or controller conflict. Inspect its service journal.')
+        publish_runtime(runtime)
+        raise
+    finally:
+        # Only our own Popen child handles are terminated; never global pkill.
+        for child in reversed(children):
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        if iface and children:
+            (RUNTIME_DIR / "resolv.conf").unlink(missing_ok=True)
+        if stopping:
+            runtime.update(association_state='stopped', signal_dbm=None)
+            publish_runtime(runtime)
+        lock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("status", help="Read-only hardware status as JSON")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    p.add_argument("--sysfs", type=Path, default=Path("/sys"))
+    p = sub.add_parser("check", help="Read-only module/firmware/binary audit as JSON")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    sub.add_parser("setup", help="Interactively add a WPA2 profile while preserving saved profiles")
+    sub.add_parser("add", help="Interactively add a WPA2 profile; root and terminal required")
+    sub.add_parser("manage", help="Interactive Wi-Fi manager; root and terminal required")
+    p = sub.add_parser("profiles", help="Read-only saved profile IDs and SSIDs as JSON")
+    p.add_argument("--root", type=Path, default=Path('/'))
+    sub.add_parser("scan", help="Scan using the running scoped controller; root required")
+    sub.add_parser('reconnect', help='Deliberately reset the bounded reconnect budget for the scoped dongle; root required')
+    for action in ('connect', 'remove'):
+        p = sub.add_parser(action)
+        p.add_argument('profile_id')
+    sub.add_parser("import-nm", help="Import saved WPA2 NM profiles locally; root required")
+    sub.add_parser("run", help="Service entrypoint; root required")
+    args = parser.parse_args()
+    if args.command == "status":
+        print(json.dumps(status(args.root.resolve(), args.sysfs.resolve()), indent=2))
+    elif args.command == "check":
+        print(json.dumps(audit(args.root.resolve()), indent=2))
+    elif args.command in ('setup', 'add'):
+        with profile_lock():
+            add_profile()
+    elif args.command == 'profiles':
+        profiles = ([{'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in load_profiles()]
+                    if args.root == Path('/') and os.geteuid() == 0 else public_profiles(args.root.resolve()))
+        print(json.dumps(profiles, ensure_ascii=True, indent=2))
+    elif args.command == 'scan':
+        print(json.dumps(scan_networks(), ensure_ascii=True, indent=2))
+    elif args.command == 'reconnect':
+        reconnect()
+    elif args.command == 'manage':
+        manage()
+    elif args.command in ('connect', 'remove'):
+        with profile_lock():
+            (connect_profile if args.command == 'connect' else remove_profile)(args.profile_id)
+    elif args.command == "import-nm":
+        with profile_lock():
+            import_nm()
+    elif args.command == "run":
+        run_service()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"cube-net: {error}", file=sys.stderr)
+        sys.exit(1)

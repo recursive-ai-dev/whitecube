@@ -1,0 +1,34 @@
+#!/usr/bin/env python3
+"""dhcpcd hook: write router DNS to /run/whitecube-net/resolv.conf (no resolved, no dbus).
+
+/etc/resolv.conf is a symlink to that file, so DNS exists only while the
+dongle holds a lease.
+"""
+import ipaddress
+import os
+import re
+import sys
+from pathlib import Path
+
+RESOLV = Path("/run/whitecube-net/resolv.conf")
+
+interface = os.environ.get("interface", "")
+if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", interface):
+    sys.exit("Invalid interface")
+
+reason = os.environ.get("reason", "")
+if reason in {"BOUND", "RENEW", "REBIND", "REBOOT", "INFORM"}:
+    servers = []
+    for item in os.environ.get("new_domain_name_servers", "").split():
+        try:
+            servers.append(str(ipaddress.ip_address(item)))
+        except ValueError:
+            pass
+    if servers:
+        body = f"# {interface} via dhcpcd (cube-net-dns)\n" + "".join(f"nameserver {s}\n" for s in servers[:3])
+        tmp = RESOLV.with_suffix(".tmp")
+        tmp.write_text(body)
+        tmp.chmod(0o644)
+        os.replace(tmp, RESOLV)
+elif reason in {"EXPIRE", "FAIL", "STOP", "STOPPED", "NOCARRIER", "DEPARTED", "RELEASE"}:
+    RESOLV.unlink(missing_ok=True)

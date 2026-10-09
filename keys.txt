@@ -1,0 +1,132 @@
+WHITE CUBE / SPACE DESKTOP
+Click Apps (top left) for the app menu: categories, type to search, Enter to
+launch, Esc to close. Click the Wi-Fi box (top right) for network settings, the clock for quick
+settings (volume, brightness, Wi-Fi, lock, power). Super or Alt+Space opens the
+app menu. Click a tab's x (or middle-click the tab) to close that window.
+
+Hold Alt with a key:
+  F1..F4  Coding / Play / Monitor / Browse workspace
+  Shift+F1..F4  move the focused window to that workspace
+  b       show / hide this workspace's Scripts (programs keep running)
+  f       fullscreen / restore focused window; ideal for bash games
+  v       show desktop / restore windows
+  c       living field controls (real 2D and 3D automata)
+  w       open the browser desktop and project shelf
+  s       settings: network, display, appearance, keyboard, sound, power, system
+  Enter   terminal (foot)
+  t       chat panel (focus or start cube-chat in this workspace)
+  d       launcher (fuzzel)
+  h       this help
+  a       keyboard display preferences, native workspace names and recovery
+  Tab / Shift+Tab  next / previous visible tab
+  1..9    jump to a tab in this workspace (also reveals hidden panels)
+  Shift+arrows  move focused window within the work area
+  Ctrl+arrows   resize focused window within the work area
+  left-drag    move the window under the pointer (hold Alt)
+  right-drag   resize the window under the pointer (hold Alt)
+  q       close focused window
+  n       next wallpaper      l     lock screen
+  Shift+Esc quit desktop     F12   dump scene tree to session log
+
+The four small cubes at the top right switch workspaces. The power button in the far
+right corner drops down Lock / Suspend / Restart / Power off (Restart and Power off ask
+for a second click, "Confirm?", within 4 seconds; Esc or a click outside cancels). Each workspace
+remembers its focused window and has its own Scripts terminal. Windows keep
+running when moved or hidden, including fullscreen games. Alt+Shift+F1..F4
+moves a window without following it; Alt+F1..F4 then follows it.
+
+Alt+C opens a command panel for the wallpaper:
+  2d / 3d       Six 2D rules or a real 18 x 18 x 18 toroidal volume
+  pause / step  Toggle running or advance exactly one generation
+  edit          Toggle painting (pauses); Alt+V then reveals the field
+  clear         Erase the field; glider / blinker plants a 2D pattern
+  seed 123      Reproducible random starting field
+  rule life     Also highlife, diamoeba, daynight, anneal, seeds
+  rotate left   Rotate 3D positions; 'rotate right' goes the other way
+  slice 8       View layer 0..17; 'slice next' or 'slice all'
+  save name     Save exact cells, rule and random state
+  replay name   Restore the saved world and start its evolution
+  loop          Toggle automatic rule/reseed cycling
+  cosmos on     Cosmic zoom: the field zooms out through cells, geometry, land,
+                planet, stars forming, galaxy and the expanding universe.
+                'cosmos off' returns to the cube field; 'cosmos' toggles.
+  phase land    Glide to cells|geometry|land|planet|stars|galaxy|universe (or 0..6)
+                and hold there. 'zoom auto' resumes the journey, 'zoom hold' freezes
+                it, 'zoom 2.5' sets an exact point, 'speed 2' paces it (0.1..8).
+  quit          Close controls; the field keeps running
+
+In edit mode drag left to draw, right to erase; in 3D use the wheel to choose
+a layer. Alt+V returns to the control panel; 'edit' again resumes simulation.
+Saved worlds live under ~/.local/state/whitecube-ca (or XDG_STATE_HOME).
+After edits/replays, automatic rule changes are disabled until 'loop'.
+The volume uses all 26 neighbours, B5/S4,5; its geometry rotates in 3D.
+Fullscreen applications or temperature >=75 C reduce animation to 2 ticks/s.
+Otherwise 2D runs at 10-14 ticks/s and 3D at 8. No missed-tick CPU bursts.
+The cosmos runs at 20 frames/s (2 under pressure, 1 with reduced motion). The cell
+field keeps evolving underneath: its density shapes the land and gas, and live
+cells are the lights on land and on the planet's night side. 3D and edit are
+unavailable while it runs. Start with it on: cosmos=1 in the whitecube config
+or CUBE_CA_COSMOS=1. The automatic journey takes about four minutes, then rewinds.
+
+Scripts is a real foot terminal with a PTY. Alt+B hides it without closing
+scripts; Alt+F resizes the same PTY for curses/bash games. Cube tabs can also
+restore hidden panels. Background apps remain on their own workspace.
+
+Session startup runs cube-check --first-boot when installed.
+Config: ~/.config/whitecube/config
+
+LAYOUTS AND DISPLAY
+Native layouts save workspace selection and names, window workspace/placement,
+panel visibility, fullscreen and maximize flags. Opening an app after login
+restores its placement by app ID/title. Saved layouts never launch commands.
+Native state is private under ~/.local/state/whitecube/native-layout.txt.
+Window placement uses fractions of the output so it adapts to display size.
+Alt+left-drag moves and Alt+right-drag resizes a normal or Scripts window.
+Placement stays within the work area and is saved when you release the button.
+Resize a window smaller before moving it; fullscreen/maximized windows retain
+their display size. Changing workspaces or closing the window cancels a drag.
+
+The bar, app menu and quick settings follow the desktop's background/tab-bar
+colors, including Space, White cube, Graphite and Paper. Changes appear within
+two seconds, and strong contrast also applies to these menus.
+
+New terminals use a 50% opaque dark background with red text, revealing the
+living cube field. Their ANSI palette still supports colored scripts and games.
+Terminal colors: ~/.config/foot/foot.ini; Scripts: ~/.config/whitecube/scripts-foot.ini.
+In [colors], alpha=0 is fully clear and alpha=1 is opaque.
+
+Alt+A changes UI scale (.8..1.6), terminal scale (.8..2), strong contrast and
+reduced motion using the same accessibility.json as the browser. Native cubes
+and focus borders update within two seconds; the CA stops automatic evolution
+and reseeding under reduced motion. Explicit step/paint remain available.
+New native foot terminals use terminal scale; Ctrl+Plus/Minus adjusts an existing
+foot terminal and Ctrl+0 resets it. Custom terminal commands remain available.
+Workspace names are listed/edited in Alt+A; the top-right cubes identify slots.
+
+BACKUP AND RECOVERY
+Alt+A can create, list, verify and review settings backups. Restore requires
+typing RESTORE after the exact paths and checksums are displayed. A recovery
+copy is made before applying changes; edited state invalidates that review.
+Backups include desktop preferences/layouts, automaton worlds/seeds, script and
+workflow definitions and project manifests. Credentials, terminal output,
+project source and container images are excluded. Backups are private, bounded
+to 32 MiB total and 2 MiB per file; rejected files are listed. Retention applies
+to ordinary backups; recovery copies are preserved until explicitly deleted.
+
+DESKTOP CHAT (center top button)
+Click Chat (top center) for the dropdown: Open Chat, Chat Settings, Quit Chat.
+Alt+Y toggles Desktop Chat, Alt+U opens Chat Settings directly.
+Full configuration (endpoint, model, API key, confirm, hotkey) lives in the
+chat Settings panel, with Test, Clear key and config path display.
+
+PRIVACY AND SETTINGS
+  Settings > Privacy (or cube-settings --page privacy) opens privacy controls.
+  Sections: Desktop, Activity, Devices, Browser. Alt+L locks the screen.
+  Automatic lock: Settings > Privacy > Desktop; off until you choose a timeout.
+  Settings: Tab/Shift+Tab moves between all controls and scrolls them into view.
+  Ctrl+PageUp/PageDown switches settings pages; PageUp/PageDown scrolls a page.
+  Quick settings/Chat/Power: Tab or arrows navigate; Enter activates; Escape closes.
+  Apps: Privacy shortcut; Quick settings: Privacy button.
+  Firefox controls apply after Firefox restarts. GTK recent-file preferences
+  apply when GTK apps restart. Hardware controls show unavailable if unsupported.
+  After installing a compositor update, log out and back in to activate it.

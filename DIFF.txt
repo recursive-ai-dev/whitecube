@@ -1,0 +1,47 @@
+Whitecube source change notes
+
+whitecube.c
+- Adds persistent Scripts panel state, desktop visibility, true fullscreen
+  geometry, browser binding, and stable tab order.
+- Separates background/window/top/overlay scene trees and routes pointer input
+  into actual surface coordinates; advertises keyboard/pointer capabilities.
+- Preserves existing chat, terminal and launcher configuration keys.
+- Restores selected-window keyboard enter when a keyboard is attached after
+  the window mapped, while retaining an already-focused layer surface.
+- Tracks the startup process group and terminates its background clients during
+  normal shutdown or SIGTERM/SIGINT/SIGHUP. Spawn waits for setsid readiness;
+  child signal state is reset so parent Wayland signal masks cannot prevent
+  session-client cleanup. Interactive application launches remain independent.
+
+cube-ca.c
+- Replaces flat dark cells with shaded white cubes against a generated star
+  field, backed by six actual evolving toroidal automata.
+- Tracks allocation sizes for safe resize/unmap, checks allocation failures,
+  handles Wayland socket loss, and uses prepare/read/cancel dispatch protocol.
+- Adds deterministic preview generation and simulation regression checks.
+
+whitecube-session / keys.txt / config.example / foot.ini / BUILD.sh
+- Starts the living background, status and notifications; opens scripts/browser
+  on demand. Documents bindings and supplies readable full ANSI game colors.
+- Builds against installed Wayland libraries, optionally using a mounted target
+  sysroot, without installing packages/modules or modifying the target.
+
+net/ (network controller, revision 2, 2026-10-07)
+- cube-net: the recovery watchdog no longer treats DNS/Internet/DHCP probe results as a Wi-Fi
+  fault. A Supervisor (pure, replayable) reassociates only for a missing association (45 s,
+  then 45/90/180/300 s), a missing lease while associated (240 s, then 240/480/900 s) or a
+  router that fails neighbour discovery (120 s, then 120/300/900 s). It never disconnects and
+  never stops retrying. Probes run in a worker thread (router neighbour state, UDP DNS to the
+  configured resolvers, bound TCP 443), are debounced and tagged with a lease generation.
+  The per-second work moved into an injectable Controller class; every decision is logged.
+  Status gains gateway_ok, dns_ms, tcp_ms, assoc_age_s, lease_age_s, reassociate_in_s,
+  actions_total; recovery_attempts/recovery_exhausted are gone. CLI and profile code unchanged.
+- cube-net-dns: validates resolvers (no loopback/multicast/link-local/reserved), options
+  timeout:2 attempts:2, no stale resolvers after a fresh lease, O_EXCL temp file.
+- dhcpcd.conf: timeout 0 (a single-interface dhcpcd otherwise exits after 30 s).
+- whitecube-network.service: Restart=always with growing delay and no start limit; extra
+  sandboxing (exposure 8.5 -> 6.1).
+- cube-settings-helper: Network page now gets summary/code and a lower-case state; firewall
+  enable is refused while ufw's outgoing default is deny.
+- apply.sh installs/rolls back the five files with a checksummed backup. legacy/ keeps the
+  replaced files. test_cube_net.py: 100 offline tests.

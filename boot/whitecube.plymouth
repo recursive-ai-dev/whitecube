@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=whitecube
+Description=Black void, white cubes; matches the whitecube desktop.
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/whitecube
+ScriptFile=/usr/share/plymouth/themes/whitecube/whitecube.script

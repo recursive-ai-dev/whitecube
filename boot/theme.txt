@@ -1,0 +1,61 @@
+# whitecube GRUB theme: pure black and white ink as the desktop.
+desktop-image: "background.png"
+desktop-color: "#000000"
+title-text: ""
+title-font: "DejaVu Sans Mono Bold 18"
+title-color: "#ffffff"
+message-font: "DejaVu Sans Mono Regular 12"
+message-color: "#ffffff"
+message-bg-color: "#000000"
+terminal-font: "DejaVu Sans Mono Regular 14"
+terminal-box: "inbox_*.png"
+
++ label {
+    left = 12%
+    top = 10%
+    width = 76%
+    text = "whitecube"
+    color = "#ffffff"
+    align = "left"
+    font = "DejaVu Sans Mono Bold 18"
+}
+
++ boot_menu {
+    left = 12%
+    top = 22%
+    width = 76%
+    height = 48%
+    item_color = "#8d99ad"
+    selected_item_color = "#ffffff"
+    selected_item_pixmap_style = "select_*.png"
+    item_font = "DejaVu Sans Mono Regular 14"
+    selected_item_font = "DejaVu Sans Mono Bold 14"
+    item_height = 34
+    item_padding = 10
+    item_spacing = 4
+    icon_width = 0
+    icon_height = 0
+    icon_spacing = 0
+    scrollbar = false
+}
+
++ label {
+    left = 12%
+    top = 76%
+    width = 76%
+    text = "enter boot   e edit   c command line"
+    color = "#8d99ad"
+    align = "left"
+    font = "DejaVu Sans Mono Regular 12"
+}
+
++ progress_bar {
+    id = "__timeout__"
+    left = 12%
+    top = 86%
+    width = 76%
+    height = 8
+    show_text = false
+    bar_style = "progress_bar_*.png"
+    highlight_style = "progress_highlight_*.png"
+}

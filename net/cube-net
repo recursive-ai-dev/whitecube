@@ -1,0 +1,2400 @@
+#!/usr/bin/python3 -I
+"""A small, dongle-specific Wi-Fi controller: its own WPA2 station over nl80211, plus dhcpcd.
+
+The station (class Station) scans, joins a saved WPA2-personal network, runs the four-way and
+group-key handshakes, installs the keys and reconnects when the link drops. It needs no
+wpa_supplicant and no wpa_cli; the crypto, netlink and EAPOL code live in this file.
+
+status/check are read-only and do not require root. run is a service entrypoint.
+Credentials are only accepted from a terminal or an explicitly requested local
+profile import; they never appear in arguments, logs or JSON status.
+
+Recovery policy (class Supervisor): every layer is repaired only by actions that
+can help that layer, and probes only observe.
+  - DNS and Internet probe failures are reported, never answered by touching Wi-Fi.
+  - The radio is reassociated only when association itself is missing, when it
+    is up but no IPv4 lease arrives for minutes, or when the router stops
+    answering neighbour discovery while associated.
+  - Retries back off to a ceiling and never stop; nothing disconnects the radio.
+"""
+import argparse
+import configparser
+from contextlib import contextmanager
+import errno
+import fcntl
+import functools
+import getpass
+import hashlib
+import hmac
+import ipaddress
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import select
+import signal
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+DEFAULT_DEVICE = {"usb_id": "2001:3329", "mac": "88:76:b9:f2:9d:29", "driver": "rtw88_8822cu"}
+CONFIG_DIR = Path("/etc/whitecube/network")
+RUNTIME_DIR = Path("/run/whitecube-net")
+PROFILE_FILE = "networks.json"          # saved networks: SSID and 256-bit PSK, root-only
+LEGACY_PROFILE_FILE = "wpa.conf"        # the old wpa_supplicant-format store; still read until networks.json exists
+
+# Recovery policy, seconds. All timers use time.monotonic(); the wall clock can
+# step when chrony first syncs and must not make the controller act.
+POLL_INTERVAL = 1.0
+L2_GRACE = 45                      # not associated this long before the first reassociation
+L2_BACKOFF = (45, 90, 180, 300)    # wait after the Nth request; the last value repeats forever
+L3_REASSOC_AFTER = 240             # associated this long with no IPv4 lease and default route
+L3_BACKOFF = (240, 480, 900)
+GW_DEAD_AFTER = 120                # router fails neighbour discovery this long while associated
+GW_BACKOFF = (120, 300, 900)
+STABLE_AFTER = 60                  # association must hold this long before the backoff resets
+L3_PENDING = 60                    # a lease younger than this is "pending", not "failed"
+PROBE_SETTLE = 3                   # let a new lease settle before probing it
+PROBE_INTERVAL = 30                # between probe suites while everything passes
+PROBE_RETRY = 10                   # ... and after any failure
+PROBE_STALE = 120                  # older probe results are "pending", not facts
+FAIL_STREAK = 2                    # failed suites in a row before a check turns red
+DNS_PROBE_NAME = "deb.debian.org"
+TCP_PROBE_TARGETS = (("1.1.1.1", 443), ("9.9.9.9", 443))
+
+
+def read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def log(message):
+    """One journal line from the service. Never pass credentials, passphrases or SSIDs."""
+    print(message, flush=True)
+
+
+def device_config(root=Path("/")):
+    path = root / "etc/whitecube/network/device.json"
+    config = json.loads(read(path)) if path.is_file() else DEFAULT_DEVICE.copy()
+    if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", config.get("usb_id", "")):
+        raise ValueError("Invalid configured USB ID")
+    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", config.get("mac", "")):
+        raise ValueError("Invalid configured MAC")
+    if config.get("driver") != "rtw88_8822cu":
+        raise ValueError("This controller expects the audited rtw88_8822cu driver")
+    if any(config.get(key) != value for key, value in DEFAULT_DEVICE.items()):
+        raise ValueError('This Whitecube build is scoped to USB 2001:3329, MAC 88:76:b9:f2:9d:29 and rtw88_8822cu.')
+    return config
+
+
+def interfaces(sysfs=Path("/sys")):
+    result = []
+    for link in sorted((sysfs / "class/net").glob("*")):
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", link.name):
+            continue
+        dev = (link / "device").resolve()
+        usb_id = ""
+        for parent in [dev, *dev.parents]:
+            vendor, product = read(parent / "idVendor"), read(parent / "idProduct")
+            if vendor and product:
+                usb_id = f"{vendor}:{product}".lower()
+                break
+        result.append({
+            "interface": link.name,
+            "usb_id": usb_id,
+            "mac": read(link / "address").lower(),
+            # Module name: Linux 6.12 registers this USB driver as rtw_8822cu, newer kernels as rtw88_8822cu.
+            "driver": ((link / "device/driver/module").resolve().name if (link / "device/driver/module").exists()
+                       else (link / "device/driver").resolve().name if (link / "device/driver").exists() else ""),
+            "operstate": read(link / "operstate"),
+            "carrier": read(link / "carrier") == "1",
+            "rx_bytes": int(read(link / "statistics/rx_bytes") or 0),
+            "tx_bytes": int(read(link / "statistics/tx_bytes") or 0),
+        })
+    return result
+
+
+def matches(interface, device):
+    return all(interface.get(key) == device[key] for key in ("usb_id", "mac", "driver"))
+
+
+def usb_devices(sysfs=Path('/sys')):
+    return [path for path in (sysfs / 'bus/usb/devices').glob('*')
+            if (read(path / 'idVendor') + ':' + read(path / 'idProduct')).lower() == DEFAULT_DEVICE['usb_id']]
+
+
+def diagnostic(config, seen, runtime, usb_present=False):
+    exact = [item for item in seen if matches(item, config)]
+    same_usb = [item for item in seen if item.get('usb_id') == config['usb_id']]
+    def result(code, summary, actions):
+        return {'diagnostic_code': code, 'diagnostic_summary': summary, 'recovery_actions': actions}
+    if not exact:
+        if not same_usb and not usb_present:
+            return result('missing-dongle', 'The scoped USB dongle is absent.',
+                          ['Reconnect USB 2001:3329 directly, then run cube-net status.'])
+        if any(item.get('mac') == config['mac'] and item.get('driver') != config['driver'] for item in same_usb) or not same_usb:
+            return result('driver-problem', 'USB 2001:3329 is present but the audited driver has no matching interface.',
+                          ['Run cube-net check and inspect journalctl -k for rtw88_8822cu or firmware errors.',
+                           'Inspect existing blacklists; do not restore deleted modules or unmask services automatically.'])
+        return result('identity-mismatch', 'The USB device does not match the scoped MAC/driver identity.',
+                      ['Use the dongle with MAC 88:76:b9:f2:9d:29; this controller will not manage another device.'])
+    if len(exact) != 1:
+        return result('identity-ambiguous', 'More than one interface matches the scoped identity.', ['Inspect cube-net status before starting a controller.'])
+    state = runtime.get('association_state', 'unknown')
+    if state in ('unknown', 'stale', 'stopped', 'failed', 'controller-unavailable', 'waiting-for-dongle'):
+        return result('controller-unavailable', 'Fresh association status is unavailable.',
+                      ['Inspect systemctl status whitecube-network.service and journalctl -u whitecube-network.service.',
+                       'After configuring a profile, start the scoped service deliberately; existing managers must not compete.'])
+    if state != 'COMPLETED':
+        return result('association-failed', 'Wi-Fi association has not completed.',
+                      ['The controller keeps scanning and reconnecting with growing delays; it does not give up.',
+                       'Check signal and scan with sudo cube-net scan.', 'Review the saved WPA2 profile with sudo cube-net manage.'])
+    if not runtime.get('ipv4_address') or not runtime.get('default_route'):
+        age = runtime.get('assoc_age_s')
+        if isinstance(age, int) and not isinstance(age, bool) and age < L3_PENDING:
+            return result('dhcp-pending', 'Associated; waiting for an IPv4 lease and default route.',
+                          ['DHCP on this router can take 20 seconds; run cube-net status again shortly.'])
+        return result('dhcp-failed', 'Wi-Fi associated but no usable IPv4 lease and default route are available.',
+                      ['dhcpcd keeps retrying; the controller reassociates if this lasts four minutes.',
+                       'Inspect journalctl -u whitecube-network.service for DHCP errors; check that the router offers IPv4 DHCP.'])
+    if runtime.get('gateway_ok') is False:
+        return result('gateway-unreachable', 'Associated with a lease, but the router does not answer neighbour discovery.',
+                      ['The controller reassociates if this lasts two minutes.', 'Check the router and your distance from it.'])
+    if not runtime.get('checks_epoch') or time.time() - runtime['checks_epoch'] > PROBE_STALE:
+        return result('checks-pending', 'Association and lease are up; fresh DNS and connectivity checks are pending.',
+                      ['Wait for the next bounded diagnostic probe, then run cube-net status.'])
+    if runtime.get('dns_ok') is False:
+        return result('dns-failed', 'The lease is fine but no configured resolver answered a DNS query.',
+                      ['Inspect /etc/resolv.conf (a link to /run/whitecube-net/resolv.conf) and the router DNS settings.',
+                       'Wi-Fi is left untouched; this clears by itself when a resolver answers again.'])
+    if runtime.get('connectivity_ok') is False:
+        return result('connectivity-lost', 'The router answers, but the bounded Internet probe could not connect.',
+                      ['Check the router uplink or a captive portal; the controller does not restart Wi-Fi for this.',
+                       'Run cube-net status again to see when it clears.'])
+    if runtime.get('dns_ok') is True and runtime.get('connectivity_ok') is True:
+        return result('online', 'Association, IPv4 lease/route, a resolver query and a bound TCP probe passed.', [])
+    return result('checks-pending', 'Some diagnostic checks are unavailable; Internet access is not established.',
+                  ['Inspect cube-net check and the service journal.'])
+
+
+# ---- cheap samplers: read every tick, no subprocesses, no network traffic
+
+def interface_ipv4(iface):
+    """The interface's IPv4 address from the kernel (SIOCGIFADDR), or None without a usable lease."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            request = struct.pack('256s', iface.encode('ascii')[:15])
+            address = ipaddress.ip_address(socket.inet_ntoa(fcntl.ioctl(sock.fileno(), 0x8915, request)[20:24]))
+    except (OSError, ValueError):
+        return None
+    return None if address.is_unspecified or address.is_link_local else str(address)
+
+
+def default_gateway(iface, table=Path('/proc/net/route')):
+    """Gateway of the IPv4 default route through iface ('direct' when on-link), else None."""
+    for line in read(table).splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 8 or fields[0] != iface or fields[1] != '00000000' or fields[7] != '00000000':
+            continue
+        try:
+            up = int(fields[3], 16) & 1
+            gateway = socket.inet_ntoa(struct.pack('<I', int(fields[2], 16)))
+        except (ValueError, OverflowError, struct.error):
+            continue
+        if up:
+            return 'direct' if gateway == '0.0.0.0' else gateway
+    return None
+
+
+# ---- slow probes: run in a worker thread; they observe and never change anything
+
+def read_resolvers(path=Path('/etc/resolv.conf')):
+    """IPv4 nameservers exactly as applications will see them (at most three)."""
+    servers = []
+    for line in read(path).splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == 'nameserver':
+            try:
+                address = ipaddress.IPv4Address(parts[1])
+            except ValueError:
+                continue
+            if str(address) not in servers:
+                servers.append(str(address))
+    return servers[:3]
+
+
+def dns_query(server, name, timeout, port=53):
+    """One A query over UDP. Returns (answered, milliseconds); raises OSError on transport failure."""
+    ident = os.urandom(2)
+    question = b''.join(bytes([len(part)]) + part.encode('ascii') for part in name.split('.')) + b'\0'
+    packet = ident + struct.pack('>HHHHH', 0x0100, 1, 0, 0, 0) + question + struct.pack('>HH', 1, 1)
+    started = time.monotonic()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((server, port))
+        sock.send(packet)
+        while True:
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise TimeoutError('DNS query timed out')
+            sock.settimeout(remaining)
+            data = sock.recv(1500)
+            if len(data) >= 12 and data[:2] == ident and data[2] & 0x80:
+                break
+    answered = (data[3] & 0x0F) == 0 and struct.unpack('>H', data[6:8])[0] > 0
+    return answered, round((time.monotonic() - started) * 1000)
+
+
+def tcp_probe(iface, targets, timeout):
+    """First reachable target wins. Returns (ok, milliseconds). iface=None skips the device binding."""
+    for host, port in targets:
+        started = time.monotonic()
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                if iface:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode('ascii') + b'\0')
+                sock.connect((host, port))
+            return True, round((time.monotonic() - started) * 1000)
+        except OSError:
+            continue
+    return False, None
+
+
+def neighbour_state(iface, gateway):
+    """Kernel neighbour-cache state of the next hop (REACHABLE, STALE, FAILED, ...), or None if absent."""
+    try:
+        ipaddress.IPv4Address(gateway)
+        out = subprocess.run(['/usr/sbin/ip', '-j', '-4', 'neigh', 'show', 'to', gateway, 'dev', iface],
+                             capture_output=True, text=True, timeout=3)
+        for entry in json.loads(out.stdout or '[]'):
+            # With a dev filter, ip omits the "dev" key; if a different one is present, it is not ours.
+            if entry.get('dst') == gateway and entry.get('dev', iface) == iface and entry.get('state'):
+                return str(entry['state'][0])
+    except (OSError, ValueError, TypeError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def poke_gateway(iface, gateway):
+    """Send an empty datagram to the discard port; its only purpose is to provoke neighbour discovery."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode('ascii') + b'\0')
+            sock.sendto(b'', (gateway, 9))
+    except OSError:
+        pass
+
+
+def gateway_alive(iface, gateway, wait=9.0, poke=poke_gateway, state=neighbour_state, pause=time.sleep):
+    """True or False once the kernel has resolved, or given up resolving, the router's link-layer address.
+
+    None when it cannot tell (no gateway, on-link route, or the entry is still being revalidated)."""
+    try:
+        ipaddress.IPv4Address(gateway)
+    except ValueError:
+        return None
+    poke(iface, gateway)
+    last = None
+    for _ in range(int(wait / 0.5) + 1):
+        last = state(iface, gateway)
+        if last in ('REACHABLE', 'PERMANENT'):
+            return True
+        if last == 'FAILED':
+            return False
+        pause(0.5)
+    return False if last == 'INCOMPLETE' else None
+
+
+def probe_suite(iface, gateway, resolvers=None):
+    """Blocking next-hop, DNS and TCP checks for a worker thread. Observes only; changes nothing."""
+    out = {'checks_epoch': time.time(), 'gateway_ok': gateway_alive(iface, gateway),
+           'dns_ok': False, 'dns_ms': None, 'connectivity_ok': None, 'tcp_ms': None}
+    for server in (read_resolvers() if resolvers is None else resolvers):
+        try:
+            answered, milliseconds = dns_query(server, DNS_PROBE_NAME, 2.0)
+        except OSError:
+            continue
+        if answered:
+            out.update(dns_ok=True, dns_ms=milliseconds)
+            break
+    ok, milliseconds = tcp_probe(iface, TCP_PROBE_TARGETS, 3.0)
+    out.update(connectivity_ok=ok, tcp_ms=milliseconds)
+    return out
+
+
+class Health:
+    """Turns raw probe suites into the steadier dns_ok / connectivity_ok / gateway_ok values users see.
+
+    A pass shows at once; a check turns False only after FAIL_STREAK failed suites in a row, so one slow
+    answer cannot paint the status bar red. An unknown result changes nothing."""
+    KEYS = ('dns_ok', 'connectivity_ok', 'gateway_ok')
+
+    def __init__(self):
+        self.value = {key: None for key in self.KEYS}
+        self.streak = {key: 0 for key in self.KEYS}
+
+    def feed(self, suite):
+        for key in self.KEYS:
+            result = suite.get(key)
+            if result is True:
+                self.value[key], self.streak[key] = True, 0
+            elif result is False:
+                self.streak[key] += 1
+                if self.streak[key] >= FAIL_STREAK:
+                    self.value[key] = False
+        return dict(self.value)
+
+    def clear(self):
+        self.__init__()
+
+    def all_good(self):
+        return self.value['dns_ok'] is True and self.value['connectivity_ok'] is True and self.value['gateway_ok'] is not False
+
+
+def status(root=Path("/"), sysfs=Path("/sys")):
+    config = device_config(root)
+    seen = interfaces(sysfs)
+    selected = [item for item in seen if matches(item, config)]
+    runtime = public_runtime(root)
+    if len(selected) == 1 and root == Path('/'):
+        signal_dbm = wireless_signal(selected[0]['interface'])
+        if signal_dbm is not None:
+            runtime['signal_dbm'] = signal_dbm
+    return {
+        "controller": "whitecube-network", "device": config,
+        "present": len(selected) == 1,
+        "interface": selected[0] if len(selected) == 1 else None,
+        "credentials_configured": any((root / "etc/whitecube/network" / name).is_file() for name in (PROFILE_FILE, LEGACY_PROFILE_FILE)),
+        "matching_usb_devices": len([item for item in seen if item["usb_id"] == config["usb_id"]]),
+        "profiles": public_profiles(root),
+        **runtime,
+        **diagnostic(config, seen, runtime, bool(usb_devices(sysfs))),
+        "note": ("Probes: router neighbour discovery, a UDP query for deb.debian.org to each configured resolver, and a TCP "
+                 "connection to 1.1.1.1:443 (then 9.9.9.9:443) bound to the dongle. Probe failures are reported only; "
+                 "they never restart or disconnect Wi-Fi."),
+    }
+
+
+def audit(root):
+    kernels = []
+    module_base = root / "lib/modules"
+    for kernel in sorted(module_base.glob("*")):
+        entry = {"kernel": kernel.name}
+        lines = read(kernel / "modules.dep").splitlines()
+        line = next((line for line in lines if line.split(":", 1)[0].endswith("/rtw88_8822cu.ko.xz") or line.split(":", 1)[0].endswith("/rtw88_8822cu.ko")), "")
+        files = line.replace(":", "").split()
+        entry["module_files"] = [{"path": name, "present": (kernel / name).is_file()} for name in files]
+        entry["usb_alias_present"] = any("usb:v2001p3329" in line and line.endswith(" rtw88_8822cu") for line in read(kernel / "modules.alias").splitlines())
+        entry["ready"] = bool(files) and all(item["present"] for item in entry["module_files"]) and entry["usb_alias_present"]
+        kernels.append(entry)
+    firmware = root / "lib/firmware/rtw88/rtw8822c_fw.bin"
+    binaries = {name: (root / path).is_file() for name, path in {
+        "dhcpcd": "usr/sbin/dhcpcd", "getent": "usr/bin/getent",
+    }.items()}
+    legacy = {name: (root / path).is_file() for name, path in {
+        "wpa_supplicant": "usr/sbin/wpa_supplicant", "wpa_cli": "usr/sbin/wpa_cli"}.items()}
+    masks = []
+    for name in ["systemd-networkd.service", "systemd-networkd.socket", "wpa_supplicant@.service", "network-pre.target"]:
+        p = root / "etc/systemd/system" / name
+        if p.is_symlink() and str(p.readlink()) == "/dev/null":
+            masks.append(name)
+    return {"root": str(root), "kernels": kernels, "firmware_present": firmware.is_file(), "binaries": binaries,
+            "existing_masks_preserved": masks, "unused_wpa_binaries_present": legacy,
+            "dependencies_ready": bool(kernels) and all(k["ready"] for k in kernels) and firmware.is_file() and all(binaries.values()),
+            "policy": "No packages or modules installed, loaded, restored, removed or unmasked. wpa_supplicant is not used and may be uninstalled."}
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise RuntimeError("This command requires root; status and check are available without root.")
+
+
+def protected(path, allow_absent=False):
+    path = Path(path)
+    for part in [*reversed(path.parents), path]:
+        try:
+            metadata = part.lstat()
+        except FileNotFoundError:
+            if allow_absent:
+                continue
+            raise RuntimeError('Required protected network path is missing.')
+        if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError('Network control paths must be root-owned, without symlinks or group/world write access.')
+    return path
+
+
+def atomic_write(path, content, mode):
+    protected(path, allow_absent=True)
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name + '-')
+    temporary = Path(temporary)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def profile_id(ssid):
+    return hashlib.sha256(ssid.encode('utf-8')).hexdigest()[:16]
+
+
+def load_legacy_profiles(path):
+    """Profiles from a wpa_supplicant-format file written by earlier revisions. Refuses what it does not understand."""
+    content = path.read_text()
+    profiles = []
+    blocks = re.findall(r'network\s*=\s*\{([^{}]*)\}', content)
+    remainder = re.sub(r'network\s*=\s*\{[^{}]*\}', '', content)
+    for line in remainder.splitlines():
+        if line.strip() not in ('', 'ctrl_interface=/run/whitecube-net/wpa', 'update_config=0'):
+            raise RuntimeError('Unsupported legacy WPA configuration; preserve and migrate it manually before editing.')
+    for block in blocks:
+        values = {}
+        for line in block.splitlines():
+            key, sep, value = line.strip().partition('=')
+            if not line.strip():
+                continue
+            if not sep or key in values or key not in ('ssid', 'psk', 'key_mgmt', 'proto'):
+                raise RuntimeError('Unsupported legacy WPA profile; refusing to discard configuration.')
+            values[key] = value
+        if (values.get('key_mgmt') != 'WPA-PSK' or values.get('proto') != 'RSN'
+                or not re.fullmatch(r'(?:[a-fA-F0-9]{2}){1,32}', values.get('ssid', ''))
+                or not re.fullmatch(r'[a-fA-F0-9]{64}', values.get('psk', ''))):
+            raise RuntimeError('Unsupported legacy WPA profile; refusing to discard configuration.')
+        try:
+            ssid = bytes.fromhex(values['ssid']).decode('utf-8')
+        except UnicodeError:
+            raise RuntimeError('Unsupported binary SSID; refusing to change profiles.')
+        profiles.append((ssid, values['psk'].lower()))
+    return profiles
+
+
+def load_profiles():
+    """[(ssid, 64-hex PSK)] from networks.json, or from the legacy wpa.conf until networks.json exists."""
+    require_root()
+    path = CONFIG_DIR / PROFILE_FILE
+    legacy = CONFIG_DIR / LEGACY_PROFILE_FILE
+    if not path.exists() and not path.is_symlink():
+        path = legacy
+        if not path.exists() and not path.is_symlink():
+            return []
+    protected(path)
+    if not path.is_file() or path.stat().st_mode & 0o077 or path.stat().st_size > 1024**2:
+        raise RuntimeError('Saved networks require a protected regular file with mode 0600.')
+    if path == legacy:
+        return load_legacy_profiles(path)
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('networks'), list):
+            raise ValueError
+        profiles = []
+        for item in data['networks']:
+            ssid = bytes.fromhex(item['ssid']).decode('utf-8')
+            psk = item['psk']
+            if not 1 <= len(ssid.encode('utf-8')) <= 32 or not re.fullmatch(r'[a-f0-9]{64}', psk):
+                raise ValueError
+            profiles.append((ssid, psk))
+    except (ValueError, KeyError, TypeError):
+        raise RuntimeError('Unsupported saved-networks file; refusing to discard configuration.') from None
+    if len({ssid for ssid, _ in profiles}) != len(profiles):
+        raise RuntimeError('Saved-networks file lists the same SSID twice; refusing to guess.')
+    return profiles
+
+
+def public_profiles(root=Path('/')):
+    path = root / 'etc/whitecube/network/profiles.json'
+    if not path.exists():
+        path = root / 'run/whitecube-net/profiles.json'
+        if not path.exists():
+            return []
+    try:
+        protected(path)
+        if path.stat().st_size > 65536:
+            return []
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            return []
+        return [{'id': item['id'], 'ssid': item['ssid']} for item in data
+                if isinstance(item, dict) and isinstance(item.get('ssid'), str)
+                and item.get('id') == profile_id(item['ssid'])]
+    except (OSError, ValueError, RuntimeError):
+        return []
+
+
+def write_profiles(profiles):
+    require_root()
+    protected(CONFIG_DIR, allow_absent=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+    path = CONFIG_DIR / PROFILE_FILE
+    protected(path, allow_absent=True)
+    entries = []
+    seen = set()
+    for ssid, secret in profiles:
+        encoded = ssid.encode("utf-8")
+        if not 1 <= len(encoded) <= 32:
+            raise ValueError("SSID must be 1 to 32 UTF-8 bytes")
+        if ssid in seen:
+            raise ValueError('Duplicate SSID; remove its existing profile before adding a replacement.')
+        seen.add(ssid)
+        if re.fullmatch(r"[A-Fa-f0-9]{64}", secret):
+            psk = secret.lower()
+        elif 8 <= len(secret.encode("utf-8")) <= 63:
+            psk = wpa_psk(secret.encode("utf-8"), encoded).hex()
+        else:
+            raise ValueError("WPA2 passphrase must be 8 to 63 UTF-8 bytes (or 64 hex digits)")
+        entries.append({"ssid": encoded.hex(), "psk": psk})
+    if path.exists():
+        backup = CONFIG_DIR / f"{PROFILE_FILE}.backup-{time.time_ns()}"
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as out:
+            out.write(path.read_bytes())
+            out.flush()
+            os.fsync(out.fileno())
+    atomic_write(path, json.dumps({"version": 1, "networks": entries}, indent=1) + "\n", 0o600)
+    atomic_write(CONFIG_DIR / 'profiles.json', json.dumps([
+        {'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in profiles], ensure_ascii=True), 0o644)
+    print(f"Saved {len(profiles)} WPA2 personal profile(s). Choose Connect to apply; credential backups remain mode 0600.")
+
+
+def migrate_profiles():
+    """One-time move of the legacy wpa.conf profiles into networks.json. The old file is left in place."""
+    require_root()
+    if (CONFIG_DIR / PROFILE_FILE).exists():
+        print(f'{PROFILE_FILE} already exists; nothing to migrate.')
+        return
+    profiles = load_profiles()
+    if not profiles:
+        raise RuntimeError('No saved networks to migrate.')
+    write_profiles(profiles)
+    print(f'The old {LEGACY_PROFILE_FILE} was not touched; delete it once the new file is working.')
+
+
+def import_nm():
+    require_root()
+    profiles = []
+    skipped = 0
+    for path in sorted(Path("/etc/NetworkManager/system-connections").glob("*")):
+        if not path.is_file():
+            continue
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(path)
+            wifi = next((s for s in ("wifi", "802-11-wireless") if parser.has_section(s)), "wifi")
+            security = next((s for s in ("wifi-security", "802-11-wireless-security") if parser.has_section(s)), "wifi-security")
+            if parser.get(security, "key-mgmt", fallback="") != "wpa-psk":
+                skipped += 1
+                continue
+            ssid = parser.get(wifi, "ssid", fallback="")
+            psk = parser.get(security, "psk", fallback="")
+            # Escaped/binary keyfile values need NM's parser; do not guess.
+            if not ssid or not psk or "\\" in ssid or "\\" in psk or re.fullmatch(r"(?:\d+;)+", ssid):
+                skipped += 1
+                continue
+            profiles.append((ssid, psk))
+        except (OSError, configparser.Error):
+            skipped += 1
+    if not profiles:
+        raise RuntimeError("No supported saved WPA2 personal profiles found. Run cube-net setup interactively.")
+    existing = load_profiles()
+    known = {ssid for ssid, _ in existing}
+    write_profiles(existing + [(ssid, psk) for ssid, psk in profiles if ssid not in known])
+    print(f"Skipped {skipped} unsupported profile(s); original files were preserved.")
+
+
+@contextmanager
+def profile_lock():
+    require_root()
+    protected(CONFIG_DIR, allow_absent=True)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o755)
+    path = CONFIG_DIR / '.profiles.lock'
+    protected(path, allow_absent=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def wireless_signal(iface, proc=Path('/proc/net/wireless')):
+    for line in read(proc).splitlines():
+        name, sep, fields = line.partition(':')
+        if sep and name.strip() == iface:
+            try:
+                level = float(fields.split()[2].rstrip('.'))
+                if -130 <= level <= 0:
+                    return level
+            except (ValueError, IndexError):
+                pass
+    return None
+
+
+def public_runtime(root=Path('/')):
+    # Keep this flat and small: cube-status reads it with a substring scanner and at most 16 KiB.
+    result = {'association_state': 'unknown', 'signal_dbm': None, 'reconnect_count': 0,
+              'service_restart_count': 0, 'last_error': None, 'updated_utc': None,
+              'ipv4_address': None, 'default_route': None, 'dns_ok': None, 'connectivity_ok': None,
+              'gateway_ok': None, 'dns_ms': None, 'tcp_ms': None, 'checks_epoch': None,
+              'assoc_age_s': None, 'lease_age_s': None, 'reassociate_in_s': None, 'actions_total': 0,
+              'ssid': None}
+    path = root / 'run/whitecube-net/status.json'
+    try:
+        protected(path)
+        if path.stat().st_size > 16384:
+            return result
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            return result
+        for key in result:
+            value = raw.get(key)
+            if key in ('reconnect_count', 'service_restart_count', 'actions_total'):
+                if isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**12:
+                    result[key] = value
+            elif key in ('assoc_age_s', 'lease_age_s', 'dns_ms', 'tcp_ms', 'reassociate_in_s'):
+                if value is None or isinstance(value, int) and not isinstance(value, bool) and 0 <= value < 10**9:
+                    result[key] = value
+            elif key in ('dns_ok', 'connectivity_ok', 'gateway_ok'):
+                if isinstance(value, bool) or value is None:
+                    result[key] = value
+            elif key == 'checks_epoch':
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= time.time() + 5:
+                    result[key] = value
+            elif key == 'signal_dbm':
+                if isinstance(value, (int, float)) and -130 <= value <= 0:
+                    result[key] = value
+            elif value is None or isinstance(value, str) and len(value) < 256:
+                result[key] = value
+        if isinstance(raw.get('updated_epoch'), (int, float)) and time.time() - raw['updated_epoch'] > 15:
+            result['association_state'] = 'stale'
+    except (OSError, ValueError, RuntimeError):
+        pass
+    return result
+
+
+def publish_runtime(data):
+    value = dict(data, updated_epoch=time.time(), updated_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    atomic_write(RUNTIME_DIR / 'status.json', json.dumps(value, ensure_ascii=True), 0o644)
+
+
+def reset_recovery_request():
+    # A root-only controller action tells the service to restart its backoff ladders. No credentials.
+    path = RUNTIME_DIR / 'recovery.request'
+    protected(path, allow_absent=True)
+    atomic_write(path, str(time.time_ns()), 0o644)
+
+
+# ---- native Wi-Fi: a WPA2-personal (RSN, CCMP) station built on nl80211 and EAPOL. Nothing here
+# ---- calls wpa_supplicant or wpa_cli; this is everything the controller used to borrow from them.
+
+SUITE_CCMP, SUITE_PSK = 0x000FAC04, 0x000FAC02
+AKM_NAMES = {1: 'EAP', 2: 'PSK', 4: 'FT-PSK', 5: 'EAP-SHA256', 6: 'PSK-SHA256', 8: 'SAE'}
+RSN_CAPS_MFPR = 0x0040                      # the AP insists on management frame protection (WPA3-style)
+OWN_RSN_CAPS = 0x000C                       # 16 PTKSA and 16 GTKSA replay counters, no PMF: what Linux clients send
+
+
+# --- AES-128 (decrypt side of RFC 3394 key unwrap) and the WPA2 key functions. Pure Python, stdlib only.
+
+def _gmul(a, b):
+    result = 0
+    for _ in range(8):
+        if b & 1:
+            result ^= a
+        carry = a & 0x80
+        a = (a << 1) & 0xFF
+        if carry:
+            a ^= 0x1B
+        b >>= 1
+    return result
+
+
+@functools.cache
+def _aes_tables():
+    inverse = [0] * 256
+    for a in range(1, 256):
+        for b in range(1, 256):
+            if _gmul(a, b) == 1:
+                inverse[a] = b
+                break
+    sbox = []
+    for x in inverse:
+        value = x
+        for shift in range(1, 5):
+            value ^= ((x << shift) | (x >> (8 - shift))) & 0xFF
+        sbox.append(value ^ 0x63)
+    unsbox = [0] * 256
+    for index, value in enumerate(sbox):
+        unsbox[value] = index
+    mult = {factor: [_gmul(a, factor) for a in range(256)] for factor in (2, 3, 9, 11, 13, 14)}
+    return sbox, unsbox, mult
+
+
+def _aes_round_keys(key):
+    if len(key) != 16:
+        raise ValueError('AES-128 needs a 16-byte key')
+    sbox = _aes_tables()[0]
+    words = [list(key[4 * i:4 * i + 4]) for i in range(4)]
+    rcon = 1
+    for i in range(4, 44):
+        word = list(words[i - 1])
+        if i % 4 == 0:
+            word = [sbox[b] for b in word[1:] + word[:1]]
+            word[0] ^= rcon
+            rcon = _gmul(rcon, 2)
+        words.append([a ^ b for a, b in zip(words[i - 4], word)])
+    return [sum(words[4 * r:4 * r + 4], []) for r in range(11)]
+
+
+def aes_decrypt_block(key, block):
+    if len(block) != 16:
+        raise ValueError('AES block is 16 bytes')
+    _, unsbox, mult = _aes_tables()
+    keys = _aes_round_keys(key)
+    state = [a ^ b for a, b in zip(block, keys[10])]
+    for rnd in range(9, -1, -1):
+        state = [state[(i - 4 * (i % 4)) % 16] for i in range(16)]            # inverse ShiftRows
+        state = [unsbox[b] for b in state]
+        state = [a ^ b for a, b in zip(state, keys[rnd])]
+        if rnd:
+            mixed = []
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = state[c:c + 4]
+                mixed += [mult[14][a0] ^ mult[11][a1] ^ mult[13][a2] ^ mult[9][a3],
+                          mult[9][a0] ^ mult[14][a1] ^ mult[11][a2] ^ mult[13][a3],
+                          mult[13][a0] ^ mult[9][a1] ^ mult[14][a2] ^ mult[11][a3],
+                          mult[11][a0] ^ mult[13][a1] ^ mult[9][a2] ^ mult[14][a3]]
+            state = mixed
+    return bytes(state)
+
+
+def aes_unwrap(kek, data):
+    """RFC 3394 key unwrap. Returns the plaintext key data, or None when the integrity check fails."""
+    if len(data) < 24 or len(data) % 8:
+        return None
+    count = len(data) // 8 - 1
+    a = data[:8]
+    r = [data[8 * i:8 * i + 8] for i in range(1, count + 1)]
+    for j in range(5, -1, -1):
+        for i in range(count, 0, -1):
+            t = count * j + i
+            block = aes_decrypt_block(kek, bytes(x ^ y for x, y in zip(a, t.to_bytes(8, 'big'))) + r[i - 1])
+            a, r[i - 1] = block[:8], block[8:]
+    return b''.join(r) if a == b'\xA6' * 8 else None
+
+
+def wpa_psk(passphrase, ssid):
+    return hashlib.pbkdf2_hmac('sha1', passphrase, ssid, 4096, 32)
+
+
+def prf_sha1(key, label, data, length):
+    out = b''
+    counter = 0
+    while len(out) < length:
+        out += hmac.new(key, label + b'\0' + data + bytes([counter]), 'sha1').digest()
+        counter += 1
+    return out[:length]
+
+
+def derive_ptk(pmk, aa, spa, anonce, snonce):
+    data = min(aa, spa) + max(aa, spa) + min(anonce, snonce) + max(anonce, snonce)
+    return prf_sha1(pmk, b'Pairwise key expansion', data, 48)       # KCK 16 | KEK 16 | TK 16 (CCMP)
+
+
+# --- information elements
+
+def mac_str(raw):
+    return ':'.join(f'{b:02x}' for b in raw)
+
+
+def mac_bytes(text):
+    return bytes.fromhex(text.replace(':', ''))
+
+
+def parse_ies(data):
+    """[(element id, body)]; a truncated tail is dropped."""
+    result, pos = [], 0
+    while pos + 2 <= len(data):
+        length = data[pos + 1]
+        if pos + 2 + length > len(data):
+            break
+        result.append((data[pos], data[pos + 2:pos + 2 + length]))
+        pos += 2 + length
+    return result
+
+
+def parse_rsn(body):
+    """{'group', 'pairwise', 'akm', 'caps'} from an RSN element body, or None if malformed or not version 1."""
+    try:
+        if len(body) < 2 or struct.unpack_from('<H', body, 0)[0] != 1:
+            return None
+        pos, group = 2, SUITE_CCMP
+        if len(body) >= pos + 4:
+            group = int.from_bytes(body[pos:pos + 4], 'big')
+            pos += 4
+        pairwise, akm, caps = [SUITE_CCMP], [0x000FAC01], 0
+        if len(body) >= pos + 2:
+            count = struct.unpack_from('<H', body, pos)[0]
+            pos += 2
+            if count == 0 or len(body) < pos + 4 * count:
+                return None
+            pairwise = [int.from_bytes(body[pos + 4 * i:pos + 4 * i + 4], 'big') for i in range(count)]
+            pos += 4 * count
+            if len(body) >= pos + 2:
+                count = struct.unpack_from('<H', body, pos)[0]
+                pos += 2
+                if count == 0 or len(body) < pos + 4 * count:
+                    return None
+                akm = [int.from_bytes(body[pos + 4 * i:pos + 4 * i + 4], 'big') for i in range(count)]
+                pos += 4 * count
+                if len(body) >= pos + 2:
+                    caps = struct.unpack_from('<H', body, pos)[0]
+        return {'group': group, 'pairwise': pairwise, 'akm': akm, 'caps': caps}
+    except struct.error:
+        return None
+
+
+def build_rsn_ie():
+    """The RSN element we associate with and repeat in message 2: CCMP group and pairwise, PSK, no PMF."""
+    return (b'\x30\x14' + struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big')
+            + struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big')
+            + struct.pack('<H', 1) + SUITE_PSK.to_bytes(4, 'big') + struct.pack('<H', OWN_RSN_CAPS))
+
+
+def unsupported_reason(rsn):
+    """Why we cannot join an AP with this RSN element, or None when WPA2-PSK with CCMP is on offer."""
+    if rsn is None:
+        return 'no WPA2 (RSN) element'
+    if SUITE_PSK not in rsn['akm']:
+        return 'not WPA2-personal (no PSK key management)'
+    if SUITE_CCMP not in rsn['pairwise'] or rsn['group'] != SUITE_CCMP:
+        return 'needs a cipher other than CCMP'
+    if rsn['caps'] & RSN_CAPS_MFPR:
+        return 'requires management frame protection'
+    return None
+
+
+def security_string(ies, capability):
+    """wpa_supplicant-style flags such as [WPA2-PSK-CCMP][ESS] for scan listings."""
+    flags = []
+    rsn = next((parse_rsn(body) for ident, body in ies if ident == 0x30), None)
+    if rsn:
+        names = {SUITE_CCMP: 'CCMP', 0x000FAC02: 'TKIP', 0x000FAC08: 'GCMP-256', 0x000FAC09: 'GCMP-256'}
+        akm = '+'.join(AKM_NAMES.get(s & 0xFF, f'AKM{s & 0xFF}') if s >> 8 == 0x000FAC else 'AKM'
+                       for s in rsn['akm'])
+        cipher = '+'.join(names.get(s, 'OTHER') for s in rsn['pairwise'])
+        flags.append(f'[{"WPA3" if "PSK" not in akm and "SAE" in akm else "WPA2"}-{akm}-{cipher}]')
+    if any(ident == 0xDD and body[:4] == b'\x00\x50\xf2\x01' for ident, body in ies):
+        flags.append('[WPA-PSK-CCMP+TKIP]')
+    if not flags and capability & 0x10:
+        flags.append('[WEP]')
+    if capability & 0x01:
+        flags.append('[ESS]')
+    return ''.join(flags)
+
+
+# --- EAPOL-Key frames and the supplicant side of the handshakes (IEEE 802.11-2016 12.7)
+
+KI_VERSION, KI_PAIRWISE, KI_INSTALL, KI_ACK = 0x0007, 0x0008, 0x0040, 0x0080
+KI_MIC, KI_SECURE, KI_ERROR, KI_REQUEST, KI_ENCRYPTED = 0x0100, 0x0200, 0x0400, 0x0800, 0x1000
+EAPOL_KEY_FIXED = 99                         # 4-byte EAPOL header + 95 bytes up to the key data
+GTK_KDE = b'\x00\x0f\xac\x01'
+
+
+def eapol_key_parse(frame):
+    """Fields of an RSN EAPOL-Key frame (bytes after the Ethernet header), or None if it is anything else."""
+    if len(frame) < EAPOL_KEY_FIXED or frame[1] != 3 or frame[4] != 2:
+        return None
+    body_length = struct.unpack_from('>H', frame, 2)[0]
+    if 4 + body_length > len(frame) or body_length < EAPOL_KEY_FIXED - 4:
+        return None
+    frame = frame[:4 + body_length]
+    data_length = struct.unpack_from('>H', frame, 97)[0]
+    if EAPOL_KEY_FIXED + data_length > len(frame):
+        return None
+    return {'raw': frame, 'version': frame[0], 'info': struct.unpack_from('>H', frame, 5)[0],
+            'key_length': struct.unpack_from('>H', frame, 7)[0], 'replay': struct.unpack_from('>Q', frame, 9)[0],
+            'nonce': frame[17:49], 'rsc': frame[65:73], 'mic': frame[81:97],
+            'data': frame[EAPOL_KEY_FIXED:EAPOL_KEY_FIXED + data_length]}
+
+
+def eapol_key_build(version, info, key_length, replay, nonce, data, kck=None):
+    body = (bytes([2]) + struct.pack('>HHQ', info, key_length, replay) + nonce + bytes(16) + bytes(8) + bytes(8)
+            + bytes(16) + struct.pack('>H', len(data)) + data)
+    frame = bytes([version, 3]) + struct.pack('>H', len(body)) + body
+    if kck is not None:
+        frame = frame[:81] + eapol_key_mic(kck, frame) + frame[97:]
+    return frame
+
+
+def eapol_key_mic(kck, frame):
+    return hmac.new(kck, frame[:81] + bytes(16) + frame[97:], 'sha1').digest()[:16]
+
+
+def key_data_elements(data):
+    """(RSN element body or None, [(key id, transmit, key bytes)]) from decrypted EAPOL key data."""
+    rsn, gtks, pos = None, [], 0
+    while pos + 2 <= len(data):
+        ident, length = data[pos], data[pos + 1]
+        if ident == 0xDD and length == 0:
+            break                                  # padding that follows the last element
+        body = data[pos + 2:pos + 2 + length]
+        if len(body) < length:
+            break
+        if ident == 0x30:
+            rsn = body
+        elif ident == 0xDD and body[:4] == GTK_KDE and len(body) > 6:
+            gtks.append((body[4] & 3, bool(body[4] & 4), body[6:]))
+        pos += 2 + length
+    return rsn, gtks
+
+
+class Handshake:
+    """The supplicant half of the WPA2 four-way handshake and later group-key updates.
+
+    Feed it received EAPOL-Key frames with receive(); it answers with a list of actions for the caller:
+      ('send', frame)  ('install_ptk', tk)  ('install_gtk', index, key, rsc)  ('complete',)
+      ('group_done',)  ('ignore', why)      ('fail', why)
+    It touches no socket, clock or kernel, so tests can play the access point against it."""
+
+    def __init__(self, pmk, aa, spa, own_ie, ap_rsn, random=os.urandom):
+        self.pmk, self.aa, self.spa, self.own_ie, self.ap_rsn, self.random = pmk, aa, spa, own_ie, ap_rsn, random
+        self.ptk = self.anonce = self.snonce = None
+        self.replay = None
+        self.installed = False
+
+    def _reply(self, frame, info, nonce, data):
+        return eapol_key_build(frame['version'], info, frame['key_length'], frame['replay'], nonce, data, self.ptk[:16])
+
+    def receive(self, raw):
+        frame = eapol_key_parse(raw)
+        if frame is None:
+            return [('ignore', 'not an RSN EAPOL-Key frame')]
+        info = frame['info']
+        if not info & KI_ACK or info & (KI_REQUEST | KI_ERROR):
+            return [('ignore', 'not a message from the authenticator')]
+        if info & KI_VERSION != 2:
+            return [('fail', f'access point uses EAPOL key descriptor version {info & KI_VERSION}; only 2 (CCMP) is supported')]
+        if info & KI_PAIRWISE:
+            return self._message_1(frame) if not info & KI_MIC else self._message_3(frame)
+        return self._group(frame)
+
+    def _message_1(self, frame):
+        if frame['info'] & (KI_INSTALL | KI_SECURE | KI_ENCRYPTED):
+            return [('ignore', 'malformed message 1')]
+        if self.installed:
+            return [('fail', 'the access point started a pairwise key refresh, which is not supported; reconnecting')]
+        self.anonce, self.snonce = frame['nonce'], self.random(32)
+        self.ptk = derive_ptk(self.pmk, self.aa, self.spa, self.anonce, self.snonce)
+        self.replay = frame['replay']            # message 1 is accepted whatever its counter: the AP may start over
+        info = 2 | KI_PAIRWISE | KI_MIC
+        return [('send', self._reply(frame, info, self.snonce, self.own_ie))]
+
+    def _authentic(self, frame):
+        return (self.ptk is not None and hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw']), frame['mic'])
+                and (self.replay is None or frame['replay'] > self.replay))
+
+    def _decrypt(self, frame):
+        if not frame['info'] & KI_ENCRYPTED:
+            return frame['data']
+        return aes_unwrap(self.ptk[16:32], frame['data'])
+
+    def _message_3(self, frame):
+        if self.ptk is None:
+            return [('ignore', 'message 3 before message 1')]
+        if not hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw']), frame['mic']):
+            return [('ignore', 'message 3 failed its integrity check')]
+        if self.replay is not None and frame['replay'] <= self.replay:
+            return [('ignore', 'message 3 replayed')]
+        if frame['nonce'] != self.anonce:
+            return [('ignore', 'message 3 changed the authenticator nonce')]
+        if self.installed:                       # the AP missed our message 4: answer again, never reinstall keys
+            self.replay = frame['replay']
+            return [('send', self._reply(frame, 2 | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b''))]
+        if not frame['info'] & KI_INSTALL:
+            return [('ignore', 'message 3 without the install flag')]
+        data = self._decrypt(frame)
+        if data is None:
+            return [('ignore', 'message 3 key data failed to unwrap')]
+        rsn_body, gtks = key_data_elements(data)
+        rsn = parse_rsn(rsn_body) if rsn_body is not None else None
+        if rsn is None or (self.ap_rsn and (rsn['group'], rsn['pairwise'], rsn['akm'])
+                           != (self.ap_rsn['group'], self.ap_rsn['pairwise'], self.ap_rsn['akm'])):
+            return [('fail', 'security elements in message 3 differ from the beacon (possible downgrade attack)')]
+        if not gtks or len(gtks[0][2]) != 16:
+            return [('fail', 'message 3 carries no usable CCMP group key')]
+        self.replay = frame['replay']
+        self.installed = True
+        index, _, key = gtks[0]
+        return [('send', self._reply(frame, 2 | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b'')),
+                ('install_ptk', self.ptk[32:48]), ('install_gtk', index, key, frame['rsc'][:6]), ('complete',)]
+
+    def _group(self, frame):
+        if not self.installed:
+            return [('ignore', 'group key message before the four-way handshake finished')]
+        if not self._authentic(frame):
+            return [('ignore', 'group key message failed its integrity or replay check')]
+        data = self._decrypt(frame)
+        _, gtks = key_data_elements(data) if data is not None else (None, [])
+        if not gtks or len(gtks[0][2]) != 16:
+            return [('ignore', 'group key message without a usable key')]
+        self.replay = frame['replay']
+        index, _, key = gtks[0]
+        return [('send', self._reply(frame, 2 | KI_MIC | KI_SECURE, bytes(32), b'')),
+                ('install_gtk', index, key, frame['rsc'][:6]), ('group_done',)]
+
+
+# --- generic netlink and nl80211
+
+NETLINK_GENERIC, GENL_ID_CTRL = 16, 0x10
+NLM_F_REQUEST, NLM_F_ACK, NLM_F_DUMP = 1, 4, 0x300
+NLMSG_ERROR, NLMSG_DONE = 2, 3
+NLA_F_NESTED = 0x8000
+SOL_NETLINK, NETLINK_ADD_MEMBERSHIP = 270, 1
+ETH_P_PAE, PACKET_OUTGOING = 0x888E, 4
+
+CMD_GET_INTERFACE, CMD_SET_KEY, CMD_NEW_KEY, CMD_DEL_KEY, CMD_GET_STATION, CMD_SET_STATION = 5, 10, 11, 12, 17, 18
+CMD_GET_SCAN, CMD_TRIGGER_SCAN, CMD_NEW_SCAN_RESULTS, CMD_SCAN_ABORTED = 32, 33, 34, 35
+CMD_CONNECT, CMD_DISCONNECT = 46, 48
+A_IFINDEX, A_MAC, A_KEY, A_STA_INFO, A_BSS, A_WIPHY_FREQ = 3, 6, 80, 21, 47, 38
+A_SCAN_SSIDS, A_SSID, A_IE, A_AUTH_TYPE, A_REASON_CODE, A_STATUS_CODE = 45, 52, 42, 53, 54, 72
+A_PRIVACY, A_USE_MFP, A_WPA_VERSIONS, A_CIPHER_PAIRWISE, A_CIPHER_GROUP, A_AKM = 70, 66, 75, 73, 74, 76
+A_CONTROL_PORT, A_STA_FLAGS2, A_TIMED_OUT, A_DISCONNECTED_BY_AP = 68, 67, 65, 71
+K_DATA, K_IDX, K_CIPHER, K_SEQ, K_DEFAULT, K_DEFAULT_TYPES = 1, 2, 3, 4, 5, 8
+BSS_BSSID, BSS_FREQUENCY, BSS_CAPABILITY, BSS_IES, BSS_SIGNAL_MBM, BSS_BEACON_IES = 1, 2, 5, 6, 7, 11
+STA_SIGNAL = 7
+STA_FLAG_AUTHORIZED = 1
+
+
+def nla(kind, payload=b''):
+    length = 4 + len(payload)
+    return struct.pack('=HH', length, kind) + payload + bytes(-length % 4)
+
+
+def nla_nest(kind, *children):
+    return nla(kind | NLA_F_NESTED, b''.join(children))
+
+
+def nla_u32(kind, value):
+    return nla(kind, struct.pack('=I', value))
+
+
+def nla_u8(kind, value):
+    return nla(kind, bytes([value]))
+
+
+def parse_attrs(data):
+    """{attribute type: payload}; a truncated tail is dropped."""
+    result, pos = {}, 0
+    while pos + 4 <= len(data):
+        length, kind = struct.unpack_from('=HH', data, pos)
+        if length < 4 or pos + length > len(data):
+            break
+        result[kind & 0x3FFF] = data[pos + 4:pos + length]
+        pos += (length + 3) & ~3
+    return result
+
+
+class Netlink:
+    """A generic-netlink socket: blocking requests, or non-blocking event reads."""
+
+    def __init__(self, sock=None, timeout=5.0):
+        if sock is None:
+            sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_GENERIC)
+            sock.bind((0, 0))
+        self.sock, self.seq = sock, int(time.time()) & 0xFFFF
+        self.sock.settimeout(timeout)
+
+    def close(self):
+        self.sock.close()
+
+    def request(self, family, cmd, attrs=b'', dump=False, version=0):
+        """[(command, {attribute: payload})] from the replies. Raises OSError carrying the kernel's errno."""
+        self.seq += 1
+        flags = NLM_F_REQUEST | (NLM_F_DUMP if dump else NLM_F_ACK)
+        body = struct.pack('=BBH', cmd, version, 0) + attrs
+        self.sock.send(struct.pack('=IHHII', 16 + len(body), family, flags, self.seq, 0) + body)
+        replies = []
+        while True:
+            data = self.sock.recv(1 << 17)
+            pos = 0
+            while pos + 16 <= len(data):
+                length, kind, _, seq, _ = struct.unpack_from('=IHHII', data, pos)
+                if length < 16 or pos + length > len(data):
+                    break
+                payload = data[pos + 16:pos + length]
+                pos += (length + 3) & ~3
+                if seq != self.seq:
+                    continue
+                if kind == NLMSG_ERROR:
+                    code = struct.unpack_from('=i', payload)[0] if len(payload) >= 4 else -errno.EIO
+                    if code:
+                        raise OSError(-code, os.strerror(-code))
+                    return replies
+                if kind == NLMSG_DONE:
+                    return replies
+                if len(payload) >= 4:
+                    replies.append((payload[0], parse_attrs(payload[4:])))
+
+    def read_events(self):
+        """Everything queued on a subscribed, non-blocking socket as [(command, attributes)]."""
+        events = []
+        while True:
+            try:
+                data = self.sock.recv(1 << 17)
+            except (BlockingIOError, socket.timeout):
+                return events
+            pos = 0
+            while pos + 16 <= len(data):
+                length, kind, _, _, _ = struct.unpack_from('=IHHII', data, pos)
+                if length < 16 or pos + length > len(data):
+                    break
+                payload = data[pos + 16:pos + length]
+                pos += (length + 3) & ~3
+                if kind >= GENL_ID_CTRL and len(payload) >= 4:
+                    events.append((payload[0], parse_attrs(payload[4:])))
+
+
+def resolve_nl80211(netlink):
+    """(family id, {multicast group name: id}) for nl80211."""
+    reply = netlink.request(GENL_ID_CTRL, 3, nla(2, b'nl80211\0'))
+    if not reply:
+        raise OSError(errno.ENOENT, 'nl80211 is not available')
+    attrs = reply[0][1]
+    groups = {}
+    for entry in parse_attrs(attrs.get(7, b'')).values():
+        fields = parse_attrs(entry)
+        if 1 in fields and 2 in fields:
+            groups[fields[1].rstrip(b'\0').decode()] = struct.unpack('=I', fields[2])[0]
+    return struct.unpack('=H', attrs[1])[0], groups
+
+
+def parse_bss(attrs):
+    """One scan result from an NL80211_ATTR_BSS payload, or None when it has no usable BSSID."""
+    bss = parse_attrs(attrs)
+    if BSS_BSSID not in bss or len(bss[BSS_BSSID]) != 6:
+        return None
+    ies = bss.get(BSS_IES) or bss.get(BSS_BEACON_IES) or b''
+    elements = parse_ies(ies)
+    ssid = next((body for ident, body in elements if ident == 0), b'')
+    rsn = next((parse_rsn(body) for ident, body in elements if ident == 0x30), None)
+    capability = struct.unpack('=H', bss[BSS_CAPABILITY])[0] if len(bss.get(BSS_CAPABILITY, b'')) == 2 else 0
+    return {'bssid': mac_str(bss[BSS_BSSID]),
+            'freq': struct.unpack('=I', bss[BSS_FREQUENCY])[0] if len(bss.get(BSS_FREQUENCY, b'')) == 4 else 0,
+            'signal': struct.unpack('=i', bss[BSS_SIGNAL_MBM])[0] / 100 if len(bss.get(BSS_SIGNAL_MBM, b'')) == 4 else None,
+            'ssid': ssid if not ssid or any(ssid) else b'', 'rsn': rsn,
+            'security': security_string(elements, capability)}
+
+
+class Nl80211Driver:
+    """The real radio: scanning, connecting, key installation and EAPOL for one interface.
+
+    Needs root (CAP_NET_ADMIN) except for get_scan() and signal(), which the kernel lets anyone read."""
+
+    def __init__(self, iface, subscribe=True):
+        self.iface = iface
+        self.ifindex = socket.if_nametoindex(iface)
+        self.mac = mac_bytes(read(f'/sys/class/net/{iface}/address'))
+        self.commands = Netlink()
+        self.family, groups = resolve_nl80211(self.commands)
+        self.events = self.eapol = None
+        if subscribe:
+            self.events = Netlink(timeout=0.0)
+            for name in ('mlme', 'scan'):
+                if name not in groups:
+                    raise OSError(errno.ENOENT, f'nl80211 has no {name} multicast group')
+                self.events.sock.setsockopt(SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, groups[name])
+            self.eapol = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_PAE))
+            self.eapol.bind((iface, ETH_P_PAE))
+            self.eapol.setblocking(False)
+
+    def close(self):
+        for item in (self.commands, self.events, self.eapol):
+            if item is not None:
+                item.close()
+
+    def _do(self, cmd, *attrs, dump=False):
+        return self.commands.request(self.family, cmd, nla_u32(A_IFINDEX, self.ifindex) + b''.join(attrs), dump=dump)
+
+    def bring_up(self):
+        name = self.iface.encode()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            flags = struct.unpack('16sH14x', fcntl.ioctl(sock, 0x8913, struct.pack('16sH14x', name, 0)))[1]
+            if not flags & 1:
+                fcntl.ioctl(sock, 0x8914, struct.pack('16sH14x', name, flags | 1))
+
+    def wait(self, timeout):
+        """Block up to timeout seconds; return [('scan_done', aborted) | ('connected', bssid, status) |
+        ('disconnected', reason, by_ap) | ('eapol', source, frame) | ('overrun',)]."""
+        sockets = [item.sock if isinstance(item, Netlink) else item for item in (self.events, self.eapol) if item is not None]
+        readable, _, _ = select.select(sockets, [], [], timeout)
+        out = []
+        if self.events is not None and self.events.sock in readable:
+            try:
+                raw = self.events.read_events()
+            except OSError as error:
+                raw = []
+                if error.errno == errno.ENOBUFS:
+                    out.append(('overrun',))
+            for cmd, attrs in raw:
+                if len(attrs.get(A_IFINDEX, b'')) == 4 and struct.unpack('=I', attrs[A_IFINDEX])[0] != self.ifindex:
+                    continue
+                if cmd == CMD_NEW_SCAN_RESULTS:
+                    out.append(('scan_done', False))
+                elif cmd == CMD_SCAN_ABORTED:
+                    out.append(('scan_done', True))
+                elif cmd == CMD_CONNECT:
+                    status = struct.unpack('=H', attrs[A_STATUS_CODE])[0] if len(attrs.get(A_STATUS_CODE, b'')) == 2 else 0
+                    if A_TIMED_OUT in attrs:
+                        status = -1
+                    out.append(('connected', mac_str(attrs.get(A_MAC, bytes(6))), status))
+                elif cmd == CMD_DISCONNECT:
+                    reason = struct.unpack('=H', attrs[A_REASON_CODE])[0] if len(attrs.get(A_REASON_CODE, b'')) == 2 else 0
+                    out.append(('disconnected', reason, A_DISCONNECTED_BY_AP in attrs))
+        if self.eapol is not None and self.eapol in readable:
+            while True:
+                try:
+                    data, address = self.eapol.recvfrom(4096)
+                except BlockingIOError:
+                    break
+                if address[2] != PACKET_OUTGOING and len(data) > 14 and data[12:14] == b'\x88\x8e':
+                    out.append(('eapol', mac_str(data[6:12]), data[14:]))
+        return out
+
+    def get_scan(self):
+        results = []
+        for _, attrs in self._do(CMD_GET_SCAN, dump=True):
+            if A_BSS in attrs:
+                bss = parse_bss(attrs[A_BSS])
+                if bss:
+                    results.append(bss)
+        return results
+
+    def trigger_scan(self, ssids):
+        entries = b''.join(nla(index + 1, ssid) for index, ssid in enumerate([b''] + list(ssids)))
+        self._do(CMD_TRIGGER_SCAN, nla_nest(A_SCAN_SSIDS, entries))
+
+    def connect(self, bss, ssid):
+        self._do(CMD_CONNECT, nla(A_SSID, ssid), nla(A_MAC, mac_bytes(bss['bssid'])), nla_u32(A_WIPHY_FREQ, bss['freq']),
+                 nla(A_IE, build_rsn_ie()), nla_u32(A_AUTH_TYPE, 0), nla_u32(A_USE_MFP, 0), nla_u32(A_WPA_VERSIONS, 2),
+                 nla(A_CIPHER_PAIRWISE, struct.pack('=I', SUITE_CCMP)), nla_u32(A_CIPHER_GROUP, SUITE_CCMP),
+                 nla(A_AKM, struct.pack('=I', SUITE_PSK)), nla(A_PRIVACY), nla(A_CONTROL_PORT))
+
+    def disconnect(self):
+        self._do(CMD_DISCONNECT, nla(A_REASON_CODE, struct.pack('=H', 3)))
+
+    def new_key(self, index, key, seq=b'', bssid=None):
+        """Install a CCMP key: pairwise when bssid is given, else the group key with this index.
+
+        An empty KEY_SEQ attribute is rejected by the kernel (EINVAL), so it is only sent when there is one."""
+        nested = nla_nest(A_KEY, nla(K_DATA, key), nla_u8(K_IDX, index), nla_u32(K_CIPHER, SUITE_CCMP),
+                          nla(K_SEQ, seq) if seq else b'')
+        self._do(CMD_NEW_KEY, nested, nla(A_MAC, mac_bytes(bssid)) if bssid else b'')
+
+    def default_group_key(self, index):
+        self._do(CMD_SET_KEY, nla_nest(A_KEY, nla_u8(K_IDX, index), nla(K_DEFAULT), nla_nest(K_DEFAULT_TYPES, nla(2))))
+
+    def delete_group_key(self, index):
+        self._do(CMD_DEL_KEY, nla_nest(A_KEY, nla_u8(K_IDX, index)))
+
+    def authorize(self, bssid):
+        flag = 1 << STA_FLAG_AUTHORIZED
+        self._do(CMD_SET_STATION, nla(A_MAC, mac_bytes(bssid)), nla(A_STA_FLAGS2, struct.pack('=II', flag, flag)))
+
+    def signal(self, bssid):
+        """Signal in dBm from the kernel's station table, or None."""
+        try:
+            replies = self._do(CMD_GET_STATION, nla(A_MAC, mac_bytes(bssid)))
+        except OSError:
+            return None
+        for _, attrs in replies:
+            value = parse_attrs(attrs.get(A_STA_INFO, b'')).get(STA_SIGNAL)
+            if value and struct.unpack('b', value[:1])[0] < 0:     # rtw88 over USB reports 0 when it has no value
+                return struct.unpack('b', value[:1])[0]
+        return None
+
+    def send_eapol(self, destination, payload):
+        self.eapol.send(mac_bytes(destination) + self.mac + b'\x88\x8e' + payload)
+
+
+# --- the station: scan, choose, connect, handshake, stay connected
+
+def scan_entry(bss):
+    """A scan result as the JSON that `cube-net scan` prints."""
+    ssid = ''.join(c for c in bss['ssid'].decode('utf-8', 'replace') if c.isprintable())
+    return {'bssid': bss['bssid'], 'frequency_mhz': bss['freq'],
+            'signal_dbm': round(bss['signal']) if bss['signal'] is not None else -127,
+            'security': bss['security'], 'ssid': ssid}
+
+
+class Station:
+    """Keeps the radio associated with a saved WPA2 network, and says what state it is in.
+
+    States keep the names the rest of the system already reads: INACTIVE (no saved network), DISCONNECTED,
+    SCANNING, AUTHENTICATING, ASSOCIATED, 4WAY_HANDSHAKE, COMPLETED, plus the internal DISCONNECTING.
+    All radio access happens in run()'s thread via tick(); other threads use call() and snapshot().
+    It never gives up: after any failure it scans again, with growing but capped delays."""
+
+    SCAN_DELAYS = (1, 3, 5, 10)        # after the Nth consecutive failure; the last repeats forever
+    SCAN_TIMEOUT = 20
+    CONNECT_TIMEOUT = 15
+    HANDSHAKE_TIMEOUT = 12
+    DISCONNECT_WAIT = 2
+    BAN_SECONDS = 45                   # a BSS that just failed is skipped this long when others exist
+    SIGNAL_EVERY = 2
+    USER_SCAN_WAIT = 8
+    IDLE_POLL = 0.25
+
+    def __init__(self, driver, load_profiles, log, now=time.monotonic, pause=time.sleep):
+        self.driver, self.load_profiles, self.log, self.now, self.pause = driver, load_profiles, log, now, pause
+        self.lock = threading.Lock()
+        self.state, self.ssid, self.rssi = 'INACTIVE', None, None
+        self.profiles = {}                 # ssid bytes -> 32-byte PMK
+        self.preferred = None              # ssid bytes chosen with 'select'; preferred while it is in range
+        self.commands = queue.SimpleQueue()
+        self.waiters = []                  # [(done event, result box, deadline)] for user scans
+        self.bans = {}                     # bssid -> monotonic time the ban ends
+        self.failures = 0
+        self.next_scan = 0.0
+        self.scanning = False
+        self.deadline = None
+        self.target = None                 # the BSS being joined or joined
+        self.handshake = None
+        self.early = []                    # EAPOL frames that beat the kernel's "connected" event
+        self.had_link = False              # the current association reached COMPLETED
+        self.signal_due = 0.0
+        self.error = None
+        self.stopping = False
+
+    # --- used from other threads
+
+    def snapshot(self):
+        with self.lock:
+            return {'state': self.state, 'ssid': self.ssid, 'rssi': self.rssi}
+
+    def call(self, name, *args, timeout=12.0):
+        if self.error is not None:
+            raise RuntimeError('The Wi-Fi station has stopped.')
+        done, box = threading.Event(), {}
+        self.commands.put((name, args, done, box))
+        if not done.wait(timeout):
+            raise RuntimeError('The Wi-Fi station did not answer in time.')
+        if 'error' in box:
+            raise RuntimeError(box['error'])
+        return box.get('result')
+
+    def stop(self):
+        self.stopping = True
+
+    # --- the loop
+
+    def run(self):
+        try:
+            self.driver.bring_up()
+            try:
+                self.driver.disconnect()     # a link left over from an earlier run is not ours to keep
+            except OSError:
+                pass
+            self.reload(self.now())
+            while not self.stopping:
+                self.tick(self.now(), self.driver.wait(self.IDLE_POLL))
+        except BaseException as error:   # the service sees .error, exits, and systemd restarts it
+            self.error = error
+            self.log(f'wifi: station stopped: {type(error).__name__}: {error}')
+        finally:
+            try:
+                self.driver.disconnect()
+            except OSError:
+                pass
+
+    def tick(self, now, events):
+        self._commands(now)
+        for event in events:
+            try:
+                self._event(now, event)
+            except OSError as error:
+                self._fail(now, f'radio refused a request ({error.strerror or error})')
+        try:
+            self._timers(now)
+        except OSError as error:
+            self._fail(now, f'radio refused a request ({error.strerror or error})')
+
+    def _set(self, state, ssid=None):
+        with self.lock:
+            self.state = state
+            self.ssid = ssid if state in ('COMPLETED',) else None
+            if state != 'COMPLETED':
+                self.rssi = None
+
+    # --- commands from the control socket
+
+    def _commands(self, now):
+        while True:
+            try:
+                name, args, done, box = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if name == 'scan':
+                    self.waiters.append((done, box, now + self.USER_SCAN_WAIT))
+                    if not self.scanning and self.state not in ('AUTHENTICATING', 'ASSOCIATED', '4WAY_HANDSHAKE', 'DISCONNECTING'):
+                        self._start_scan(now)
+                    elif not self.scanning:
+                        self._finish_waiters(now, force=True)
+                    continue
+                box['result'] = {'reassociate': self._reassociate, 'reload': self.reload,
+                                 'select': self._select}[name](now, *args)
+            except (RuntimeError, OSError, KeyError, ValueError) as error:
+                box['error'] = str(error) if isinstance(error, RuntimeError) else f'{name} failed: {error}'
+            done.set()
+
+    def reload(self, now):
+        try:
+            loaded = self.load_profiles()
+        except RuntimeError as error:
+            self.log(f'wifi: saved networks could not be read, keeping the previous list ({error})')
+            return 'kept'
+        self.profiles = {ssid.encode(): bytes.fromhex(psk) for ssid, psk in loaded}
+        if self.preferred not in self.profiles:
+            self.preferred = None
+        with self.lock:
+            joined = self.ssid
+        if not self.profiles:
+            self._drop(now, 'no saved networks')
+            self._set('INACTIVE')
+        elif self.state == 'INACTIVE':
+            self._set('DISCONNECTED')
+            self.next_scan = now
+        elif joined is not None and joined.encode() not in self.profiles:
+            self._drop(now, 'the saved network was removed')
+        return 'OK'
+
+    def _select(self, now, profile):
+        matches = [ssid for ssid in self.profiles if profile_id(ssid.decode('utf-8', 'replace')) == profile]
+        if len(matches) != 1:
+            raise RuntimeError('Saved profile does not exist or is ambiguous.')
+        self.preferred = matches[0]
+        with self.lock:
+            joined = self.ssid
+        if joined is not None and joined.encode() == matches[0]:
+            return 'OK'
+        return self._reassociate(now)
+
+    def _reassociate(self, now):
+        self.failures = 0
+        self.bans.clear()
+        if self.state in ('AUTHENTICATING', 'ASSOCIATED', '4WAY_HANDSHAKE', 'COMPLETED'):
+            self._drop(now, 'reassociation requested')
+        elif self.state != 'INACTIVE':
+            self.next_scan = now
+        return 'OK'
+
+    # --- radio events
+
+    def _event(self, now, event):
+        kind = event[0]
+        if kind == 'scan_done':
+            self._scan_done(now, aborted=event[1])
+        elif kind == 'connected':
+            self._connected(now, event[1], event[2])
+        elif kind == 'disconnected':
+            self._disconnected(now, event[1], event[2])
+        elif kind == 'eapol':
+            self._eapol(now, event[1], event[2])
+        elif kind == 'overrun':
+            self.log('wifi: missed some radio events; relying on timers')
+
+    def _scan_done(self, now, aborted):
+        self.scanning = False
+        try:
+            results = [] if aborted else self.driver.get_scan()
+        except OSError as error:
+            results = []
+            self.log(f'wifi: scan results unavailable ({error.strerror or error})')
+        self._finish_waiters(now, force=True)
+        if self.state == 'SCANNING':
+            if aborted or not results:
+                self._retry(now, 'scan was aborted' if aborted else 'scan found nothing')
+            else:
+                self._choose(now, results)
+        elif self.state == 'DISCONNECTED' and self.profiles and results:
+            self._choose(now, results, quiet=True)     # a user's scan may as well bring the link up
+
+    def _finish_waiters(self, now, force=False):
+        waiters, self.waiters = self.waiters, []
+        for done, box, deadline in waiters:
+            if force or now >= deadline:
+                try:
+                    box['result'] = [scan_entry(bss) for bss in self.driver.get_scan()]
+                except OSError as error:
+                    box['error'] = f'scan results unavailable: {error.strerror or error}'
+                done.set()
+            else:
+                self.waiters.append((done, box, deadline))
+
+    def _start_scan(self, now, auto=False):
+        """auto=True is the search for a network to join; otherwise a user asked and the state is left alone."""
+        try:
+            try:
+                self.driver.trigger_scan(list(self.profiles)[:3])     # saved names: finds hidden networks too
+            except OSError as error:
+                if error.errno != errno.EINVAL:                       # the radio may allow fewer names per scan
+                    raise
+                self.driver.trigger_scan([])
+        except OSError as error:
+            if error.errno != errno.EBUSY:
+                self._finish_waiters(now, force=True)
+                if auto:
+                    self._retry(now, f'scan request refused ({error.strerror or error})')
+                return
+        self.scanning = True
+        self.deadline = now + self.SCAN_TIMEOUT
+        if auto:
+            self._set('SCANNING')
+
+    def _choose(self, now, results, quiet=False):
+        usable, reasons = [], set()
+        for bss in results:
+            if bss['ssid'] not in self.profiles:
+                continue
+            reason = unsupported_reason(bss['rsn'])
+            if reason:
+                reasons.add(reason)
+            else:
+                usable.append(bss)
+        if self.preferred is not None and any(b['ssid'] == self.preferred for b in usable):
+            usable = [b for b in usable if b['ssid'] == self.preferred]
+        usable = [b for b in usable if self.bans.get(b['bssid'], 0) <= now] or usable   # bans never strand the only AP
+        if not usable:
+            if not quiet:
+                self._retry(now, 'no usable saved network in range' + (f' ({"; ".join(sorted(reasons))})' if reasons else ''))
+            return
+        bss = max(usable, key=lambda item: item['signal'] if item['signal'] is not None else -200)
+        self.target, self.had_link, self.early = bss, False, []
+        for index in (1, 2, 3):
+            try:
+                self.driver.delete_group_key(index)
+            except OSError:
+                pass
+        self.log(f'wifi: connecting on {bss["freq"]} MHz, signal {bss["signal"]} dBm')
+        self.driver.connect(bss, bss['ssid'])
+        self.deadline = now + self.CONNECT_TIMEOUT
+        self._set('AUTHENTICATING')
+
+    def _connected(self, now, bssid, status):
+        if self.state != 'AUTHENTICATING' or self.target is None:
+            return
+        if status:
+            self._ban(now, self.target['bssid'])
+            self._retry(now, 'the access point refused the association' + (f' (status {status})' if status > 0 else ' (timed out)'))
+            return
+        self.handshake = Handshake(self.profiles[self.target['ssid']], mac_bytes(self.target['bssid']),
+                                   self.driver.mac, build_rsn_ie(), self.target['rsn'])
+        self.deadline = now + self.HANDSHAKE_TIMEOUT
+        self._set('ASSOCIATED')
+        early, self.early = self.early, []
+        for frame in early:
+            self._eapol(now, self.target['bssid'], frame)
+
+    def _eapol(self, now, source, frame):
+        if self.target is None or source != self.target['bssid']:
+            return
+        if self.handshake is None:
+            if self.state == 'AUTHENTICATING' and len(self.early) < 4:
+                self.early.append(frame)   # the access point can be faster than the connect event
+            return
+        actions = self.handshake.receive(frame)
+        if self.state == 'ASSOCIATED' and any(a[0] == 'send' for a in actions):
+            self._set('4WAY_HANDSHAKE')
+        for action in actions:
+            kind = action[0]
+            if kind == 'send':
+                self.driver.send_eapol(self.target['bssid'], action[1])
+            elif kind == 'install_ptk':
+                self.pause(0.05)           # let message 4 leave the queue unencrypted before the key arrives
+                self.driver.new_key(0, action[1], bssid=self.target['bssid'])
+            elif kind == 'install_gtk':
+                self.driver.new_key(action[1], action[2], action[3])
+                try:
+                    self.driver.default_group_key(action[1])
+                except OSError:
+                    pass                    # only affects multicast transmit, which a client does not use
+            elif kind == 'complete':
+                self.driver.authorize(self.target['bssid'])
+                self.had_link, self.failures, self.deadline = True, 0, None
+                self.bans.pop(self.target['bssid'], None)
+                self.signal_due = now
+                self._set('COMPLETED', self.target['ssid'].decode('utf-8', 'replace')[:64])
+                self.log('wifi: handshake complete, link authorized')
+            elif kind == 'group_done':
+                self.log('wifi: group key updated')
+            elif kind == 'ignore':
+                self.log(f'wifi: ignored a frame: {action[1]}')
+            elif kind == 'fail':
+                self._ban(now, self.target['bssid'])
+                self._fail(now, action[1])
+                return
+
+    def _disconnected(self, now, reason, by_ap):
+        if self.state == 'DISCONNECTING':
+            self._idle(now, 1)
+            return
+        if self.state not in ('AUTHENTICATING', 'ASSOCIATED', '4WAY_HANDSHAKE', 'COMPLETED'):
+            return
+        mid_handshake = self.state in ('ASSOCIATED', '4WAY_HANDSHAKE')
+        if self.target is not None and not self.had_link:
+            self._ban(now, self.target['bssid'])
+        hint = ' during the handshake; check the saved passphrase' if mid_handshake and reason in (2, 15) else ''
+        self.log(f'wifi: link lost, reason {reason} ({"access point" if by_ap else "local"}){hint}')
+        self._idle(now, 1 if self.had_link else None)
+
+    # --- timers and failure handling
+
+    def _timers(self, now):
+        state = self.state
+        if self.waiters:
+            self._finish_waiters(now)
+        if self.scanning and now > self.deadline:
+            self.scanning = False
+            self._finish_waiters(now, force=True)
+            if state == 'SCANNING':
+                self._retry(now, 'scan timed out')
+            return
+        if state == 'DISCONNECTED' and now >= self.next_scan and self.profiles and not self.scanning:
+            self._start_scan(now, auto=True)
+        elif state in ('AUTHENTICATING', 'ASSOCIATED', '4WAY_HANDSHAKE') and now > self.deadline:
+            self._fail(now, 'connection attempt timed out' if state == 'AUTHENTICATING'
+                       else 'the handshake did not finish in time; check the saved passphrase')
+        elif state == 'DISCONNECTING' and now > self.deadline:
+            self._idle(now, 1)
+        elif state == 'COMPLETED' and now >= self.signal_due and self.target is not None:
+            self.signal_due = now + self.SIGNAL_EVERY
+            rssi = self.driver.signal(self.target['bssid'])
+            with self.lock:
+                self.rssi = rssi
+
+    def _ban(self, now, bssid):
+        self.bans[bssid] = now + self.BAN_SECONDS
+
+    def _idle(self, now, delay=None):
+        """Back to looking for a network. delay=None climbs the failure ladder, otherwise scan after delay s."""
+        self.handshake, self.scanning, self.early = None, False, []
+        self._set('DISCONNECTED')
+        if delay is None:
+            self.failures += 1
+            delay = self.SCAN_DELAYS[min(self.failures, len(self.SCAN_DELAYS)) - 1]
+        self.next_scan = now + delay
+
+    def _retry(self, now, why):
+        self.log(f'wifi: {why}; scanning again')
+        self._idle(now)
+
+    def _drop(self, now, why):
+        """Leave the current network on purpose and wait briefly for the kernel to confirm."""
+        self.log(f'wifi: leaving the network: {why}')
+        self.handshake = None
+        try:
+            self.driver.disconnect()
+        except OSError:
+            self._idle(now, 0)
+            return
+        self.deadline = now + self.DISCONNECT_WAIT
+        self._set('DISCONNECTING')
+
+    def _fail(self, now, why):
+        self.log(f'wifi: {why}')
+        try:
+            self.driver.disconnect()
+        except OSError:
+            pass
+        self._idle(now)
+
+
+# --- control socket: how `cube-net scan|connect|reconnect|remove` reach the running station
+
+CONTROL_COMMANDS = ('scan', 'reassociate', 'reload', 'select')
+
+
+class ControlServer(threading.Thread):
+    """A root-only unix socket speaking one JSON line each way. It runs nothing but the four station commands."""
+
+    def __init__(self, path, station, allowed_uid=0):
+        super().__init__(name='cube-net-control', daemon=True)
+        self.path, self.station, self.allowed_uid, self.halt = Path(path), station, allowed_uid, False
+        self.path.unlink(missing_ok=True)
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(str(self.path))
+        os.chmod(self.path, 0o600)
+        self.server.listen(4)
+        self.server.settimeout(0.5)
+
+    def stop(self):
+        self.halt = True
+
+    def run(self):
+        while not self.halt:
+            try:
+                connection, _ = self.server.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with connection:
+                try:
+                    self.serve(connection)
+                except (OSError, ValueError):
+                    pass
+        self.server.close()
+        self.path.unlink(missing_ok=True)
+
+    def serve(self, connection):
+        connection.settimeout(15)
+        uid = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))[1]
+        data = b''
+        while not data.endswith(b'\n') and len(data) < 4096:
+            chunk = connection.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+        try:
+            request = json.loads(data)
+            command, args = request['cmd'], request.get('args', [])
+            if uid != self.allowed_uid:
+                raise RuntimeError('Only root may control the Wi-Fi station.')
+            if command not in CONTROL_COMMANDS or not isinstance(args, list) or not all(isinstance(a, str) for a in args):
+                raise RuntimeError('Unknown station command.')
+            reply = {'ok': True, 'result': self.station.call(command, *args)}
+        except RuntimeError as error:
+            reply = {'ok': False, 'error': str(error)}
+        except (ValueError, KeyError, TypeError):
+            reply = {'ok': False, 'error': 'Malformed station request.'}
+        connection.sendall(json.dumps(reply, ensure_ascii=True).encode() + b'\n')
+
+
+def control_call(command, *args, timeout=15):
+    """Ask the running service's station to do something. Root only; raises RuntimeError with a reason."""
+    require_root()
+    path = RUNTIME_DIR / 'control.sock'
+    try:
+        protected(path)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(timeout)
+            connection.connect(str(path))
+            connection.sendall(json.dumps({'cmd': command, 'args': list(args)}).encode() + b'\n')
+            data = b''
+            while not data.endswith(b'\n') and len(data) < 1 << 20:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+    except (OSError, RuntimeError):
+        raise RuntimeError('Start the configured whitecube-network service before managing this connection.') from None
+    try:
+        reply = json.loads(data)
+    except ValueError:
+        raise RuntimeError('The Wi-Fi station sent an unreadable answer.') from None
+    if not reply.get('ok'):
+        raise RuntimeError(str(reply.get('error', 'The Wi-Fi station refused the request.')))
+    return reply.get('result')
+
+
+def selftest():
+    """Read-only checks that the built-in station can work on this machine. No root needed; nothing is changed.
+
+    Returns the number of failed checks."""
+    failures = []
+
+    def check(name, ok, detail=''):
+        if not ok:
+            failures.append(name)
+        print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ''))
+
+    check('AES-128 against the FIPS-197 vector',
+          aes_decrypt_block(bytes(range(16)), bytes.fromhex('69c4e0d86a7b0430d8cdb78070b4c55a')).hex() == '00112233445566778899aabbccddeeff')
+    check('AES key unwrap against the RFC 3394 vector',
+          (aes_unwrap(bytes.fromhex('000102030405060708090A0B0C0D0E0F'),
+                      bytes.fromhex('1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5')) or b'').hex() == '00112233445566778899aabbccddeeff')
+    check('passphrase hashing against the IEEE 802.11i vector',
+          wpa_psk(b'password', b'IEEE').hex() == 'f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e')
+    config = device_config()
+    candidates = [item for item in interfaces() if matches(item, config)]
+    check('the scoped dongle is present', len(candidates) == 1, candidates[0]['interface'] if candidates else 'not found')
+    if len(candidates) != 1:
+        return len(failures)
+    try:
+        driver = Nl80211Driver(candidates[0]['interface'], subscribe=False)
+    except OSError as error:
+        check('nl80211 is reachable', False, error.strerror or str(error))
+        return len(failures)
+    try:
+        check('nl80211 is reachable', True, f'family {driver.family}, address {mac_str(driver.mac)}')
+        found = driver.get_scan()
+        check('the kernel scan cache decodes', True, f'{len(found)} access point(s)')
+    except OSError as error:
+        check('the kernel scan cache decodes', False, error.strerror or str(error))
+        return len(failures)
+    finally:
+        driver.close()
+    for bss in sorted(found, key=lambda item: -(item['signal'] if item['signal'] is not None else -200)):
+        reason = unsupported_reason(bss['rsn'])
+        name = bss['ssid'].decode('utf-8', 'replace') or '(hidden)'
+        print(f"     {name}  {bss['freq']} MHz  {bss['signal']} dBm  {bss['security']}  ->  {'usable' if reason is None else 'not usable: ' + reason}")
+    try:
+        saved = [ssid for ssid, _ in load_profiles()] if os.geteuid() == 0 else None
+    except RuntimeError as error:
+        check('saved networks are readable', False, str(error))
+        saved = None
+    if saved is None:
+        print('note saved networks are only checked when run as root (sudo cube-net selftest)')
+    else:
+        for ssid in saved:
+            matching = [b for b in found if b['ssid'] == ssid.encode()]
+            usable = [b for b in matching if unsupported_reason(b['rsn']) is None]
+            check(f'saved network "{ssid}" is in range and joinable', bool(usable),
+                  'not in the scan cache; run a scan first' if not matching else '' if usable else unsupported_reason(matching[0]['rsn']))
+    running = competing_processes(candidates[0]['interface'])
+    if running:
+        print('note these will compete with the built-in station until stopped: ' + ', '.join(running))
+    return len(failures)
+
+
+def reconnect():
+    require_root()
+    control_call('reassociate')
+    reset_recovery_request()
+    print(json.dumps({'state': 'reconnecting',
+                      'detail': 'Reassociation requested and the retry delays were reset; the controller keeps retrying and never gives up.'}))
+
+
+def backoff(table, count):
+    """Minimum spacing after the count-th request (1-based); the last entry repeats."""
+    return table[min(count, len(table)) - 1]
+
+
+class Supervisor:
+    """Pure decision logic: from what is observed, decide whether a Wi-Fi remedy is due now.
+
+    Each layer has its own slow ladder, and only a fault in that layer can start it:
+      association missing   -> reassociate after L2_GRACE, then spaced by L2_BACKOFF
+      associated, no lease  -> reassociate after L3_REASSOC_AFTER, then spaced by L3_BACKOFF
+      router unreachable    -> reassociate after GW_DEAD_AFTER, then spaced by GW_BACKOFF
+    DNS and Internet reachability are deliberately not inputs: reassociating cannot repair them.
+    The only remedy is a reassociation request; this class never disconnects and never stops retrying.
+    It performs nothing itself, takes time as an argument and is deterministic, so tests can replay incidents."""
+
+    def __init__(self, now):
+        self.actions_total = 0
+        self.reset(now)
+
+    def reset(self, now):
+        """Start every ladder over, e.g. after the user asked to reconnect."""
+        self.down_since = None       # start of the current not-associated stretch
+        self.assoc_since = None      # start of the current associated stretch
+        self.nolease_since = None    # start of the current associated-without-lease stretch
+        self.l2_count, self.l2_next = 0, 0.0
+        self.l3_count, self.l3_next = 0, 0.0
+        self.gw_count, self.gw_next = 0, 0.0
+        self.gw_bad_since = None
+
+    def step(self, now, associated, have_lease, gateway_ok):
+        """Returns the reason to request a reassociation now, or None."""
+        reason = None
+        if not associated:
+            self.assoc_since = None
+            self.nolease_since = None
+            self.gw_bad_since = None
+            if self.down_since is None:
+                self.down_since = now
+                self.l2_next = max(self.l2_next, now + L2_GRACE)
+            if now >= self.l2_next:
+                reason = f'not associated for {int(now - self.down_since)}s'
+                self.l2_count += 1
+                self.l2_next = now + backoff(L2_BACKOFF, self.l2_count)
+        else:
+            self.down_since = None
+            if self.assoc_since is None:
+                self.assoc_since = now
+            if now - self.assoc_since >= STABLE_AFTER:
+                self.l2_count = 0
+            if have_lease:
+                self.nolease_since = None
+                self.l3_count, self.l3_next = 0, 0.0
+            else:
+                if self.nolease_since is None:
+                    self.nolease_since = now
+                waited = now - self.nolease_since
+                if waited >= L3_REASSOC_AFTER and now >= self.l3_next:
+                    reason = f'associated but no IPv4 lease and default route for {int(waited)}s'
+                    self.l3_count += 1
+                    self.l3_next = now + backoff(L3_BACKOFF, self.l3_count)
+            if have_lease and gateway_ok is False:
+                if self.gw_bad_since is None:
+                    self.gw_bad_since = now
+                bad = now - self.gw_bad_since
+                if bad >= GW_DEAD_AFTER and now >= self.gw_next and reason is None:
+                    reason = f'router unreachable for {int(bad)}s while associated'
+                    self.gw_count += 1
+                    self.gw_next = now + backoff(GW_BACKOFF, self.gw_count)
+            elif gateway_ok is True or not have_lease:
+                self.gw_bad_since = None
+                if gateway_ok is True:
+                    self.gw_count, self.gw_next = 0, 0.0
+        if reason:
+            self.actions_total += 1
+        return reason
+
+    def outlook(self, now, associated, have_lease):
+        """Seconds until the next scheduled reassociation, or None when none is pending."""
+        if not associated:
+            return None if self.down_since is None else max(0, int(self.l2_next - now))
+        if not have_lease and self.nolease_since is not None:
+            return max(0, int(max(self.nolease_since + L3_REASSOC_AFTER, self.l3_next) - now))
+        if self.gw_bad_since is not None:
+            return max(0, int(max(self.gw_bad_since + GW_DEAD_AFTER, self.gw_next) - now))
+        return None
+
+
+def selected_interface():
+    config = device_config()
+    candidates = [item for item in interfaces() if matches(item, config)]
+    if len(candidates) != 1:
+        raise RuntimeError('The configured USB, MAC and driver must identify exactly one attached dongle.')
+    return candidates[0]['interface']
+
+
+def scan_networks():
+    require_root()
+    iface = selected_interface()
+    return {'interface': iface, 'networks': control_call('scan'),
+            'note': 'Fresh scan by the running controller; SSIDs are shown as text with non-printable characters removed.'}
+
+
+def connect_profile(identifier):
+    if not re.fullmatch(r'[a-f0-9]{16}', identifier):
+        raise ValueError('Invalid saved profile ID.')
+    selected = [ssid for ssid, _ in load_profiles() if profile_id(ssid) == identifier]
+    if len(selected) != 1:
+        raise ValueError('Saved profile does not exist or is ambiguous.')
+    control_call('reload')
+    control_call('select', identifier)
+    reset_recovery_request()
+    print(json.dumps({'selected_profile': identifier, 'state': 'connecting',
+                      'detail': 'Selection accepted; association and DHCP completion are reported by status.'}))
+
+
+def add_profile():
+    require_root()
+    if not sys.stdin.isatty():
+        raise RuntimeError('Run add in a terminal; passwords are never accepted as arguments.')
+    existing = load_profiles()
+    ssid = input('Wi-Fi SSID: ')
+    secret = getpass.getpass('WPA2 passphrase: ')
+    if secret != getpass.getpass('Confirm passphrase: '):
+        raise ValueError('Passphrases do not match')
+    write_profiles(existing + [(ssid, secret)])
+
+
+def remove_profile(identifier):
+    if not re.fullmatch(r'[a-f0-9]{16}', identifier):
+        raise ValueError('Invalid saved profile ID.')
+    existing = load_profiles()
+    filtered = [(ssid, secret) for ssid, secret in existing if profile_id(ssid) != identifier]
+    if len(filtered) != len(existing) - 1:
+        raise ValueError('Saved profile does not exist or is ambiguous.')
+    write_profiles(filtered)
+    try:
+        control_call('reload')
+    except RuntimeError:
+        print('Profile removed from disk; running controller reload unavailable. Restart it or choose Connect to apply.')
+
+
+def manage():
+    require_root()
+    if not sys.stdin.isatty():
+        raise RuntimeError('Run manage in an interactive terminal.')
+    while True:
+        print('\nWhitecube Wi-Fi: [l] saved profiles, [s] scan, [c] connect, [a] add, [r] remove, [q] quit')
+        choice = input('Choice: ').strip().lower()
+        if choice == 'q':
+            return
+        if choice == 'l':
+            print(json.dumps([{'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in load_profiles()], ensure_ascii=True, indent=2))
+        elif choice == 's':
+            print(json.dumps(scan_networks(), ensure_ascii=True, indent=2))
+        elif choice in ('a', 'r', 'c'):
+            with profile_lock():
+                if choice == 'a':
+                    add_profile()
+                elif choice == 'r':
+                    remove_profile(input('Exact profile ID to remove: ').strip())
+                else:
+                    connect_profile(input('Profile ID: ').strip())
+
+
+class SystemIO:
+    """The controller's real outside world for one interface: the station, kernel tables, threads, journal."""
+
+    def __init__(self, iface, station=None):
+        self.iface = iface
+        self.station = station
+
+    def link(self):
+        """{'state', 'ssid', 'rssi'} of the Wi-Fi station; RuntimeError when it is not running."""
+        if self.station is None or self.station.error is not None:
+            raise RuntimeError('The Wi-Fi station is not running.')
+        return self.station.snapshot()
+
+    def reassociate(self):
+        if self.station is None:
+            raise RuntimeError('The Wi-Fi station is not running.')
+        self.station.call('reassociate')
+
+    def request(self):
+        return read(RUNTIME_DIR / 'recovery.request')
+
+    def signal(self):
+        return wireless_signal(self.iface)
+
+    def sample(self):
+        return interface_ipv4(self.iface), default_gateway(self.iface)
+
+    def start_probe(self, generation, gateway, results):
+        def work():
+            try:
+                results.put((generation, probe_suite(self.iface, gateway)))
+            except Exception as error:  # a probe thread must never take the controller down
+                self.log(f'probe error: {type(error).__name__}')
+        worker = threading.Thread(target=work, daemon=True, name='cube-net-probe')
+        worker.start()
+        return worker
+
+    def publish(self, runtime):
+        publish_runtime(runtime)
+
+    def log(self, message):
+        log(message)
+
+
+class Controller:
+    """The service loop's once-a-second work. Every outside effect goes through `io`, so tests can run
+    this real decision code against a scripted radio, router and clock."""
+
+    STATES = ('DISCONNECTED', 'INACTIVE', 'INTERFACE_DISABLED', 'SCANNING', 'AUTHENTICATING',
+                  'ASSOCIATING', 'ASSOCIATED', '4WAY_HANDSHAKE', 'GROUP_HANDSHAKE', 'COMPLETED')
+
+    def __init__(self, runtime, io, now, ever_connected, request):
+        self.runtime, self.io = runtime, io
+        self.ever_connected, self.request = ever_connected, request
+        self.disconnected_since = now
+        self.supervisor = Supervisor(now)
+        self.health = Health()
+        self.results = queue.SimpleQueue()   # (lease generation, probe suite) from the probe worker
+        self.worker = None
+        self.probe_due = 0.0
+        self.generation = 0                  # bumps whenever the lease changes, so stale probe results are dropped
+        self.lease_key = None
+        self.assoc_started = self.lease_started = None
+        self.last_state = self.last_checks = None
+
+    def tick(self, now):
+        try:
+            self.step(now)
+        except (RuntimeError, subprocess.SubprocessError):
+            self.runtime.update(association_state='controller-unavailable', last_error='Wi-Fi station status is unavailable.')
+        self.io.publish(self.runtime)
+
+    def step(self, now):
+        runtime, io, health, supervisor = self.runtime, self.io, self.health, self.supervisor
+        request = io.request()
+        if request != self.request:
+            self.request = request
+            supervisor.reset(now)
+            self.probe_due = 0.0
+            io.log('recovery: retry delays reset by cube-net')
+        link = io.link()
+        state = link.get('state', 'unknown')
+        if state not in self.STATES:
+            state = 'unknown'
+        if state == 'COMPLETED':
+            if runtime['association_state'] != 'COMPLETED' and self.ever_connected:
+                runtime['reconnect_count'] += 1
+            self.ever_connected = True
+            runtime['last_error'] = None
+            self.disconnected_since = now
+        elif self.ever_connected:
+            runtime['last_error'] = 'Association lost; waiting for reconnection.'
+        elif now - self.disconnected_since > 30:
+            runtime['last_error'] = 'Association has not completed for 30 seconds; check signal and saved profile.'
+        if state != self.last_state:
+            io.log(f'wifi_state {self.last_state or "-"} -> {state}')
+            self.last_state = state
+        runtime['association_state'] = state
+        # Shown by the cube-status bar.
+        runtime['ssid'] = (link.get('ssid') or '')[:64] or None if state == 'COMPLETED' else None
+        runtime['signal_dbm'] = io.signal()
+        rssi = link.get('rssi')
+        if isinstance(rssi, int) and not isinstance(rssi, bool) and -130 <= rssi <= 0:
+            runtime['signal_dbm'] = rssi
+
+        associated = state == 'COMPLETED'
+        address, gateway = io.sample() if associated else (None, None)
+        have_lease = bool(address and gateway)
+        runtime.update(ipv4_address=address, default_route=gateway)
+        if not associated:
+            self.assoc_started = None
+        elif self.assoc_started is None:
+            self.assoc_started = now
+        if (address, gateway) != self.lease_key and (have_lease or self.lease_key is not None):
+            # A new, changed or vanished lease invalidates every earlier probe result.
+            self.generation += 1
+            health.clear()
+            runtime.update(dns_ok=None, connectivity_ok=None, gateway_ok=None, dns_ms=None, tcp_ms=None, checks_epoch=None)
+            self.lease_started = now if have_lease else None
+            self.probe_due = now + PROBE_SETTLE if have_lease else 0.0
+            self.last_checks = None
+            io.log(f'lease {address} via {gateway}' if have_lease else 'lease lost')
+        self.lease_key = (address, gateway) if have_lease else None
+
+        self.collect(now)
+        if have_lease and associated and now >= self.probe_due and (self.worker is None or not self.worker.is_alive()):
+            self.worker = io.start_probe(self.generation, gateway, self.results)
+            self.probe_due = now + PROBE_RETRY   # replaced when the result arrives
+
+        reason = supervisor.step(now, associated, have_lease, health.value['gateway_ok'])
+        if reason:
+            try:
+                io.reassociate()
+                io.log(f'recovery: requested reassociation #{supervisor.actions_total} - {reason}')
+            except RuntimeError:
+                io.log(f'recovery: the Wi-Fi station rejected reassociation - {reason}')
+        runtime.update(assoc_age_s=int(now - self.assoc_started) if self.assoc_started is not None else None,
+                       lease_age_s=int(now - self.lease_started) if self.lease_started is not None and have_lease else None,
+                       reassociate_in_s=supervisor.outlook(now, associated, have_lease),
+                       actions_total=supervisor.actions_total)
+
+    def collect(self, now):
+        """Fold finished probe suites into the debounced health values; drop results for an older lease."""
+        runtime, health = self.runtime, self.health
+        while True:
+            try:
+                generation, suite = self.results.get_nowait()
+            except queue.Empty:
+                return
+            if generation != self.generation:
+                continue
+            runtime.update(health.feed(suite), dns_ms=suite['dns_ms'], tcp_ms=suite['tcp_ms'],
+                           checks_epoch=suite['checks_epoch'])
+            self.probe_due = now + (PROBE_INTERVAL if health.all_good() else PROBE_RETRY)
+            checks = (health.value['gateway_ok'], health.value['dns_ok'], health.value['connectivity_ok'])
+            if checks != self.last_checks:
+                self.last_checks = checks
+                word = {True: 'ok', False: 'FAILED', None: '?'}
+                dns_ms = f'({suite["dns_ms"]}ms)' if suite['dns_ms'] is not None else ''
+                tcp_ms = f'({suite["tcp_ms"]}ms)' if suite['tcp_ms'] is not None else ''
+                self.io.log(f'checks: router={word[checks[0]]} dns={word[checks[1]]}{dns_ms} '
+                            f'internet={word[checks[2]]}{tcp_ms} - reported only; Wi-Fi is not touched for these')
+
+
+def competing_processes(iface, proc=Path("/proc")):
+    """Report conflicts; never terminate processes owned by another controller."""
+    found = []
+    for path in proc.glob("[0-9]*/cmdline"):
+        try:
+            args = path.read_bytes().split(b"\0")
+        except OSError:
+            continue
+        decoded = [arg.decode(errors="replace") for arg in args if arg]
+        if not decoded:
+            continue
+        command = Path(decoded[0]).name
+        if command in {"NetworkManager", "iwd", "dhcpcd", "wpa_supplicant"}:
+            found.append(command)
+    return sorted(set(found))
+
+
+def run_service():
+    require_root()
+    config = device_config()
+    saved = next((CONFIG_DIR / name for name in (PROFILE_FILE, LEGACY_PROFILE_FILE) if (CONFIG_DIR / name).exists()), None)
+    if saved is None:
+        raise RuntimeError(f"No saved networks: {CONFIG_DIR / PROFILE_FILE} does not exist")
+    for path in [CONFIG_DIR / "device.json", saved, CONFIG_DIR / "dhcpcd.conf"]:
+        protected(path)
+        metadata = path.stat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError(f"{path} must be root-owned and not writable by other users")
+    if saved.stat().st_mode & 0o077:
+        raise RuntimeError(f"{saved.name} must have mode 0600")
+    protected(RUNTIME_DIR, allow_absent=True)
+    RUNTIME_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
+    RUNTIME_DIR.chmod(0o755)
+    protected(RUNTIME_DIR / 'controller.lock', allow_absent=True)
+    lock = (RUNTIME_DIR / "controller.lock").open("w")
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    # Support profiles created before public metadata was introduced. Service
+    # ProtectSystem=full keeps /etc read-only, so publish this fallback in /run.
+    try:
+        profiles = load_profiles()
+        atomic_write(RUNTIME_DIR / 'profiles.json', json.dumps([
+            {'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in profiles], ensure_ascii=True), 0o644)
+    except RuntimeError:
+        pass  # An unreadable or hand-edited profile file is reported by the station, not rewritten here.
+    runtime = public_runtime()
+    previous_state = runtime['association_state']
+    runtime.update(association_state='waiting-for-dongle', signal_dbm=None, ssid=None,
+                   service_restart_count=runtime['service_restart_count'] + (1 if runtime['updated_utc'] else 0),
+                   last_error=None, ipv4_address=None, default_route=None, dns_ok=None, connectivity_ok=None,
+                   gateway_ok=None, dns_ms=None, tcp_ms=None, checks_epoch=None, assoc_age_s=None,
+                   lease_age_s=None, reassociate_in_s=None, actions_total=0)
+    publish_runtime(runtime)
+    ever_connected = previous_state == 'COMPLETED' or runtime['reconnect_count'] > 0
+    request = read(RUNTIME_DIR / 'recovery.request')
+    stopping = False
+    children = []
+    station = control = thread = driver = None
+
+    def stop(_signum, _frame):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    iface = None
+    try:
+        print("Waiting for the configured USB dongle", flush=True)
+        while not stopping:
+            candidates = [item for item in interfaces() if matches(item, config)]
+            if len(candidates) > 1:
+                raise RuntimeError("Device identity is ambiguous")
+            if candidates:
+                iface = candidates[0]["interface"]
+                break
+            publish_runtime(runtime)
+            time.sleep(1)
+        if stopping:
+            return
+        conflicts = competing_processes(iface)
+        if conflicts:
+            raise RuntimeError("Refusing to compete with existing controller(s): " + ", ".join(conflicts))
+        print(f"Managing {iface} with the built-in WPA2 station and the existing {config['driver']} module", flush=True)
+        driver = Nl80211Driver(iface)
+        station = Station(driver, load_profiles, log)
+        thread = threading.Thread(target=station.run, name="cube-net-wifi", daemon=True)
+        thread.start()
+        control = ControlServer(RUNTIME_DIR / "control.sock", station)
+        control.start()
+        children.append(subprocess.Popen(["/usr/sbin/dhcpcd", "-4", "-B", "-f", str(CONFIG_DIR / "dhcpcd.conf"), "-c", "/usr/local/libexec/cube-net-dns", iface]))
+        controller = Controller(runtime, SystemIO(iface, station), time.monotonic(), ever_connected, request)
+        while not stopping:
+            tick = time.monotonic()
+            if station.error is not None or not thread.is_alive():
+                raise RuntimeError("The Wi-Fi station stopped; the service will retry")
+            if any(child.poll() is not None for child in children):
+                raise RuntimeError("A network child process exited; the service will retry")
+            if not any(item["interface"] == iface and matches(item, config) for item in interfaces()):
+                raise RuntimeError("Configured dongle removed or identity changed")
+            controller.tick(tick)
+            time.sleep(max(0.2, POLL_INTERVAL - (time.monotonic() - tick)))
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        runtime.update(association_state='failed', signal_dbm=None,
+                       last_error='Connection controller stopped after a device, process or controller conflict. Inspect its service journal.')
+        publish_runtime(runtime)
+        raise
+    finally:
+        if station is not None:
+            station.stop()
+        if thread is not None:
+            thread.join(timeout=5)
+        if control is not None:
+            control.stop()
+            control.join(timeout=2)
+        if driver is not None:
+            driver.close()
+        # Only our own Popen child handles are terminated; never global pkill.
+        for child in reversed(children):
+            if child.poll() is None:
+                child.terminate()
+        for child in children:
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        if iface and children:
+            (RUNTIME_DIR / "resolv.conf").unlink(missing_ok=True)
+        if stopping:
+            runtime.update(association_state='stopped', signal_dbm=None)
+            publish_runtime(runtime)
+        lock.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("status", help="Read-only hardware status as JSON")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    p.add_argument("--sysfs", type=Path, default=Path("/sys"))
+    p = sub.add_parser("check", help="Read-only module/firmware/binary audit as JSON")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    sub.add_parser("setup", help="Interactively add a WPA2 profile while preserving saved profiles")
+    sub.add_parser("add", help="Interactively add a WPA2 profile; root and terminal required")
+    sub.add_parser("manage", help="Interactive Wi-Fi manager; root and terminal required")
+    p = sub.add_parser("profiles", help="Read-only saved profile IDs and SSIDs as JSON")
+    p.add_argument("--root", type=Path, default=Path('/'))
+    sub.add_parser("scan", help="Scan using the running scoped controller; root required")
+    sub.add_parser('reconnect', help='Reassociate now and restart the retry delays for the scoped dongle; root required')
+    for action in ('connect', 'remove'):
+        p = sub.add_parser(action)
+        p.add_argument('profile_id')
+    sub.add_parser("import-nm", help="Import saved WPA2 NM profiles locally; root required")
+    sub.add_parser("selftest", help="Read-only check that the built-in Wi-Fi station can work here; no root needed")
+    sub.add_parser("migrate", help="Copy saved networks from the old wpa.conf into networks.json; root required")
+    sub.add_parser("run", help="Service entrypoint; root required")
+    args = parser.parse_args()
+    if args.command == "status":
+        print(json.dumps(status(args.root.resolve(), args.sysfs.resolve()), indent=2))
+    elif args.command == "check":
+        print(json.dumps(audit(args.root.resolve()), indent=2))
+    elif args.command in ('setup', 'add'):
+        with profile_lock():
+            add_profile()
+    elif args.command == 'profiles':
+        profiles = ([{'id': profile_id(ssid), 'ssid': ssid} for ssid, _ in load_profiles()]
+                    if args.root == Path('/') and os.geteuid() == 0 else public_profiles(args.root.resolve()))
+        print(json.dumps(profiles, ensure_ascii=True, indent=2))
+    elif args.command == 'scan':
+        print(json.dumps(scan_networks(), ensure_ascii=True, indent=2))
+    elif args.command == 'reconnect':
+        reconnect()
+    elif args.command == 'manage':
+        manage()
+    elif args.command in ('connect', 'remove'):
+        with profile_lock():
+            (connect_profile if args.command == 'connect' else remove_profile)(args.profile_id)
+    elif args.command == "import-nm":
+        with profile_lock():
+            import_nm()
+    elif args.command == "selftest":
+        sys.exit(1 if selftest() else 0)
+    elif args.command == "migrate":
+        with profile_lock():
+            migrate_profiles()
+    elif args.command == "run":
+        run_service()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print(f"cube-net: {error}", file=sys.stderr)
+        sys.exit(1)

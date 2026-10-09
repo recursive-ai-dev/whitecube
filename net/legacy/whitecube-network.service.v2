@@ -1,0 +1,41 @@
+[Unit]
+Description=Whitecube network for USB 2001:3329
+After=systemd-udevd.service
+ConditionPathExists=/etc/whitecube/network/wpa.conf
+# An unattended machine's only network must keep trying. The old limit (5 starts in
+# 300 s) let systemd give up for good; restarts now back off to RestartMaxDelaySec instead.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cube-net run
+Restart=always
+RestartSec=5
+RestartSteps=4
+RestartMaxDelaySec=60
+RuntimeDirectory=whitecube-net
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+# Nothing here loads kernel modules, reads kernel logs, sets the clock or hostname, or
+# needs namespaces; the deny list also keeps these processes inside "no new modules".
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

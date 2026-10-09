@@ -1,0 +1,562 @@
+#!/usr/bin/python3 -I
+"""Backend for cube-settings. No dbus, no polkit, no daemons.
+
+Output: one record per line, fields separated by TAB, first field is the record
+type. Errors: non-zero exit and a one-line reason on stderr.
+
+Read commands run as the desktop user. Changes need root and are reached only
+through sudo (see /etc/sudoers.d/whitecube-settings): network, brightness,
+power and status reads are password-free; everything else asks for a password.
+Every argument is validated here, never trusted from the caller.
+"""
+import grp
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CUBE_NET = "/usr/local/bin/cube-net"
+UFW_DEFAULTS = Path("/etc/default/ufw")
+ZONEINFO = Path("/usr/share/zoneinfo")
+XKB_LIST = Path("/usr/share/X11/xkb/rules/evdev.lst")
+BACKLIGHT = Path("/sys/class/backlight")
+POWER = Path("/sys/class/power_supply")
+
+# Services the panel may change. Anything else is shown read-only or not at all.
+SERVICES = {
+    "whitecube-network.service": "Wi-Fi (cube-net)",
+    "chrony.service": "Network time sync",
+    "ufw.service": "Firewall rules at boot",
+    "cron.service": "Scheduled jobs (cron)",
+    "anacron.timer": "Catch-up jobs (anacron)",
+    "ssh.service": "SSH server",
+    "cups.service": "Printing",
+    "rsync.service": "rsync daemon",
+    "lm-sensors.service": "Hardware sensors",
+    "zramswap.service": "Compressed RAM swap",
+    "smartmontools.service": "Disk health monitor",
+    "tlp.service": "Laptop power saving (TLP)",
+    "openvpn.service": "OpenVPN",
+    "apt-daily.timer": "Daily package list refresh",
+    "apt-daily-upgrade.timer": "Unattended upgrades",
+    "fstrim.timer": "Weekly SSD trim",
+    "man-db.timer": "Manual page index",
+    "plocate-updatedb.timer": "File search index",
+    "logrotate.timer": "Log rotation",
+    "e2scrub_all.timer": "ext4 metadata check",
+}
+# Shown so the state is visible, but never changed from the panel: stopping these
+# would end the session or the boot.
+PROTECTED = {
+    "seatd.service": "Seat access for the desktop",
+    "getty@tty1.service": "Autologin on tty1",
+    "systemd-udevd.service": "Device manager",
+    "systemd-journald.service": "System log",
+}
+GROUPS = ("audio", "video", "input", "render", "plugdev", "netdev", "sudo", "lp", "dialout", "users")
+POWER_ACTIONS = {"poweroff": "poweroff", "reboot": "reboot", "suspend": "suspend"}
+
+
+def fail(message):
+    print(message, file=sys.stderr)
+    sys.exit(1)
+
+
+def clean(value):
+    return re.sub(r"[\t\r\n\x00-\x1f\x7f]", " ", "" if value is None else str(value))
+
+
+def emit(*fields):
+    print("\t".join(clean(f) for f in fields))
+
+
+def run(*args, timeout=10, check=False, input_text=None):
+    result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=input_text)
+    if check and result.returncode != 0:
+        fail((result.stderr or result.stdout).strip().splitlines()[-1] if (result.stderr or result.stdout).strip()
+             else f"{args[0]} failed")
+    return result
+
+
+def require_root():
+    if os.geteuid() != 0:
+        fail("This change needs root; cube-settings runs it through sudo.")
+
+
+def caller():
+    """The desktop user: SUDO_UID when elevated, otherwise ourselves."""
+    uid = int(os.environ.get("SUDO_UID", os.getuid())) if os.geteuid() == 0 else os.getuid()
+    return pwd.getpwuid(uid)
+
+
+def read(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+def cube_net_module():
+    loader = importlib.machinery.SourceFileLoader("cube_net", CUBE_NET)
+    spec = importlib.util.spec_from_loader("cube_net", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+# ---------------------------------------------------------------- reads (user)
+
+def net():
+    data = json.loads(run(CUBE_NET, "status", timeout=8, check=True).stdout)
+    iface = data.get("interface") or {}
+    emit("net", "present", "yes" if data.get("present") else "no")
+    emit("net", "interface", iface.get("interface", ""))
+    for key in ("association_state", "signal_dbm", "ipv4_address", "default_route", "dns_ok", "gateway_ok",
+                "connectivity_ok", "last_error", "reconnect_count", "dns_ms", "tcp_ms", "assoc_age_s",
+                "lease_age_s", "reassociate_in_s", "actions_total"):
+        if key in data:
+            value = data[key]
+            if key == "association_state" and isinstance(value, str):
+                value = value.lower()  # the panel colours "completed"/"connected" green; wpa reports COMPLETED
+            emit("net", key, "yes" if value is True else "no" if value is False else value)
+    # cube-net publishes diagnostic_summary/diagnostic_code; the panel reads net/summary and net/code.
+    summary = data.get("diagnostic_summary") or data.get("summary") or ""
+    wait = data.get("reassociate_in_s")
+    if summary and isinstance(wait, int) and not isinstance(wait, bool):
+        summary += f" Next automatic reassociation in {wait} s."
+    emit("net", "summary", summary)
+    emit("net", "code", data.get("diagnostic_code") or data.get("code") or "")
+    emit("net", "dns_servers", " ".join(line.split()[1] for line in read("/etc/resolv.conf").splitlines()
+                                         if line.startswith("nameserver ") and len(line.split()) > 1))
+    service = run("/usr/bin/systemctl", "is-enabled", "whitecube-network.service").stdout.strip()
+    if not service:
+        # Unprivileged systemctl needs the system D-Bus, which whitecube does not run.
+        unit = Path("/etc/systemd/system/whitecube-network.service")
+        wants = Path("/etc/systemd/system/multi-user.target.wants/whitecube-network.service")
+        service = ("masked" if unit.is_symlink() and os.path.realpath(unit) == "/dev/null"
+                   else "enabled" if wants.is_symlink() or wants.exists()
+                   else "disabled" if unit.exists() else "unknown")
+    emit("net", "service", service)
+    for profile in data.get("profiles", []):
+        emit("profile", profile.get("id", ""), profile.get("ssid", ""))
+
+
+def power():
+    for supply in sorted(POWER.glob("*")):
+        kind = read(supply / "type")
+        if kind == "Battery":
+            emit("battery", supply.name, read(supply / "capacity", "?"), read(supply / "status", "Unknown"),
+                 read(supply / "energy_full", read(supply / "charge_full", "")),
+                 read(supply / "energy_full_design", read(supply / "charge_full_design", "")))
+        elif kind == "Mains":
+            emit("ac", supply.name, "online" if read(supply / "online") == "1" else "offline")
+    for device in sorted(BACKLIGHT.glob("*")):
+        maximum = int(read(device / "max_brightness", "0") or 0)
+        current = int(read(device / "brightness", "0") or 0)
+        if maximum > 0:
+            emit("backlight", device.name, round(current * 100 / maximum))
+
+
+def audio_mode():
+    path = Path(caller().pw_dir) / ".config/whitecube/config"
+    for line in read(path).splitlines():
+        if line.startswith("audio="):
+            return "pipewire" if line.split("=", 1)[1].strip() == "pipewire" else "alsa"
+    return "alsa"
+
+
+def pipewire_running():
+    return run("/usr/bin/pgrep", "-u", str(os.getuid()), "-x", "pipewire").returncode == 0
+
+
+def mixer_target():
+    """First card with a usable playback volume, preferring Master over PCM/Speaker."""
+    for line in read("/proc/asound/cards").splitlines():
+        match = re.match(r"\s*(\d+)\s+\[", line)
+        if not match:
+            continue
+        controls = re.findall(r"'([^']+)',0", run("/usr/bin/amixer", "-c", match.group(1), "scontrols").stdout)
+        for name in ("Master", "PCM", "Speaker", "Headphone"):
+            if name in controls:
+                return match.group(1), name
+    return None
+
+
+def sound():
+    mode = audio_mode()
+    emit("sound", "mode", mode)
+    emit("sound", "pipewire_running", "yes" if pipewire_running() else "no")
+    if mode == "pipewire" and pipewire_running():
+        out = run("/usr/bin/wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@").stdout
+        match = re.search(r"Volume:\s*([0-9.]+)", out)
+        emit("sound", "volume", round(float(match.group(1)) * 100) if match else "?")
+        emit("sound", "muted", "yes" if "MUTED" in out else "no")
+        emit("sound", "backend", "wpctl")
+    else:
+        target = mixer_target()
+        if not target:
+            emit("sound", "volume", "none")
+            emit("sound", "muted", "no")
+            emit("sound", "backend", "no ALSA volume control")
+        else:
+            card, control = target
+            out = run("/usr/bin/amixer", "-c", card, "-M", "sget", control).stdout
+            levels = re.findall(r"\[(\d+)%\]", out)
+            emit("sound", "volume", levels[0] if levels else "?")
+            emit("sound", "muted", "yes" if "[off]" in out else "no")
+            emit("sound", "backend", f"amixer card {card} {control}")
+    for line in read("/proc/asound/cards").splitlines():
+        match = re.match(r"\s*(\d+)\s+\[(\S+)\s*\]:\s*(.*)", line)
+        if match:
+            emit("card", match.group(1), match.group(2), match.group(3))
+
+
+def system():
+    emit("sys", "hostname", read("/etc/hostname") or os.uname().nodename)
+    zone = ""
+    try:
+        target = os.readlink("/etc/localtime")
+        zone = target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else target
+    except OSError:
+        zone = read("/etc/timezone")
+    emit("sys", "timezone", zone or "UTC")
+    emit("sys", "time", time.strftime("%Y-%m-%d %H:%M:%S %Z"))
+    os_release = dict(line.split("=", 1) for line in read("/etc/os-release").splitlines() if "=" in line)
+    emit("sys", "os", os_release.get("PRETTY_NAME", "Linux").strip('"'))
+    emit("sys", "kernel", os.uname().release)
+    seconds = float(read("/proc/uptime", "0").split()[0])
+    emit("sys", "uptime", f"{int(seconds // 86400)}d {int(seconds % 86400 // 3600)}h {int(seconds % 3600 // 60)}m")
+    mem = {k: int(v.split()[0]) for k, v in (l.split(":", 1) for l in read("/proc/meminfo").splitlines() if ":" in l)}
+    emit("sys", "memory", f"{(mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)) // 1024} MiB used of "
+                          f"{mem.get('MemTotal', 0) // 1024} MiB")
+    cpu = next((l.split(":", 1)[1].strip() for l in read("/proc/cpuinfo").splitlines() if l.startswith("model name")), "")
+    emit("sys", "cpu", f"{cpu} ({os.cpu_count()} threads)")
+    tracking = run("/usr/bin/chronyc", "-n", "tracking", timeout=3).stdout
+    status = re.search(r"Leap status\s*:\s*(.*)", tracking)
+    emit("sys", "time_sync", status.group(1) if status else "chrony not answering")
+
+
+def disks():
+    out = run("/usr/bin/lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,FSTYPE,LABEL,MOUNTPOINT,FSUSE%").stdout
+    def walk(nodes, depth):
+        for node in nodes:
+            size = int(node.get("size") or 0)
+            emit("disk", "  " * depth + node.get("name", ""), node.get("type", ""), f"{size / 1e9:.1f} GB",
+                 node.get("fstype") or "", node.get("label") or "", node.get("mountpoint") or "",
+                 node.get("fsuse%") or "")
+            walk(node.get("children", []), depth + 1)
+    walk(json.loads(out or '{"blockdevices": []}').get("blockdevices", []), 0)
+
+
+def users():
+    for user in sorted(pwd.getpwall(), key=lambda u: u.pw_uid):
+        if user.pw_uid == 0 or 1000 <= user.pw_uid < 60000:
+            groups = sorted(g.gr_name for g in grp.getgrall() if user.pw_name in g.gr_mem)
+            emit("user", user.pw_name, user.pw_uid, user.pw_gecos.split(",")[0], user.pw_shell, " ".join(groups))
+    emit("groups", " ".join(GROUPS))
+
+
+def updates():
+    out = run("/usr/bin/apt", "list", "--upgradable", timeout=30).stdout
+    names = [line.split("/", 1)[0] for line in out.splitlines() if "/" in line and "upgradable" in line]
+    stamp = Path("/var/lib/apt/periodic/update-success-stamp")
+    lists = Path("/var/lib/apt/lists")
+    try:
+        when = (stamp if stamp.exists() else lists).stat().st_mtime
+        emit("updates", "refreshed", time.strftime("%Y-%m-%d %H:%M", time.localtime(when)))
+    except OSError:
+        emit("updates", "refreshed", "never")
+    emit("updates", "count", len(names))
+    for name in names[:200]:
+        emit("package", name)
+
+
+def timezones():
+    for path in sorted(ZONEINFO.rglob("*")):
+        rel = path.relative_to(ZONEINFO).as_posix()
+        if path.is_file() and re.fullmatch(r"[A-Z][A-Za-z_+-]*(/[A-Za-z0-9_+-]+){1,2}", rel) and \
+                not rel.startswith(("posix/", "right/", "Etc/", "SystemV/")):
+            emit("zone", rel)
+    emit("zone", "UTC")
+
+
+def xkb_section(name):
+    section, out = None, []
+    for line in read(XKB_LIST).splitlines():
+        if line.startswith("! "):
+            section = line[2:].strip()
+        elif section == name and line.strip():
+            out.append(line.strip())
+    return out
+
+
+def layouts():
+    for line in xkb_section("layout"):
+        code, _, desc = line.partition(" ")
+        emit("layout", code, desc.strip())
+
+
+def variants(layout):
+    if not re.fullmatch(r"[a-z]{2,8}", layout):
+        fail("Invalid layout")
+    for line in xkb_section("variant"):
+        code, _, rest = line.partition(" ")
+        owner, _, desc = rest.strip().partition(":")
+        if owner == layout:
+            emit("variant", code, desc.strip())
+
+
+def set_volume(value):
+    if not re.fullmatch(r"\d{1,3}", value) or int(value) > 100:
+        fail("Volume must be 0-100")
+    if audio_mode() == "pipewire" and pipewire_running():
+        run("/usr/bin/wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{int(value) / 100:.2f}", check=True)
+    else:
+        target = mixer_target() or fail("No ALSA volume control")
+        run("/usr/bin/amixer", "-q", "-c", target[0], "-M", "sset", target[1], f"{int(value)}%", check=True)
+
+
+def toggle_mute():
+    if audio_mode() == "pipewire" and pipewire_running():
+        run("/usr/bin/wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle", check=True)
+    else:
+        target = mixer_target() or fail("No ALSA volume control")
+        run("/usr/bin/amixer", "-q", "-c", target[0], "sset", target[1], "toggle", check=True)
+
+
+# ------------------------------------------------- root, password-free (sudoers)
+
+def services():
+    require_root()
+    for unit, desc in list(SERVICES.items()) + list(PROTECTED.items()):
+        state = run("/usr/bin/systemctl", "is-enabled", unit).stdout.strip()
+        if state in ("", "not-found") or "No such file" in state:
+            continue
+        active = run("/usr/bin/systemctl", "is-active", unit).stdout.strip()
+        emit("service", unit, desc, state, active, "protected" if unit in PROTECTED else "")
+
+
+def firewall():
+    require_root()
+    out = run("/usr/sbin/ufw", "status", "verbose", timeout=10).stdout
+    status = re.search(r"Status:\s*(\w+)", out)
+    default = re.search(r"Default:\s*(.*)", out)
+    emit("fw", "status", status.group(1) if status else "unknown")
+    emit("fw", "default", default.group(1).strip() if default else "")
+    rules = False
+    for line in out.splitlines():
+        if line.startswith("--"):
+            rules = True
+        elif rules and line.strip():
+            emit("rule", line.strip())
+
+
+def net_scan():
+    require_root()
+    data = json.loads(run(CUBE_NET, "scan", timeout=20, check=True).stdout)
+    best = {}
+    for item in data.get("networks", []):
+        ssid = item.get("ssid", "")
+        if ssid and (ssid not in best or item["signal_dbm"] > best[ssid]["signal_dbm"]):
+            best[ssid] = item
+    for item in sorted(best.values(), key=lambda i: -i["signal_dbm"]):
+        security = "WPA2" if "WPA2" in item["security"] or "RSN" in item["security"] else \
+                   "open" if "WPA" not in item["security"] and "WEP" not in item["security"] else item["security"]
+        emit("ap", item["ssid"], item["signal_dbm"], item["frequency_mhz"], security)
+
+
+def net_profile(action, identifier):
+    require_root()
+    if not re.fullmatch(r"[a-f0-9]{16}", identifier):
+        fail("Invalid profile id")
+    run(CUBE_NET, action, identifier, timeout=20, check=True)
+    emit("ok", action, identifier)
+
+
+def net_add():
+    """SSID and passphrase arrive on stdin (two lines), never as arguments."""
+    require_root()
+    lines = sys.stdin.read(512).split("\n")
+    if len(lines) < 2:
+        fail("Expected SSID and passphrase on stdin")
+    ssid, secret = lines[0], lines[1]
+    module = cube_net_module()
+    with module.profile_lock():
+        existing = [p for p in module.load_profiles() if p[0] != ssid]
+        module.write_profiles(existing + [(ssid, secret)])
+    emit("ok", "net-add", module.profile_id(ssid))
+
+
+def net_reconnect():
+    require_root()
+    run("/usr/bin/systemctl", "restart", "whitecube-network.service", timeout=30, check=True)
+    emit("ok", "net-reconnect")
+
+
+def brightness(percent):
+    require_root()
+    if not re.fullmatch(r"\d{1,3}", percent) or not 1 <= int(percent) <= 100:
+        fail("Brightness must be 1-100")
+    devices = sorted(BACKLIGHT.glob("*"))
+    if not devices:
+        fail("No backlight on this machine")
+    device = devices[0]
+    maximum = int(read(device / "max_brightness", "0"))
+    (device / "brightness").write_text(str(max(1, round(maximum * int(percent) / 100))))
+    emit("ok", "brightness", percent)
+
+
+def power_action(action):
+    require_root()
+    if action not in POWER_ACTIONS:
+        fail("Unknown power action")
+    os.sync()
+    run("/usr/bin/systemctl", POWER_ACTIONS[action], "--no-wall", timeout=30, check=True)
+    emit("ok", action)
+
+
+# ------------------------------------------------ root, password required
+
+def set_hostname(name):
+    require_root()
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", name):
+        fail("Hostname: lowercase letters, digits and hyphens, 1-63 characters")
+    old = read("/etc/hostname")
+    Path("/etc/hostname").write_text(name + "\n")
+    hosts = read("/etc/hosts").splitlines()
+    hosts = [l for l in hosts if not l.startswith("127.0.1.1")]
+    hosts.insert(1 if hosts else 0, f"127.0.1.1\t{name}")
+    Path("/etc/hosts").write_text("\n".join(hosts) + "\n")
+    run("/usr/bin/hostname", name, check=True)
+    emit("ok", "hostname", old, name)
+
+
+def set_timezone(zone):
+    require_root()
+    if not re.fullmatch(r"[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+){0,2}", zone):
+        fail("Invalid time zone")
+    target = (ZONEINFO / zone).resolve()
+    if not target.is_file() or ZONEINFO.resolve() not in target.parents:
+        fail("Unknown time zone")
+    tmp = Path("/etc/.localtime.cube-settings")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(ZONEINFO / zone)
+    os.replace(tmp, "/etc/localtime")
+    Path("/etc/timezone").write_text(zone + "\n")
+    emit("ok", "timezone", zone)
+
+
+def service(action, unit):
+    require_root()
+    if action not in ("start", "stop", "restart", "enable", "disable", "unmask"):
+        fail("Unknown service action")
+    if unit not in SERVICES:
+        fail(f"{unit} is not managed from the panel")
+    args = ["/usr/bin/systemctl", action, unit] if action in ("start", "stop", "restart", "unmask") else \
+           ["/usr/bin/systemctl", action, "--now", unit]
+    run(*args, timeout=60, check=True)
+    emit("ok", action, unit)
+
+
+def ufw_default(name):
+    """A /etc/default/ufw setting, upper-cased, or None when absent."""
+    for line in read(UFW_DEFAULTS).splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() == name:  # tolerate odd spacing: a guard must fail closed
+            return value.strip().strip("\"'").upper()
+    return None
+
+
+def firewall_set(action):
+    require_root()
+    commands = {
+        "enable": ["--force", "enable"], "disable": ["disable"],
+        "deny-incoming": ["default", "deny", "incoming"], "allow-incoming": ["default", "allow", "incoming"],
+    }
+    if action not in commands:
+        fail("Unknown firewall action")
+    if action == "enable" and ufw_default("DEFAULT_OUTPUT_POLICY") in ("DROP", "REJECT"):
+        # ufw applies this policy to the built-in OUTPUT chain: turning the firewall on would cut off DNS,
+        # web, NTP and DHCP renewals, i.e. the machine's only network.
+        fail("Not turned on: outgoing is set to deny, which would block every new connection. "
+             "Run 'sudo ufw default allow outgoing' first.")
+    run("/usr/sbin/ufw", *commands[action], timeout=30, check=True)
+    emit("ok", "firewall", action)
+
+
+def group(action, user, name):
+    require_root()
+    if action not in ("add", "remove") or name not in GROUPS:
+        fail("Group not managed from the panel")
+    try:
+        account = pwd.getpwnam(user)
+    except KeyError:
+        fail("Unknown user")
+    if not 1000 <= account.pw_uid < 60000:
+        fail("Only regular users can be changed")
+    if action == "remove" and name == "sudo" and account.pw_name == caller().pw_name:
+        fail("Refusing to remove your own sudo access from the panel")
+    run("/usr/sbin/adduser" if action == "add" else "/usr/sbin/deluser", "--quiet", user, name,
+        timeout=20, check=True)
+    emit("ok", "group", action, user, name)
+
+
+def console_keyboard(layout, variant):
+    require_root()
+    if not re.fullmatch(r"[a-z]{2,8}", layout) or not re.fullmatch(r"[a-z0-9_-]{0,32}", variant):
+        fail("Invalid keyboard layout")
+    path = Path("/etc/default/keyboard")
+    lines = read(path).splitlines()
+    values = {"XKBLAYOUT": layout, "XKBVARIANT": variant}
+    out = []
+    for line in lines:
+        key = line.split("=", 1)[0]
+        out.append(f'{key}="{values.pop(key)}"' if key in values else line)
+    out += [f'{k}="{v}"' for k, v in values.items()]
+    path.write_text("\n".join(out) + "\n")
+    run("/usr/bin/setupcon", "--save-only", timeout=30)
+    emit("ok", "console-keyboard", layout, variant)
+
+
+COMMANDS = {
+    # user
+    "net": (net, 0), "power": (power, 0), "sound": (sound, 0), "system": (system, 0), "disks": (disks, 0),
+    "users": (users, 0), "updates": (updates, 0), "timezones": (timezones, 0), "layouts": (layouts, 0),
+    "variants": (variants, 1), "volume": (set_volume, 1), "mute": (toggle_mute, 0),
+    # root, password-free
+    "services": (services, 0), "firewall": (firewall, 0), "net-scan": (net_scan, 0),
+    "net-connect": (lambda i: net_profile("connect", i), 1), "net-forget": (lambda i: net_profile("remove", i), 1),
+    "net-add": (net_add, 0), "net-reconnect": (net_reconnect, 0), "brightness": (brightness, 1),
+    "power-action": (power_action, 1),
+    # root, password
+    "hostname": (set_hostname, 1), "timezone": (set_timezone, 1), "service": (service, 2),
+    "firewall-set": (firewall_set, 1), "group": (group, 3), "console-keyboard": (console_keyboard, 2),
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        fail("usage: cube-settings-helper " + "|".join(sorted(COMMANDS)))
+    function, count = COMMANDS[sys.argv[1]]
+    args = sys.argv[2:]
+    if sys.argv[1] == "console-keyboard" and len(args) == 1:
+        args.append("")
+    if len(args) != count:
+        fail(f"{sys.argv[1]} takes {count} argument(s)")
+    function(*args)
+
+
+if __name__ == "__main__":
+    os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin"
+    try:
+        main()
+    except subprocess.TimeoutExpired as error:
+        fail(f"Timed out: {error.cmd[0]}")
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as error:
+        fail(str(error))

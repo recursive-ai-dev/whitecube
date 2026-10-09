@@ -1,0 +1,26 @@
+[Unit]
+Description=Whitecube network for USB 2001:3329
+After=systemd-udevd.service
+ConditionPathExists=/etc/whitecube/network/wpa.conf
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cube-net run
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=whitecube-net
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=restart
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=15
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,226 @@
+Whitecube native upgrade validation (2026-10-07)
+
+Build command:
+  ./BUILD.sh /mnt/nvme_root
+
+Results:
+- whitecube and cube-ca built with GCC 14 and the target's installed wlroots
+  0.18.2 / Wayland / xkbcommon libraries. No compiler warnings.
+- No package, module, firmware, or target-file installation was performed.
+- cube-ca --self-test passes a toroidal blinker crossing a grid boundary and
+  100 generations under each of six rules (Life, HighLife, Diamoeba, Day/Night,
+  Anneal, Seeds).
+- cube-ca --preview build/cube-space.ppm produced the included 1440x900 image.
+  build/cube-space.png was visually inspected: white shaded cubes and stars.
+- whitecube -h runs successfully with the target dynamic loader.
+- Target loader dependency resolution for whitecube contains no libX11/libxcb.
+- BUILD.sh passes bash -n; whitecube-session passes sh -n.
+- Startup lifecycle regression test passed using the exact spawn/stop helpers:
+  a child shell and its background process receive shutdown SIGTERM even when
+  the parent has SIGTERM blocked for the Wayland signal event loop. The test
+  also verifies that the startup group is separate from the compositor group.
+  Source/test binary: build/startup-lifecycle-test.{c,executable} (the executable
+  is named startup-lifecycle-test without a suffix).
+- Headless runtime creates the wlroots headless backend and pixman renderer,
+  but Wayland bind() returns Operation not permitted in this environment.
+  Interactive native focus, panel/fullscreen behavior, graphics hardware, and
+  actual session startup must therefore be checked when booted into the target.
+
+Scope:
+- Extends the installed Whitecube session selected by woez's .bash_profile
+  (/home/woez/.bash_profile); leaves experimental cubezero source untouched.
+- Alt+b toggles a persistent floating foot terminal with app_id cube-scripts.
+  Alt+f changes scene geometry and the client's fullscreen state, resizing the
+  same terminal so curses/bash games receive its real PTY dimensions.
+- Alt+v hides/restores windows; Alt+w opens /usr/local/bin/whitecube-web open.
+- Existing chat binding and normal terminal/launcher commands remain supported.
+- Correct pointer surface routing/capabilities and layer ordering are included
+  for browser and panel input. Tab ordering remains stable when focus changes.
+- Startup clients run in one tracked process group. Alt+Esc, SIGTERM, SIGINT,
+  and SIGHUP terminate the event loop and signal that group before teardown.
+  A readiness pipe removes the fork/setsid shutdown race; application children
+  reset inherited signal dispositions/masks before exec.
+- Attaching a keyboard after a window mapped sends keyboard enter to that
+  selected visible window. Existing layer-shell keyboard focus is retained.
+  Actual hardware hotplug remains untested because Wayland bind is blocked.
+- CA buffers remember their own mapped sizes across resize; allocation failures
+  stop the renderer safely. Scene size changes use logical output dimensions.
+- The existing compositor remains primarily a single-output desktop; this
+  upgrade is not a claim of comprehensive multi-monitor support.
+
+Installation inputs:
+- build/whitecube -> /usr/local/bin/whitecube
+- build/cube-ca -> /usr/local/bin/cube-ca
+- whitecube-session -> /usr/local/bin/whitecube-session
+- keys.txt -> /usr/share/whitecube/keys.txt
+- config.example: merge colors and scripts/browser settings into user's config.
+- foot.ini: optional complete ANSI color palette for game/script readability.
+- source-hashes.json records original copied source files.
+- deployment-base-hashes.json records original installed file versions.
+
+Selected improvements added and checked (2026-10-07):
+- Four native workspaces (Coding, Play, Monitor, Browse), Alt+F1..F4 and
+  Alt+Shift+F1..F4, clickable indicators, per-workspace Scripts panels.
+- Workspace regression harness extracts the actual focus/workspace functions
+  from whitecube.c and checks focus isolation, hidden panels, fullscreen moves,
+  empty workspaces and invalidation of saved window references. All pass.
+  Harness models Wayland requests; actual scene/input rendering needs target boot.
+- Native cube-ca adds a true 18x18x18 periodic B5/S4,5 volume, 26-neighbour
+  updates, projected depth sorting, rotation and individual z slices.
+- Native edit mode paints with the Wayland pointer, with 2D gliders/blinkers,
+  deterministic random seeds, named atomic seed snapshots and exact replay.
+  cube-ca --menu / --control communicate over a private per-display Unix socket.
+- Native self-tests verify the 26-neighbour birth across wraparound/z planes,
+  isolated cell death, painting/slice bounds, rejected traversal seed names,
+  and seven-generation equality after a saved 3D seed is replayed.
+- Foreground fullscreen and >=75 C thermal pressure cap ticks at 2/s; otherwise
+  volume ticks at 8/s. Paused idle fields poll at 2/s. Missed ticks never cause
+  a simulation catch-up burst. Thermal hints are sampled every two seconds.
+- Native build includes libm for projection. Target existing dependencies used;
+  no modules or packages added. Native build currently has no compiler warnings.
+- build/cube-space-3d.png generated by --preview-3d and visually inspected.
+- Session startup invokes cube-check --first-boot after compositor initialization.
+- New control socket and actual native Wayland input cannot be exercised here
+  because this environment blocks socket binding. Boot-time check remains required.
+
+Additional requested native improvements (2026-10-07):
+- Rebuilt whitecube/cube-ca with the existing target toolchain, without warnings.
+- Native desktop-state C regression passed private atomic layout roundtrip,
+  output-relative placement bounds, app ID/title matching, symlink refusal,
+  restored workspace/hidden/fullscreen/maximized flags and workspace names.
+  The format stores no commands and mapping an app only restores UI state.
+- Actual compositor helper regression additionally passed previous-tab keyboard
+  navigation, keyboard move/resize bounds and fullscreen geometry protection.
+- Shared accessibility.json parsing passed UI and terminal scale bounds,
+  strong contrast and reduced-motion preference checks. Native reduced motion
+  disables automatic CA evolution/reseeding while retaining explicit controls.
+- Python native control integration passed keyboard menu preference/name saves
+  and foot exec argv capture with literal metacharacter/empty arguments, scaled
+  custom font, high contrast and unchanged original foot configuration.
+- Recovery tests passed settings/manifests allowlists, credential-like exclusions,
+  checksums, retained recovery copies, retention persistence, reviewed restore,
+  stale review refusal, path/symlink escape protection and interrupted-write undo.
+- Installer tests passed new module coverage, unknown existing-file refusal,
+  prior bundle hash acceptance, custom native config preservation and service
+  mask preservation in addition to existing backup/rollback checks.
+- Real Wayland display, visible focus rendering, resizing a running native game,
+  output scaling and reconnect across login still require the booted hardware.
+  No target files, packages, modules, blacklists or service masks were changed.
+
+Network controller revision 2 (2026-10-07, from the live USB; NVMe root read-only, home read-write)
+Evidence for the defect:
+- Installed-system journal, last boot: reassociation requests at +30/+45/+75 s after service
+  start, then a locally generated disconnect (kernel: Reason 2 PREV_AUTH_NOT_VALID x3, then
+  Reason 3 DEAUTH_LEAVING) and silence. Replaying the old decision functions
+  (net/legacy/cube-net.v1) with every probe healthy and DHCP taking 19 s reproduces the
+  bounce at +30 s and +45 s; the same timeline leaves the new Supervisor idle.
+- dhcpcd.conf had no timeout: dhcpcd(8)/dhcpcd.conf(5) say a single-interface dhcpcd exits when
+  it expires (default 30 s); DHCP finished 3 s before that deadline in the journal.
+- ufw: with /etc/default/ufw as installed, ufw-init-functions sets ":OUTPUT DROP" when enabled.
+Checks run:
+- python3 -I net/test_cube_net.py -> 100 tests OK (also run by BUILD.sh). Eight mutation
+  checks (stale probe results accepted, DNS failure driving reassociation, no debounce,
+  no-lease timer from association start, flat backoff, 30 s grace, ignored dead router,
+  dhcpcd timeout removed) are each caught; one initially survived, the test was strengthened.
+- Real, read-only calls on the live dongle's network: SIOCGIFADDR and /proc/net/route samplers,
+  ip -j neigh (REACHABLE in 0 s; an unowned address FAILED in 3.6 s), UDP DNS to the router's
+  Rogers resolvers (34-84 ms), device-bound TCP to 1.1.1.1:443 (99-316 ms), full probe_suite ->
+  diagnostic "online". This found a real bug (ip omits "dev" with a dev filter); fixed.
+- Source parses with the Python 3.13 grammar (target python3 is 3.13.5). The unit passes
+  systemd-analyze verify with the live systemd 259; every directive exists in the target's 257.
+- apply.sh on a root-owned fixture: dry run changes nothing; apply installs 5 files root:root
+  with a 0700 sha256 backup; second apply is a no-op; rollback refuses after a later edit
+  (--force overrides), restores identical bytes, removes files that did not exist before;
+  refuses a non-root path and a read-only target. The real NVMe root was not modified.
+Not run (cannot be, without cutting the live session's own connection): the service under
+systemd with the real dhcpcd (revision 2 also had wpa_supplicant; revision 3 replaced it with the
+built-in station, see net/README.txt for what was and was not tested), an actual reassociation, dhcpcd with timeout 0,
+cube-status/browser rendering of the new fields. See net/README.txt for the first-boot check.
+No packages, modules, services, masks, sysctls, sudoers or firewall state were changed.
+
+Desktop improvements (2026-10-08):
+- ./BUILD.sh completed against the installed toolchain with no compiler warnings.
+  All existing workspace/layout/CA checks and all 100 network tests passed.
+  Network socket tests were run outside the restricted execution sandbox.
+- compositor-test.c uses the actual compositor implementation and checks removed
+  command keys returning to defaults, layered overrides, malformed/overflowing
+  numbers, dimensions/repeat limits, a real Caps Lock XKB state, mouse move and
+  resize bounds, small edge placements, and cancellation before client release.
+- status-theme-test.c checks readable normal/muted text for Space, White cube,
+  Graphite and Paper, strong contrast and refusal of malformed color values.
+- Fresh Meson configuration declares Cairo/Pango and both new regressions pass.
+- foot -C accepted source foot.ini / foot-ca.ini and the user's default Foot /
+  Scripts profiles. Red text and alpha=0.5 are enabled for new terminals;
+  prior user configurations are retained in build/reliability-before-nqicdw7o.
+- Bar/menu/quick-settings previews were rendered with the native Cairo code.
+  Four theme variants are in build/theme-previews/; Space and Paper were
+  visually reviewed.
+- Runtime dependency audit found the validation host lacks the documented
+  /usr/local X-free Cairo. Both /usr/local/bin/whitecube and the staged desktop
+  binaries resolve distro Cairo with X11/XCB dependencies. This is an existing
+  host-library issue, not a passing X-free deployment check; no system libraries
+  were changed. See build/dependency-audit.txt for the actual resolutions.
+- Compiled binaries are staged in build/. The running compositor and installed
+  system binaries have not been replaced. Native interactive Alt+mouse input
+  remains to be exercised in a desktop session using the rebuilt compositor.
+
+Desktop Chat live deployment (2026-10-08):
+- Read-only host audit confirmed the running compositor/top bar used older
+  /usr/local/bin binaries without the Desktop Chat launcher strings. The
+  rebuilt binaries included both the menu and native Chat shortcut commands.
+- Installed build/whitecube, build/cube-status and whitecube-session in
+  ~/.local/bin. Installed hashes match their source artifacts. Updated only
+  the session path in ~/.bash_profile; bash -n and sh -n pass. System binaries
+  were retained. Before-change files: build/desktop-chat-before-moos_sei.
+- Session selects its adjacent compositor and prepends its own directory to
+  PATH. This selects the updated compositor and top bar at the next login.
+- Desktop Chat launcher no longer invokes npx from the compositor's working
+  directory. It resolves the project directory and uses local/global installed
+  Electron with the native Wayland flag, preserving literal arguments.
+- Fixed first-launch settings IPC racing document load, and cancellation of
+  pending shows by hide/toggle requests. npm test passed all four test files;
+  direct startup tests passed all four cases and the launcher test passed its
+  unrelated-working-directory/literal-argument case. Node/shell syntax passes.
+- Activated the per-user top bar on the actual wayland-0 socket, checked it was
+  running before terminating only the previous top bar. Live verification:
+  cube-status PID 26028 uses ~/.local/bin/cube-status; compositor PID 1816
+  remains unchanged. All other desktop applications were left running.
+- Launched Desktop Chat --settings on the live socket. Electron PID 26043 and
+  its renderer remain running. No model request or settings save was performed.
+  Runtime logs contain expected Chromium DBus messages on this no-DBus desktop.
+- Alt+Y / Alt+U and other compiled compositor improvements still require the
+  next login. No compositor restart or physical shortcut/drag check was done.
+
+2026-10-08 — Desktop/privacy upgrade
+------------------------------------
+./BUILD.sh: PASS (outside sandbox for existing loopback socket tests).
+  Native compositor config/bindings/geometry/privacy/lock-isolation checks: PASS.
+  Native desktop state, workspace extraction, theme palettes, CA checks: PASS.
+  Settings persistence/navigation/modal isolation/themes: PASS.
+  Status network privacy/keyboard traversal/scaled layout self-test: PASS.
+  Existing network-controller Python suite: 100 tests PASS.
+  User-only privacy backend: 29 tests PASS.
+  Per-user installer with isolated account and symlink rejection: PASS.
+meson test -C build/meson-privacy --print-errorlogs: all 7 tests PASS.
+  Settings test also covers render-only registry discovery without a keyboard context.
+python3 session-lock-test.py --compositor build/whitecube --require-headless: PASS.
+  Uses temporary HOME/runtime, two headless outputs and real installed swaylock.
+  Confirms lock acknowledgment, concurrent rejection, crash recovery, unlock/relock.
+  Never connects to a live desktop. Socket sandbox escalation was required.
+Settings final C build: -Wall -Wextra -Werror PASS.
+Native previews: privacy overview/desktop/activity/browser, dark at160% scaling,
+  and existing appearance/display/keyboard pages rendered; privacy images reviewed.
+Status previews: privacy labels plus compact Chat/status positioning reviewed.
+
+Installed per-user: whitecube, cube-settings, cube-status, cube-privacy,
+  whitecube-session, Settings desktop entry; only settings_cmd changed in config.
+All installed hashes match ~/.local/state/whitecube/privacy-install.json.
+Installed Settings --render privacy and cube-status --selftest: PASS.
+Before-install copies: build/privacy-install-before-p0vp79jh/manifest.json.
+Source backup: build/privacy-before-20261008-090356.tar.gz.
+Source review patch: build/privacy-upgrade.patch.
+
+Activation: log out and back in for compositor/top-bar/session-wrapper changes.
+No running compositor was restarted; no live browser/GTK preferences were changed,
+no microphone was muted, and no user history/cache data was cleared by validation.
+Physical input/audio hardware behavior and suspend/resume were not exercised.

@@ -1,0 +1,594 @@
+#!/usr/bin/python3 -I
+"""User-only privacy controls for Whitecube; no daemon, sudo or D-Bus.
+
+status: TSV setting/key/(0,1,mixed,unmanaged,unsupported,error)/detail records.
+        TSV action/key/(available,unsupported,error)/detail records.
+set KEY 0|1: change one control, retaining all unrelated preferences.
+clear recent|thumbnails|clipboard: explicitly remove the selected data.
+
+Firefox values describe Whitecube's startup overrides, not a running browser.
+Only profiles selected as installation defaults (or explicit profile defaults)
+are changed. Existing user.js content outside the managed block is retained.
+
+GTK settings: https://docs.gtk.org/gtk4/class.Settings.html
+Firefox categories: https://firefox-source-docs.mozilla.org/toolkit/components/
+antitracking/anti-tracking/etp-matrix/index.html
+Firefox preferences verified against Mozilla's documentation on 2026-10-08:
+https://firefox-admin-docs.mozilla.org/reference/policies/disabletelemetry/
+https://firefox-source-docs.mozilla.org/browser/urlbar/preferences.html
+https://support.mozilla.org/en-US/kb/how-stop-firefox-making-automatic-connections
+https://searchfox.org/firefox-main/source/modules/libpref/init/StaticPrefList.yaml
+https://searchfox.org/firefox-main/source/browser/app/profile/firefox.js
+"""
+import configparser
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+
+MAX_FILE = 1024 * 1024
+MAX_PROFILES = 16
+MAX_CACHE_ENTRIES = 20000
+BEGIN = "// BEGIN WHITECUBE PRIVACY\n"
+END = "// END WHITECUBE PRIVACY\n"
+META = "// controls: "
+FIREFOX_KEYS = (
+    "firefox_telemetry", "firefox_https_only", "firefox_tracking_strict",
+    "firefox_suggestions", "firefox_prefetch", "firefox_session_restore",
+)
+NOFOLLOW = os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class PrivacyError(Exception):
+    pass
+
+
+def clean(value):
+    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value))
+
+
+def emit(*fields):
+    print("\t".join(clean(value) for value in fields))
+
+
+def home():
+    value = Path(os.environ.get("HOME", ""))
+    if not value.is_absolute() or ".." in value.parts:
+        raise PrivacyError("HOME must be an absolute path without '..'")
+    return value
+
+
+def xdg(name, fallback):
+    value = os.environ.get(name, "")
+    return Path(value) if value and Path(value).is_absolute() else home() / fallback
+
+
+@contextlib.contextmanager
+def directory(path, create=False, owned=True):
+    """Walk with directory FDs: no symlink ancestors and no path re-resolution."""
+    path = Path(path)
+    if not path.is_absolute() or ".." in path.parts:
+        raise PrivacyError("Unsafe configuration directory")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=fd)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if owned and os.fstat(fd).st_uid != os.getuid():
+            raise PrivacyError("Configuration directory is owned by another user")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_at(parent, name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | NOFOLLOW, dir_fd=parent)
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise PrivacyError("Expected a regular configuration file owned by this user")
+        if info.st_size > MAX_FILE:
+            raise PrivacyError("Configuration file exceeds the 1 MiB safety limit")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(MAX_FILE + 1)
+        if len(data) > MAX_FILE:
+            raise PrivacyError("Configuration file exceeds the 1 MiB safety limit")
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def read(path):
+    try:
+        with directory(path.parent) as fd:
+            return read_at(fd, path.name)
+    except FileNotFoundError:
+        return None
+
+
+def replace(path, content, previous):
+    """Private atomic replacement; refuse a changed file or symlink destination."""
+    data = content.encode("utf-8")
+    if len(data) > MAX_FILE:
+        raise PrivacyError("Result exceeds the 1 MiB safety limit")
+    with directory(path.parent, create=True) as parent:
+        if read_at(parent, path.name) != previous:
+            raise PrivacyError("Preferences changed during editing; refresh and retry")
+        name = ".whitecube-privacy-" + secrets.token_hex(12)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW,
+                     0o600, dir_fd=parent)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
+        finally:
+            try:
+                os.unlink(name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+
+
+def apply_edits(edits):
+    """Compensate multi-file failures; never undo an intervening outside edit."""
+    attempted = []
+    try:
+        for path, previous, updated in edits:
+            attempted.append((path, previous, updated))
+            replace(path, updated, previous)
+    except (OSError, ValueError, PrivacyError) as error:
+        unrestored = 0
+        for path, previous, updated in reversed(attempted):
+            try:
+                current = read(path)
+                if current == previous:
+                    continue
+                if current != updated:
+                    # An editor or another application wrote here. Keep its work.
+                    unrestored += 1
+                    continue
+                if previous is not None:
+                    replace(path, previous, updated)
+                else:
+                    with directory(path.parent) as parent:
+                        if read_at(parent, path.name) != updated:
+                            raise PrivacyError("Preferences changed during rollback")
+                        os.unlink(path.name, dir_fd=parent)
+                        os.fsync(parent)
+            except (OSError, ValueError, PrivacyError):
+                unrestored += 1
+        detail = (f"could not restore {unrestored} file(s); refresh status" if unrestored
+                  else "original preferences restored")
+        raise PrivacyError(f"Privacy update failed; {detail}: {error}") from error
+
+
+@contextlib.contextmanager
+def change_lock():
+    with directory(xdg("XDG_STATE_HOME", ".local/state") / "whitecube", create=True) as parent:
+        fd = os.open("privacy.lock", os.O_WRONLY | os.O_CREAT | os.O_NONBLOCK | NOFOLLOW,
+                     0o600, dir_fd=parent)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise PrivacyError("Unsafe privacy lock file")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise PrivacyError("Another privacy change is in progress") from None
+            yield
+        finally:
+            os.close(fd)
+
+
+def ini(text):
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    parser.read_string(text or "")
+    return parser
+
+
+def gtk_paths():
+    root = xdg("XDG_CONFIG_HOME", ".config")
+    return [root / version / "settings.ini" for version in ("gtk-3.0", "gtk-4.0")]
+
+
+def gtk_value(text):
+    parser = ini(text)
+    value = parser.get("Settings", "gtk-recent-files-enabled", fallback=None)
+    if value is None:
+        return "unmanaged"
+    value = value.strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return "1"
+    if value in ("false", "0", "no", "off"):
+        return "0"
+    raise PrivacyError("GTK recent-file setting has an unrecognized value")
+
+
+def gtk_edit(text, enabled):
+    """Validate INI, then replace just the target key without losing comments."""
+    ini(text)
+    lines = (text or "").splitlines(keepends=True)
+    section = None
+    insertion = None
+    for index, line in enumerate(lines):
+        match = re.match(r"^\s*\[([^]]+)\]", line)
+        if match:
+            if section == "Settings" and insertion is None:
+                insertion = index
+            section = match.group(1)
+        elif section == "Settings" and re.match(r"^\s*gtk-recent-files-enabled\s*[=:]", line, re.I):
+            lines[index] = "gtk-recent-files-enabled=" + str(enabled).lower() + "\n"
+            return "".join(lines)
+    line = "gtk-recent-files-enabled=" + str(enabled).lower() + "\n"
+    if section == "Settings":
+        insertion = len(lines)
+    if insertion is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        return "".join(lines) + "\n[Settings]\n" + line
+    if insertion and not lines[insertion - 1].endswith("\n"):
+        lines[insertion - 1] += "\n"
+    lines.insert(insertion, line)
+    return "".join(lines)
+
+
+def aggregate(values):
+    unique = set(values)
+    return next(iter(unique)) if len(unique) == 1 else "mixed"
+
+
+def firefox_profiles():
+    """Discover real defaults; never infer a profile from a directory glob."""
+    roots = [xdg("XDG_CONFIG_HOME", ".config") / "mozilla/firefox", home() / ".mozilla/firefox"]
+    selected = []
+    for root in dict.fromkeys(roots):
+        data = read(root / "profiles.ini")
+        if data is None:
+            continue
+        parser = ini(data)
+        profiles = {}
+        explicit = []
+        for section in parser.sections():
+            if not section.startswith("Profile"):
+                continue
+            raw = parser.get(section, "Path", fallback="")
+            if not raw:
+                continue
+            path = Path(raw)
+            if ".." in path.parts:
+                raise PrivacyError("Firefox profile path contains '..'")
+            if parser.get(section, "IsRelative", fallback="1") == "1":
+                if path.is_absolute():
+                    raise PrivacyError("Firefox relative profile path is absolute")
+                path = root / path
+            elif not path.is_absolute():
+                raise PrivacyError("Firefox profile path must be absolute")
+            if not path.is_relative_to(home()):
+                raise PrivacyError("Firefox profile is outside this user's home")
+            profiles[raw] = path
+            if parser.get(section, "Default", fallback="0") == "1":
+                explicit.append(path)
+        install = []
+        for section in parser.sections():
+            if section.startswith("Install"):
+                raw = parser.get(section, "Default", fallback="")
+                if raw and raw not in profiles:
+                    raise PrivacyError("Firefox installation default is not a registered profile")
+                if raw:
+                    install.append(profiles[raw])
+        chosen = install or explicit or (list(profiles.values()) if len(profiles) == 1 else [])
+        for path in chosen:
+            if path in selected:
+                continue
+            if len(selected) >= MAX_PROFILES:
+                raise PrivacyError("Too many Firefox default profiles")
+            with directory(path):
+                pass
+            selected.append(path)
+    return selected
+
+
+def firefox_preferences(key, enabled):
+    if key == "firefox_telemetry":
+        return {"datareporting.healthreport.uploadEnabled": enabled,
+                "datareporting.policy.dataSubmissionEnabled": enabled,
+                "toolkit.telemetry.archive.enabled": enabled,
+                "datareporting.usage.uploadEnabled": enabled}
+    if key == "firefox_https_only":
+        return {"dom.security.https_only_mode": enabled,
+                "dom.security.https_only_mode_pbm": enabled}
+    if key == "firefox_tracking_strict":
+        return {"browser.contentblocking.category": "strict" if enabled else "standard"}
+    if key == "firefox_suggestions":
+        return {"browser.search.suggest.enabled": enabled,
+                "browser.urlbar.suggest.searches": enabled}
+    if key == "firefox_prefetch":
+        return {"network.prefetch-next": enabled,
+                "network.dns.disablePrefetch": not enabled,
+                "network.http.speculative-parallel-limit": 6 if enabled else 0,
+                "browser.urlbar.speculativeConnect.enabled": enabled}
+    if key == "firefox_session_restore":
+        # This changes automatic startup restoration, not Firefox's recovery files.
+        return {"browser.startup.page": 3 if enabled else 1,
+                "browser.sessionstore.resume_from_crash": enabled}
+    raise PrivacyError("Unknown Firefox control")
+
+
+def firefox_block(controls):
+    result = BEGIN + META + json.dumps(controls, sort_keys=True) + "\n"
+    for key in sorted(controls):
+        for preference, value in firefox_preferences(key, controls[key]).items():
+            result += "user_pref(" + json.dumps(preference) + ", " + json.dumps(value) + ");\n"
+    return result + END
+
+
+def firefox_boundary(text):
+    """Ensure appended directives cannot be swallowed by a comment or string."""
+    position = 0
+    while position < len(text):
+        if text.startswith("//", position):
+            end = text.find("\n", position + 2)
+            position = len(text) if end < 0 else end + 1
+        elif text.startswith("/*", position):
+            end = text.find("*/", position + 2)
+            if end < 0:
+                raise PrivacyError("Firefox user.js contains an unterminated comment")
+            position = end + 2
+        elif text[position] in ("'", '"'):
+            quote = text[position]
+            position += 1
+            while position < len(text) and text[position] != quote:
+                if text[position] == "\\":
+                    position += 2
+                elif text[position] in "\r\n":
+                    raise PrivacyError("Firefox user.js contains an unterminated string")
+                else:
+                    position += 1
+            if position >= len(text):
+                raise PrivacyError("Firefox user.js contains an unterminated string")
+            position += 1
+        else:
+            position += 1
+
+
+def firefox_parse(text):
+    text = text or ""
+    if BEGIN.rstrip("\n") not in text and END.rstrip("\n") not in text:
+        firefox_boundary(text)
+        return text, {}
+    if text.count(BEGIN) != 1 or text.count(END) != 1:
+        raise PrivacyError("Firefox privacy block is malformed; review user.js")
+    before, rest = text.split(BEGIN)
+    firefox_boundary(before)
+    block, after = rest.split(END)
+    if not block.startswith(META):
+        raise PrivacyError("Firefox privacy block is malformed; review user.js")
+    try:
+        controls = json.loads(block.splitlines()[0][len(META):])
+    except (ValueError, IndexError):
+        raise PrivacyError("Firefox privacy block metadata is invalid") from None
+    if not isinstance(controls, dict) or any(key not in FIREFOX_KEYS or type(value) is not bool
+                                            for key, value in controls.items()):
+        raise PrivacyError("Firefox privacy block contains unknown controls")
+    if firefox_block(controls) != BEGIN + block + END:
+        raise PrivacyError("Firefox privacy block was edited; review user.js")
+    # A later custom override may supersede our block, so do not claim it applies.
+    if after.strip():
+        raise PrivacyError("Preferences follow the Firefox privacy block; review user.js")
+    return before + after, controls
+
+
+def command(args):
+    try:
+        return subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=3, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def microphone():
+    wpctl = shutil.which("wpctl")
+    if wpctl:
+        result = command([wpctl, "get-volume", "@DEFAULT_AUDIO_SOURCE@"])
+        if result and result.returncode == 0 and re.search(r"^Volume:\s+[0-9.]+", result.stdout):
+            return ("1" if "[MUTED]" in result.stdout else "0", "PipeWire default input only",
+                    [wpctl, "set-mute", "@DEFAULT_AUDIO_SOURCE@"])
+    amixer = shutil.which("amixer")
+    if amixer:
+        result = command([amixer, "sget", "Capture"])
+        if result and result.returncode == 0:
+            values = re.findall(r"Capture[^\n]*\[(on|off)\]", result.stdout)
+            if values:
+                muted = ["1" if value == "off" else "0" for value in values]
+                return aggregate(muted), "ALSA default Capture control only", [amixer, "sset", "Capture"]
+    return "unsupported", "No usable PipeWire input or ALSA Capture mute control", None
+
+
+def clipboard_tool():
+    tool = shutil.which("wl-copy")
+    return tool if tool and os.environ.get("WAYLAND_DISPLAY") else None
+
+
+def status():
+    try:
+        emit("setting", "remember_recent", aggregate([gtk_value(read(p)) for p in gtk_paths()]),
+             "GTK 3/4 startup preference; restart GTK apps; existing history stays until cleared")
+    except (OSError, ValueError, configparser.Error, PrivacyError) as error:
+        emit("setting", "remember_recent", "error", str(error))
+    value, detail, _ = microphone()
+    emit("setting", "microphone_muted", value, detail)
+    try:
+        profiles = firefox_profiles()
+        controls = [firefox_parse(read(path / "user.js"))[1] for path in profiles]
+        emit("scope", "firefox", len(profiles), "Detected default profile(s); restart Firefox after changes")
+        for key in FIREFOX_KEYS:
+            value = aggregate([str(int(item[key])) if key in item else "unmanaged" for item in controls]) if controls else "unsupported"
+            emit("setting", key, value,
+                 "Whitecube startup override; restart Firefox" if controls else "No unambiguous existing Firefox default profile")
+    except (OSError, ValueError, configparser.Error, PrivacyError) as error:
+        emit("scope", "firefox", "error", str(error))
+        for key in FIREFOX_KEYS:
+            emit("setting", key, "error", str(error))
+    emit("action", "recent", "available", "Remove GTK recent-file list; does not remove documents or browser history")
+    emit("action", "thumbnails", "available", "Remove standard thumbnail caches; original images remain")
+    emit("action", "clipboard", "available" if clipboard_tool() else "unsupported",
+         "Clear regular Wayland clipboard; compositor data-control support required; application copies remain")
+
+
+def set_value(key, enabled):
+    if key == "remember_recent":
+        edits = [(path, read(path)) for path in gtk_paths()]
+        edits = [(path, old, gtk_edit(old, enabled)) for path, old in edits]
+        apply_edits(edits)
+        return "Saved GTK 3/4 preference; restart GTK apps"
+    if key == "microphone_muted":
+        _, _, action = microphone()
+        if not action:
+            raise PrivacyError("No usable microphone mute control")
+        value = str(int(enabled)) if action[1] == "set-mute" else ("nocap" if enabled else "cap")
+        result = command(action + [value])
+        if not result or result.returncode:
+            raise PrivacyError("Microphone control failed; input state could not be changed")
+        state, _, _ = microphone()
+        if state != str(int(enabled)):
+            raise PrivacyError("Microphone change could not be verified")
+        return "Default input mute state verified; other inputs are unaffected"
+    if key in FIREFOX_KEYS:
+        profiles = firefox_profiles()
+        if not profiles:
+            raise PrivacyError("No unambiguous existing Firefox default profile")
+        edits = []
+        for profile in profiles:
+            path = profile / "user.js"
+            old = read(path)
+            original, controls = firefox_parse(old)
+            controls[key] = enabled
+            if original and not original.endswith("\n"):
+                original += "\n"
+            edits.append((path, old, original + firefox_block(controls)))
+        apply_edits(edits)
+        return f"Saved for {len(edits)} default Firefox profile(s); restart Firefox"
+    raise PrivacyError("Unknown privacy control")
+
+
+def clear_recent():
+    path = xdg("XDG_DATA_HOME", ".local/share") / "recently-used.xbel"
+    try:
+        with directory(path.parent) as parent:
+            try:
+                info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return "No GTK recent-file list to remove"
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                raise PrivacyError("Recent-file list is not a regular file owned by this user")
+            os.unlink(path.name, dir_fd=parent)
+        return "GTK recent-file list removed; open applications may recreate it"
+    except FileNotFoundError:
+        return "No GTK recent-file list to remove"
+
+
+def clear_tree(fd, count, depth=0):
+    if depth > 8:
+        raise PrivacyError("Thumbnail cache nesting exceeds safety limit")
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            count[0] += 1
+            if count[0] > MAX_CACHE_ENTRIES:
+                raise PrivacyError("Thumbnail cache exceeds 20,000 entries; some previews were cleared")
+            info = entry.stat(follow_symlinks=False)
+            if info.st_uid != os.getuid():
+                raise PrivacyError("Thumbnail cache contains another user's entry")
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=fd)
+                try:
+                    clear_tree(child, count, depth + 1)
+                finally:
+                    os.close(child)
+                os.rmdir(entry.name, dir_fd=fd)
+            elif stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                # Unlinking a cache symlink removes only the link, never its target.
+                os.unlink(entry.name, dir_fd=fd)
+            else:
+                raise PrivacyError("Thumbnail cache contains a special file; stopped safely")
+
+
+def clear_thumbnails():
+    count = [0]
+    roots = [xdg("XDG_CACHE_HOME", ".cache") / "thumbnails", home() / ".thumbnails"]
+    for root in dict.fromkeys(roots):
+        try:
+            with directory(root) as parent:
+                for size in ("normal", "large", "x-large", "xx-large", "fail"):
+                    try:
+                        child = os.open(size, os.O_RDONLY | os.O_DIRECTORY | NOFOLLOW, dir_fd=parent)
+                    except FileNotFoundError:
+                        continue
+                    try:
+                        if os.fstat(child).st_uid != os.getuid():
+                            raise PrivacyError("Thumbnail cache is owned by another user")
+                        clear_tree(child, count)
+                    finally:
+                        os.close(child)
+        except FileNotFoundError:
+            continue
+    return f"Removed {count[0]} thumbnail cache entries; apps may create new previews"
+
+
+def clear(key):
+    if key == "recent":
+        return clear_recent()
+    if key == "thumbnails":
+        return clear_thumbnails()
+    if key == "clipboard":
+        tool = clipboard_tool()
+        if not tool:
+            raise PrivacyError("wl-copy and a Wayland session are required")
+        result = command([tool, "--clear"])
+        if not result or result.returncode:
+            raise PrivacyError("Clipboard clear failed; compositor may not support data-control")
+        return "Regular Wayland clipboard cleared; application copies and primary selection are unaffected"
+    raise PrivacyError("Unknown privacy clear action")
+
+
+def main(argv):
+    if os.geteuid() != os.getuid() or os.geteuid() == 0:
+        raise PrivacyError("Run cube-privacy as the desktop user, never with sudo")
+    if argv == ["status"]:
+        status()
+    elif len(argv) == 3 and argv[0] == "set" and argv[2] in ("0", "1"):
+        with change_lock():
+            detail = set_value(argv[1], argv[2] == "1")
+        emit("ok", argv[1], detail)
+    elif len(argv) == 2 and argv[0] == "clear" and argv[1] in ("recent", "thumbnails", "clipboard"):
+        with change_lock():
+            detail = clear(argv[1])
+        emit("ok", argv[1], detail)
+    else:
+        raise PrivacyError("Usage: cube-privacy status | set CONTROL 0|1 | clear recent|thumbnails|clipboard")
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except (OSError, ValueError, configparser.Error, PrivacyError) as error:
+        print(clean(error), file=sys.stderr)
+        sys.exit(1)

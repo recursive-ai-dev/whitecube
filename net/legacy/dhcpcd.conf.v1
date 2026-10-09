@@ -1,0 +1,9 @@
+# Dedicated to the selected dongle. No global DHCP configuration is read.
+# No hostname is transmitted or changed. DNS is passed to systemd-resolved.
+clientid
+vendorclassid
+option domain_name_servers, domain_name, domain_search
+option interface_mtu
+require dhcp_server_identifier
+noipv4ll
+nohook wpa_supplicant, resolv.conf, hostname, ntp.conf
