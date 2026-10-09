@@ -141,7 +141,7 @@ class ElementTests(unittest.TestCase):
 
     def test_the_access_points_rsn_element_parses_and_is_usable(self):
         rsn = net.parse_rsn(AP_RSN[2:])
-        self.assertEqual(rsn, {"group": CCMP, "pairwise": [CCMP], "akm": [PSK], "caps": 0x000C})
+        self.assertEqual(rsn, {"group": CCMP, "pairwise": [CCMP], "akm": [PSK], "caps": 0x000C, "mgmt": None})
         self.assertIsNone(net.unsupported_reason(rsn))
 
     def test_our_own_element_is_wellformed_and_matches_what_we_claim(self):
@@ -163,7 +163,9 @@ class ElementTests(unittest.TestCase):
         self.assertIn("PSK", net.unsupported_reason(rsn(akm=(0x000FAC01,))))                 # enterprise
         self.assertIn("CCMP", net.unsupported_reason(rsn(group=0x000FAC02)))                 # TKIP group
         self.assertIn("CCMP", net.unsupported_reason(rsn(pairwise=(0x000FAC02,))))
-        self.assertIn("management frame", net.unsupported_reason(rsn(caps=0x00C0)))
+        self.assertIsNone(net.unsupported_reason(rsn(caps=0x00C0)))                           # PMF required: now supported
+        self.assertIsNone(net.unsupported_reason(rsn(akm=(0x000FAC06,), caps=0x00C0)))        # PSK-SHA256 with PMF: supported
+        self.assertIn("PSK", net.unsupported_reason(rsn(akm=(0x000FAC08,), caps=0x00C0)))     # SAE only: still not
         self.assertIsNone(net.unsupported_reason(rsn(akm=(PSK, 0x000FAC08), caps=0x0080)))   # WPA3 transition mode is fine
 
     def test_malformed_rsn_elements_are_rejected_not_guessed(self):
@@ -188,17 +190,50 @@ def ap_frame(info, replay, nonce, data, key_length=16, rsc=bytes(8), mic=bytes(1
     return bytes([version, 3]) + struct.pack(">H", len(body)) + body
 
 
-def ap_mic(kck, frame):
-    return hmac.new(kck, frame[:81] + bytes(16) + frame[97:], hashlib.sha1).digest()[:16]
+def openssl_cmac(key, data):
+    """AES-128-CMAC by the openssl CLI: an implementation that shares no code with cube-net."""
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory, "in")
+        source.write_bytes(data)
+        done = subprocess.run(["openssl", "mac", "-cipher", "AES-128-CBC", "-macopt", f"hexkey:{key.hex()}", "-binary",
+                               "-in", str(source), "CMAC"], capture_output=True)
+        if done.returncode:
+            raise unittest.SkipTest("openssl cannot do CMAC here")
+        return done.stdout
 
 
-def ap_sign(kck, frame):
-    return frame[:81] + ap_mic(kck, frame) + frame[97:]
+def ap_mic(kck, frame, ver=2):
+    zeroed = frame[:81] + bytes(16) + frame[97:]
+    return openssl_cmac(kck, zeroed) if ver == 3 else hmac.new(kck, zeroed, hashlib.sha1).digest()[:16]
 
 
-def ap_ptk(pmk, anonce, snonce, aa=AP):
+def ap_sign(kck, frame, ver=2):
+    return frame[:81] + ap_mic(kck, frame, ver) + frame[97:]
+
+
+def ap_ptk(pmk, anonce, snonce, aa=AP, sha256=False):
     data = min(aa, STA) + max(aa, STA) + min(anonce, snonce) + max(anonce, snonce)
+    if sha256:       # IEEE 802.11-2016 12.7.1.7.2 with SHA-256: counter and length are 16-bit little-endian
+        return b"".join(hmac.new(pmk, struct.pack("<H", i) + b"Pairwise key expansion" + data + struct.pack("<H", 384), hashlib.sha256).digest()
+                        for i in (1, 2))[:48]
     return b"".join(hmac.new(pmk, b"Pairwise key expansion\0" + data + bytes([i]), hashlib.sha1).digest() for i in range(3))[:48]
+
+
+def rsn_bytes(group=CCMP, pairwise=(CCMP,), akm=(PSK,), caps=0x000C, mgmt=None):
+    body = struct.pack("<H", 1) + group.to_bytes(4, "big") + struct.pack("<H", len(pairwise))
+    body += b"".join(p.to_bytes(4, "big") for p in pairwise) + struct.pack("<H", len(akm)) + b"".join(a.to_bytes(4, "big") for a in akm)
+    body += struct.pack("<H", caps)
+    if mgmt is not None:
+        body += struct.pack("<H", 0) + mgmt.to_bytes(4, "big")
+    return b"\x30" + bytes([len(body)]) + body
+
+
+def ap_igtk_kde(index, ipn, key):
+    return b"\xdd" + bytes([4 + 2 + 6 + 16]) + b"\x00\x0f\xac\x09" + struct.pack("<H", index) + ipn + key
+
+
+PMF_AP_RSN = rsn_bytes(caps=0x00CC, mgmt=0x000FAC06)                         # PSK, PMF required
+SHA256_AP_RSN = rsn_bytes(akm=(0x000FAC06,), caps=0x00CC, mgmt=0x000FAC06)  # PSK-SHA256 only, PMF required
 
 
 def ap_kde(index, key, tx=True):
@@ -216,8 +251,10 @@ def ap_pad(data):
 class Authenticator:
     """The access point's half of the handshakes, with every knob a test needs to break something."""
 
-    def __init__(self, pmk, gtk=b"G" * 16, gtk_index=1, rsn=AP_RSN, anonce=b"A" * 32, aa=AP):
+    def __init__(self, pmk, gtk=b"G" * 16, gtk_index=1, rsn=AP_RSN, anonce=b"A" * 32, aa=AP, ver=2, igtk=None, expect_ie=None):
         self.pmk, self.gtk, self.gtk_index, self.rsn, self.anonce, self.aa = pmk, gtk, gtk_index, rsn, anonce, aa
+        self.ver, self.igtk = ver, igtk                  # igtk = (index, ipn, key) or None
+        self.expect_ie = expect_ie
         self.ptk = self.snonce = None
         self.replay = 0
         self.msg2_ok = self.msg4_ok = False
@@ -225,7 +262,7 @@ class Authenticator:
 
     def msg1(self):
         self.replay += 1
-        return ap_frame(0x008A, self.replay, self.anonce, b"")
+        return ap_frame(0x0088 | self.ver, self.replay, self.anonce, b"")
 
     def receive(self, frame):
         """Check a frame from the supplicant. Returns 'msg2', 'msg4', 'group2' or a reason it is bad."""
@@ -235,40 +272,43 @@ class Authenticator:
             return "wrong replay counter"
         if info & 0x0008 and info & 0x0100 and not info & 0x0200:                 # message 2
             self.snonce = frame[17:49]
-            self.ptk = ap_ptk(self.pmk, self.anonce, self.snonce, self.aa)
-            if not hmac.compare_digest(ap_mic(self.ptk[:16], frame), frame[81:97]):
+            self.ptk = ap_ptk(self.pmk, self.anonce, self.snonce, self.aa, sha256=self.ver == 3)
+            if not hmac.compare_digest(ap_mic(self.ptk[:16], frame, self.ver), frame[81:97]):
                 return "bad MIC"
-            if info != 0x010A or frame[99:] != net.build_rsn_ie():
+            if info != 0x0108 | self.ver or frame[99:] != (self.expect_ie or net.build_rsn_ie()):
                 return "bad message 2 contents"
             self.msg2_ok = True
             return "msg2"
         if info & 0x0008 and info & 0x0200:                                          # message 4
-            if info != 0x030A or not hmac.compare_digest(ap_mic(self.ptk[:16], frame), frame[81:97]) or frame[99:]:
+            if info != 0x0308 | self.ver or not hmac.compare_digest(ap_mic(self.ptk[:16], frame, self.ver), frame[81:97]) or frame[99:]:
                 return "bad message 4"
             self.msg4_ok = True
             return "msg4"
         if not info & 0x0008:                                                         # group message 2
-            if info != 0x0302 or not hmac.compare_digest(ap_mic(self.ptk[:16], frame), frame[81:97]):
+            if info != 0x0300 | self.ver or not hmac.compare_digest(ap_mic(self.ptk[:16], frame, self.ver), frame[81:97]):
                 return "bad group message 2"
             self.group_ok = True
             return "group2"
         return "unexpected"
 
-    def msg3(self, tamper=None, rsc=bytes(6) + bytes(2), anonce=None, info=0x13CA, data=None, bump=True):
+    def msg3(self, tamper=None, rsc=bytes(6) + bytes(2), anonce=None, info=None, data=None, bump=True):
         if bump:
             self.replay += 1
-        plain = ap_pad(data if data is not None else self.rsn + ap_kde(self.gtk_index, self.gtk))
+        info = 0x13C8 | self.ver if info is None else info
+        default = self.rsn + ap_kde(self.gtk_index, self.gtk) + (ap_igtk_kde(*self.igtk) if self.igtk else b"")
+        plain = ap_pad(data if data is not None else default)
         key_data = openssl_wrap(self.ptk[16:32], plain)
         frame = ap_frame(info, self.replay, anonce or self.anonce, key_data, rsc=rsc)
-        frame = ap_sign(self.ptk[:16], frame)
+        frame = ap_sign(self.ptk[:16], frame, self.ver)
         if tamper == "mic":
             frame = frame[:81] + bytes(16) + frame[97:]
         return frame
 
-    def group1(self, gtk, index=2, rsc=bytes(8)):
+    def group1(self, gtk, index=2, rsc=bytes(8), igtk=None):
         self.replay += 1
-        key_data = openssl_wrap(self.ptk[16:32], ap_pad(ap_kde(index, gtk)))
-        return ap_sign(self.ptk[:16], ap_frame(0x1382 | (index << 4), self.replay, bytes(32), key_data, key_length=0, rsc=rsc))
+        plain = (ap_kde(index, gtk) if gtk else b"") + (ap_igtk_kde(*igtk) if igtk else b"")
+        key_data = openssl_wrap(self.ptk[16:32], ap_pad(plain))
+        return ap_sign(self.ptk[:16], ap_frame(0x1380 | self.ver | (index << 4), self.replay, bytes(32), key_data, key_length=0, rsc=rsc), self.ver)
 
 
 PMK = net.wpa_psk(b"correct horse battery", b"EMPIRE")
@@ -819,8 +859,9 @@ class DriverEventTests(unittest.TestCase):
 
 class FakeAP:
     def __init__(self, ssid=b"EMPIRE", bssid="c0:94:35:ad:ec:aa", signal=-59.0, freq=5220, passphrase=b"correct horse battery",
-                 rsn=None, refuse=False, answers=True, join_delay=0.3):
+                 rsn=None, refuse=False, answers=True, join_delay=0.3, rsn_bytes=None):
         self.ssid, self.bssid, self.signal, self.freq = ssid, bssid, signal, freq
+        self.rsn_bytes = rsn_bytes or AP_RSN
         self.pmk = net.wpa_psk(passphrase, ssid)
         self.rsn = rsn if rsn is not None else net.parse_rsn(AP_RSN[2:])
         self.refuse, self.answers, self.join_delay = refuse, answers, join_delay
@@ -848,6 +889,7 @@ class FakeRadio:
         self.signal_value = -58
         self.deauth_after_msg2 = None
         self.power_save_error = self.country_error = None
+        self.last_connect = None
 
     def at(self, delay, event):
         self.queue.append((self.now + delay, event))
@@ -893,8 +935,9 @@ class FakeRadio:
             raise self.get_scan_error
         return [ap.scan_entry() for ap in self.aps]
 
-    def connect(self, bss, ssid):
+    def connect(self, bss, ssid, akm=PSK, pmf=False):
         self.record("connect", bss["bssid"], ssid)
+        self.last_connect = {"akm": akm, "pmf": pmf}
         ap = next(ap for ap in self.aps if ap.bssid == bss["bssid"])
         self.joined = ap
         if ap.refuse:
@@ -903,7 +946,9 @@ class FakeRadio:
             return
         self.at(ap.join_delay, ("connected", ap.bssid, 0))
         if ap.answers:
-            ap.auth = Authenticator(ap.pmk, aa=net.mac_bytes(ap.bssid))
+            ap.auth = Authenticator(ap.pmk, aa=net.mac_bytes(ap.bssid), rsn=ap.rsn_bytes, ver=3 if akm == 0x000FAC06 else 2,
+                                    igtk=(4, b"\x01\x00\x00\x00\x00\x00", b"I" * 16) if pmf else None,
+                                    expect_ie=net.build_rsn_ie(akm, pmf))
             self.at(ap.join_delay + 0.6, ("eapol", ap.bssid, ap.auth.msg1()))
 
     def send_eapol(self, destination, payload):
@@ -934,6 +979,14 @@ class FakeRadio:
 
     def authorize(self, bssid):
         self.record("authorize", bssid)
+
+    def new_igtk(self, index, key, ipn):
+        self.record("new_igtk", index, key, ipn)
+        if self.key_error is not None:
+            raise self.key_error
+
+    def default_igtk(self, index):
+        self.record("default_igtk", index)
 
     def set_power_save(self, enabled):
         self.record("set_power_save", enabled)
@@ -1140,8 +1193,8 @@ class StationTests(unittest.TestCase):
         bench = Bench([FakeAP(join_delay=1.0)])
         original = bench.radio.connect
 
-        def fast_ap(bss, ssid):
-            original(bss, ssid)
+        def fast_ap(bss, ssid, **kw):
+            original(bss, ssid, **kw)
             ap = bench.radio.joined
             bench.radio.queue = [(due, ("eapol", ap.bssid, ap.auth.msg1()) if event[0] == "eapol" else event) for due, event in bench.radio.queue]
             bench.radio.queue = [(0 if event[0] == "eapol" else due, event) for due, event in bench.radio.queue]   # message 1 arrives first
@@ -1194,9 +1247,9 @@ class StationTests(unittest.TestCase):
         self.assertTrue(any("keeping the previous list" in line for line in bench.logs))
 
     def test_a_network_that_needs_wpa3_or_pmf_is_reported_and_never_joined(self):
-        wpa3 = net.parse_rsn(AP_RSN[2:14] + b"\x01\x00\x00\x0f\xac\x08\xc0\x00")
-        pmf = net.parse_rsn(AP_RSN[2:20] + b"\xc0\x00")
-        for rsn, word in ((wpa3, "PSK"), (pmf, "management frame")):
+        wpa3 = net.parse_rsn(AP_RSN[2:14] + b"\x01\x00\x00\x0f\xac\x08\xc0\x00")                     # SAE only
+        other_mgmt = net.parse_rsn(AP_RSN[2:20] + b"\xc0\x00\x00\x00\x00\x0f\xac\x0b")                 # BIP-GMAC-256
+        for rsn, word in ((wpa3, "PSK"), (other_mgmt, "management frame cipher")):
             bench = Bench([FakeAP(rsn=rsn)]).run(30)
             self.assertEqual(bench.radio.count("connect"), 0, word)
             self.assertTrue(any(word in line for line in bench.logs), word)
@@ -1324,11 +1377,11 @@ class StationTests(unittest.TestCase):
         original = bench.radio.connect
         attempts = []
 
-        def flaky(bss, ssid):
+        def flaky(bss, ssid, **kw):
             attempts.append(1)
             if len(attempts) == 1:
                 raise OSError(errno.EALREADY, "already connected")
-            return original(bss, ssid)
+            return original(bss, ssid, **kw)
         bench.radio.connect = flaky
         bench.run(30)
         self.assertEqual(bench.state, "COMPLETED")
@@ -1399,6 +1452,266 @@ class StationTests(unittest.TestCase):
         self.assertIsInstance(bench.station.error, OSError)
         with self.assertRaises(RuntimeError):
             bench.station.call("scan")
+
+
+# ------------------------------------------------------------------ management frame protection (802.11w) and SHA-256 key management
+
+class PmfCryptoTests(unittest.TestCase):
+    def test_aes_encrypt_matches_fips_197_and_inverts_decrypt(self):
+        key = bytes(range(16))
+        self.assertEqual(net.aes_encrypt_block(key, bytes.fromhex("00112233445566778899aabbccddeeff")).hex(), "69c4e0d86a7b0430d8cdb78070b4c55a")
+        for _ in range(10):
+            key, block = os.urandom(16), os.urandom(16)
+            self.assertEqual(net.aes_decrypt_block(key, net.aes_encrypt_block(key, block)), block)
+
+    def test_aes_encrypt_agrees_with_openssl(self):
+        if not shutil_which("openssl"):
+            self.skipTest("no openssl")
+        for _ in range(8):
+            key, block = os.urandom(16), os.urandom(16)
+            theirs = subprocess.run(["openssl", "enc", "-aes-128-ecb", "-nopad", "-K", key.hex()], input=block, capture_output=True).stdout
+            self.assertEqual(net.aes_encrypt_block(key, block), theirs)
+
+    def test_cmac_matches_the_rfc_4493_vectors(self):
+        key = bytes.fromhex("2b7e151628aed2a6abf7158809cf4f3c")
+        message = bytes.fromhex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710")
+        for size, expected in ((0, "bb1d6929e95937287fa37d129b756746"), (16, "070a16b46b4d4144f79bdd9dd04a287c"),
+                               (40, "dfa66747de9ae63030ca32611497c827"), (64, "51f0bebf7e3b9d92fc49741779363cfe")):
+            self.assertEqual(net.aes_cmac(key, message[:size]).hex(), expected, size)
+
+    def test_cmac_agrees_with_openssl_for_every_length_around_the_block_size(self):
+        if not shutil_which("openssl"):
+            self.skipTest("no openssl")
+        key = os.urandom(16)
+        for size in (0, 1, 15, 16, 17, 31, 32, 33, 95, 99, 119):
+            data = os.urandom(size)
+            self.assertEqual(net.aes_cmac(key, data), openssl_cmac(key, data), size)
+
+    def test_the_sha256_kdf_is_the_documented_little_endian_counter_construction(self):
+        key, data = os.urandom(32), os.urandom(76)
+        expected = b"".join(hmac.new(key, struct.pack("<H", i) + b"Pairwise key expansion" + data + struct.pack("<H", 384), hashlib.sha256).digest()
+                            for i in (1, 2))[:48]
+        self.assertEqual(net.kdf_sha256(key, b"Pairwise key expansion", data, 48), expected)
+        self.assertNotEqual(net.kdf_sha256(key, b"Pairwise key expansion", data, 32), expected[:32])   # the length is part of the input
+
+    def test_the_sha256_ptk_differs_from_the_sha1_ptk_and_is_symmetric(self):
+        pmk, an, sn = os.urandom(32), os.urandom(32), os.urandom(32)
+        one, two = net.derive_ptk(pmk, AP, STA, an, sn), net.derive_ptk(pmk, AP, STA, an, sn, sha256=True)
+        self.assertNotEqual(one, two)
+        self.assertEqual(two, net.derive_ptk(pmk, STA, AP, sn, an, sha256=True))
+        self.assertEqual(two, ap_ptk(pmk, an, sn, AP, sha256=True))                    # the test-side derivation agrees
+
+
+class PmfElementTests(unittest.TestCase):
+    def test_the_plain_element_is_byte_for_byte_what_it_always_was(self):
+        self.assertEqual(net.build_rsn_ie(), rsn_bytes(caps=0x000C))
+        self.assertEqual(net.build_rsn_ie(), b"\x30\x14\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x04\x01\x00\x00\x0f\xac\x02\x0c\x00")
+
+    def test_the_pmf_element_names_the_key_management_and_the_management_cipher(self):
+        ie = net.build_rsn_ie(0x000FAC06, True)
+        self.assertEqual(ie[1], len(ie) - 2)
+        rsn = net.parse_rsn(ie[2:])
+        self.assertEqual((rsn["akm"], rsn["mgmt"]), ([0x000FAC06], 0x000FAC06))
+        self.assertEqual(rsn["caps"] & 0x00C0, 0x00C0)                                   # capable and required
+        self.assertEqual(ie, rsn_bytes(akm=(0x000FAC06,), caps=0x00CC, mgmt=0x000FAC06))
+
+    def test_pmkids_are_skipped_and_the_management_cipher_is_read(self):
+        body = rsn_bytes(caps=0x00CC)[2:] + struct.pack("<H", 1) + b"P" * 16 + bytes.fromhex("000fac06")
+        self.assertEqual(net.parse_rsn(body)["mgmt"], 0x000FAC06)
+        self.assertEqual(net.parse_rsn(rsn_bytes(caps=0x0080)[2:])["mgmt"], 0x000FAC06)   # protection on, none named: the default
+        self.assertIsNone(net.parse_rsn(rsn_bytes(caps=0x000C)[2:])["mgmt"])
+
+    def test_the_plan_uses_pmf_only_when_the_network_needs_it(self):
+        plan = lambda **kw: net.pmf_plan(net.parse_rsn(rsn_bytes(**kw)[2:]))
+        self.assertEqual(plan(), (PSK, False))
+        self.assertEqual(plan(caps=0x008C), (PSK, False))                                       # capable but not required: keep plain WPA2
+        self.assertEqual(plan(akm=(PSK, 0x000FAC08), caps=0x008C), (PSK, False))                # WPA3 transition mode: plain WPA2
+        self.assertEqual(plan(caps=0x00CC), (PSK, True))
+        self.assertEqual(plan(akm=(0x000FAC06,), caps=0x00CC), (0x000FAC06, True))
+        self.assertEqual(plan(akm=(PSK, 0x000FAC06), caps=0x00CC), (PSK, True))                 # prefers plain PSK when offered
+        self.assertIsNone(plan(akm=(0x000FAC08,), caps=0x00CC))                                 # SAE only
+        self.assertIsNone(net.pmf_plan(None))
+
+
+def pmf_handshake(akm=PSK, ap_rsn=PMF_AP_RSN, pmk=None):
+    pmk = pmk or PMK
+    return net.Handshake(pmk, AP, STA, net.build_rsn_ie(akm, True), net.parse_rsn(ap_rsn[2:]), fixed_random(), akm=akm, pmf=True)
+
+
+class PmfHandshakeTests(unittest.TestCase):
+    IGTK = (4, b"\x07\x00\x00\x00\x00\x00", b"I" * 16)
+
+    def setUp(self):
+        if not shutil_which("openssl"):
+            self.skipTest("the access point side uses the openssl CLI")
+
+    def ap(self, ver, rsn, akm):
+        return Authenticator(PMK, rsn=rsn, ver=ver, igtk=self.IGTK, expect_ie=net.build_rsn_ie(akm, True))
+
+    def complete(self, ap, sta):
+        msg2 = sta.receive(ap.msg1())
+        self.assertEqual(kinds(msg2), ["send"])
+        self.assertEqual(ap.receive(msg2[0][1]), "msg2")
+        return sta.receive(ap.msg3())
+
+    def test_psk_with_pmf_required_keeps_descriptor_2_and_installs_the_igtk(self):
+        ap, sta = self.ap(2, PMF_AP_RSN, PSK), pmf_handshake(PSK)
+        actions = self.complete(ap, sta)
+        self.assertEqual(kinds(actions), ["send", "install_ptk", "install_gtk", "install_igtk", "complete"])
+        self.assertEqual(actions[3][1:], self.IGTK)
+        self.assertEqual(ap.receive(actions[0][1]), "msg4")
+
+    def test_psk_sha256_runs_descriptor_3_with_cmac_and_the_sha256_kdf_end_to_end(self):
+        ap, sta = self.ap(3, SHA256_AP_RSN, 0x000FAC06), pmf_handshake(0x000FAC06, SHA256_AP_RSN)
+        actions = self.complete(ap, sta)
+        self.assertEqual(kinds(actions), ["send", "install_ptk", "install_gtk", "install_igtk", "complete"])
+        self.assertEqual(actions[1][1], ap.ptk[32:48])                                  # both sides derived the same temporal key
+        self.assertEqual(ap.receive(actions[0][1]), "msg4")
+        self.assertTrue(ap.msg2_ok and ap.msg4_ok)
+
+    def test_the_descriptor_3_key_info_values_on_the_wire(self):
+        ap, sta = self.ap(3, SHA256_AP_RSN, 0x000FAC06), pmf_handshake(0x000FAC06, SHA256_AP_RSN)
+        self.assertEqual(struct.unpack_from(">H", ap.msg1(), 5)[0], 0x008B)
+        msg2 = sta.receive(ap.msg1())[0][1]
+        self.assertEqual(struct.unpack_from(">H", msg2, 5)[0], 0x010B)
+        ap.receive(msg2)
+        msg3 = ap.msg3()
+        self.assertEqual(struct.unpack_from(">H", msg3, 5)[0], 0x13CB)
+        self.assertEqual(struct.unpack_from(">H", sta.receive(msg3)[0][1], 5)[0], 0x030B)
+
+    def test_a_wrong_passphrase_is_still_caught_by_the_authenticator_under_sha256(self):
+        ap = self.ap(3, SHA256_AP_RSN, 0x000FAC06)
+        sta = pmf_handshake(0x000FAC06, SHA256_AP_RSN, pmk=net.wpa_psk(b"nope nope nope", b"EMPIRE"))
+        self.assertEqual(ap.receive(sta.receive(ap.msg1())[0][1]), "bad MIC")
+
+    def test_a_forged_sha256_message_3_is_ignored(self):
+        ap, sta = self.ap(3, SHA256_AP_RSN, 0x000FAC06), pmf_handshake(0x000FAC06, SHA256_AP_RSN)
+        ap.receive(sta.receive(ap.msg1())[0][1])
+        self.assertEqual(kinds(sta.receive(ap.msg3(tamper="mic"))), ["ignore"])
+        self.assertEqual(kinds(sta.receive(ap.msg3()))[0], "send")                       # the genuine one still works
+
+    def test_message_3_without_an_igtk_fails_when_protection_is_required(self):
+        ap, sta = Authenticator(PMK, rsn=PMF_AP_RSN, igtk=None, expect_ie=net.build_rsn_ie(PSK, True)), pmf_handshake(PSK)
+        ap.receive(sta.receive(ap.msg1())[0][1])
+        actions = sta.receive(ap.msg3())
+        self.assertEqual(kinds(actions), ["fail"])
+        self.assertIn("integrity group key", actions[0][1])
+
+    def test_descriptor_versions_must_match_the_negotiated_key_management(self):
+        v2_ap = self.ap(2, PMF_AP_RSN, PSK)
+        self.assertEqual(kinds(pmf_handshake(0x000FAC06, SHA256_AP_RSN).receive(v2_ap.msg1())), ["fail"])
+        v3_ap = self.ap(3, SHA256_AP_RSN, 0x000FAC06)
+        self.assertEqual(kinds(pmf_handshake(PSK).receive(v3_ap.msg1())), ["fail"])
+
+    def test_group_updates_can_carry_a_new_gtk_a_new_igtk_or_both(self):
+        ap, sta = self.ap(3, SHA256_AP_RSN, 0x000FAC06), pmf_handshake(0x000FAC06, SHA256_AP_RSN)
+        ap.receive(self.complete(ap, sta)[0][1])
+        new_igtk = (5, b"\x09\x00\x00\x00\x00\x00", b"J" * 16)
+        both = sta.receive(ap.group1(b"H" * 16, igtk=new_igtk))
+        self.assertEqual(kinds(both), ["send", "install_gtk", "install_igtk", "group_done"])
+        self.assertEqual(both[2][1:], new_igtk)
+        self.assertEqual(ap.receive(both[0][1]), "group2")
+        only = sta.receive(ap.group1(None, igtk=(4, b"\x0a\x00\x00\x00\x00\x00", b"K" * 16)))
+        self.assertEqual(kinds(only), ["send", "install_igtk", "group_done"])
+
+    def test_without_protection_the_igtk_is_ignored(self):
+        ap = Authenticator(PMK, igtk=self.IGTK)
+        sta = new_handshake()
+        msg2 = sta.receive(ap.msg1())[0][1]
+        self.assertEqual(ap.receive(msg2), "msg2")
+        self.assertEqual(kinds(sta.receive(ap.msg3())), ["send", "install_ptk", "install_gtk", "complete"])
+
+
+class PmfDriverTests(unittest.TestCase):
+    def setUp(self):
+        self.rec = Recorder()
+        self.driver = make_driver(self.rec)
+
+    def attrs(self):
+        return self.rec.sent[-1][2]
+
+    def test_connecting_with_protection_asks_the_kernel_for_it(self):
+        bss = net.parse_bss(bss_attrs(rsn=SHA256_AP_RSN))
+        self.driver.connect(bss, b"EMPIRE", akm=0x000FAC06, pmf=True)
+        a = self.attrs()
+        self.assertEqual(struct.unpack("=I", a[net.A_USE_MFP])[0], 1)                  # NL80211_MFP_REQUIRED
+        self.assertEqual(struct.unpack("=I", a[net.A_AKM])[0], 0x000FAC06)
+        self.assertEqual(a[net.A_IE], net.build_rsn_ie(0x000FAC06, True))
+        self.driver.connect(net.parse_bss(bss_attrs()), b"EMPIRE")
+        a = self.attrs()
+        self.assertEqual((struct.unpack("=I", a[net.A_USE_MFP])[0], struct.unpack("=I", a[net.A_AKM])[0]), (0, PSK))   # the default is unchanged
+
+    def test_the_igtk_is_a_bip_cmac_key_with_a_six_byte_packet_number(self):
+        self.driver.new_igtk(4, b"I" * 16, b"\x01\x02\x03\x04\x05\x06")
+        key = net.parse_attrs(self.attrs()[net.A_KEY])
+        self.assertEqual((key[net.K_DATA], key[net.K_IDX], key[net.K_SEQ]), (b"I" * 16, b"\x04", b"\x01\x02\x03\x04\x05\x06"))
+        self.assertEqual(struct.unpack("=I", key[net.K_CIPHER])[0], 0x000FAC06)
+        self.assertNotIn(net.A_MAC, self.attrs())
+        self.driver.default_igtk(5)
+        key = net.parse_attrs(self.attrs()[net.A_KEY])
+        self.assertEqual((key[net.K_IDX], net.K_DEFAULT_MGMT in key), (b"\x05", True))
+        self.assertEqual(self.rec.sent[-1][1], net.CMD_SET_KEY)
+
+
+class PmfStationTests(unittest.TestCase):
+    def setUp(self):
+        if not shutil_which("openssl"):
+            self.skipTest("the access point side uses the openssl CLI")
+
+    def pmf_ap(self, akm_sha256=False, **kw):
+        rsn_b = SHA256_AP_RSN if akm_sha256 else PMF_AP_RSN
+        return FakeAP(rsn=net.parse_rsn(rsn_b[2:]), rsn_bytes=rsn_b, **kw)
+
+    def test_a_psk_network_that_requires_protection_is_joined_with_it(self):
+        bench = Bench([self.pmf_ap()]).run(15)
+        self.assertEqual(bench.state, "COMPLETED")
+        self.assertEqual(bench.radio.last_connect, {"akm": PSK, "pmf": True})
+        names = bench.radio.names()
+        self.assertLess(names.index("new_key", names.index("new_key") + 1), names.index("new_igtk"))   # GTK first, then IGTK
+        self.assertLess(names.index("new_igtk"), names.index("authorize"))                             # the port opens last
+        self.assertEqual(names.count("default_igtk"), 1)
+        igtk = next(c for c in bench.radio.calls if c[0] == "new_igtk")
+        self.assertEqual(igtk[1], (4, b"I" * 16, b"\x01\x00\x00\x00\x00\x00"))
+        self.assertTrue(any("management frame protection" in line for line in bench.logs))
+
+    def test_a_psk_sha256_network_is_joined_with_descriptor_3(self):
+        bench = Bench([self.pmf_ap(akm_sha256=True)]).run(15)
+        self.assertEqual(bench.state, "COMPLETED")
+        self.assertEqual(bench.radio.last_connect, {"akm": 0x000FAC06, "pmf": True})
+        self.assertTrue(bench.radio.aps[0].auth.msg4_ok)
+
+    def test_an_ordinary_network_never_touches_protection(self):
+        bench = Bench([FakeAP()]).run(12)
+        self.assertEqual(bench.radio.last_connect, {"akm": PSK, "pmf": False})
+        self.assertEqual((bench.radio.count("new_igtk"), bench.radio.count("default_igtk")), (0, 0))
+        self.assertFalse(any("management frame" in line for line in bench.logs))
+
+    def test_a_wrong_passphrase_never_completes_a_protected_connection_either(self):
+        bench = Bench([self.pmf_ap(passphrase=b"not the right one")]).run(120)
+        self.assertNotIn("COMPLETED", bench.states())
+        self.assertEqual((bench.radio.count("new_key"), bench.radio.count("new_igtk"), bench.radio.count("authorize")), (0, 0, 0))
+
+    def test_a_kernel_that_refuses_the_igtk_fails_the_attempt_and_never_opens_the_port(self):
+        bench = Bench([self.pmf_ap()])
+        original = bench.radio.new_igtk
+
+        def refuse(index, key, ipn):
+            original(index, key, ipn)
+            raise OSError(errno.EINVAL, "bad key")
+        bench.radio.new_igtk = refuse
+        bench.run(30)
+        self.assertEqual(bench.radio.count("authorize"), 0)
+        self.assertNotIn("COMPLETED", bench.states())
+
+    def test_group_key_refreshes_with_a_new_igtk_are_installed_while_connected(self):
+        bench = Bench([self.pmf_ap()]).run(15)
+        ap = bench.radio.aps[0]
+        before = bench.radio.count("new_igtk")
+        bench.radio.at(0, ("eapol", ap.bssid, ap.auth.group1(b"H" * 16, igtk=(5, b"\x09\x00\x00\x00\x00\x00", b"J" * 16))))
+        bench.run(1)
+        self.assertEqual(bench.radio.count("new_igtk"), before + 1)
+        self.assertEqual(bench.state, "COMPLETED")
+
 
 
 class StationCallTests(unittest.TestCase):
@@ -1531,15 +1844,20 @@ class SelftestTests(unittest.TestCase):
         self.assertIn("only checked when run as root", text)
 
     def test_a_saved_network_that_cannot_be_joined_is_a_failure_with_the_reason(self):
-        pmf = net.parse_rsn(AP_RSN[2:20] + b"\xc0\x00")
-        failures, text = self.run_selftest([FakeAP(rsn=pmf).scan_entry()], profiles=[("EMPIRE", "00" * 32)])
+        sae_only = net.parse_rsn(AP_RSN[2:14] + b"\x01\x00\x00\x0f\xac\x08\xc0\x00")
+        failures, text = self.run_selftest([FakeAP(rsn=sae_only).scan_entry()], profiles=[("EMPIRE", "00" * 32)])
         self.assertEqual(failures, 1)
-        self.assertIn("management frame protection", text)
+        self.assertIn("not WPA2-personal", text)
 
     def test_a_saved_network_that_is_out_of_range_says_to_scan(self):
         failures, text = self.run_selftest([], profiles=[("EMPIRE", "00" * 32)])
         self.assertEqual(failures, 1)
         self.assertIn("run a scan first", text)
+
+    def test_a_network_that_requires_protection_is_called_joinable(self):
+        protected = FakeAP(rsn=net.parse_rsn(PMF_AP_RSN[2:]), rsn_bytes=PMF_AP_RSN)
+        failures, _ = self.run_selftest([protected.scan_entry()], profiles=[("EMPIRE", "00" * 32)])
+        self.assertEqual(failures, 0)
 
     def test_a_joinable_saved_network_passes_and_a_running_rival_is_only_a_note(self):
         failures, text = self.run_selftest([FakeAP().scan_entry()], profiles=[("EMPIRE", "00" * 32)], competing=["wpa_supplicant"])

@@ -18,16 +18,23 @@ It is still ONE stdlib-only Python file, and dhcpcd is still used for DHCP.
   wpa.conf                           /etc/whitecube/network/networks.json (0600, SSID + 256-bit PSK)
 
 Everything is deliberately narrower than wpa_supplicant: WPA2-personal (RSN) with CCMP only, one
-radio, IPv4. It will NOT join: open, WEP, WPA1/TKIP, WPA3-only (SAE), enterprise, or networks that
-REQUIRE management frame protection (WPA3 transition mode, which does not require it, is fine). Such
+radio, IPv4. It will NOT join: open, WEP, WPA1/TKIP, WPA3-only (SAE), or enterprise networks. Such
 networks show in scans with their security string and are skipped with the reason in the journal.
+Management frame protection (802.11w) is used ONLY when a network requires it (or offers nothing but
+PSK-SHA256): the association then carries MFPC+MFPR and the BIP-CMAC-128 management cipher, the
+handshake uses descriptor version 3 (AES-CMAC MIC, SHA-256 KDF) for PSK-SHA256, and the IGTK from
+message 3 / group updates is installed. A network that merely ALLOWS protection (WPA3 transition mode)
+is joined exactly like plain WPA2, so what works today is unchanged. SAE (WPA3-personal) is not
+implemented: it is a large protocol with no independent oracle to test it against here, and an
+unverifiable guess would be worse than an honest "unsupported".
 Your router (EMPIRE) is WPA2-PSK/CCMP, no PMF: `cube-net selftest` says "usable".
 
 Security properties kept: the passphrase is hashed (never stored); message 3 is only accepted with a
 valid MIC, a higher replay counter and the same ANonce; its security elements must match the beacon
 (downgrade check); a repeated message 3 is answered but never reinstalls keys (no key reinstallation);
 group updates need a valid MIC and replay counter; an AP-initiated pairwise rekey makes us reconnect.
-Not implemented: PMF/802.11w, SAE, TKIP, 802.11r roaming, PMKSA caching, background roaming scans.
+Not implemented: SAE, TKIP, 802.11r roaming, PMKSA caching, background roaming scans, SA-Query is left
+to the kernel.
 
 Saved networks: networks.json replaces wpa.conf. Until networks.json exists the old wpa.conf is still
 read (read-only), so the first start after installing needs no migration. `sudo cube-net migrate`

@@ -707,6 +707,9 @@ def reset_recovery_request():
 # ---- calls wpa_supplicant or wpa_cli; this is everything the controller used to borrow from them.
 
 SUITE_CCMP, SUITE_PSK = 0x000FAC04, 0x000FAC02
+SUITE_PSK_SHA256, SUITE_BIP_CMAC = 0x000FAC06, 0x000FAC06      # key management 6; management-group cipher 6
+RSN_CAPS_MFPC = 0x0080
+IGTK_KDE = b'\x00\x0f\xac\x09'
 AKM_NAMES = {1: 'EAP', 2: 'PSK', 4: 'FT-PSK', 5: 'EAP-SHA256', 6: 'PSK-SHA256', 8: 'SAE'}
 RSN_CAPS_MFPR = 0x0040                      # the AP insists on management frame protection (WPA3-style)
 OWN_RSN_CAPS = 0x000C                       # 16 PTKSA and 16 GTKSA replay counters, no PMF: what Linux clients send
@@ -786,6 +789,47 @@ def aes_decrypt_block(key, block):
     return bytes(state)
 
 
+def aes_encrypt_block(key, block):
+    if len(block) != 16:
+        raise ValueError('AES block is 16 bytes')
+    sbox, _, mult = _aes_tables()
+    keys = _aes_round_keys(key)
+    state = [a ^ b for a, b in zip(block, keys[0])]
+    for rnd in range(1, 11):
+        state = [sbox[b] for b in state]
+        state = [state[(i + 4 * (i % 4)) % 16] for i in range(16)]            # ShiftRows
+        if rnd < 10:
+            mixed = []
+            for c in range(0, 16, 4):
+                a0, a1, a2, a3 = state[c:c + 4]
+                mixed += [mult[2][a0] ^ mult[3][a1] ^ a2 ^ a3, a0 ^ mult[2][a1] ^ mult[3][a2] ^ a3,
+                          a0 ^ a1 ^ mult[2][a2] ^ mult[3][a3], mult[3][a0] ^ a1 ^ a2 ^ mult[2][a3]]
+            state = mixed
+        state = [a ^ b for a, b in zip(state, keys[rnd])]
+    return bytes(state)
+
+
+def aes_cmac(key, message):
+    """AES-128-CMAC (RFC 4493): the MIC of EAPOL key descriptor version 3."""
+    def double(block):
+        value = int.from_bytes(block, 'big') << 1
+        if value >> 128:
+            value = (value & ((1 << 128) - 1)) ^ 0x87
+        return value.to_bytes(16, 'big')
+    k1 = double(aes_encrypt_block(key, bytes(16)))
+    k2 = double(k1)
+    blocks = [message[i:i + 16] for i in range(0, len(message), 16)] or [b'']
+    if len(blocks[-1]) == 16:
+        last = bytes(a ^ b for a, b in zip(blocks[-1], k1))
+    else:
+        padded = blocks[-1] + b'\x80' + bytes(15 - len(blocks[-1]))
+        last = bytes(a ^ b for a, b in zip(padded, k2))
+    state = bytes(16)
+    for block in blocks[:-1]:
+        state = aes_encrypt_block(key, bytes(a ^ b for a, b in zip(state, block)))
+    return aes_encrypt_block(key, bytes(a ^ b for a, b in zip(state, last)))
+
+
 def aes_unwrap(kek, data):
     """RFC 3394 key unwrap. Returns the plaintext key data, or None when the integrity check fails."""
     if len(data) < 24 or len(data) % 8:
@@ -814,8 +858,19 @@ def prf_sha1(key, label, data, length):
     return out[:length]
 
 
-def derive_ptk(pmk, aa, spa, anonce, snonce):
+def kdf_sha256(key, label, data, length):
+    """The 802.11 KDF used with SHA-256 key management: HMAC-SHA256(key, counter | label | data | bits), counter little-endian."""
+    out, counter = b'', 1
+    while len(out) < length:
+        out += hmac.new(key, struct.pack('<H', counter) + label + data + struct.pack('<H', length * 8), 'sha256').digest()
+        counter += 1
+    return out[:length]
+
+
+def derive_ptk(pmk, aa, spa, anonce, snonce, sha256=False):
     data = min(aa, spa) + max(aa, spa) + min(anonce, snonce) + max(anonce, snonce)
+    if sha256:
+        return kdf_sha256(pmk, b'Pairwise key expansion', data, 48)
     return prf_sha1(pmk, b'Pairwise key expansion', data, 48)       # KCK 16 | KEK 16 | TK 16 (CCMP)
 
 
@@ -867,28 +922,53 @@ def parse_rsn(body):
                 pos += 4 * count
                 if len(body) >= pos + 2:
                     caps = struct.unpack_from('<H', body, pos)[0]
-        return {'group': group, 'pairwise': pairwise, 'akm': akm, 'caps': caps}
+                    pos += 2
+        mgmt = None
+        if len(body) >= pos + 2:                       # PMKID list, then the management-group cipher
+            pmkids = struct.unpack_from('<H', body, pos)[0]
+            pos += 2 + 16 * pmkids
+            if len(body) >= pos + 4:
+                mgmt = int.from_bytes(body[pos:pos + 4], 'big')
+        if caps & RSN_CAPS_MFPC and mgmt is None:
+            mgmt = SUITE_BIP_CMAC                      # the default when protection is on and none is named
+        return {'group': group, 'pairwise': pairwise, 'akm': akm, 'caps': caps, 'mgmt': mgmt}
     except struct.error:
         return None
 
 
-def build_rsn_ie():
-    """The RSN element we associate with and repeat in message 2: CCMP group and pairwise, PSK, no PMF."""
-    return (b'\x30\x14' + struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big')
-            + struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big')
-            + struct.pack('<H', 1) + SUITE_PSK.to_bytes(4, 'big') + struct.pack('<H', OWN_RSN_CAPS))
+def build_rsn_ie(akm=SUITE_PSK, pmf=False):
+    """The RSN element we associate with and repeat in message 2: CCMP group and pairwise, one PSK key
+    management, and management frame protection only when the network requires it."""
+    body = (struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big') + struct.pack('<H', 1) + SUITE_CCMP.to_bytes(4, 'big')
+            + struct.pack('<H', 1) + akm.to_bytes(4, 'big'))
+    if not pmf:
+        return b'\x30' + bytes([len(body) + 2]) + body + struct.pack('<H', OWN_RSN_CAPS)
+    body += struct.pack('<H', OWN_RSN_CAPS | RSN_CAPS_MFPC | RSN_CAPS_MFPR) + struct.pack('<H', 0) + SUITE_BIP_CMAC.to_bytes(4, 'big')
+    return b'\x30' + bytes([len(body)]) + body
+
+
+def pmf_plan(rsn):
+    """(akm, use_pmf) for an access point we can join, or None. PMF is used only when the network requires it
+    (or offers nothing but PSK-SHA256); otherwise the long-proven plain WPA2 association is kept."""
+    if rsn is None:
+        return None
+    if SUITE_PSK in rsn['akm'] and not rsn['caps'] & RSN_CAPS_MFPR:
+        return SUITE_PSK, False
+    akm = SUITE_PSK if SUITE_PSK in rsn['akm'] else SUITE_PSK_SHA256 if SUITE_PSK_SHA256 in rsn['akm'] else None
+    return (akm, True) if akm else None
 
 
 def unsupported_reason(rsn):
     """Why we cannot join an AP with this RSN element, or None when WPA2-PSK with CCMP is on offer."""
     if rsn is None:
         return 'no WPA2 (RSN) element'
-    if SUITE_PSK not in rsn['akm']:
+    plan = pmf_plan(rsn)
+    if plan is None:
         return 'not WPA2-personal (no PSK key management)'
     if SUITE_CCMP not in rsn['pairwise'] or rsn['group'] != SUITE_CCMP:
         return 'needs a cipher other than CCMP'
-    if rsn['caps'] & RSN_CAPS_MFPR:
-        return 'requires management frame protection'
+    if plan[1] and rsn.get('mgmt') != SUITE_BIP_CMAC:
+        return 'needs a management frame cipher other than BIP-CMAC-128'
     return None
 
 
@@ -936,17 +1016,35 @@ def eapol_key_parse(frame):
             'data': frame[EAPOL_KEY_FIXED:EAPOL_KEY_FIXED + data_length]}
 
 
-def eapol_key_build(version, info, key_length, replay, nonce, data, kck=None):
+def eapol_key_build(version, info, key_length, replay, nonce, data, kck=None, descriptor=2):
     body = (bytes([2]) + struct.pack('>HHQ', info, key_length, replay) + nonce + bytes(16) + bytes(8) + bytes(8)
             + bytes(16) + struct.pack('>H', len(data)) + data)
     frame = bytes([version, 3]) + struct.pack('>H', len(body)) + body
     if kck is not None:
-        frame = frame[:81] + eapol_key_mic(kck, frame) + frame[97:]
+        frame = frame[:81] + eapol_key_mic(kck, frame, descriptor) + frame[97:]
     return frame
 
 
-def eapol_key_mic(kck, frame):
-    return hmac.new(kck, frame[:81] + bytes(16) + frame[97:], 'sha1').digest()[:16]
+def eapol_key_mic(kck, frame, descriptor=2):
+    """Key descriptor version 2 (PSK/CCMP): HMAC-SHA1 truncated to 128 bits. Version 3 (SHA-256 key management): AES-CMAC."""
+    zeroed = frame[:81] + bytes(16) + frame[97:]
+    return aes_cmac(kck, zeroed) if descriptor == 3 else hmac.new(kck, zeroed, 'sha1').digest()[:16]
+
+
+def igtk_elements(data):
+    """[(key id, IPN, key)] for the IGTK elements in decrypted EAPOL key data."""
+    found, pos = [], 0
+    while pos + 2 <= len(data):
+        ident, length = data[pos], data[pos + 1]
+        if ident == 0xDD and length == 0:
+            break
+        body = data[pos + 2:pos + 2 + length]
+        if len(body) < length:
+            break
+        if ident == 0xDD and body[:4] == IGTK_KDE and len(body) == 4 + 2 + 6 + 16:
+            found.append((struct.unpack_from('<H', body, 4)[0], body[6:12], body[12:28]))
+        pos += 2 + length
+    return found
 
 
 def key_data_elements(data):
@@ -975,14 +1073,17 @@ class Handshake:
       ('group_done',)  ('ignore', why)      ('fail', why)
     It touches no socket, clock or kernel, so tests can play the access point against it."""
 
-    def __init__(self, pmk, aa, spa, own_ie, ap_rsn, random=os.urandom):
+    def __init__(self, pmk, aa, spa, own_ie, ap_rsn, random=os.urandom, akm=SUITE_PSK, pmf=False):
         self.pmk, self.aa, self.spa, self.own_ie, self.ap_rsn, self.random = pmk, aa, spa, own_ie, ap_rsn, random
+        self.akm, self.pmf = akm, pmf
+        self.sha256 = akm == SUITE_PSK_SHA256          # SHA-256 key management: KDF-SHA256, AES-CMAC, descriptor version 3
+        self.version = 3 if self.sha256 else 2
         self.ptk = self.anonce = self.snonce = None
         self.replay = None
         self.installed = False
 
     def _reply(self, frame, info, nonce, data):
-        return eapol_key_build(frame['version'], info, frame['key_length'], frame['replay'], nonce, data, self.ptk[:16])
+        return eapol_key_build(frame['version'], info, frame['key_length'], frame['replay'], nonce, data, self.ptk[:16], self.version)
 
     def receive(self, raw):
         frame = eapol_key_parse(raw)
@@ -991,8 +1092,8 @@ class Handshake:
         info = frame['info']
         if not info & KI_ACK or info & (KI_REQUEST | KI_ERROR):
             return [('ignore', 'not a message from the authenticator')]
-        if info & KI_VERSION != 2:
-            return [('fail', f'access point uses EAPOL key descriptor version {info & KI_VERSION}; only 2 (CCMP) is supported')]
+        if info & KI_VERSION != self.version:
+            return [('fail', f'access point uses EAPOL key descriptor version {info & KI_VERSION}; expected {self.version}')]
         if info & KI_PAIRWISE:
             return self._message_1(frame) if not info & KI_MIC else self._message_3(frame)
         return self._group(frame)
@@ -1003,13 +1104,13 @@ class Handshake:
         if self.installed:
             return [('fail', 'the access point started a pairwise key refresh, which is not supported; reconnecting')]
         self.anonce, self.snonce = frame['nonce'], self.random(32)
-        self.ptk = derive_ptk(self.pmk, self.aa, self.spa, self.anonce, self.snonce)
+        self.ptk = derive_ptk(self.pmk, self.aa, self.spa, self.anonce, self.snonce, self.sha256)
         self.replay = frame['replay']            # message 1 is accepted whatever its counter: the AP may start over
-        info = 2 | KI_PAIRWISE | KI_MIC
+        info = self.version | KI_PAIRWISE | KI_MIC
         return [('send', self._reply(frame, info, self.snonce, self.own_ie))]
 
     def _authentic(self, frame):
-        return (self.ptk is not None and hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw']), frame['mic'])
+        return (self.ptk is not None and hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw'], self.version), frame['mic'])
                 and (self.replay is None or frame['replay'] > self.replay))
 
     def _decrypt(self, frame):
@@ -1020,7 +1121,7 @@ class Handshake:
     def _message_3(self, frame):
         if self.ptk is None:
             return [('ignore', 'message 3 before message 1')]
-        if not hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw']), frame['mic']):
+        if not hmac.compare_digest(eapol_key_mic(self.ptk[:16], frame['raw'], self.version), frame['mic']):
             return [('ignore', 'message 3 failed its integrity check')]
         if self.replay is not None and frame['replay'] <= self.replay:
             return [('ignore', 'message 3 replayed')]
@@ -1028,7 +1129,7 @@ class Handshake:
             return [('ignore', 'message 3 changed the authenticator nonce')]
         if self.installed:                       # the AP missed our message 4: answer again, never reinstall keys
             self.replay = frame['replay']
-            return [('send', self._reply(frame, 2 | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b''))]
+            return [('send', self._reply(frame, self.version | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b''))]
         if not frame['info'] & KI_INSTALL:
             return [('ignore', 'message 3 without the install flag')]
         data = self._decrypt(frame)
@@ -1041,11 +1142,17 @@ class Handshake:
             return [('fail', 'security elements in message 3 differ from the beacon (possible downgrade attack)')]
         if not gtks or len(gtks[0][2]) != 16:
             return [('fail', 'message 3 carries no usable CCMP group key')]
+        igtks = igtk_elements(data)
+        if self.pmf and not igtks:
+            return [('fail', 'message 3 carries no integrity group key although management frame protection is required')]
         self.replay = frame['replay']
         self.installed = True
         index, _, key = gtks[0]
-        return [('send', self._reply(frame, 2 | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b'')),
-                ('install_ptk', self.ptk[32:48]), ('install_gtk', index, key, frame['rsc'][:6]), ('complete',)]
+        actions = [('send', self._reply(frame, self.version | KI_PAIRWISE | KI_MIC | KI_SECURE, bytes(32), b'')),
+                   ('install_ptk', self.ptk[32:48]), ('install_gtk', index, key, frame['rsc'][:6])]
+        if self.pmf:
+            actions.append(('install_igtk',) + igtks[0])
+        return actions + [('complete',)]
 
     def _group(self, frame):
         if not self.installed:
@@ -1054,12 +1161,17 @@ class Handshake:
             return [('ignore', 'group key message failed its integrity or replay check')]
         data = self._decrypt(frame)
         _, gtks = key_data_elements(data) if data is not None else (None, [])
-        if not gtks or len(gtks[0][2]) != 16:
+        igtks = igtk_elements(data) if data is not None and self.pmf else []
+        if not (gtks and len(gtks[0][2]) == 16) and not igtks:
             return [('ignore', 'group key message without a usable key')]
         self.replay = frame['replay']
-        index, _, key = gtks[0]
-        return [('send', self._reply(frame, 2 | KI_MIC | KI_SECURE, bytes(32), b'')),
-                ('install_gtk', index, key, frame['rsc'][:6]), ('group_done',)]
+        actions = [('send', self._reply(frame, self.version | KI_MIC | KI_SECURE, bytes(32), b''))]
+        if gtks and len(gtks[0][2]) == 16:
+            index, _, key = gtks[0]
+            actions.append(('install_gtk', index, key, frame['rsc'][:6]))
+        if igtks:
+            actions.append(('install_igtk',) + igtks[0])
+        return actions + [('group_done',)]
 
 
 # --- generic netlink and nl80211
@@ -1080,7 +1192,7 @@ A_IFINDEX, A_MAC, A_KEY, A_STA_INFO, A_BSS, A_WIPHY_FREQ = 3, 6, 80, 21, 47, 38
 A_SCAN_SSIDS, A_SSID, A_IE, A_AUTH_TYPE, A_REASON_CODE, A_STATUS_CODE = 45, 52, 42, 53, 54, 72
 A_PRIVACY, A_USE_MFP, A_WPA_VERSIONS, A_CIPHER_PAIRWISE, A_CIPHER_GROUP, A_AKM = 70, 66, 75, 73, 74, 76
 A_CONTROL_PORT, A_STA_FLAGS2, A_TIMED_OUT, A_DISCONNECTED_BY_AP = 68, 67, 65, 71
-K_DATA, K_IDX, K_CIPHER, K_SEQ, K_DEFAULT, K_DEFAULT_TYPES = 1, 2, 3, 4, 5, 8
+K_DATA, K_IDX, K_CIPHER, K_SEQ, K_DEFAULT, K_DEFAULT_MGMT, K_DEFAULT_TYPES = 1, 2, 3, 4, 5, 6, 8
 BSS_BSSID, BSS_FREQUENCY, BSS_CAPABILITY, BSS_IES, BSS_SIGNAL_MBM, BSS_BEACON_IES = 1, 2, 5, 6, 7, 11
 STA_SIGNAL = 7
 STA_FLAG_AUTHORIZED = 1
@@ -1294,11 +1406,11 @@ class Nl80211Driver:
         entries = b''.join(nla(index + 1, ssid) for index, ssid in enumerate([b''] + list(ssids)))
         self._do(CMD_TRIGGER_SCAN, nla_nest(A_SCAN_SSIDS, entries))
 
-    def connect(self, bss, ssid):
+    def connect(self, bss, ssid, akm=SUITE_PSK, pmf=False):
         self._do(CMD_CONNECT, nla(A_SSID, ssid), nla(A_MAC, mac_bytes(bss['bssid'])), nla_u32(A_WIPHY_FREQ, bss['freq']),
-                 nla(A_IE, build_rsn_ie()), nla_u32(A_AUTH_TYPE, 0), nla_u32(A_USE_MFP, 0), nla_u32(A_WPA_VERSIONS, 2),
-                 nla(A_CIPHER_PAIRWISE, struct.pack('=I', SUITE_CCMP)), nla_u32(A_CIPHER_GROUP, SUITE_CCMP),
-                 nla(A_AKM, struct.pack('=I', SUITE_PSK)), nla(A_PRIVACY), nla(A_CONTROL_PORT))
+                 nla(A_IE, build_rsn_ie(akm, pmf)), nla_u32(A_AUTH_TYPE, 0), nla_u32(A_USE_MFP, 1 if pmf else 0),
+                 nla_u32(A_WPA_VERSIONS, 2), nla(A_CIPHER_PAIRWISE, struct.pack('=I', SUITE_CCMP)),
+                 nla_u32(A_CIPHER_GROUP, SUITE_CCMP), nla(A_AKM, struct.pack('=I', akm)), nla(A_PRIVACY), nla(A_CONTROL_PORT))
 
     def disconnect(self):
         self._do(CMD_DISCONNECT, nla(A_REASON_CODE, struct.pack('=H', 3)))
@@ -1310,6 +1422,13 @@ class Nl80211Driver:
         nested = nla_nest(A_KEY, nla(K_DATA, key), nla_u8(K_IDX, index), nla_u32(K_CIPHER, SUITE_CCMP),
                           nla(K_SEQ, seq) if seq else b'')
         self._do(CMD_NEW_KEY, nested, nla(A_MAC, mac_bytes(bssid)) if bssid else b'')
+
+    def new_igtk(self, index, key, ipn):
+        """Install the BIP-CMAC-128 integrity group key that protects management frames."""
+        self._do(CMD_NEW_KEY, nla_nest(A_KEY, nla(K_DATA, key), nla_u8(K_IDX, index), nla_u32(K_CIPHER, SUITE_BIP_CMAC), nla(K_SEQ, ipn)))
+
+    def default_igtk(self, index):
+        self._do(CMD_SET_KEY, nla_nest(A_KEY, nla_u8(K_IDX, index), nla(K_DEFAULT_MGMT)))
 
     def default_group_key(self, index):
         self._do(CMD_SET_KEY, nla_nest(A_KEY, nla_u8(K_IDX, index), nla(K_DEFAULT), nla_nest(K_DEFAULT_TYPES, nla(2))))
@@ -1619,8 +1738,10 @@ class Station:
                 self.driver.delete_group_key(index)
             except OSError:
                 pass
-        self.log(f'wifi: connecting on {bss["freq"]} MHz, signal {bss["signal"]} dBm')
-        self.driver.connect(bss, bss['ssid'])
+        akm, pmf = pmf_plan(bss['rsn'])
+        self.target = dict(bss, akm=akm, pmf=pmf)
+        self.log(f'wifi: connecting on {bss["freq"]} MHz, signal {bss["signal"]} dBm' + (', with management frame protection' if pmf else ''))
+        self.driver.connect(bss, bss['ssid'], akm=akm, pmf=pmf)
         self.deadline = now + self.CONNECT_TIMEOUT
         self._set('AUTHENTICATING')
 
@@ -1632,7 +1753,8 @@ class Station:
             self._retry(now, 'the access point refused the association' + (f' (status {status})' if status > 0 else ' (timed out)'))
             return
         self.handshake = Handshake(self.profiles[self.target['ssid']], mac_bytes(self.target['bssid']),
-                                   self.driver.mac, build_rsn_ie(), self.target['rsn'])
+                                   self.driver.mac, build_rsn_ie(self.target['akm'], self.target['pmf']), self.target['rsn'],
+                                   akm=self.target['akm'], pmf=self.target['pmf'])
         self.deadline = now + self.HANDSHAKE_TIMEOUT
         self._set('ASSOCIATED')
         early, self.early = self.early, []
@@ -1662,6 +1784,12 @@ class Station:
                     self.driver.default_group_key(action[1])
                 except OSError:
                     pass                    # only affects multicast transmit, which a client does not use
+            elif kind == 'install_igtk':
+                self.driver.new_igtk(action[1], action[3], action[2])
+                try:
+                    self.driver.default_igtk(action[1])
+                except OSError:
+                    pass                    # a missing default only affects how the kernel picks the key for broadcast management frames
             elif kind == 'complete':
                 self.driver.authorize(self.target['bssid'])
                 self.had_link, self.failures, self.deadline = True, 0, None
