@@ -1043,7 +1043,7 @@ static void page_network(void) {
 		if (button("Connect")) action("Connect", P_FREE, 2, "net-connect", r->f[1]);
 		if (button("Forget")) {
 			char t[160]; snprintf(t, sizeof(t), "Forget %s? Its passphrase is removed from this computer.", r->f[2]);
-			struct pending p = make_pending("Forget network", P_FREE, 2, "net-forget", r->f[1]);
+			struct pending p = make_pending("Forget network", P_PASS, 2, "net-forget", r->f[1]);
 			confirm("Forget network", t, "Forget", true, &p);
 		}
 		row_end();
@@ -1715,7 +1715,7 @@ static void draw_modal(double W, double H) {
 			if (!modal.a.buf[0] || strlen(modal.a.buf) > 32) toast("The network name must be 1-32 characters");
 			else if (pl < 8 || pl > 63) toast("The passphrase must be 8-63 characters");
 			else {
-				struct pending p = make_pending("Save network", P_FREE, 1, "net-add");
+				struct pending p = make_pending("Save network", P_PASS, 1, "net-add");
 				p.chain = C_CONNECT_ADDED;
 				snprintf(p.input, sizeof(p.input), "%s\n%s\n", modal.a.buf, modal.b.buf);
 				explicit_bzero(modal.b.buf, sizeof(modal.b.buf));

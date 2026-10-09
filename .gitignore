@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.bak*
 *.new-*
+build-asan/
