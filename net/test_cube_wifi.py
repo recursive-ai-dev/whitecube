@@ -686,6 +686,23 @@ class DriverEncodingTests(unittest.TestCase):
         self.assertEqual(a[net.A_MAC], AP)
         self.assertEqual(struct.unpack("=II", a[net.A_STA_FLAGS2]), (2, 2))      # mask and value: the AUTHORIZED flag
 
+    def test_power_save_and_country_are_encoded_as_the_kernel_expects(self):
+        self.driver.set_power_save(False)
+        cmd, a = self.last()
+        self.assertEqual((cmd, struct.unpack("=I", a[net.A_PS_STATE])[0]), (net.CMD_SET_POWER_SAVE, 0))
+        self.driver.set_power_save(True)
+        self.assertEqual(struct.unpack("=I", self.last()[1][net.A_PS_STATE])[0], 1)
+        self.driver.set_country("CA")
+        family, cmd, attrs, _ = self.rec.sent[-1]
+        self.assertEqual((cmd, attrs[net.A_REG_ALPHA2]), (net.CMD_REQ_SET_REG, b"CA\0"))
+        self.assertNotIn(net.A_IFINDEX, attrs)                                 # the regulatory request is global
+        self.rec.script[net.CMD_GET_POWER_SAVE] = [(62, {net.A_PS_STATE: struct.pack("=I", 1)})]
+        self.assertIs(self.driver.power_save(), True)
+        self.rec.script[net.CMD_GET_POWER_SAVE] = OSError(errno.EOPNOTSUPP, "no")
+        self.assertIsNone(self.driver.power_save())
+        self.rec.script[net.CMD_GET_POWER_SAVE] = []
+        self.assertIsNone(self.driver.power_save())
+
     def test_disconnect_says_leaving(self):
         self.driver.disconnect()
         cmd, a = self.last()
@@ -830,6 +847,7 @@ class FakeRadio:
         self.key_error = None
         self.signal_value = -58
         self.deauth_after_msg2 = None
+        self.power_save_error = self.country_error = None
 
     def at(self, delay, event):
         self.queue.append((self.now + delay, event))
@@ -917,6 +935,16 @@ class FakeRadio:
     def authorize(self, bssid):
         self.record("authorize", bssid)
 
+    def set_power_save(self, enabled):
+        self.record("set_power_save", enabled)
+        if self.power_save_error is not None:
+            raise self.power_save_error
+
+    def set_country(self, alpha2):
+        self.record("set_country", alpha2)
+        if self.country_error is not None:
+            raise self.country_error
+
     def signal(self, bssid):
         return self.signal_value
 
@@ -990,6 +1018,57 @@ class StationTests(unittest.TestCase):
         bench = Bench([FakeAP()]).run(3)
         scan = next(c for c in bench.radio.calls if c[0] == "trigger_scan")
         self.assertEqual(scan[1], ((b"EMPIRE",),))
+
+    def test_power_save_is_turned_off_after_every_successful_connection(self):
+        bench = Bench([FakeAP()]).run(12)
+        self.assertEqual([c[1] for c in bench.radio.calls if c[0] == "set_power_save"], [(False,)])
+        self.assertLess(bench.radio.names().index("authorize"), bench.radio.names().index("set_power_save"))
+        bench.radio.joined = None
+        bench.radio.at(0, ("disconnected", 4, True))
+        bench.run(14)
+        self.assertEqual(bench.radio.count("set_power_save"), 2)               # again on the new association
+
+    def test_power_save_can_be_left_on_by_configuration(self):
+        bench = Bench([FakeAP()])
+        bench.station.options["power_save"] = True
+        bench.run(12)
+        self.assertEqual([c[1] for c in bench.radio.calls if c[0] == "set_power_save"], [(True,)])
+
+    def test_a_radio_that_refuses_the_power_save_change_keeps_its_link(self):
+        bench = Bench([FakeAP()])
+        bench.radio.power_save_error = OSError(errno.EOPNOTSUPP, "not supported")
+        bench.run(12)
+        self.assertEqual(bench.state, "COMPLETED")
+        self.assertTrue(any("could not change power save" in line for line in bench.logs))
+
+    def test_the_country_is_set_once_at_start_only_when_configured(self):
+        quiet = Bench([FakeAP()], start=False)
+        quiet.station.options["country"] = None
+        quiet.radio.wait = lambda timeout: (__import__("time").sleep(0.02), [])[1]
+        quiet.station.now = __import__("time").monotonic
+        threading.Timer(0.2, quiet.station.stop).start()
+        quiet.station.run()
+        self.assertEqual(quiet.radio.count("set_country"), 0)
+        bench = Bench([FakeAP()], start=False)
+        bench.station.options["country"] = "CA"
+        bench.radio.wait = lambda timeout: (__import__("time").sleep(0.02), [])[1]
+        bench.station.now = __import__("time").monotonic
+        threading.Timer(0.2, bench.station.stop).start()
+        bench.station.run()
+        self.assertEqual([c[1] for c in bench.radio.calls if c[0] == "set_country"], [("CA",)])
+        self.assertLess(bench.radio.names().index("set_country"), bench.radio.names().index("disconnect"))
+        self.assertTrue(any("country set to CA" in line for line in bench.logs))
+
+    def test_a_refused_country_does_not_stop_the_station(self):
+        bench = Bench([FakeAP()], start=False)
+        bench.station.options["country"] = "CA"
+        bench.radio.country_error = OSError(errno.EPERM, "denied")
+        bench.radio.wait = lambda timeout: (__import__("time").sleep(0.02), [])[1]
+        bench.station.now = __import__("time").monotonic
+        threading.Timer(0.2, bench.station.stop).start()
+        bench.station.run()
+        self.assertIsNone(bench.station.error)
+        self.assertTrue(any("could not set the regulatory country" in line for line in bench.logs))
 
     def test_signal_is_polled_while_connected(self):
         bench = Bench([FakeAP()]).run(12)
@@ -1425,6 +1504,9 @@ class SelftestTests(unittest.TestCase):
             def __init__(self, iface, subscribe=True):
                 pass
 
+            def power_save(self):
+                return True
+
             def get_scan(self):
                 if isinstance(scan, Exception):
                     raise scan
@@ -1601,8 +1683,8 @@ class ServiceIntegration(unittest.TestCase):
 
         real_station, real_control = net.Station, net.ControlServer
 
-        def make_station(driver, load_profiles, log):
-            stations.append(real_station(driver, load_profiles, log))
+        def make_station(driver, load_profiles, log, options=None):
+            stations.append(real_station(driver, load_profiles, log, options=options))
             return stations[0]
 
         def client():

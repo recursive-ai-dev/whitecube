@@ -814,6 +814,19 @@ class ProfileRegression(unittest.TestCase):
         self.assertRegex(net.profile_id("EMPIRE"), r"^[0-9a-f]{16}$")
         self.assertNotEqual(net.profile_id("EMPIRE"), net.profile_id("empire"))
 
+    def test_country_and_power_save_are_validated_and_passed_to_the_station(self):
+        root = Path(self.tmp.name) / "root2"
+        (root / "etc/whitecube/network").mkdir(parents=True)
+        path = root / "etc/whitecube/network/device.json"
+        path.write_text(json.dumps(dict(net.DEFAULT_DEVICE, country="CA", power_save=True)))
+        config = net.device_config(root)
+        self.assertEqual(net.station_options(config), {"country": "CA", "power_save": True})
+        self.assertEqual(net.station_options(net.DEFAULT_DEVICE), {"country": None, "power_save": False})
+        for bad in ({"country": "canada"}, {"country": "ca"}, {"country": 5}, {"power_save": "yes"}):
+            path.write_text(json.dumps(dict(net.DEFAULT_DEVICE, **bad)))
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                net.device_config(root)
+
     def test_device_scope_is_still_enforced(self):
         root = Path(self.tmp.name) / "root"
         (root / "etc/whitecube/network").mkdir(parents=True)
@@ -856,6 +869,16 @@ class FileTests(unittest.TestCase):
             self.assertNotIn(needle, source, needle)
         self.assertEqual(net.audit(Path("/nonexistent"))["unused_wpa_binaries_present"], {"wpa_supplicant": False, "wpa_cli": False})
         self.assertNotIn("wpa_supplicant", net.audit(Path("/nonexistent"))["binaries"])
+
+    def test_the_staged_hardening_dropin_is_optional_and_keeps_what_both_processes_need(self):
+        text = (HERE / "whitecube-network.hardening.conf").read_text()
+        values = dict(l.split("=", 1) for l in text.splitlines() if "=" in l and not l.startswith("#"))
+        caps = set(values["CapabilityBoundingSet"].split())
+        self.assertTrue({"CAP_NET_ADMIN", "CAP_NET_RAW", "CAP_NET_BIND_SERVICE"} <= caps)      # netlink, EAPOL, DHCP port 68
+        self.assertTrue({"CAP_SETUID", "CAP_SETGID", "CAP_SYS_CHROOT"} <= caps)               # dhcpcd privilege separation
+        self.assertNotIn("CAP_SYS_ADMIN", caps)
+        self.assertEqual(values["MemoryDenyWriteExecute"], "yes")
+        self.assertNotIn("net/whitecube-network.hardening.conf", (HERE / "apply.sh").read_text())   # never installed by apply.sh
 
     def test_the_wifi_tests_are_part_of_the_build(self):
         self.assertIn("net/test_cube_wifi.py", (REPO / "BUILD.sh").read_text())
@@ -1295,8 +1318,8 @@ class FakeStation:
     script = staticmethod(lambda t: {"state": "COMPLETED", "ssid": "EMPIRE", "rssi": -50})
     clock = None
 
-    def __init__(self, driver, load_profiles, log):
-        self.driver, self.load_profiles, self.log = driver, load_profiles, log
+    def __init__(self, driver, load_profiles, log, options=None):
+        self.driver, self.load_profiles, self.log, self.options = driver, load_profiles, log, options
         self.error, self.calls, self.halt = None, [], threading.Event()
         FakeStation.instances.append(self)
 

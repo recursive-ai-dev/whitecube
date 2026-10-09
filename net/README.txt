@@ -37,6 +37,18 @@ writes networks.json (with a 0600 backup of the previous one).
 Journal lines are now "wifi_state SCANNING -> COMPLETED" (was wpa_state) plus "wifi: ..." lines for
 connect attempts, refusals, link loss and handshake problems. No SSIDs, passphrases or keys.
 
+OPTIONS in /etc/whitecube/network/device.json (all optional; the file must stay root-owned)
+  "country": "CA"        set the regulatory domain once at service start (otherwise the kernel flips
+                         WORLD <-> the AP's country on every reassociation)
+  "power_save": true     keep radio power-save on (default: it is switched OFF after each connection;
+                         on this dongle it was ON and is the suspected cause of the 40-700 ms jitter)
+  `cube-net selftest` shows the current power-save state. Compare: ping -c 50 10.0.0.1 before/after.
+
+OPTIONAL HARDENING: net/whitecube-network.hardening.conf is a staged systemd drop-in (capability bounding
+set, PrivateDevices, ProtectKernelTunables, MemoryDenyWriteExecute): exposure 6.1 -> 4.6 offline. cube-net and
+its tests were run with the same MDWE kernel flag set and pass; dhcpcd under it is UNTESTED, hence a drop-in
+that apply.sh never installs (install/undo commands are in the file).
+
 TRY IT WITHOUT RISK, BEFORE INSTALLING
   python3 -I net/cube-net selftest        no root, changes nothing: crypto test vectors, real
                                           netlink to the kernel, decodes the live scan cache and says

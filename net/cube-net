@@ -92,7 +92,16 @@ def device_config(root=Path("/")):
         raise ValueError("This controller expects the audited rtw88_8822cu driver")
     if any(config.get(key) != value for key, value in DEFAULT_DEVICE.items()):
         raise ValueError('This Whitecube build is scoped to USB 2001:3329, MAC 88:76:b9:f2:9d:29 and rtw88_8822cu.')
+    if 'country' in config and not (isinstance(config['country'], str) and re.fullmatch(r'[A-Z]{2}', config['country'])):
+        raise ValueError('Invalid configured country: use a two-letter ISO code such as "CA".')
+    if 'power_save' in config and not isinstance(config['power_save'], bool):
+        raise ValueError('Invalid configured power_save: use true or false.')
     return config
+
+
+def station_options(config):
+    """What device.json may tune: country (regulatory domain, unset = leave to the kernel) and power_save."""
+    return {'country': config.get('country'), 'power_save': config.get('power_save', False)}
 
 
 def interfaces(sysfs=Path("/sys")):
@@ -1065,6 +1074,8 @@ ETH_P_PAE, PACKET_OUTGOING = 0x888E, 4
 CMD_GET_INTERFACE, CMD_SET_KEY, CMD_NEW_KEY, CMD_DEL_KEY, CMD_GET_STATION, CMD_SET_STATION = 5, 10, 11, 12, 17, 18
 CMD_GET_SCAN, CMD_TRIGGER_SCAN, CMD_NEW_SCAN_RESULTS, CMD_SCAN_ABORTED = 32, 33, 34, 35
 CMD_CONNECT, CMD_DISCONNECT = 46, 48
+CMD_REQ_SET_REG, CMD_SET_POWER_SAVE, CMD_GET_POWER_SAVE = 27, 61, 62
+A_REG_ALPHA2, A_PS_STATE = 33, 93
 A_IFINDEX, A_MAC, A_KEY, A_STA_INFO, A_BSS, A_WIPHY_FREQ = 3, 6, 80, 21, 47, 38
 A_SCAN_SSIDS, A_SSID, A_IE, A_AUTH_TYPE, A_REASON_CODE, A_STATUS_CODE = 45, 52, 42, 53, 54, 72
 A_PRIVACY, A_USE_MFP, A_WPA_VERSIONS, A_CIPHER_PAIRWISE, A_CIPHER_GROUP, A_AKM = 70, 66, 75, 73, 74, 76
@@ -1306,6 +1317,22 @@ class Nl80211Driver:
     def delete_group_key(self, index):
         self._do(CMD_DEL_KEY, nla_nest(A_KEY, nla_u8(K_IDX, index)))
 
+    def set_power_save(self, enabled):
+        self._do(CMD_SET_POWER_SAVE, nla_u32(A_PS_STATE, 1 if enabled else 0))
+
+    def power_save(self):
+        """True/False from the kernel, or None when it cannot say."""
+        try:
+            for _, attrs in self._do(CMD_GET_POWER_SAVE):
+                if len(attrs.get(A_PS_STATE, b'')) == 4:
+                    return bool(struct.unpack('=I', attrs[A_PS_STATE])[0])
+        except OSError:
+            pass
+        return None
+
+    def set_country(self, alpha2):
+        self.commands.request(self.family, CMD_REQ_SET_REG, nla(A_REG_ALPHA2, alpha2.encode('ascii') + b'\0'))
+
     def authorize(self, bssid):
         flag = 1 << STA_FLAG_AUTHORIZED
         self._do(CMD_SET_STATION, nla(A_MAC, mac_bytes(bssid)), nla(A_STA_FLAGS2, struct.pack('=II', flag, flag)))
@@ -1354,8 +1381,9 @@ class Station:
     USER_SCAN_WAIT = 8
     IDLE_POLL = 0.25
 
-    def __init__(self, driver, load_profiles, log, now=time.monotonic, pause=time.sleep):
+    def __init__(self, driver, load_profiles, log, now=time.monotonic, pause=time.sleep, options=None):
         self.driver, self.load_profiles, self.log, self.now, self.pause = driver, load_profiles, log, now, pause
+        self.options = {'country': None, 'power_save': False, **(options or {})}
         self.lock = threading.Lock()
         self.state, self.ssid, self.rssi = 'INACTIVE', None, None
         self.profiles = {}                 # ssid bytes -> 32-byte PMK
@@ -1400,6 +1428,12 @@ class Station:
     def run(self):
         try:
             self.driver.bring_up()
+            if self.options['country']:
+                try:
+                    self.driver.set_country(self.options['country'])
+                    self.log(f"wifi: regulatory country set to {self.options['country']}")
+                except OSError as error:
+                    self.log(f"wifi: could not set the regulatory country ({error.strerror or error})")
             try:
                 self.driver.disconnect()     # a link left over from an earlier run is not ours to keep
             except OSError:
@@ -1635,6 +1669,7 @@ class Station:
                 self.signal_due = now
                 self._set('COMPLETED', self.target['ssid'].decode('utf-8', 'replace')[:64])
                 self.log('wifi: handshake complete, link authorized')
+                self._apply_power_save()
             elif kind == 'group_done':
                 self.log('wifi: group key updated')
             elif kind == 'ignore':
@@ -1643,6 +1678,13 @@ class Station:
                 self._ban(now, self.target['bssid'])
                 self._fail(now, action[1])
                 return
+
+    def _apply_power_save(self):
+        """Radio power-save adds latency and jitter on this dongle; off unless device.json asks for it."""
+        try:
+            self.driver.set_power_save(bool(self.options['power_save']))
+        except OSError as error:
+            self.log(f"wifi: could not change power save ({error.strerror or error}); the link is unaffected")
 
     def _disconnected(self, now, reason, by_ap):
         if self.state == 'DISCONNECTING':
@@ -1839,6 +1881,9 @@ def selftest():
         check('nl80211 is reachable', True, f'family {driver.family}, address {mac_str(driver.mac)}')
         found = driver.get_scan()
         check('the kernel scan cache decodes', True, f'{len(found)} access point(s)')
+        saving = driver.power_save()
+        print(f"note radio power save is {'unknown' if saving is None else 'on' if saving else 'off'}"
+              + ('; the service turns it off after connecting (device.json "power_save": true keeps it on)' if saving else ''))
     except OSError as error:
         check('the kernel scan cache decodes', False, error.strerror or str(error))
         return len(failures)
@@ -2287,7 +2332,7 @@ def run_service():
             raise RuntimeError("Refusing to compete with existing controller(s): " + ", ".join(conflicts))
         print(f"Managing {iface} with the built-in WPA2 station and the existing {config['driver']} module", flush=True)
         driver = Nl80211Driver(iface)
-        station = Station(driver, load_profiles, log)
+        station = Station(driver, load_profiles, log, options=station_options(config))
         thread = threading.Thread(target=station.run, name="cube-net-wifi", daemon=True)
         thread.start()
         control = ControlServer(RUNTIME_DIR / "control.sock", station)
