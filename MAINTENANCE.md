@@ -185,3 +185,10 @@ under build/privacy-install-before-*, with installed hashes also recorded in
 files already replaced. It never stops the compositor; log out and back in to
 activate the complete upgrade. New Settings windows can use the installed binary
 immediately. Source backup: build/privacy-before-20261008-090356.tar.gz.
+
+## Health check, cleanup, hooks
+`whitecube-doctor` (read-only, no root; `--json` available) reports firewall output policy, the Wi-Fi
+controller, competing network managers, wpa_supplicant leftovers, installed-vs-source drift and
+over-broad passwordless sudo, each with the fix command. Tests: python3 -I test-doctor.py.
+`tools/clean.sh [--apply]` removes __pycache__ and build/. `tools/install-hooks.sh` enables the
+pre-commit hook that runs the pure-Python suites (git config core.hooksPath tools/hooks).

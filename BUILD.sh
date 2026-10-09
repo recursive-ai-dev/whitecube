@@ -67,6 +67,7 @@ fi
 python3 -I net/test_cube_net.py
 python3 -I net/test_cube_wifi.py
 python3 -I test-privacy.py
+python3 -I test-doctor.py
 python3 -I test-install.py
 bash -n net/apply.sh
 printf 'Built: %s/build/{whitecube,cube-ca,cube-settings,cube-status}; previews: build/cube-space.ppm build/{bar,menu,menu-search}.png\n' "$native_dir"

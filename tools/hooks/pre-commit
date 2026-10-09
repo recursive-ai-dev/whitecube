@@ -4,7 +4,7 @@
 # Skip once, knowingly, with: git commit --no-verify
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-for t in net/test_cube_net.py net/test_cube_wifi.py test-privacy.py test-install.py; do
+for t in net/test_cube_net.py net/test_cube_wifi.py test-privacy.py test-doctor.py test-install.py; do
   out=$(python3 -I "$t" 2>&1) || { printf '%s\n' "$out" | tail -25; echo "pre-commit: $t failed; commit refused" >&2; exit 1; }
 done
 echo "pre-commit: python test suites passed"
