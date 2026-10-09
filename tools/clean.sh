@@ -7,7 +7,7 @@
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 apply=0; [[ ${1:-} == --apply ]] && apply=1
-products=(whitecube cube-ca cube-settings cube-status workspace-test workspace-test.c desktop-state-test compositor-test
+products=(whitecube cube-ca cube-settings cube-status workspace-test workspace-test.c desktop-state-test compositor-test hotplug-test
           status-theme-test settings-test cube-space.ppm bar.png menu.png menu-search.png quick.png chat.png power.png toolchain)
 mapfile -t targets < <(find "$here" -path "$here/.git" -prune -o \( -name __pycache__ -type d -o -name '*.pyc' -type f \) -print
   for d in build-asan build-cairo; do [[ -d $here/$d ]] && echo "$here/$d"; done

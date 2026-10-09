@@ -64,10 +64,12 @@ python3 workspace-test.py > $out/workspace-test.c
 "$cc" "${flags[@]}" $out/workspace-test.c -o $out/workspace-test
 "$cc" "${flags[@]}" desktop-state-test.c -o $out/desktop-state-test
 "$cc" "${flags[@]}" -DWLR_USE_UNSTABLE compositor-test.c -o $out/compositor-test "${compositor_flags[@]}" -lm
+"$cc" "${flags[@]}" -DWLR_USE_UNSTABLE hotplug-test.c -o $out/hotplug-test "${compositor_flags[@]}" -lm
 "$cc" "${flags[@]}" status-theme-test.c -o $out/status-theme-test -lm
 "$cc" "${flags[@]}" settings-test.c xdg-shell-protocol.c wlr-output-management-protocol.c -o $out/settings-test "${settings_flags[@]}" -lm
 if [[ -n $sysroot ]]; then
 	"$loader" --library-path "$libpath" $out/compositor-test
+	WLR_RENDERER=pixman "$loader" --library-path "$libpath" $out/hotplug-test
 	"$loader" --library-path "$libpath" $out/status-theme-test
 	"$loader" --library-path "$libpath" $out/settings-test
 	"$loader" --library-path "$libpath" $out/cube-status --selftest
@@ -78,6 +80,7 @@ if [[ -n $sysroot ]]; then
   "$loader" --library-path "$libpath" $out/cube-status --render "$out" >/dev/null
 else
 	$out/compositor-test
+	WLR_RENDERER=pixman $out/hotplug-test      # real wlroots headless backend: outputs added and removed at runtime
 	$out/status-theme-test
 	$out/settings-test
 	$out/cube-status --selftest
