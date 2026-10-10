@@ -1,0 +1,48 @@
+Whitecube Desktop 0.5.0 — panel and chat update (2026-10-10)
+
+The 22 improvements in this release:
+
+ 1. Chat launches from the packaged command rather than the development PATH.
+ 2. The Debian package includes a private Electron runtime and its library dependencies.
+ 3. Chromium's sandbox helper is shipped root-owned with mode 4755, supporting hosts
+    with unprivileged user namespaces disabled; sandboxing stays enabled.
+ 4. Chat is immediately beside the networking button, with shared responsive geometry.
+ 5. The Chat dropdown opens below its button and is clamped to the display width.
+ 6. All windows stay under one workspace tab-count button, including zero/one-tab states.
+ 7. Opening the tab list selects and scrolls to the focused window.
+ 8. Alt+G, arrows, Tab, Home/End, PageUp/PageDown, Enter and Delete control the tab list.
+ 9. Tab rows show their number, focused-window marker, hidden status and selection.
+10. Launching Chat normally from an application menu shows the window immediately.
+11. Open Chat explicitly shows Chat, so repeated clicks do not hide it.
+12. Missing keys, invalid settings and IPC failures release the send controls and show errors.
+13. Overlapping replies and New Chat during a reply are blocked; working/stopping status is visible.
+14. Stop reply cancels tool confirmations and retry waits without executing cancelled tools.
+15. Test uses unsaved fields, validates model-list responses and checks exact model IDs.
+16. Settings validate HTTP(S) endpoints/model names and normalize completion URLs to base URLs.
+17. Clearing the API key preserves endpoint, model, hotkey and confirmation preferences.
+18. Configuration saves are atomic and private; basic_text storage is honestly labeled plaintext.
+19. Dialogs trap keyboard focus, expose accessible labels, and return focus when dismissed;
+    Ctrl+N and Ctrl+, provide New Chat and Settings shortcuts.
+20. Unsent drafts are restored across app restarts.
+21. Reading history preserves the scroll position; Jump to latest resumes following responses.
+22. Completed assistant replies have a Copy reply button, alongside the existing code Copy button.
+
+Validation:
+  ./BUILD.sh: compositor, output hotplug, theme, settings, network, workspace,
+  privacy, packaging, migration and editor checks, plus Desktop Chat's Node tests.
+  tests/test-desktop-chat-ui.cjs: actual Electron/Wayland renderer using an isolated
+  profile and local mock API, including missing-key recovery, edited settings,
+  Markdown/streaming, Stop during tool confirmation, drafts and scrolling.
+  tests/session-lock-test.py: isolated two-output lock lifecycle and real swaylock.
+  packaging/check-chat-runtime.py: runtime/locale/licenses/launcher/sandbox/library checks.
+
+Runtime policy:
+  Native compositor/bar/settings/wallpaper remain linked against private X-free Cairo
+  and wlroots. Existing Electron Chat uses Chromium's distribution GTK/X compatibility
+  libraries, but launches exclusively with Ozone Wayland and DISPLAY unset. It starts
+  neither XWayland nor a D-Bus daemon. Runtime licenses are included in the package.
+
+Activation:
+  Installing updates /usr system-wide and retains per-user settings. Log out and back
+  in to activate the compositor's grouped tabs and Alt+G. The bar can be refreshed
+  independently so the moved Chat button is available without closing windows.

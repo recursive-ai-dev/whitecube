@@ -1,0 +1,86 @@
+Whitecube Trainer — native small-model workshop (whitecube-desktop 0.6.1)
+
+The complete local Tensegrity pipeline is now in apps/cube-train/pipeline.
+Installed files live in /usr/share/whitecube/cube-train, with cube-train as the
+native GTK4 app and whitecube-train as the command-line entry point.
+
+Twenty improvements
+
+1. A GTK4/libadwaita Wayland app, styled with the shared Whitecube native theme,
+   registered in Applications with its own launcher and icon.
+2. 1M, 2M, 5M and 10M model choices, checked against actual model parameter counts:
+   1,005,768; 1,981,512; 4,987,448; 10,034,184. Legacy 4M/8M runs remain supported.
+3. Model shape and FP32 weight size shown before starting a run.
+4. Native folder/file selection and an asynchronous corpus inspection summary.
+5. Validation of supported/empty corpus files, token caps and numeric settings,
+   plus a conservative free-disk budget before starting.
+6. GPU/CPU selection, batch size, gradient accumulation and CPU thread controls.
+7. Asynchronous runtime checks for PyTorch, CUDA/GPU name and Parquet support,
+   with an editable Python environment shared with Chat.
+8. Cancellable corpus preparation that cleans unfinished temporary data.
+9. Stop finishes the current optimizer step and saves usable weights; stopping
+   before training has begun is reported without claiming a saved checkpoint.
+10. Adjustable GPU and CPU temperature stops, plus temperature/memory telemetry.
+11. The existing global training lock also prevents competing legacy train jobs.
+12. Independent background workers survive closing/reopening the app; process
+    birth identity is checked before a saved job can be signalled.
+13. Persistent run states, live completed/target steps, training loss and logs.
+14. A native loss graph with training and validation series.
+15. Bounded log/metric reads, optional follow output, and preserved reading position.
+16. Resume reuses architecture, corpus and optimizer state, validates a larger
+    total step target, and preserves the saved LR horizon unless explicitly set.
+17. Atomic private settings, automatic form preference saving and saved defaults.
+18. Editable friendly run names with stable folders/checkpoint IDs; Chat uses
+    those names unless a checkpoint already has its own explicit alias.
+19. Native CPU checkpoint previews and Chat with Best/Latest buttons that select
+    the exact checkpoint in a new or already running Desktop Chat instance.
+20. JSON run reports, clipboard actions, and keyboard shortcuts: Ctrl+1/2/3 for
+    pages, Ctrl+N for a new run, Ctrl+Enter to start, and F5 to refresh.
+
+Additional requested model management
+
+Delete opens a confirmation dialog for an entire run, Best checkpoint, or Latest
+checkpoint. The selected files move to the standard user Trash. Active training
+blocks removal. Removing Latest disables Resume until Latest is restored, so a
+request to continue training cannot silently restart with random weights.
+
+Optional heat and workload controls
+
+Enable "Stagger training with cooling breaks" to set a training burst and a
+pause, e.g. 30 seconds of work followed by 10 seconds of cooling. Breaks start
+after a complete optimizer step; temperature checks and Stop remain active.
+The last step does not add an unnecessary break. Closing the window leaves the
+background job and its pacing active. These choices also apply to Resume.
+
+"Give training lower CPU and disk priority" uses nice 10 and idle I/O scheduling
+for the training process. It does not change other apps' priorities or NVIDIA
+power settings. CPU priority alone does not limit GPU workload; timed cooling
+breaks reduce sustained work, with the temperature limits retained as stops.
+Smaller batches and fewer CPU threads are available in Advanced settings.
+
+  whitecube-train --2m --burst-seconds 30 --cooldown-seconds 10 --low-priority
+
+Pipeline integrity
+
+Corpora are streamed with a token cap and a seeded document-group validation
+split. Duplicate documents stay in the same split. Checkpoints retain the model,
+optimizer, RNG, scaler and schedule states needed by the existing resume path.
+The local models are byte-level prose models with a 256-byte context; larger
+parameter counts do not automatically make them instruction/chat models.
+
+No corpus or trained weights are included in the Debian package. Existing data
+stays in ~/train-in and ~/train-out; the model code ships with the desktop.
+The native window runs with system GTK. Training/inference reuse the configured
+PyTorch environment, including the existing CUDA environment on this machine.
+For CPU-only installations, python3-torch and python3-numpy are optional package
+suggestions. Parquet input additionally needs pyarrow in the chosen environment.
+
+Example command-line runs (choose the corpus and step budget for your dataset):
+  whitecube-train --2m
+  whitecube-train --5m --steps 1000
+  whitecube-train --10m --device cpu --cpu-threads 2
+  whitecube-train --resume ~/train-out/<run-id> --steps 2000
+
+Source provenance: the user's installed ~/.local/share/tensegrity pipeline was
+copied into Whitecube, preserving its model and preparation implementations.
+The original usage notes are retained as pipeline/LEGACY-USAGE.txt.

@@ -1,0 +1,15 @@
+#!/usr/bin/python3 -I
+"""Command-line entry to the same pipeline used by Whitecube Trainer."""
+import os
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parent.parent
+for directory in (root / 'apps/cube-train', root / 'share/whitecube/cube-train'):
+    if (directory / 'engine.py').is_file():
+        sys.path.insert(0, str(directory))
+        import engine
+        executable = engine.Trainer().preferences()['python']
+        os.execv(executable, [executable, '-u', str(directory / 'pipeline/train_supervisor.py'), *sys.argv[1:]])
+print('whitecube-train: pipeline files are missing; reinstall whitecube-desktop', file=sys.stderr)
+raise SystemExit(1)

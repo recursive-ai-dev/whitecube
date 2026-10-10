@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Chrootables
+GenericName=Debian Workspaces
+Comment=Create, enter, snapshot and share Debian chroot workspaces
+Exec=/usr/bin/chrootables
+TryExec=/usr/bin/chrootables
+Icon=chrootables
+Terminal=false
+Categories=System;Development;
+Keywords=chroot;Debian;debootstrap;workspace;snapshot;sandbox;container;
+StartupNotify=true
+StartupWMClass=org.whitecube.Chrootables
+X-Wayland-Native=true

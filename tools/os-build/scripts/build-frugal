@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# whitecube build-frugal — interactive frugal overlay system builder
+# Walks you through creating a Puppy-style frugal system with optional
+# kernel, initrd, ESP, bootloader, and encryption.
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/lib.sh"
+
+require_whitecube
+
+header "Build Frugal Overlay System"
+echo " This creates a base.sfs (squashfs) + save.img (ext4) overlay system."
+
+# ── step 1: system name ───────────────────────────────────────────────────────
+name=$(prompt "System name" "myfrugal")
+name="${name// /_}"
+
+if whitecube info "$name" &>/dev/null; then
+    die "System '$name' already exists"
+fi
+
+# ── step 2: base source ───────────────────────────────────────────────────────
+echo -e "\n ${DIM}Base source: where does the read-only data come from?${RST}"
+src_type=$(select_one "Base source type" \
+    "empty (start fresh)" \
+    "ISO file (extract to squashfs)" \
+    "directory (snapshot to squashfs)" \
+    "existing squashfs file")
+
+base_src=""
+case "$src_type" in
+    "empty (start fresh)")
+        info "An empty base will be created — you can populate it later."
+        ;;
+    "ISO file (extract to squashfs)")
+        base_src=$(prompt "Path to ISO file" "")
+        [[ -f "$base_src" ]] || die "File not found: $base_src"
+        ;;
+    "directory (snapshot to squashfs)")
+        base_src=$(prompt "Path to directory" "/")
+        [[ -d "$base_src" ]] || die "Directory not found: $base_src"
+        ;;
+    "existing squashfs file")
+        base_src=$(prompt "Path to .sfs file" "")
+        [[ -f "$base_src" ]] || die "File not found: $base_src"
+        ;;
+esac
+
+# ── step 3: sizes ─────────────────────────────────────────────────────────────
+size=$(prompt "Save layer size (the writable overlay)" "2G")
+save_size=$(prompt "Save image size (can differ from total)" "$size")
+
+# ── step 4: boot components ───────────────────────────────────────────────────
+echo ""
+if confirm "Include a bootloader (StringsBoot UEFI)?" "y"; then
+    bootloader="--bootloader"
+    if confirm "Create an isolated ESP image?" "y"; then
+        auto_esp="--auto-esp"
+        kernel=$(prompt "Path to kernel (vmlinuz)" "")
+        [[ -n "$kernel" && -f "$kernel" ]] || die "Kernel not found or not specified"
+        initrd=$(prompt "Path to initrd (optional)" "") || true
+        esp_size=$(prompt "ESP size" "256M")
+    else
+        auto_esp=""
+        kernel=""
+        initrd=""
+        esp_size=""
+    fi
+else
+    bootloader=""
+    auto_esp=""
+    kernel=""
+    initrd=""
+    esp_size=""
+fi
+
+# ── step 5: encryption ────────────────────────────────────────────────────────
+encrypt=""
+if confirm "Encrypt the save layer with LUKS2?" "n"; then
+    encrypt="--encrypt"
+fi
+
+# ── step 6: review ─────────────────────────────────────────────────────────────
+header "Review"
+echo "  Name:       $name"
+echo "  Base:       ${base_src:-empty}"
+echo "  Size:       $size (save: $save_size)"
+echo "  Bootloader: ${bootloader:-no}"
+echo "  Auto ESP:   ${auto_esp:-no}"
+echo "  Kernel:     ${kernel:-none}"
+echo "  Initrd:     ${initrd:-none}"
+echo "  Encrypt:    ${encrypt:-no}"
+echo ""
+
+if ! confirm "Create this system?" "Y"; then
+    die "Cancelled."
+fi
+
+# ── step 7: build ──────────────────────────────────────────────────────────────
+header "Building"
+
+# Create the frugal system
+# `whitecube new --from` accepts a directory, a .sfs archive or an .iso directly,
+# so all three source kinds take the same path.  The old directory branch tried
+# to run `whitecube snap <dir> --output <name>` first, but `snap` takes a system
+# name and has no --output flag, so that branch could never succeed.
+if [[ -n "$base_src" ]]; then
+    info "Creating frugal system from: $base_src"
+    whitecube new "$name" --type frugal --size "$size" \
+        --save-size "$save_size" \
+        ${bootloader:+--bootloader} \
+        ${auto_esp:+--auto-esp} \
+        ${kernel:+--boot-kernel "$kernel"} \
+        ${initrd:+--boot-initrd "$initrd"} \
+        ${encrypt:+--encrypt} \
+        --from "$base_src"
+else
+    info "Creating empty frugal system..."
+    whitecube new "$name" --type frugal --size "$size" \
+        --save-size "$save_size" \
+        ${bootloader:+--bootloader} \
+        ${auto_esp:+--auto-esp} \
+        ${kernel:+--boot-kernel "$kernel"} \
+        ${initrd:+--boot-initrd "$initrd"} \
+        ${encrypt:+--encrypt}
+fi
+
+# The kernel and initrd are installed into the system directory by
+# `whitecube new --boot-kernel/--boot-initrd` above, and `whitecube run` boots from
+# them directly.  The previous block here read a meta key ("esp") that nothing
+# ever wrote, so it was always a no-op.
+if [[ -n "${initrd:-}" ]]; then
+    if whitecube info "$name" --json 2>/dev/null | grep -q '"initrd"'; then
+        ok "Initrd installed for direct-kernel boot"
+    else
+        warn "Initrd was not recorded for '$name'"
+    fi
+fi
+
+echo ""
+ok "Frugal system '$name' created!"
+sub "  whitecube run $name --mode vm"
+sub "  whitecube run $name --mode container"
+if [[ -n "${kernel:-}" ]]; then
+    sub "  whitecube run $name --uefi --kernel $kernel"
+fi
+echo ""
+sub "Frugal management:"
+sub "  whitecube frugal snapshot $name [--label mylabel]"
+sub "  whitecube frugal merge $name"
+sub "  whitecube frugal list $name"
+done_msg

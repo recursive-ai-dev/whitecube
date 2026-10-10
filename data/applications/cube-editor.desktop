@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Cube Editor
+GenericName=Linux ISO Studio
+Comment=Inspect, customize, rebuild and test Linux ISO images
+Exec=/usr/bin/cube-editor
+TryExec=/usr/bin/cube-editor
+Icon=cube-editor
+Terminal=false
+Categories=System;
+Keywords=ISO;Linux;Live;Image;Remaster;Cubic;Build;QEMU;
+StartupNotify=true
+StartupWMClass=org.whitecube.CubeEditor
+X-Wayland-Native=true

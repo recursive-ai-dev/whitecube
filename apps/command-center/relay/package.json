@@ -1,0 +1,20 @@
+{
+  "name": "command-center-relay",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node dist/index.js",
+    "test": "npm run build && node --test dist/server.test.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "dbus-next": "^0.10.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.14.0",
+    "typescript": "~5.8.2"
+  }
+}

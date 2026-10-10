@@ -1,0 +1,5 @@
+{
+  "name": "Whitecube Command Center",
+  "description": "A Wayland desktop command center for Whitecube on Ubuntu and Debian to manage scripts, executables, and path configurations with an integrated terminal.",
+  "requestFramePermissions": []
+}

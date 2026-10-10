@@ -1,0 +1,51 @@
+#!/bin/sh
+# Whitecube session boot chain. Runs ordered stages, logs each one, and never lets a failed
+# stage block the desktop. Hook it in whitecube-session's `clients` line (see boot/README.md).
+# Stages: wayland socket -> wallpaper (free API, 123% watermark crop) -> swaybg -> bar/ca -> command center.
+set -u
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+lab=$(CDPATH= cd -- "$here/.." && pwd)
+state="${XDG_STATE_HOME:-$HOME/.local/state}/whitecube"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/whitecube"
+mkdir -p -m 700 "$state" "$cache"
+log="$state/bootchain.log"
+: > "$log"
+
+stage() { # stage NAME COMMAND...   -> logs ok/fail with elapsed seconds
+  name=$1; shift
+  t0=$(date +%s)
+  if "$@" >>"$log" 2>&1; then r=ok; else r="fail($?)"; fi
+  printf '%s %-12s %s %ss\n' "$(date +%T)" "$name" "$r" "$(( $(date +%s) - t0 ))" | tee -a "$log" >&2
+}
+
+wait_wayland() {
+  i=0
+  while [ $i -lt 50 ]; do
+    [ -n "${WAYLAND_DISPLAY:-}" ] && [ -S "${XDG_RUNTIME_DIR:-/nonexistent}/$WAYLAND_DISPLAY" ] && return 0
+    i=$((i + 1)); sleep 0.1
+  done
+  return 1
+}
+
+refresh_wallpaper() {
+  size=${WHITECUBE_SIZE:-1920x1080}
+  # Fresh image when the network answers; otherwise keep yesterday's.
+  timeout 25 python3 "$here/make-boot-bg.py" --fetch --size "$size" --out "$cache/wallpaper.new.png" \
+    && mv -f "$cache/wallpaper.new.png" "$cache/wallpaper.png"
+  [ -f "$cache/wallpaper.png" ]
+}
+
+show_wallpaper() {
+  command -v swaybg >/dev/null 2>&1 || return 1
+  swaybg -i "$cache/wallpaper.png" -m fill &
+}
+
+start_if_present() { command -v "$1" >/dev/null 2>&1 || return 1; "$@" & }
+
+stage wayland    wait_wayland || exit 1
+stage wallpaper  refresh_wallpaper
+stage swaybg     show_wallpaper
+stage cube-ca    start_if_present cube-ca
+stage cube-status start_if_present cube-status
+stage whitecube-command-center sh -c "[ -f '$lab/dist/index.html' ] && '$lab/whitecube-command-center.sh' &"
+wait

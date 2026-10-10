@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=ca.smddev.CommandCenter1
+Exec=/usr/local/libexec/command-center/command-center-helperd
+User=root
+SystemdService=command-center-helperd.service

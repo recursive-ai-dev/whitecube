@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Whitecube
+Description=Near-black smoked glass, red wordmark and progress bar. Includes the disk passphrase prompt.
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/whitecube
+ScriptFile=/usr/share/plymouth/themes/whitecube/whitecube.script

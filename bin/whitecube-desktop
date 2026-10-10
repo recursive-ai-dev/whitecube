@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Keyboard-accessible native display preferences and reviewable settings recovery."""
+import json
+import os
+from pathlib import Path
+import sys
+
+base = Path('/usr/share/whitecube/workspace')
+if not (base / 'desktop_state.py').is_file():
+    base = Path(__file__).resolve().parent.parent / 'workspace'
+sys.path.insert(0, str(base))
+from desktop_state import DesktopStore
+from recovery import RecoveryConsole
+from workspace_data import atomic_json
+
+state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'whitecube'
+store = DesktopStore(state)
+console = RecoveryConsole(state=state)
+
+
+def main():
+    while True:
+        settings = store.get_settings()
+        print('\nWHITECUBE / DISPLAY AND RECOVERY\n')
+        print(f"UI scale {settings['ui_scale']}; terminal scale {settings['terminal_scale']}; contrast {settings['contrast']}; reduced motion {settings['reduced_motion']}")
+        print('u  UI scale (.8..1.6)   t  Terminal scale (.8..2)\nc  Toggle strong contrast   m  Toggle reduced motion\nn  Rename native workspaces   b  Create settings backup\nl  List backups   v  Verify backup   r  Review and restore backup\nq  Return to desktop')
+        try:
+            choice = input('Choice > ').strip().lower()
+            if choice == 'q':
+                return
+            if choice in ('u', 't'):
+                key = 'ui_scale' if choice == 'u' else 'terminal_scale'
+                settings[key] = float(input('Scale > '))
+                store.save_settings(settings)
+            elif choice == 'c':
+                settings['contrast'] = 'strong' if settings['contrast'] == 'normal' else 'normal'
+                store.save_settings(settings)
+            elif choice == 'm':
+                settings['reduced_motion'] = not settings['reduced_motion']
+                store.save_settings(settings)
+            elif choice == 'n':
+                names = []
+                for index, default in enumerate(['Coding', 'Play', 'Monitor', 'Browse']):
+                    name = input(f'Workspace {index + 1} ({default}) > ').strip() or default
+                    encoded = name.encode('utf-8')
+                    if len(encoded) > 63 or any(ord(char) < 32 or ord(char) == 127 for char in name):
+                        raise ValueError('Workspace names must be at most 63 UTF-8 bytes with no control characters')
+                    names.append(encoded.hex())
+                atomic_json(state / 'native-names.json', {f'w{i}': value for i, value in enumerate(names)})
+            elif choice == 'b':
+                print(json.dumps(console.create(input('Backup label > ')), indent=2))
+            elif choice == 'l':
+                print(json.dumps(console.list(), indent=2))
+            elif choice in ('v', 'r'):
+                identifier = input('Backup identifier > ').strip()
+                if choice == 'v':
+                    print(json.dumps(console.verify(identifier), indent=2))
+                else:
+                    review = console.review(identifier)
+                    print(json.dumps(review, indent=2))
+                    if input('Type RESTORE to apply these exact changes > ').strip() == 'RESTORE':
+                        print(json.dumps(console.restore(identifier, review['review_token']), indent=2))
+            print('Display changes apply within two seconds; terminal scale applies to newly opened native terminals. Existing foot terminals have Ctrl+Plus/Minus for font size.')
+        except (OSError, ValueError, KeyError) as exc:
+            print('Unable to apply choice:', exc)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        print()

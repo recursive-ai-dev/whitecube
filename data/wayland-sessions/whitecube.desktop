@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Whitecube
+Comment=Pure-Wayland tabbed cube desktop (no X11, no D-Bus)
+Exec=/usr/bin/whitecube-session
+Type=Application
+DesktopNames=whitecube

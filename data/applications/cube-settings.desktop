@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Whitecube Settings
+Comment=Desktop, privacy, sound, network and system preferences
+Exec=/usr/bin/cube-settings
+Icon=preferences-system
+Terminal=false
+Categories=Settings;System;
+Keywords=Privacy;Desktop;Network;Sound;

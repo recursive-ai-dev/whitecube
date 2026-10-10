@@ -1,0 +1,30 @@
+{
+  "source": "/home/woez/cubic/program/appimage/Cubic-Focal-2022.01.70-x86_64.AppImage",
+  "source_sha256": "7fc88a3db59e1bd95dfb22af5a7629025918113d55c0ac96ded4c03158b30468",
+  "source_bytes": 89154752,
+  "extracted_to": "cubic-2022.01.70",
+  "squashfs_offset": 189632,
+  "extraction_command": [
+    "unsquashfs",
+    "-d",
+    "cubic-2022.01.70",
+    "-o",
+    "189632",
+    "/home/woez/cubic/program/appimage/Cubic-Focal-2022.01.70-x86_64.AppImage"
+  ],
+  "original_preserved": true,
+  "code_license": "GPL-3.0-or-later (per source headers)",
+  "icon_license": "CC-BY-NC-SA-4.0 (per package copyright)",
+  "copyright": "PJ Singh",
+  "source_directory": "usr/share/cubic",
+  "upstream_policy_should_not_be_installed": true,
+  "policy_reason": "The original policy permits root file modification helpers without authentication.",
+  "adaptation_targets": {
+    "iso_analysis": "usr/share/cubic/cubic/utilities/iso_utilities.py",
+    "iso_extraction": "usr/share/cubic/cubic/pages/extract_page.py",
+    "iso_generation": "usr/share/cubic/cubic/pages/generate_page.py",
+    "rootfs_helpers": "usr/share/cubic/commands",
+    "virtual_environment": "usr/share/cubic/cubic/utilities/console.py",
+    "qemu_preview": "usr/share/cubic/cubic/utilities/emulator.py"
+  }
+}

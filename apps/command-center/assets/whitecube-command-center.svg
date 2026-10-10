@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <title>Whitecube Command Center</title>
+  <rect x="8" y="8" width="240" height="240" rx="52" fill="#10151e"/>
+  <path d="M128 38 208 83v90l-80 45-80-45V83Z" fill="#1b1720" stroke="#ff3b3b" stroke-width="8" stroke-linejoin="round"/>
+  <path d="m48 83 80 45 80-45M128 128v90" fill="none" stroke="#ff7a7a" stroke-width="5"/>
+  <path d="m88 73 19 11-19 11m32 5 26 15" fill="none" stroke="#fff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

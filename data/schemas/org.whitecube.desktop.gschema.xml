@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.whitecube.desktop" path="/org/whitecube/desktop/">
+    <key name="tab-w" type="i">
+      <default>180</default>
+      <range min="60" max="400"/>
+      <summary>Tab width</summary>
+      <description>Width of window tabs in logical pixels; updates the compositor live.</description>
+    </key>
+    <key name="tab-h" type="i">
+      <default>40</default>
+      <range min="20" max="80"/>
+      <summary>Tab bar height</summary>
+      <description>Height before interface scaling; updates the compositor and top bar live.</description>
+    </key>
+    <key name="grid-step" type="i">
+      <default>64</default>
+      <range min="16" max="256"/>
+      <summary>Grid spacing</summary>
+      <description>Space between background grid lines; updates live.</description>
+    </key>
+    <key name="bg" type="s">
+      <default>'06080d'</default>
+      <summary>Desktop background</summary>
+      <description>Six hex digits. Applies to compositor, settings and top bar.</description>
+    </key>
+    <key name="grid" type="s">
+      <default>'0c0f15'</default>
+      <summary>Grid colour</summary>
+      <description>Six hex digits. Applies to compositor grid lines.</description>
+    </key>
+    <key name="tabbar" type="s">
+      <default>'090c12'</default>
+      <summary>Tab bar colour</summary>
+      <description>Six hex digits. Applies to compositor, settings and top bar.</description>
+    </key>
+    <key name="border" type="s">
+      <default>'0d0d0d'</default>
+      <summary>Focused border</summary>
+      <description>Six hex digits. Strong contrast overrides the visible border.</description>
+    </key>
+    <key name="unfocused" type="s">
+      <default>'d4d4d4'</default>
+      <summary>Unfocused tabs</summary>
+      <description>Six hex digits. Strong contrast overrides this colour.</description>
+    </key>
+    <key name="terminal" type="s">
+      <default>'/usr/bin/whitecube-terminal'</default>
+      <summary>Terminal command</summary>
+      <description>Shell command launched by Alt+Enter. Maximum 127 bytes.</description>
+    </key>
+    <key name="launcher" type="s">
+      <default>'fuzzel'</default>
+      <summary>Launcher command</summary>
+      <description>Shell command launched by Alt+D. Maximum 127 bytes.</description>
+    </key>
+    <key name="browser-cmd" type="s">
+      <default>'/usr/bin/whitecube-web open'</default>
+      <summary>Browser command</summary>
+      <description>Shell command launched by Alt+W.</description>
+    </key>
+    <key name="settings-cmd" type="s">
+      <default>'cube-settings'</default>
+      <summary>Settings command</summary>
+      <description>Shell command launched by Alt+S.</description>
+    </key>
+    <key name="help-cmd" type="s">
+      <default>'/usr/bin/whitecube-terminal -T keys -e less /usr/share/whitecube/keys.txt'</default>
+      <summary>Help command</summary>
+      <description>Shell command launched by Alt+F1.</description>
+    </key>
+    <key name="chat-cmd" type="s">
+      <default>'foot -a cube-chat -T cube-chat /usr/bin/cube-chat'</default>
+      <summary>Chat command</summary>
+      <description>Shell command for the native chat window.</description>
+    </key>
+    <key name="chat-app-id" type="s">
+      <default>'cube-chat'</default>
+      <summary>Chat application ID</summary>
+      <description>Wayland application ID used to locate the native chat window.</description>
+    </key>
+    <key name="scripts-cmd" type="s">
+      <default>'/usr/bin/whitecube-terminal -a cube-scripts -T Scripts /usr/bin/cube-scripts'</default>
+      <summary>Scripts command</summary>
+      <description>Shell command for the scripts window.</description>
+    </key>
+    <key name="scripts-app-id" type="s">
+      <default>'cube-scripts'</default>
+      <summary>Scripts application ID</summary>
+      <description>Wayland application ID used to locate the scripts window.</description>
+    </key>
+    <key name="xkb-model" type="s">
+      <default>''</default>
+      <summary>Keyboard model</summary>
+      <description>XKB model. An empty value uses the platform default.</description>
+    </key>
+    <key name="xkb-layout" type="s">
+      <default>''</default>
+      <summary>Keyboard layout</summary>
+      <description>XKB layout or comma-separated layouts; changes connected keyboards live.</description>
+    </key>
+    <key name="xkb-variant" type="s">
+      <default>''</default>
+      <summary>Keyboard variant</summary>
+      <description>XKB variant corresponding to the selected layout.</description>
+    </key>
+    <key name="xkb-options" type="s">
+      <default>''</default>
+      <summary>Keyboard options</summary>
+      <description>Comma-separated XKB options; changes connected keyboards live.</description>
+    </key>
+    <key name="repeat-rate" type="i">
+      <default>25</default>
+      <range min="0" max="100"/>
+      <summary>Keyboard repeat rate</summary>
+      <description>Repeated keys per second. Zero disables repeat.</description>
+    </key>
+    <key name="repeat-delay" type="i">
+      <default>600</default>
+      <range min="100" max="2000"/>
+      <summary>Keyboard repeat delay</summary>
+      <description>Milliseconds before a held key starts repeating.</description>
+    </key>
+    <key name="privacy-hide-titles" type="b">
+      <default>false</default>
+      <summary>Hide window titles</summary>
+      <description>Show application names in the compositor tab bar.</description>
+    </key>
+    <key name="privacy-hide-network" type="b">
+      <default>false</default>
+      <summary>Hide network names</summary>
+      <description>Conceal network names in the top bar and quick settings.</description>
+    </key>
+    <key name="privacy-remember-layout" type="b">
+      <default>true</default>
+      <summary>Remember window layouts</summary>
+      <description>Save and restore window positions. Disabling removes the saved native layout.</description>
+    </key>
+    <key name="privacy-save-titles" type="b">
+      <default>true</default>
+      <summary>Save titles in layouts</summary>
+      <description>Allow window titles in saved layout records; disabling scrubs stored titles.</description>
+    </key>
+    <key name="privacy-clipboard" type="b">
+      <default>true</default>
+      <summary>Allow clipboard sharing</summary>
+      <description>Allow applications to share the Wayland clipboard. Disabling clears it.</description>
+    </key>
+    <key name="privacy-clear-clipboard-on-lock" type="b">
+      <default>true</default>
+      <summary>Clear clipboard on lock</summary>
+      <description>Drop the Wayland selection after the graphical session locks.</description>
+    </key>
+    <key name="privacy-lock-minutes" type="i">
+      <default>0</default>
+      <range min="0" max="120"/>
+      <summary>Automatic lock timeout</summary>
+      <description>Idle minutes before swaylock starts. Zero disables automatic locking.</description>
+    </key>
+    <key name="pointer-speed" type="i">
+      <default>0</default>
+      <range min="-100" max="100"/>
+      <summary>Pointer speed</summary>
+      <description>Libinput acceleration speed from -100 (slow) to 100 (fast). Requires a capable pointer.</description>
+    </key>
+    <key name="natural-scroll" type="b">
+      <default>false</default>
+      <summary>Natural scrolling</summary>
+      <description>Reverse scrolling on supported libinput pointing devices.</description>
+    </key>
+    <key name="left-handed" type="b">
+      <default>false</default>
+      <summary>Left-handed pointing</summary>
+      <description>Swap primary buttons on supported libinput pointing devices.</description>
+    </key>
+    <key name="tap-to-click" type="b">
+      <default>false</default>
+      <summary>Touchpad tap to click</summary>
+      <description>Enable tapping on libinput touchpads with tap support.</description>
+    </key>
+    <key name="disable-while-typing" type="b">
+      <default>true</default>
+      <summary>Disable touchpad while typing</summary>
+      <description>Suppress accidental touchpad motion during typing on supported devices.</description>
+    </key>
+    <key name="clock-format" type="s">
+      <default>'24h'</default>
+      <choices>
+        <choice value="24h"/>
+        <choice value="12h"/>
+      </choices>
+      <summary>Clock format</summary>
+      <description>Use 24-hour or 12-hour time in the live top bar.</description>
+    </key>
+    <key name="clock-seconds" type="b">
+      <default>false</default>
+      <summary>Show clock seconds</summary>
+      <description>Include seconds in the live top bar clock.</description>
+    </key>
+  </schema>
+</schemalist>

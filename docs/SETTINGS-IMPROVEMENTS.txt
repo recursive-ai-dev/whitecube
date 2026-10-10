@@ -1,0 +1,38 @@
+Whitecube 0.2.0 settings changes (identified and implemented before rebuilding)
+
+1. A typed org.whitecube.desktop schema and shared reader for 37 native settings,
+   with live compositor/bar reload and inherited legacy config values.
+2. Searchable, paginated Advanced editor with key descriptions and override filter.
+3. Type, range, colour, length and real XKB keymap validation before writes.
+4. Individual resets with explicit origin/inheritance information.
+5. Grouped dconf transactions with independent read-back verification; writes work
+   through a short-lived D-Bus session when Whitecube has no session bus.
+6. Pointer acceleration speed on supported libinput devices, including hotplug.
+7. Natural scrolling with capability checks and device-default restoration.
+8. Left-handed pointer buttons with capability checks and reset.
+9. Touchpad tap-to-click with capability checks and reset.
+10. Touchpad disable-while-typing with capability checks and reset.
+11. Live top bar 12/24-hour clock and optional seconds.
+12. Keyboard repeat supports Off, 0-100/s and 100-2000 ms delay.
+13. Caps Lock-to-Escape and Caps Lock-to-Ctrl are mutually exclusive.
+14. Accessibility uses the consumer's bounded parser, creates missing directories,
+    saves atomically/private, rolls back failed UI edits and follows external changes.
+15. Async native saves report verified success; other save paths check return values
+    so failed theme/application/audio writes no longer claim success.
+16. Display coordinates, modes and scale are validated; submitted values are frozen;
+    all eight transforms are accessible; output persistence is atomic/private and
+    reports failure separately from a successful live display apply.
+
+Validation: schema/helper checks; C UI/config/consumer regressions; independent
+headless Wayland + dconf integration for all 37 values, reset/inheritance, external
+writes, rejected batches and actual clock output. Physical libinput behaviour
+requires a running upgraded compositor and devices supporting each capability.
+
+The desktop does not gain a persistent D-Bus service. cube-preferences uses dconf
+and a transient writer bus. dconf-editor itself is not needed. Configuration files
+and dconf values remain separate layers: dconf override > user config > system
+config > built-in/device default. Existing preferences are not migrated or erased.
+
+For diagnostics only, WHITECUBE_SETTINGS_REPORT=/private/directory makes the
+compositor and bar write their actually loaded values to compositor.ini/status.ini.
+Normal operation does not write these reports. Report files have mode 0600.

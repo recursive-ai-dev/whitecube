@@ -1,0 +1,196 @@
+#!/usr/bin/python3 -I
+"""Whitecube's typed, per-user dconf writer. Never uses sudo or a shell.
+
+set-many accepts tab-separated config keys and plain values on stdin. A single
+dconf transaction commits the validated group; independent reads verify it.
+"""
+import argparse
+import ctypes
+import fcntl
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+SCHEMA = 'org.whitecube.desktop'
+PREFIX = '/org/whitecube/desktop/'
+
+
+def schema():
+    here = Path(__file__).resolve().parent
+    paths = [os.environ.get('GSETTINGS_SCHEMA_DIR'), here / 'build/schemas', here.parent / 'build/schemas',
+             here / 'schemas', here.parent / 'share/whitecube/schemas']
+    for path in paths:
+        if not path or not (Path(path) / 'gschemas.compiled').is_file():
+            continue
+        source = Gio.SettingsSchemaSource.new_from_directory(str(path), None, False)
+        found = source.lookup(SCHEMA, False)
+        if found:
+            return found
+    raise ValueError('Whitecube settings schema is missing; reinstall the Whitecube bundle')
+
+
+def validate(spec, name, text):
+    key = name.replace('_', '-')
+    if not spec.has_key(key):
+        raise ValueError(f'Unknown Whitecube setting: {name}')
+    sk = spec.get_key(key)
+    kind = sk.get_value_type().dup_string()
+    if len(text.encode()) > (127 if key in ('terminal', 'launcher', 'chat-app-id', 'scripts-app-id') else
+                             63 if key in ('xkb-model', 'xkb-layout', 'xkb-variant') else 255):
+        raise ValueError(f'{key}: value is too long')
+    if any(ord(c) < 32 or ord(c) == 127 for c in text):
+        raise ValueError(f'{key}: control characters are not allowed')
+    if kind == 'b':
+        if text not in ('true', 'false', '0', '1'):
+            raise ValueError(f'{key}: expected true or false')
+        value = GLib.Variant('b', text in ('true', '1'))
+    elif kind == 'i':
+        if not re.fullmatch(r'-?[0-9]+', text):
+            raise ValueError(f'{key}: expected a whole number')
+        value = GLib.Variant('i', int(text))
+    else:
+        value = GLib.Variant('s', text)
+    if not sk.range_check(value):
+        raise ValueError(f'{key}: outside the allowed range {sk.get_range().print_(False)}')
+    if key in ('bg', 'grid', 'tabbar', 'border', 'unfocused') and not re.fullmatch('[0-9a-fA-F]{6}', text):
+        raise ValueError(f'{key}: expected six hex digits')
+    if key in ('terminal', 'launcher') or key.endswith('-cmd'):
+        if not text.strip():
+            raise ValueError(f'{key}: command cannot be empty')
+    if key.startswith('xkb-') and not re.fullmatch(r'[a-zA-Z0-9_,:+.\-]*', text):
+        raise ValueError(f'{key}: invalid keyboard identifier')
+    return key, value
+
+
+def dconf(*args, input=None):
+    result = subprocess.run(['/usr/bin/dconf', *args], input=input, text=True,
+                            capture_output=True, timeout=10)
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or 'dconf did not save the change')
+    return result.stdout.strip()
+
+
+def validate_keyboard(settings, values):
+    if not any(key.startswith('xkb-') for key in values):
+        return
+    inherited = {}
+    for path in (Path('/etc/whitecube/config'), Path.home() / '.config/whitecube/config'):
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                if '=' in line and not line.startswith('#'):
+                    key, value = line.split('=', 1)
+                    inherited[key.replace('_', '-')] = value
+    names = []
+    for key in ('xkb-model', 'xkb-layout', 'xkb-variant', 'xkb-options'):
+        value = values[key] if key in values else settings.get_user_value(key)
+        names.append(value.get_string() if value is not None else inherited.get(key, ''))
+    options = names[-1].split(',')
+    if 'caps:escape' in options and 'ctrl:nocaps' in options:
+        raise ValueError('Caps Lock cannot be both Escape and Ctrl')
+    class Names(ctypes.Structure):
+        _fields_ = [(x, ctypes.c_char_p) for x in ('rules', 'model', 'layout', 'variant', 'options')]
+    lib = ctypes.CDLL('libxkbcommon.so.0')
+    lib.xkb_context_new.argtypes = [ctypes.c_int]; lib.xkb_context_new.restype = ctypes.c_void_p
+    lib.xkb_keymap_new_from_names.argtypes = [ctypes.c_void_p, ctypes.POINTER(Names), ctypes.c_int]
+    lib.xkb_keymap_new_from_names.restype = ctypes.c_void_p
+    lib.xkb_keymap_unref.argtypes = [ctypes.c_void_p]; lib.xkb_context_unref.argtypes = [ctypes.c_void_p]
+    ctx = lib.xkb_context_new(0)
+    if not ctx:
+        raise ValueError('Could not validate keyboard configuration')
+    params = Names(None, *(x.encode() if x else None for x in names))
+    keymap = lib.xkb_keymap_new_from_names(ctx, ctypes.byref(params), 0)
+    if keymap:
+        lib.xkb_keymap_unref(keymap)
+    lib.xkb_context_unref(ctx)
+    if not keymap:
+        raise ValueError('Keyboard model, layout or variant was rejected; nothing was saved')
+
+
+def write_many(spec, pairs):
+    values = dict(validate(spec, key, text) for key, text in pairs)
+    if not values or len(values) > 32:
+        raise ValueError('Expected between 1 and 32 settings')
+    settings = Gio.Settings.new_full(spec, None, None)
+    validate_keyboard(settings, values)
+    for key in values:
+        if not settings.is_writable(key):
+            raise ValueError(f'{key} is locked by the administrator')
+    # CLI load commits one dconf changeset; it does not clear unmentioned keys.
+    payload = '[/]\n' + ''.join(f'{k}={v.print_(True)}\n' for k, v in values.items())
+    dconf('load', PREFIX, input=payload)
+    for key, value in values.items():
+        actual = dconf('read', PREFIX + key)
+        parsed = GLib.Variant.parse(value.get_type(), actual, None, None) if actual else None
+        if parsed is None or not value.equal(parsed):
+            raise ValueError(f'{key}: saved value could not be verified')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=('set', 'set-many', 'reset', 'list'))
+    parser.add_argument('args', nargs='*')
+    args = parser.parse_args()
+    if args.command != 'list' and not os.environ.get('WHITECUBE_PREFS_WRITER'):
+        # Always use a fresh writer: a long-lived dconf-service on an unrelated
+        # bus can retain stale database contents after another session writes.
+        os.environ['WHITECUBE_PREFS_WRITER'] = '1'
+        os.execv('/usr/bin/dbus-run-session', ['dbus-run-session', '--', '/usr/bin/python3',
+                                            '-I', str(Path(__file__).resolve()), *sys.argv[1:]])
+    lock = None
+    if args.command != 'list':
+        directory = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'whitecube'
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = os.open(directory / 'preferences.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ValueError('Another Whitecube settings write is still running')
+                time.sleep(.02)
+    spec = schema()
+    if args.command == 'set-many':
+        if args.args:
+            parser.error('set-many takes values on stdin')
+        data = sys.stdin.read(16385)
+        if len(data) > 16384:
+            raise ValueError('Settings input is too large')
+        lines = [line.split('\t', 1) for line in data.splitlines()]
+        if any(len(line) != 2 for line in lines):
+            raise ValueError('Expected key, tab, value on each line')
+        write_many(spec, lines)
+    elif args.command == 'set':
+        if len(args.args) != 2:
+            parser.error('set requires KEY VALUE')
+        write_many(spec, [args.args])
+    elif args.command == 'reset':
+        if len(args.args) != 1:
+            parser.error('reset requires KEY')
+        key = args.args[0].replace('_', '-')
+        if not spec.has_key(key):
+            raise ValueError('Unknown Whitecube setting')
+        dconf('reset', PREFIX + key)
+        if dconf('read', PREFIX + key):
+            raise ValueError('Reset could not be verified')
+    else:
+        settings = Gio.Settings.new_full(spec, None, None)
+        for key in sorted(spec.list_keys()):
+            val = settings.get_user_value(key)
+            print(key, val.print_(False) if val else '(inherited)', sep='\t')
+    if lock is not None:
+        os.close(lock)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ValueError, OverflowError, GLib.Error, OSError, subprocess.TimeoutExpired) as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

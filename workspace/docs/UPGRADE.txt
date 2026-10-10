@@ -1,0 +1,131 @@
+WHITECUBE TEN-IMPROVEMENT GUIDE
+
+Deployment: everything in this bundle is staged in /home/lubuntu/whitecube-upgrade.
+The actual /mnt/nvme_root is read-only and none of these new files is installed.
+Four Debian13 roles are configured, but all four real8GiB images are absent.
+The previous bundle is preserved in whitecube-upgrade-prior-20261007 next to it.
+
+Install from an ordinary terminal with permitted writable target access:
+  sudo python3 /home/lubuntu/whitecube-upgrade/install.py --root /mnt/nvme_root --apply
+After booting target, extract the bundle and use --root / instead.
+No remount, sandbox bypass, host package installation or module restoration is
+performed by the desktop installer. It journals replacements, preserves unknown
+edits by refusing them, merges existing config overrides and preserves /dev/null
+network service masks. Backups and rollback are described in INSTALL.txt.
+
+PERSISTENT AND TILED BASH
+
+Launch using whitecube-web open (desktop Alt+W). The HTTP terminal interface is
+127.0.0.1:8787 with exact Host/Origin and an API token; project assets use8788.
+The new sessions.sock is private0600 inside a0700 per-user state directory and
+checks the peer UID. A separate Python supervisor owns the PTY and output ring.
+Reload auto-discovers sessions. Closing a pane/hiding/maximizing does not stop it.
+Only Terminate stops that session's groups. No stale timeout kills a game.
+Workspace process restarts retain the private browser token, sessions and queue.
+A broker/host restart ends processes; unfinished queue records become interrupted.
+The desktop never reruns commands merely because it restores a layout.
+
+Bash Split side-by-side / top-bottom creates up to4 panes. Use a pane's selector
+to move an existing session, its Maximize button for a game, and its remove button
+to hide that pane while retaining its session. Pointer drag or keyboard arrows on
+focused separators resize. Eight total sessions can be retained at once.
+A desktop cube-shaped Enter a lab button opens the Labs drawer. Opening a lab
+animates its cube until launcher completion feedback. Reduced motion disables it.
+Provisioning remains explicit; button feedback never invents a ready filesystem.
+
+RESOURCES AND WRITABLE SHARING
+
+  cube-lab status
+  cube-lab resources web
+  sudo cube-lab resources web --cpu 2 --memory-mib 2048
+  sudo cube-lab enter build --project /home/woez/Projects/Orbit --project-mode rw --command make
+
+CPU .1..128 cores, RAM128..65536MiB, default2/2048; CPUQuota, MemoryMax, no swap,
+OOM group stop are applied via existing systemd-run and nspawn. Change stopped
+lab preferences; next launch applies them. Status reports actual cgroup counters,
+current/peak RAM, CPU, OOM events/kills and last-run outcome. Each disk stays8GiB.
+Browser limits actions use sudo inside a real PTY; no password in request argv.
+Read-only is default. Top-level manifest project_mode:"rw" grants changes to the
+entire single real immediate project at /project. Descriptor pinning and link/
+mount/special-file validation prevent sharing outside that scope. Other projects
+are unmounted. Existing rootidmap maps the project owner without recursive chown.
+No extra dependency was added for these features. Provisioning only requests the
+previously demonstrated missing debootstrap/distro-info/systemd-container tools
+and rechecks the package plan. It never restores a deleted module or unmasks a
+service. See containers/README.txt for runtime details and hardware limitations.
+
+BACKUP AND REVIEWED RESTORE
+
+Recovery drawer: label, retention1..50 (saved preference), Create, Verify, Review
+restore. Creation synchronizes browser seeds/layout; checksums verify bounded
+private files. Review lists each create/replace/unchanged path with saved/current
+hashes. Restore requires that specific review token and unchanged current state;
+it makes a protected recovery copy first, then atomically writes files, rolling
+back completed writes on error. Reload applies restored views; no commands start.
+Alt+A opens the keyboard native display/recovery console with the same backups.
+
+Scope: Whitecube config, script descriptors, native worlds, browser seeds,
+workspace layouts/accessibility, workflow definitions, immediate project manifests.
+Credential-like files/JSON keys/command arguments are excluded. SSH/Wi-Fi/browser
+API credentials, PTY transcripts, histories, queue logs, full project source and
+container images are never silently copied. Bound2MiB/file,32MiB total,512files;
+symlinks refused. Retention prunes ordinary backups; recovery copies are preserved.
+Full container snapshots are separate deliberate8GiB operations, as before.
+
+LAYOUT, PROJECT AND JOB CONTROLS
+
+Display drawer saves workspace names, UI/terminal scale, strong contrast and
+reduced motion. Saved browser state includes selected app views, window geometry,
+visibility, current/maximized panes and pane sizes. Native restores placement of
+windows as the corresponding app_id/title appears; it launches no saved programs.
+Shared accessibility.json changes apply to native UI/CA within two seconds.
+Native terminal scale applies to new terminals; existing foot font sizes can be
+changed with Ctrl+Plus/Minus/0. Native Alt+Tab/Alt+Shift+Tab navigate windows;
+Alt+Shift+arrows move; Alt+Ctrl+arrows resize. Browser titlebars focus with Tab and
+use Alt+arrows move/Alt+Shift+arrows resize. Dialogs/buttons and seed controls are
+keyboard reachable with visible focus. Seed painting also has X/Y keyboard input.
+Reduced motion pauses native CA evolution/rotation and stops browser animation
+including launcher feedback, while manual step/painting remain available.
+
+Project Build/Test/Preview selects a manifest-defined literal argv action and host
+or selected lab. Logs and the initial command's actual exit code remain separate
+from its still-live interactive Bash. Preview readiness checks are bounded,
+loopback-only with redirects disabled, and fail closed for failed commands.
+Commands, writable scope and workflow formats are in MANIFESTS.txt/examples.
+
+Workflows tab creates named sequences using script IDs and literal args arrays;
+Queue, dependency status, per-step logs/history, Cancel and stop-on-failure controls.
+Notify is optional and browser permission is requested only on the explicit button.
+Work survives workspace restarts because execution belongs to the PTY supervisor.
+
+EXACT-DONGLE DIAGNOSTICS
+
+Scope remains USB2001:3329/MAC88:76:b9:f2:9d:29/rtw88_8822cu. Stages distinguish
+missing USB device, wrong/missing driver, no supported profile/controller,
+association failure, DHCP address/route failure, DNS failure, lost connectivity,
+and successful checks. Read-only status exposes only public metadata. Controller
+probes use the selected interface/IP. Recovery suggestions are stage-specific.
+  sudo cube-net reconnect
+permits at most3 attempts before pausing reassociation; reconnect/new profile can
+reset a budget deliberately. Systemd restarts are also limited5 per300seconds.
+It does not stop another manager, load restored drivers or alter blacklists/masks.
+See network/README.txt. A carrier bit alone is never presented as Internet access.
+
+TESTING AND HARDWARE CHECKS
+
+./verify.sh runs all Python/browser checks and compiler/shell syntax checks;
+native/BUILD.sh /mnt/nvme_root uses existing target headers/libraries and runs
+native CA/workspace/layout/settings harnesses. VALIDATION.json gives final counts.
+Real PTYs test games/job control, process isolation, resize, literal args, queue
+failure/cancel and reconnection to the same independent owner/game process after
+Workspace close/recreation. The sandbox blocks Unix socket bind/connect, so these
+supervisor tests use a test-only pipe harness, never a production fallback. The
+real socket transport test is marked skipped, not passed. HTTP authorization and
+routes are exercised in-process; TCP browser/runtime tests cannot run here.
+
+Still required after permitted install + target boot: actual Wayland rendering/
+keyboard/launcher review, HTTP/browser previews and production Unix transport,
+real nspawn provisioning, CPU/RAM enforcement/OOM, idmapped writable sharing, and
+Wi-Fi association/DHCP/DNS/connectivity/reconnect. Run cube-check --first-boot,
+then after provisioning `sudo cube-check --containers`; use the feature-specific
+commands above and review diagnostic outcomes. Tests do not prove hardware works.

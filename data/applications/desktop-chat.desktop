@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Desktop Chat
+Comment=Global-hotkey AI chat panel with filesystem tools
+Exec=/usr/bin/desktop-chat --toggle
+Icon=/usr/share/whitecube/desktop-chat/assets/icon.png
+Terminal=false
+Type=Application
+Categories=Utility;
+StartupWMClass=desktop-chat
+X-Wayland-Native=true

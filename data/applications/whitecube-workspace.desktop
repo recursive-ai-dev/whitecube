@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Whitecube Workspace
+Comment=Living cube space, Bash games and your local projects
+Exec=/usr/bin/whitecube-web open
+Icon=utilities-terminal
+Terminal=false
+Categories=System;Utility;

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "id": "my-script",
+  "name": "My script",
+  "description": "A Bash script from my Projects directory.",
+  "path": "my-project/check.sh",
+  "args": ["sample.txt"],
+  "arguments": [{"name": "file", "description": "Input file path"}],
+  "tags": ["development"]
+}

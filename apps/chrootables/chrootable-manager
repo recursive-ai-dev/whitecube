@@ -1,0 +1,1597 @@
+#!/usr/bin/env bash
+# Debian image workspaces. Self-contained for easy installation.
+set -Eeuo pipefail
+
+APP_NAME="Chrootable Manager"
+APP_VERSION=2.1.0
+SCRIPT_PATH=${BASH_SOURCE[0]}
+STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
+DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
+DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-http://deb.debian.org/debian}
+FALLBACK_DNS=${CHROOTABLE_FALLBACK_DNS:-1.1.1.1 8.8.8.8}
+EPHEMERAL_SIZE=${CHROOTABLE_EPHEMERAL_SIZE:-}
+MAX_SIZE_MIB=1048576
+NON_INTERACTIVE=1
+DEMO=0
+LOCK_FDS=()
+REQUIRED_COMMANDS=(awk basename chroot cp date dd debootstrap df dpkg e2fsck flock
+    gzip hostname install ip losetup mkdir mkfs.ext4 mktemp mount mountpoint mv readlink
+    resize2fs rm rmdir sha256sum stat tail tar truncate umount unshare whiptail)
+
+configure_paths() {
+    IMAGE_DIR="$STORE_DIR/images"
+    LOG_DIR="$STORE_DIR/logs"
+    EXPORT_DIR="$STORE_DIR/exports"
+    SNAPSHOT_DIR="$STORE_DIR/snapshots"
+}
+configure_paths
+
+fail() { printf 'Error: %s\n' "$*" >&2; return 1; }
+info() { printf '%s\n' "$*" >&2; }
+# Workers log to the operation log; fd 3, when the parent opened it, reaches the user.
+progress() { { printf '%s\n' "$*" >&3; } 2>/dev/null || true; }
+valid_name() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+# Seven digits at most, so the arithmetic comparison can never overflow.
+valid_size_mib() { [[ $1 =~ ^[1-9][0-9]{0,6}$ ]] && (( $1 <= MAX_SIZE_MIB )); }
+valid_lifecycle() { [[ $1 == persistent || $1 == ephemeral ]]; }
+valid_profile() { profile_record "$1" >/dev/null; }
+valid_description() { (( ${#1} <= 200 )) && [[ $1 != *[[:cntrl:]]* ]]; }
+valid_suite() { [[ $1 =~ ^[a-z][a-z0-9.+-]{0,31}$ ]]; }
+valid_mirror() {
+    local pattern='^(https?|file|ssh)://[^[:space:][:cntrl:]"'\''\]+$'
+    [[ $1 =~ $pattern ]]
+}
+valid_tmpfs_size() { [[ $1 =~ ^[1-9][0-9]{0,8}[kKmMgG%]?$ ]]; }
+timestamp() { date --iso-8601=seconds; }
+image_size_mib() { local bytes; bytes=$(stat -c%s -- "$1") || return; printf '%s\n' "$((bytes / 1048576))"; }
+allocated_bytes() { local blocks; blocks=$(stat -c%b -- "$1") || return; printf '%s\n' "$((blocks * 512))"; }
+human_bytes() { awk -v bytes="$1" 'BEGIN {split("B KiB MiB GiB TiB", u); i=1; while(bytes>=1024 && i<5){bytes/=1024; i++} printf "%.1f %s", bytes, u[i]}'; }
+
+resolve_image() {
+    valid_name "$1" || { fail "Invalid name: $1. Use 1-64 letters, digits, dots, underscores or hyphens; start with a letter or digit."; return 1; }
+    local image="$IMAGE_DIR/$1.img"
+    [[ -f $image && ! -L $image ]] || { fail "Chrootable not found (or is a symlink): $1"; return 1; }
+    printf '%s\n' "$image"
+}
+unused_image() {
+    valid_name "$1" || { fail "Invalid name: $1"; return 1; }
+    [[ ! -e $IMAGE_DIR/$1.img && ! -L $IMAGE_DIR/$1.img ]] || { fail "A chrootable named '$1' already exists."; return 1; }
+}
+# Plain reads instead of an awk process per key: listings ask for every column
+# of every image. Unreadable metadata falls back quietly.
+metadata_value() {
+    local image=$1 key=$2 fallback=${3-unknown} line value=''
+    if [[ -f $image.meta && ! -L $image.meta && -r $image.meta ]]; then
+        while IFS= read -r line || [[ -n $line ]]; do
+            if [[ $line == "$key="* ]]; then value=${line#*=}; break; fi
+        done <"$image.meta"
+    fi
+    printf '%s\n' "${value:-$fallback}"
+}
+image_lifecycle() {
+    local lifecycle=persistent
+    if [[ -f $1.meta && ! -L $1.meta ]]; then lifecycle=$(metadata_value "$1" lifecycle persistent)
+    elif [[ -f $1.mode && ! -L $1.mode && -r $1.mode ]]; then read -r lifecycle <"$1.mode" || true; fi
+    valid_lifecycle "$lifecycle" || lifecycle=persistent
+    printf '%s\n' "$lifecycle"
+}
+write_metadata() {
+    local image=$1 temporary
+    temporary=$(mktemp "$image.meta.XXXXXX") || return
+    if ! printf 'format=2\nlifecycle=%s\nsuite=%s\narchitecture=%s\nsize_mib=%s\ncreated_at=%s\nlast_used_at=%s\nprofile=%s\norigin=%s\n' \
+        "$2" "$3" "$4" "$5" "$6" "$7" "${8:-minimal}" "${9:-none}" >"$temporary" ||
+        ! mv -T -- "$temporary" "$image.meta"; then
+        rm -f -- "$temporary"; return 1
+    fi
+}
+metadata_set() {
+    local image=$1 key=$2 value=$3 temporary
+    [[ $key =~ ^[a-z_]+$ && $value != *$'\n'* && $value != *$'\r'* ]] || return 1
+    # Upgrade legacy .mode files before creating .meta, preserving their mode.
+    if [[ ! -f $image.meta && -f $image ]]; then
+        write_metadata "$image" "$(image_lifecycle "$image")" unknown unknown "$(image_size_mib "$image")" unknown never || return
+    fi
+    temporary=$(mktemp "$image.meta.XXXXXX") || return
+    if [[ -f $image.meta && ! -L $image.meta ]]; then
+        awk -F= -v key="$key" '$1 != key' "$image.meta" >"$temporary" || { rm -f -- "$temporary"; return 1; }
+    fi
+    printf '%s=%s\n' "$key" "$value" >>"$temporary" && mv -T -- "$temporary" "$image.meta" || { rm -f -- "$temporary"; return 1; }
+}
+# Also carries keys outside the fixed set (release, description, keys written by
+# newer versions), but not history that each copy records for itself.
+copy_metadata() {
+    local source=$1 destination=$2 line key
+    write_metadata "$destination" "$(image_lifecycle "$source")" \
+        "$(metadata_value "$source" suite unknown)" "$(metadata_value "$source" architecture unknown)" \
+        "$(image_size_mib "$source")" "$(metadata_value "$source" created_at unknown)" \
+        "$(metadata_value "$source" last_used_at never)" "$(metadata_value "$source" profile minimal)" \
+        "$(metadata_value "$source" origin none)" || return
+    [[ -f $source.meta && ! -L $source.meta && -r $source.meta ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        key=${line%%=*}
+        [[ $line == *=* && $key =~ ^[a-z_]+$ ]] || continue
+        case $key in
+            format|lifecycle|suite|architecture|size_mib|created_at|last_used_at|profile|origin) ;;
+            snapshot_at|restored_from|restored_at) ;;
+            *) printf '%s\n' "$line" >>"$destination.meta" || return ;;
+        esac
+    done <"$source.meta"
+}
+
+# Keep lock files after deletion: unlinking one would allow two processes to
+# lock different inodes for the same name. Descriptors close on process exit.
+# Returns 1 while another process holds the lock, 2 if it cannot be opened.
+# LOCK_FDS lets spawn_worker keep the descriptors away from guests.
+try_lock_image() {
+    local lock_path=$1.lock new_fd
+    [[ ! -L $lock_path ]] || return 2
+    exec {new_fd}>>"$lock_path" || return 2
+    if ! flock -n "$new_fd"; then exec {new_fd}>&-; return 1; fi
+    LOCK_FDS+=("$new_fd")
+    printf -v "$2" '%s' "$new_fd"
+}
+lock_image() {
+    local lock_status=0
+    try_lock_image "$1" "$2" || lock_status=$?
+    case $lock_status in
+        0) ;;
+        1) fail "This chrootable is already in use: $(basename "$1" .img)" ;;
+        *) fail "Cannot open the lock file (missing directory or a symlink): $1.lock" ;;
+    esac
+}
+image_status() {
+    local descriptor
+    if [[ -f $1.lock && ! -L $1.lock ]]; then
+        if ! exec {descriptor}<"$1.lock"; then printf 'unknown'; return; fi
+        if flock -n "$descriptor"; then printf 'ready'; else printf 'busy'; fi
+        exec {descriptor}>&-
+    else printf 'ready'; fi
+}
+assert_offline() {
+    local devices
+    [[ -f $1 && ! -L $1 ]] || { fail "Image disappeared or became a symlink: $1"; return 1; }
+    devices=$(losetup -j "$1") || { fail "Could not check loop devices."; return 1; }
+    [[ -z $devices ]] || { fail "Image is attached to a loop device. Unmount/detach it before continuing: $1"; return 1; }
+}
+snapshot_count() {
+    local file count=0
+    for file in "$SNAPSHOT_DIR/$1/"*.img; do [[ -f $file && ! -L $file ]] && count=$((count + 1)); done
+    printf '%s' "$count"
+}
+
+package_for_command() {
+    case $1 in
+        whiptail|debootstrap|dpkg|hostname|tar|gzip) printf '%s' "$1" ;;
+        mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
+        mount|umount|losetup) printf mount ;;
+        mountpoint|unshare|flock) printf util-linux ;;
+        ip) printf iproute2 ;;
+        awk) printf mawk ;;
+        *) printf coreutils ;;
+    esac
+}
+require_root() { [[ $EUID -eq 0 ]] || { fail "This operation needs root. Run with sudo."; return 1; }; }
+check_prerequisites() {
+    local command package existing; local -a packages=()
+    require_root || return
+    for command in "${REQUIRED_COMMANDS[@]}"; do
+        [[ $command != whiptail || $NON_INTERACTIVE -eq 0 ]] || continue
+        command -v "$command" >/dev/null 2>&1 && continue
+        package=$(package_for_command "$command"); existing=" ${packages[*]} "
+        [[ $existing == *" $package "* ]] || packages+=("$package")
+    done
+    if (( ${#packages[@]} )); then
+        [[ ${CHROOTABLE_AUTO_INSTALL:-1} != 0 ]] || { fail "Missing packages: ${packages[*]}. Install them or run --setup with CHROOTABLE_AUTO_INSTALL=1."; return 1; }
+        command -v apt-get >/dev/null || { fail "Install these packages first: ${packages[*]}"; return 1; }
+        info "Installing dependencies: ${packages[*]} (log: /var/log/chrootable-manager-dependencies.log)"
+        apt-get update >>/var/log/chrootable-manager-dependencies.log 2>&1 &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}" >>/var/log/chrootable-manager-dependencies.log 2>&1 || {
+            fail "Dependency installation failed. See /var/log/chrootable-manager-dependencies.log"; return 1;
+        }
+    fi
+}
+# Read-only commands canonicalize too, so their paths match the ones that write
+# operations recorded in the journal.
+resolve_store() {
+    [[ $STORE_DIR == /* && $STORE_DIR != *[[:cntrl:]]* ]] || {
+        fail "CHROOTABLE_HOME must be an absolute path without control characters."; return 1;
+    }
+    STORE_DIR=$(readlink -m -- "$STORE_DIR") || return
+    [[ $STORE_DIR != / ]] || { fail "The store cannot be /."; return 1; }
+    configure_paths
+}
+owned_private_directory() {
+    local owner permissions
+    [[ -d $1 && ! -L $1 ]] || { fail "Expected a real directory, not a file or symlink: $1"; return 1; }
+    owner=$(stat -c%u -- "$1") && permissions=$(stat -c%a -- "$1") || return
+    [[ $owner == "$EUID" ]] && (( (8#$permissions & 0022) == 0 )) || {
+        fail "Must be owned by the current user and not writable by group/others: $1"; return 1;
+    }
+}
+# Existing directories keep their mode, so an administrator can make the store
+# readable for root-free browsing; new directories start private.
+init_store() {
+    local directory
+    resolve_store || return
+    for directory in "$STORE_DIR" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR"; do
+        if [[ -e $directory || -L $directory ]]; then owned_private_directory "$directory" || return
+        else install -d -m 0700 "$directory" || return; fi
+    done
+}
+check_readable_store() {
+    local directory
+    resolve_store || return
+    for directory in "$STORE_DIR" "$IMAGE_DIR" "$SNAPSHOT_DIR" "$LOG_DIR" "$EXPORT_DIR"; do
+        [[ ! -e $directory || ( -r $directory && -x $directory ) ]] || {
+            fail "The store is not readable by this user. Run with sudo to view $STORE_DIR"; return 1;
+        }
+    done
+}
+
+record_event() {
+    local descriptor
+    exec {descriptor}>>"$STORE_DIR/.activity.lock" || return
+    flock "$descriptor" || return
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(timestamp)" "$1" "$2" "$3" "$4" >>"$STORE_DIR/activity.tsv"
+    exec {descriptor}>&-
+}
+begin_operation() {
+    OPERATION=$1; OP_NAME=$2; PENDING=; WORK=; GUEST_EXITED=
+    OP_LOG=$(mktemp "$LOG_DIR/$2-$1-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return
+    printf '%s  %s  %s\n' "$(timestamp)" "$1" "$2" >>"$OP_LOG"
+    trap finish_operation EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+finish_operation() {
+    local status=$?
+    if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+    if [[ -n ${WORK:-} ]]; then
+        # Files the worker hands back; its mounts ended with its namespace.
+        rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/release" "$WORK/codename" "$WORK/architecture" || true
+        rmdir "$WORK/root" "$WORK/lower" "$WORK/overlay" "$WORK" 2>/dev/null || true
+    fi
+    if (( status == 0 )); then
+        printf 'Completed: %s\n' "$(timestamp)" >>"$OP_LOG"
+        record_event "$OPERATION" "$OP_NAME" ok "$OP_LOG" || true
+    elif [[ -n ${GUEST_EXITED:-} ]]; then
+        # The guest's own output explains its exit status; the log adds nothing.
+        printf 'Guest exited with status %s: %s\n' "$status" "$(timestamp)" >>"$OP_LOG"
+        record_event "$OPERATION" "$OP_NAME" "exit $status" "$OP_LOG" || true
+    else
+        printf 'Failed with status %s: %s\n' "$status" "$(timestamp)" >>"$OP_LOG"
+        record_event "$OPERATION" "$OP_NAME" failed "$OP_LOG" || true
+        info "Operation failed (status $status). Log: $OP_LOG"
+    fi
+    return "$status"
+}
+make_workdir() { WORK=$(mktemp -d /run/chrootable-manager.XXXXXX); }
+# Workers start through $BASH, so a copy without the executable bit (or on a
+# noexec mount) works. The parent keeps the image locks; guests never inherit them.
+spawn_worker() (
+    local lock_fd
+    for lock_fd in "${LOCK_FDS[@]}"; do exec {lock_fd}>&-; done
+    exec unshare "$@"
+)
+run_worker() { spawn_worker --mount --uts --ipc --pid --fork --kill-child "$BASH" "$SCRIPT_PATH" --worker "$@"; }
+publish_image() {
+    local pending=$1 destination=$2
+    mv -T -- "$pending.meta" "$destination.meta" || return
+    mv -T -- "$pending" "$destination" || return
+}
+
+# NAME|SUGGESTED_MIB|MINIMUM_MIB|PACKAGES|DESCRIPTION. Minimums leave room for
+# debootstrap's downloads, so an undersized image fails before fetching anything.
+PROFILES=(
+    'minimal|2048|512||Debian minbase; a clean starting point'
+    'build|4096|1536|build-essential git ca-certificates curl pkg-config|C/C++ toolchain, make, Git, curl, pkg-config'
+    'python|4096|1024|python3 python3-venv python3-pip git ca-certificates curl|Python 3, venv, pip, Git, curl'
+    'network|2048|768|iproute2 iputils-ping dnsutils curl ca-certificates openssh-client|iproute2, ping, DNS tools, curl, SSH client'
+)
+profile_record() {
+    local record
+    for record in "${PROFILES[@]}"; do
+        [[ ${record%%|*} != "$1" ]] || { printf '%s\n' "$record"; return 0; }
+    done
+    return 1
+}
+# Fields: 1 suggested MiB, 2 minimum MiB, 3 packages, 4 description.
+profile_field() {
+    local record; local -a fields=()
+    record=$(profile_record "$1") || return
+    IFS='|' read -r -a fields <<<"$record"
+    printf '%s\n' "${fields[$2]:-}"
+}
+profile_packages() { profile_field "$1" 3; }
+list_profiles() {
+    local format=${1:-text} record package comma='' separator; local -a fields=() packages=()
+    if [[ $format == json ]]; then printf '['; else printf '%-10s %-10s %-9s %s\n' PROFILE SUGGESTED MINIMUM INCLUDES; fi
+    for record in "${PROFILES[@]}"; do
+        IFS='|' read -r -a fields <<<"$record"
+        if [[ $format != json ]]; then
+            printf '%-10s %-10s %-9s %s\n' "${fields[0]}" "$((fields[1] / 1024)) GiB" "${fields[2]} MiB" "${fields[4]}"
+            continue
+        fi
+        read -r -a packages <<<"${fields[3]}"
+        printf '%s{"name":' "$comma"; json_string "${fields[0]}"
+        printf ',"suggested_mib":%s,"minimum_mib":%s,"description":' "${fields[1]}" "${fields[2]}"; json_string "${fields[4]}"
+        printf ',"packages":['; separator=
+        for package in "${packages[@]}"; do printf '%s' "$separator"; json_string "$package"; separator=,; done
+        printf ']}'; comma=,
+    done
+    [[ $format != json ]] || printf ']\n'
+}
+
+allocate_image() {
+    local target=$1 size_mib=$2
+    if command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+        return 0
+    elif truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1; then
+        return 0
+    fi
+    dd if=/dev/zero of="$target" bs=1M count="$size_mib" status=none conv=fsync >>"$OP_LOG" 2>&1
+}
+# Allocates only the new tail (sparse clones stay sparse). Never dd: rewriting
+# from offset 0 would erase the filesystem.
+grow_image_file() {
+    local target=$1 current_mib=$2 size_mib=$3
+    if command -v fallocate >/dev/null 2>&1 &&
+        fallocate -o "${current_mib}M" -l "$((size_mib - current_mib))M" "$target" >>"$OP_LOG" 2>&1; then
+        return 0
+    fi
+    truncate -s "${size_mib}M" "$target" >>"$OP_LOG" 2>&1
+}
+require_free_space() {
+    local directory=$1 bytes=$2 available
+    available=$(df -PB1 -- "$directory" | awk 'NR == 2 {print $4}') || return
+    [[ $available =~ ^[0-9]+$ ]] || { fail "Could not read the free space of $directory."; return 1; }
+    (( available >= bytes )) || {
+        fail "Not enough free space in $directory: $(human_bytes "$bytes") needed, $(human_bytes "$available") available."; return 1;
+    }
+}
+# A reflink shares blocks and costs nothing; only a real copy needs the space.
+copy_image_file() {
+    local source=$1 destination=$2 needed
+    cp --reflink=always -- "$source" "$destination" 2>/dev/null && return 0
+    needed=$(allocated_bytes "$source") || return
+    require_free_space "${destination%/*}" "$needed" || return
+    info "Copying $(human_bytes "$needed") (this filesystem has no reflinks)..."
+    cp --sparse=always -- "$source" "$destination" >>"$OP_LOG" 2>&1
+}
+host_architecture() {
+    local machine
+    if command -v dpkg >/dev/null 2>&1; then dpkg --print-architecture; return; fi
+    machine=$(uname -m) || return
+    case $machine in
+        x86_64) printf 'amd64\n' ;; aarch64) printf 'arm64\n' ;; armv7l|armv8l) printf 'armhf\n' ;;
+        i?86) printf 'i386\n' ;; ppc64le) printf 'ppc64el\n' ;; *) printf '%s\n' "$machine" ;;
+    esac
+}
+# Mirrors debootstrap's own script lookup, so a typo fails before allocating.
+debootstrap_knows_suite() {
+    local scripts=${DEBOOTSTRAP_DIR:-/usr/share/debootstrap}/scripts
+    [[ ! -d $scripts || -e $scripts/$1 ]] && return 0
+    command -v distro-info >/dev/null 2>&1 || return 1
+    debian-distro-info --series "$1" >/dev/null 2>&1 || ubuntu-distro-info --series "$1" >/dev/null 2>&1
+}
+check_debian_source() {
+    valid_suite "$DEBIAN_SUITE" || { fail "CHROOTABLE_DEBIAN_SUITE is not a suite name: $DEBIAN_SUITE"; return 1; }
+    valid_mirror "$DEBIAN_MIRROR" || { fail "CHROOTABLE_DEBIAN_MIRROR must be an http(s)://, file:// or ssh:// URL: $DEBIAN_MIRROR"; return 1; }
+    debootstrap_knows_suite "$DEBIAN_SUITE" || { fail "debootstrap has no script for '$DEBIAN_SUITE'. Check the name or update debootstrap."; return 1; }
+}
+# One sanitized line the worker wrote about the guest (record_guest_details).
+worker_detail() {
+    local value=''
+    if [[ -f $WORK/$1 && ! -L $WORK/$1 ]]; then IFS= read -r value <"$WORK/$1" || true; fi
+    value=${value//[[:cntrl:]]/}
+    printf '%s\n' "${value:0:120}"
+}
+
+create_image() (
+    local name=$1 size=$2 lifecycle=$3 profile=${4:-minimal} image descriptor arch minimum release
+    unused_image "$name" || return
+    valid_size_mib "$size" || { fail "Size must be a whole number from 1 to $MAX_SIZE_MIB MiB."; return 1; }
+    valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
+    valid_profile "$profile" || { fail "Unknown profile: $profile. See --profiles."; return 1; }
+    minimum=$(profile_field "$profile" 2)
+    (( size >= minimum )) || { fail "The $profile profile needs at least $minimum MiB ($(profile_field "$profile" 1) MiB suggested)."; return 1; }
+    check_debian_source || return
+    image="$IMAGE_DIR/$name.img"
+    lock_image "$image" descriptor || return
+    unused_image "$name" || return
+    require_free_space "$IMAGE_DIR" "$((size * 1048576))" || return
+    begin_operation create "$name" || return
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    make_workdir || return
+    arch=$(host_architecture) || return
+    info "Creating $name / Debian $DEBIAN_SUITE / $profile / $size MiB. Log: $OP_LOG"
+    info "Allocating and formatting the image..."
+    allocate_image "$PENDING" "$size" || return
+    mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    info "Bootstrapping Debian $DEBIAN_SUITE; downloading packages takes a few minutes..."
+    run_worker create "$PENDING" "$WORK" "$name" "$arch" "$profile" 3>&2 >>"$OP_LOG" 2>&1 || return
+    write_metadata "$PENDING" "$lifecycle" "$DEBIAN_SUITE" "$arch" "$size" "$(timestamp)" never "$profile" || return
+    release=$(worker_detail release)
+    [[ -z $release ]] || metadata_set "$PENDING" release "$release" || return
+    publish_image "$PENDING" "$image" || return
+    PENDING=
+    info "Created '$name'. Enter with: sudo $0 --enter $name"
+)
+clone_image() (
+    # shellcheck disable=SC2034  # destination_lock holds the new name's lock until exit
+    local source=$1 name=$2 descriptor destination_lock destination
+    unused_image "$name" || return
+    lock_image "$source" descriptor || return
+    assert_offline "$source" || return
+    destination="$IMAGE_DIR/$name.img"
+    lock_image "$destination" destination_lock || return
+    unused_image "$name" || return
+    begin_operation clone "$(basename "$source" .img)" || return
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    copy_image_file "$source" "$PENDING" || return
+    copy_metadata "$source" "$PENDING" || return
+    metadata_set "$PENDING" created_at "$(timestamp)" || return
+    metadata_set "$PENDING" last_used_at never || return
+    metadata_set "$PENDING" origin "$(basename "$source" .img)" || return
+    publish_image "$PENDING" "$destination" || return
+    PENDING=
+    info "Created clone '$name'."
+)
+fsck_preflight() {
+    local status=0
+    e2fsck -f -p "$1" >>"$2" 2>&1 || status=$?
+    (( status <= 1 ))
+}
+resize_image() (
+    local image=$1 requested=$2 current descriptor
+    current=$(image_size_mib "$image") || return
+    valid_size_mib "$requested" && (( requested > current )) || { fail "Choose a size larger than $current MiB (maximum $MAX_SIZE_MIB)."; return 1; }
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    # The new capacity is allocated up front like at creation, so a full host
+    # disk cannot surface later as I/O errors inside the guest.
+    require_free_space "$IMAGE_DIR" "$(( (requested - current) * 1048576 ))" || return
+    begin_operation resize "$(basename "$image" .img)" || return
+    fsck_preflight "$image" "$OP_LOG" || return
+    grow_image_file "$image" "$current" "$requested" || return
+    resize2fs "$image" >>"$OP_LOG" 2>&1 || return
+    metadata_set "$image" size_mib "$requested" || return
+    info "Expanded '$(basename "$image" .img)' to $requested MiB."
+)
+repair_image() (
+    local image=$1 descriptor status=0
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    begin_operation repair "$(basename "$image" .img)" || return
+    e2fsck -f -y "$image" >>"$OP_LOG" 2>&1 || status=$?
+    (( status <= 1 )) || return "$status"
+    info "Filesystem repair completed. Log: $OP_LOG"
+)
+export_image() (
+    local image=$1 name descriptor archive token checksum
+    name=$(basename "$image" .img)
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    begin_operation export "$name" || return
+    make_workdir || return
+    PENDING=$(mktemp "$EXPORT_DIR/.$name.XXXXXX.partial") || return
+    token=${PENDING%.partial}; token=${token##*.}
+    archive="$EXPORT_DIR/$name-$(date +%Y%m%d-%H%M%S)-$token.tar.gz"
+    info "Packing the filesystem into ${archive##*/}..."
+    run_worker export "$image" "$WORK" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    info "Computing the checksum..."
+    checksum=$(sha256sum -- "$PENDING") || return
+    mv -T -- "$PENDING" "$archive" || return
+    PENDING=
+    # --import verifies the archive against this file when it sits beside it.
+    printf '%s  %s\n' "${checksum%% *}" "${archive##*/}" >"$archive.sha256" || return
+    printf '%s\n' "$archive"
+)
+# Takes --export archives and other root filesystem tarballs (tar detects gzip,
+# xz or zstd). A NAME.sha256 file beside the archive is verified first.
+import_image() (
+    local name=$1 archive=$2 size=$3 lifecycle=$4 image descriptor expected actual suite architecture release origin
+    unused_image "$name" || return
+    valid_size_mib "$size" || { fail "Size must be a whole number from 1 to $MAX_SIZE_MIB MiB."; return 1; }
+    valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
+    archive=$(readlink -f -- "$archive") && [[ -f $archive && -r $archive ]] || { fail "Archive not found or unreadable: $2"; return 1; }
+    image="$IMAGE_DIR/$name.img"
+    lock_image "$image" descriptor || return
+    unused_image "$name" || return
+    require_free_space "$IMAGE_DIR" "$((size * 1048576))" || return
+    begin_operation import "$name" || return
+    if [[ -f $archive.sha256 ]]; then
+        read -r expected _ <"$archive.sha256" || true
+        actual=$(sha256sum -- "$archive") || return
+        [[ ${actual%% *} == "${expected:-}" ]] || { fail "Checksum mismatch: $archive is damaged or was changed."; return 1; }
+        info "Checksum verified: ${archive##*/}"
+    fi
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    make_workdir || return
+    info "Importing $name from ${archive##*/} / $size MiB. Log: $OP_LOG"
+    allocate_image "$PENDING" "$size" || return
+    mkfs.ext4 -F -L "${name:0:16}" "$PENDING" >>"$OP_LOG" 2>&1 || return
+    info "Unpacking the archive..."
+    run_worker import "$PENDING" "$WORK" "$archive" 3>&2 >>"$OP_LOG" 2>&1 || {
+        fail "Extraction failed. If the log reports no space left, import with a larger size. Log: $OP_LOG"; return 1;
+    }
+    suite=$(worker_detail codename); [[ $suite =~ ^[a-z][a-z0-9.+-]*$ ]] || suite=unknown
+    architecture=$(worker_detail architecture); [[ $architecture =~ ^[a-z0-9][a-z0-9-]*$ ]] || architecture=unknown
+    origin=${archive##*/}; origin=${origin//[[:cntrl:]]/}
+    write_metadata "$PENDING" "$lifecycle" "$suite" "$architecture" "$size" "$(timestamp)" never imported "$origin" || return
+    release=$(worker_detail release)
+    [[ -z $release ]] || metadata_set "$PENDING" release "$release" || return
+    publish_image "$PENDING" "$image" || return
+    PENDING=
+    info "Imported '$name'. Enter with: sudo $0 --enter $name"
+)
+set_lifecycle() (
+    local image=$1 lifecycle=$2 descriptor name
+    name=$(basename "$image" .img)
+    valid_lifecycle "$lifecycle" || { fail "Lifecycle must be persistent or ephemeral."; return 1; }
+    lock_image "$image" descriptor || return
+    if [[ $(image_lifecycle "$image") == "$lifecycle" ]]; then info "'$name' already uses $lifecycle sessions."; return 0; fi
+    begin_operation mode "$name" || return
+    metadata_set "$image" lifecycle "$lifecycle" || return
+    info "'$name' now uses $lifecycle sessions."
+)
+describe_image() (
+    local image=$1 description=$2 descriptor name
+    name=$(basename "$image" .img)
+    valid_description "$description" || { fail "A description is at most 200 characters, without control characters."; return 1; }
+    lock_image "$image" descriptor || return
+    begin_operation describe "$name" || return
+    metadata_set "$image" description "$description" || return
+    if [[ -n $description ]]; then info "Updated the description of '$name'."; else info "Cleared the description of '$name'."; fi
+)
+# Snapshots follow the workspace; logs and journal entries keep the old name.
+rename_image() (
+    # shellcheck disable=SC2034  # destination_lock holds the new name's lock until exit
+    local image=$1 new_name=$2 name descriptor destination destination_lock
+    name=$(basename "$image" .img)
+    [[ $new_name != "$name" ]] || { fail "'$name' already has that name."; return 1; }
+    unused_image "$new_name" || return
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    destination="$IMAGE_DIR/$new_name.img"
+    lock_image "$destination" destination_lock || return
+    unused_image "$new_name" || return
+    [[ ! -e $SNAPSHOT_DIR/$new_name && ! -L $SNAPSHOT_DIR/$new_name ]] || {
+        fail "Snapshots named '$new_name' remain from a deleted workspace. Restore or drop them, or pick another name."; return 1;
+    }
+    begin_operation rename "$name" || return
+    if [[ -f $image.meta ]]; then mv -T -- "$image.meta" "$destination.meta" || return; fi
+    if ! mv -T -- "$image" "$destination"; then
+        if [[ -f $destination.meta ]]; then mv -T -- "$destination.meta" "$image.meta" || true; fi
+        return 1
+    fi
+    if [[ -f $image.mode ]]; then mv -T -- "$image.mode" "$destination.mode" || return; fi
+    if [[ -d $SNAPSHOT_DIR/$name && ! -L $SNAPSHOT_DIR/$name ]]; then
+        mv -T -- "$SNAPSHOT_DIR/$name" "$SNAPSHOT_DIR/$new_name" || return
+    fi
+    e2label "$destination" "${new_name:0:16}" >>"$OP_LOG" 2>&1 || true
+    info "Renamed '$name' to '$new_name'."
+)
+delete_image() (
+    local image=$1 descriptor
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    begin_operation delete "$(basename "$image" .img)" || return
+    rm -f -- "$image" "$image.meta" "$image.mode" || return
+    info "Deleted '$(basename "$image" .img)'. Snapshots and exports were retained."
+)
+
+snapshot_path() {
+    valid_name "$1" && valid_name "$2" || { fail "Invalid image name or snapshot label."; return 1; }
+    [[ ! -L $SNAPSHOT_DIR/$1 ]] || { fail "Snapshot directories must not be symlinks."; return 1; }
+    printf '%s/%s/%s.img\n' "$SNAPSHOT_DIR" "$1" "$2"
+}
+# Caller holds the image lock throughout snapshot/restore, including copies.
+save_snapshot_locked() {
+    local image=$1 label=$2 name destination
+    name=$(basename "$image" .img)
+    destination=$(snapshot_path "$name" "$label") || return
+    [[ ! -e $destination && ! -L $destination ]] || { fail "Snapshot '$label' already exists."; return 1; }
+    install -d -m 0700 "$SNAPSHOT_DIR/$name" || return
+    PENDING=$(mktemp "$SNAPSHOT_DIR/$name/.$label.XXXXXX.partial") || return
+    copy_image_file "$image" "$PENDING" || return
+    copy_metadata "$image" "$PENDING" || return
+    metadata_set "$PENDING" snapshot_at "$(timestamp)" || return
+    publish_image "$PENDING" "$destination" || return
+    PENDING=
+    info "Saved snapshot '$label' for '$name'."
+}
+snapshot_image() (
+    local image=$1 label=$2 descriptor destination
+    valid_name "$label" || { fail "Invalid snapshot label."; return 1; }
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    destination=$(snapshot_path "$(basename "$image" .img)" "$label") || return
+    [[ ! -e $destination && ! -L $destination ]] || { fail "Snapshot '$label' already exists."; return 1; }
+    begin_operation snapshot "$(basename "$image" .img)" || return
+    save_snapshot_locked "$image" "$label"
+)
+restore_image() (
+    local name=$1 label=$2 image snapshot descriptor recovery
+    snapshot=$(snapshot_path "$name" "$label") || return
+    [[ -f $snapshot && ! -L $snapshot ]] || { fail "Snapshot not found: $name / $label"; return 1; }
+    image="$IMAGE_DIR/$name.img"
+    [[ ! -L $image ]] || { fail "Refusing a symlink image."; return 1; }
+    lock_image "$image" descriptor || return
+    assert_offline "$snapshot" || return
+    if [[ -e $image ]]; then assert_offline "$image" || return; fi
+    begin_operation restore "$name" || return
+    if [[ -f $image ]]; then
+        recovery="before-restore-$(date +%Y%m%d-%H%M%S)-$BASHPID"
+        save_snapshot_locked "$image" "$recovery" || return
+    fi
+    PENDING=$(mktemp "$IMAGE_DIR/.$name.XXXXXX.partial") || return
+    copy_image_file "$snapshot" "$PENDING" || return
+    copy_metadata "$snapshot" "$PENDING" || return
+    metadata_set "$PENDING" restored_from "$label" || return
+    metadata_set "$PENDING" restored_at "$(timestamp)" || return
+    publish_image "$PENDING" "$image" || return
+    PENDING=
+    info "Restored '$name' from '$label'."
+    [[ -z ${recovery:-} ]] || info "Undo this restore with: sudo $0 --restore $name $recovery --yes"
+)
+drop_snapshot() (
+    local name=$1 label=$2 snapshot descriptor
+    snapshot=$(snapshot_path "$name" "$label") || return
+    [[ -f $snapshot && ! -L $snapshot ]] || { fail "Snapshot not found: $name / $label"; return 1; }
+    lock_image "$IMAGE_DIR/$name.img" descriptor || return
+    assert_offline "$snapshot" || return
+    begin_operation drop-snapshot "$name" || return
+    rm -f -- "$snapshot" "$snapshot.meta" || return
+    # The next snapshot recreates it; an empty one would only clutter listings.
+    rmdir -- "$SNAPSHOT_DIR/$name" 2>/dev/null || true
+    info "Deleted snapshot '$name / $label'."
+)
+list_snapshots() {
+    local name=$1 format=${2:-text} snapshot comma=
+    valid_name "$name" || { fail "Invalid image name."; return 1; }
+    [[ $format != json ]] || printf '['
+    for snapshot in "$SNAPSHOT_DIR/$name/"*.img; do
+        [[ -f $snapshot && ! -L $snapshot ]] || continue
+        if [[ $format != json ]]; then
+            printf '%s\t%s MiB\t%s\n' "$(basename "$snapshot" .img)" "$(image_size_mib "$snapshot")" "$(metadata_value "$snapshot" snapshot_at unknown)"
+            continue
+        fi
+        printf '%s{"label":' "$comma"; json_string "$(basename "$snapshot" .img)"
+        printf ',"snapshot_at":'; json_string "$(metadata_value "$snapshot" snapshot_at unknown)"
+        printf ',"path":'; json_string "$snapshot"
+        printf ',"size_mib":%s,"allocated_bytes":%s}' "$(image_size_mib "$snapshot")" "$(allocated_bytes "$snapshot")"
+        comma=,
+    done
+    [[ $format != json ]] || printf ']\n'
+    return 0
+}
+
+enter_chrootable() (
+    local image=$1 lifecycle=$2 network=$3 descriptor status=0 name
+    shift 3
+    name=$(basename "$image" .img)
+    if [[ $lifecycle == ephemeral && -n $EPHEMERAL_SIZE ]] && ! valid_tmpfs_size "$EPHEMERAL_SIZE"; then
+        fail "CHROOTABLE_EPHEMERAL_SIZE must look like 2G, 512M or 50%: $EPHEMERAL_SIZE"; return 1
+    fi
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    begin_operation session "$name" || return
+    make_workdir || return
+    local -a namespace=(--mount --uts --ipc --pid --fork --kill-child)
+    [[ $network != isolated ]] || namespace+=(--net)
+    spawn_worker "${namespace[@]}" "$BASH" "$SCRIPT_PATH" --worker enter "$image" "$WORK" "$name" "$lifecycle" "$network" "$@" || status=$?
+    # A worker marker distinguishes a guest command failure from mount failure.
+    if [[ -f $WORK/started ]]; then
+        GUEST_EXITED=1
+        metadata_set "$image" last_used_at "$(timestamp)" || info "Could not record the last-used time."
+    fi
+    return "$status"
+)
+worker_cleanup() {
+    local status=$? cleanup_status=0
+    cd / || true
+    # Only PID 1 of the session's own namespace may signal "every process".
+    if (( $$ == 1 )); then
+        kill -TERM -1 2>/dev/null || true
+        sleep 0.05 2>/dev/null || true
+        kill -KILL -1 2>/dev/null || true
+    fi
+    if mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT/dev/ptmx"; then umount "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT/dev/pts"; then umount "$WORKER_ROOT/dev/pts" 2>/dev/null || true; fi
+    if mountpoint -q "$WORKER_ROOT"; then umount -R "$WORKER_ROOT" 2>/dev/null || umount -l "$WORKER_ROOT" || cleanup_status=$?; fi
+    if mountpoint -q "$WORKER_LOWER"; then umount "$WORKER_LOWER" 2>/dev/null || umount -l "$WORKER_LOWER" || cleanup_status=$?; fi
+    if mountpoint -q "$WORKER_OVERLAY"; then umount "$WORKER_OVERLAY" 2>/dev/null || umount -l "$WORKER_OVERLAY" || cleanup_status=$?; fi
+    (( status != 0 || cleanup_status == 0 )) || status=$cleanup_status
+    exit "$status"
+}
+# Guest DNS: the host's resolvers minus loopback stubs (systemd-resolved's
+# 127.0.0.53, ::1) that a chroot cannot reach; fallbacks when none remain.
+setup_resolv_conf() {
+    local work=$1 root=$2
+    local target="$root/etc/resolv.conf" dest="$work/resolv.conf" source_file server; local -a servers=()
+    for source_file in /run/systemd/resolve/resolv.conf /etc/resolv.conf ''; do
+        [[ -z $source_file || ( -f $source_file && -r $source_file ) ]] && break
+    done
+    : >"$dest" || return
+    if [[ -n $source_file ]]; then
+        awk '$1 == "nameserver" && ($2 ~ /^127\./ || $2 == "::1") {next} {print}' "$source_file" >"$dest" || true
+    fi
+    if ! awk '$1 == "nameserver" {found = 1} END {exit !found}' "$dest"; then
+        read -r -a servers <<<"$FALLBACK_DNS"
+        for server in "${servers[@]}"; do
+            if [[ $server =~ ^[0-9A-Fa-f.:]+$ ]]; then printf 'nameserver %s\n' "$server"; fi
+        done >>"$dest"
+    fi
+    # Never follow a guest symlink here: it would resolve against the host.
+    [[ -d $root/etc && ! -L $root/etc ]] || return 0
+    if [[ -L $target || ( -e $target && ! -f $target ) ]]; then
+        info "Keeping the guest's own /etc/resolv.conf because it is not a regular file."
+        return 0
+    fi
+    [[ -e $target ]] || : >"$target" || return 0
+    mount --bind "$dest" "$target" || info "Could not share the host's DNS settings with the guest."
+}
+# Full-screen programs need terminfo for $TERM inside the guest. Minbase ships
+# only a few entries (no foot, kitty or alacritty): fall back to xterm-256color.
+guest_terminal() {
+    local root=$1 term=${TERM:-xterm} directory
+    if [[ $term =~ ^[A-Za-z0-9][A-Za-z0-9.+_-]*$ ]]; then
+        for directory in etc/terminfo usr/share/terminfo usr/lib/terminfo lib/terminfo; do
+            [[ ! -e $root/$directory/${term:0:1}/$term ]] || { printf '%s\n' "$term"; return; }
+        done
+    fi
+    printf 'xterm-256color\n'
+}
+# A host locale the guest never generated makes perl and apt warn on every
+# command; C.UTF-8 always exists.
+guest_locale() {
+    local root=$1 lang=${LANG:-C.UTF-8}
+    case $lang in C|POSIX|C.UTF-8|C.utf8) printf '%s\n' "$lang"; return ;; esac
+    if [[ $lang =~ ^[A-Za-z0-9_.@-]+$ && -f $root/usr/lib/locale/locale-archive && -f $root/etc/locale.gen ]] &&
+        awk -v want="$lang" '$1 == want {found = 1} END {exit !found}' "$root/etc/locale.gen"; then
+        printf '%s\n' "$lang"
+    else printf 'C.UTF-8\n'; fi
+}
+# Facts for the parent's metadata, one line per file; the parent sanitizes them.
+record_guest_details() {
+    local root=$1 work=$2
+    awk '/^PRETTY_NAME=/ {sub(/^PRETTY_NAME=/, ""); gsub(/^"|"$/, ""); print; exit}' "$root/etc/os-release" >"$work/release" 2>/dev/null || true
+    awk -F= '$1 == "VERSION_CODENAME" {gsub(/"/, "", $2); print $2; exit}' "$root/etc/os-release" >"$work/codename" 2>/dev/null || true
+    awk '$0 == "Package: dpkg" {found = 1; next} found && /^Architecture:/ {print $2; exit} /^$/ {found = 0}' \
+        "$root/var/lib/dpkg/status" >"$work/architecture" 2>/dev/null || true
+}
+# Cleanup signals every process in its PID namespace and the worker makes all
+# mounts private: refuse to run anywhere but in the namespaces spawn_worker makes.
+worker_isolated() {
+    local own host
+    (( $$ == 1 )) || { fail "--worker is internal and must run as PID 1 of a new PID namespace."; return 1; }
+    own=$(readlink /proc/self/ns/mnt 2>/dev/null) || own=
+    host=$(readlink /proc/1/ns/mnt 2>/dev/null) || host=
+    [[ -z $own || $own != "$host" ]] || { fail "--worker is internal and must run in a new mount namespace."; return 1; }
+}
+mount_session_devices() {
+    mkdir -p "$WORKER_ROOT/proc" "$WORKER_ROOT/dev" "$WORKER_ROOT/run" || return
+    mount -t proc proc "$WORKER_ROOT/proc" || return
+    mount --rbind /dev "$WORKER_ROOT/dev" || return
+    mount --make-rslave "$WORKER_ROOT/dev" || return
+    if mkdir -p "$WORKER_ROOT/dev/pts" 2>/dev/null; then
+        mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$WORKER_ROOT/dev/pts" 2>/dev/null &&
+            mount --bind "$WORKER_ROOT/dev/pts/ptmx" "$WORKER_ROOT/dev/ptmx" 2>/dev/null || true
+    fi
+    mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
+}
+worker_main() (
+    local kind=$1 image=$2 work=$3
+    shift 3
+    require_root || return
+    worker_isolated || return
+    WORKER_ROOT="$work/root"; WORKER_LOWER="$work/lower"; WORKER_OVERLAY="$work/overlay"
+    trap worker_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mount --make-rprivate / || return
+    mkdir -p "$WORKER_ROOT" || return
+    case $kind in
+        create)
+            local name=$1 arch=$2 profile=$3 packages
+            mount -o loop "$image" "$WORKER_ROOT" || return
+            debootstrap --variant=minbase --arch="$arch" "$DEBIAN_SUITE" "$WORKER_ROOT" "$DEBIAN_MIRROR" || return
+            printf '%s\n' "$name" >"$WORKER_ROOT/etc/hostname" || return
+            printf '127.0.0.1 localhost\n127.0.1.1 %s\n::1 localhost ip6-localhost ip6-loopback\n' "$name" >"$WORKER_ROOT/etc/hosts" || return
+            packages=$(profile_packages "$profile") || return
+            if [[ -n $packages ]]; then
+                progress "Installing the $profile profile: $packages"
+                setup_resolv_conf "$work" "$WORKER_ROOT"
+                mount_session_devices || return
+                local -a package_list=()
+                read -r -a package_list <<<"$packages"
+                # A clean environment: host locale and variables stay out of the log.
+                local -a apt_env=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive)
+                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get update || return
+                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get install -y --no-install-recommends "${package_list[@]}" || return
+                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get clean || return
+            fi
+            record_guest_details "$WORKER_ROOT" "$work"
+            ;;
+        export)
+            mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
+            tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
+            ;;
+        import)
+            mount -o loop "$image" "$WORKER_ROOT" || return
+            # '*.*' restores every xattr namespace, file capabilities included.
+            tar --numeric-owner --acls --xattrs --xattrs-include='*.*' -xpf "$1" -C "$WORKER_ROOT" || return
+            record_guest_details "$WORKER_ROOT" "$work"
+            ;;
+        enter)
+            local name=$1 lifecycle=$2 network=$3 tmpfs_options=mode=0755,nosuid,nodev
+            shift 3
+            if [[ $lifecycle == ephemeral ]]; then
+                if [[ -n $EPHEMERAL_SIZE ]]; then valid_tmpfs_size "$EPHEMERAL_SIZE" || return; tmpfs_options+=",size=$EPHEMERAL_SIZE"; fi
+                mkdir -p "$WORKER_LOWER" "$WORKER_OVERLAY" || return
+                mount -o loop,ro,noload "$image" "$WORKER_LOWER" || return
+                mount -t tmpfs -o "$tmpfs_options" tmpfs "$WORKER_OVERLAY" || return
+                mkdir -p "$WORKER_OVERLAY/upper" "$WORKER_OVERLAY/work" || return
+                mount -t overlay overlay -o "lowerdir=$WORKER_LOWER,upperdir=$WORKER_OVERLAY/upper,workdir=$WORKER_OVERLAY/work" "$WORKER_ROOT" || return
+            else
+                mount -o loop "$image" "$WORKER_ROOT" || return
+            fi
+            if [[ $network == isolated ]]; then
+                ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null || true
+            else
+                setup_resolv_conf "$work" "$WORKER_ROOT"
+            fi
+            mount_session_devices || return
+            hostname "$name" || return
+            local -a environment=(HOME=/root USER=root LOGNAME=root SHELL=/bin/bash
+                "LANG=$(guest_locale "$WORKER_ROOT")" "TERM=$(guest_terminal "$WORKER_ROOT")"
+                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                "CHROOTABLE_NAME=$name" "CHROOTABLE_LIFECYCLE=$lifecycle" "CHROOTABLE_NETWORK=$network")
+            [[ -z ${COLORTERM:-} ]] || environment+=("COLORTERM=$COLORTERM")
+            printf 'started\n' >"$work/started" || return
+            # Scripts get exactly the command's stdout; the banner is shell-only.
+            if (( $# == 0 )); then
+                info "[$name] $lifecycle session | network: $network"
+                [[ $lifecycle != ephemeral ]] || info "All filesystem changes in this session disappear on exit."
+                set -- /bin/bash --login
+            fi
+            cd "$WORKER_ROOT" || return
+            chroot "$WORKER_ROOT" /usr/bin/env -i "${environment[@]}" "$@" || return
+            cd / || return
+            ;;
+        *) fail "Unknown worker operation."; return 2 ;;
+    esac
+)
+
+# JSON output needs no Python/jq dependency and never evaluates metadata.
+json_string() {
+    local value=$1 character number i
+    # Most values need no escaping; skip the per-character loop for them.
+    if [[ $value != *[\"\\[:cntrl:]]* ]]; then printf '"%s"' "$value"; return; fi
+    printf '"'
+    for ((i=0; i<${#value}; i++)); do
+        character=${value:i:1}
+        case $character in
+            '"') printf '\\"' ;; \\) printf '\\\\' ;;
+            *) printf -v number '%d' "'$character"
+               if (( number < 32 )); then printf '\\u%04x' "$number"; else printf '%s' "$character"; fi ;;
+        esac
+    done
+    printf '"'
+}
+image_json() {
+    local image=$1 name key value comma=
+    name=$(basename "$image" .img)
+    printf '{'
+    for key in name path status lifecycle suite architecture release profile description \
+        created_at last_used_at origin restored_from restored_at; do
+        case $key in
+            name) value=$name ;; path) value=$image ;; status) value=$(image_status "$image") ;;
+            lifecycle) value=$(image_lifecycle "$image") ;; profile) value=$(metadata_value "$image" "$key" minimal) ;;
+            last_used_at) value=$(metadata_value "$image" "$key" never) ;;
+            description|restored_from|restored_at) value=$(metadata_value "$image" "$key" '') ;;
+            *) value=$(metadata_value "$image" "$key" unknown) ;;
+        esac
+        printf '%s"%s":' "$comma" "$key"; json_string "$value"; comma=,
+    done
+    printf ',"size_mib":%s,"allocated_bytes":%s,"snapshots":%s}' "$(image_size_mib "$image")" "$(allocated_bytes "$image")" "$(snapshot_count "$name")"
+}
+list_images() {
+    local format=${1:-text} image comma=
+    [[ $format != json ]] || printf '['
+    for image in "$IMAGE_DIR/"*.img; do
+        [[ -f $image && ! -L $image ]] || continue
+        valid_name "$(basename "$image" .img)" || continue
+        if [[ $format == json ]]; then printf '%s' "$comma"; image_json "$image"; comma=,
+        else printf '%s\t%s\t%s MiB\n' "$(basename "$image" .img)" "$(image_lifecycle "$image")" "$(image_size_mib "$image")"; fi
+    done
+    [[ $format != json ]] || printf ']\n'
+    return 0
+}
+image_details() {
+    local image=$1 name value
+    name=$(basename "$image" .img)
+    printf '%s  /  %s  /  %s\n' "$name" "$(image_status "$image")" "$(image_lifecycle "$image")"
+    value=$(metadata_value "$image" description '')
+    [[ -z $value ]] || printf '%s\n' "$value"
+    printf '\nDebian %-14s Architecture %s\nProfile %-13s Snapshots    %s\n' \
+        "$(metadata_value "$image" suite unknown)" "$(metadata_value "$image" architecture unknown)" \
+        "$(metadata_value "$image" profile minimal)" "$(snapshot_count "$name")"
+    value=$(metadata_value "$image" release '')
+    [[ -z $value ]] || printf 'Release  %s\n' "$value"
+    printf 'Capacity %s MiB   Allocated %s\nCreated  %s\nLast run %s\n' \
+        "$(image_size_mib "$image")" "$(human_bytes "$(allocated_bytes "$image")")" \
+        "$(metadata_value "$image" created_at 'unknown (legacy image)')" "$(metadata_value "$image" last_used_at never)"
+    value=$(metadata_value "$image" origin none)
+    if [[ $value != none ]]; then
+        if [[ $(metadata_value "$image" profile minimal) == imported ]]; then printf 'Imported %s\n' "$value"
+        else printf 'Clone of %s\n' "$value"; fi
+    fi
+    value=$(metadata_value "$image" restored_from '')
+    [[ -z $value ]] || printf 'Restored %s at %s\n' "$value" "$(metadata_value "$image" restored_at unknown)"
+    printf 'Image    %s\n' "$image"
+}
+workspace_summary() {
+    local image total=0 persistent=0 ephemeral=0 busy=0 bytes=0 snapshots=0 snapshot_bytes=0 allocated free=unknown
+    for image in "$IMAGE_DIR/"*.img; do
+        [[ -f $image && ! -L $image ]] || continue
+        allocated=$(allocated_bytes "$image") || allocated=0
+        total=$((total + 1)); bytes=$((bytes + allocated))
+        if [[ $(image_lifecycle "$image") == ephemeral ]]; then ephemeral=$((ephemeral + 1)); else persistent=$((persistent + 1)); fi
+        [[ $(image_status "$image") != busy ]] || busy=$((busy + 1))
+    done
+    for image in "$SNAPSHOT_DIR/"*/*.img; do
+        [[ -f $image && ! -L $image ]] || continue
+        allocated=$(allocated_bytes "$image") || allocated=0
+        snapshots=$((snapshots + 1)); snapshot_bytes=$((snapshot_bytes + allocated))
+    done
+    # Free space where new images go; images/ may be a separate mount.
+    if [[ -d $IMAGE_DIR ]]; then free=$(df -Ph -- "$IMAGE_DIR" | awk 'NR == 2 {print $4}')
+    elif [[ -d $STORE_DIR ]]; then free=$(df -Ph -- "$STORE_DIR" | awk 'NR == 2 {print $4}'); fi
+    printf '%s workspaces   %s persistent   %s disposable   %s busy\n' "$total" "$persistent" "$ephemeral" "$busy"
+    printf '%s in images   %s in %s snapshots   %s host free\n' "$(human_bytes "$bytes")" "$(human_bytes "$snapshot_bytes")" "$snapshots" "$free"
+}
+dashboard() {
+    local image accent='' reset=''
+    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then accent=$'\033[1;36m'; reset=$'\033[0m'; fi
+    printf '\n%sCHROOTABLE%s  /  Debian environment workbench  /  %s\n\n' "$accent" "$reset" "$APP_VERSION"
+    workspace_summary
+    printf '\n%-24s %-7s %-11s %-10s %-9s %s\n' WORKSPACE STATE MODE PROFILE CAPACITY SNAPSHOTS
+    for image in "$IMAGE_DIR/"*.img; do
+        [[ -f $image && ! -L $image ]] || continue
+        printf '%-24s %-7s %-11s %-10s %-9s %s\n' "$(basename "$image" .img)" "$(image_status "$image")" \
+            "$(image_lifecycle "$image")" "$(metadata_value "$image" profile minimal)" "$(image_size_mib "$image")M" "$(snapshot_count "$(basename "$image" .img)")"
+    done
+    printf '\nStore: %s\n' "$STORE_DIR"
+    if [[ -f $STORE_DIR/activity.tsv ]]; then printf '\nRecent activity\n'; activity 5; fi
+    printf '\nCreate: --create NAME 4096 persistent build\nExplore: --help | --profiles | --doctor | --demo\n\n'
+}
+activity() {
+    local count=${1:-20} format=${2:-text} time operation name status log comma=
+    if [[ ! -f $STORE_DIR/activity.tsv ]]; then
+        if [[ $format == json ]]; then printf '[]\n'; else printf 'No operations recorded yet. Create a workspace to get started.\n'; fi
+        return 0
+    fi
+    if [[ $format != json ]]; then
+        tail -n "$count" "$STORE_DIR/activity.tsv" | awk -F '\t' '{printf "%s  %-14s %-20s %s\n", $1, $2, $3, $4}'
+        return
+    fi
+    printf '['
+    while IFS=$'\t' read -r time operation name status log; do
+        printf '%s{"time":' "$comma"; json_string "$time"
+        printf ',"operation":'; json_string "$operation"
+        printf ',"name":'; json_string "$name"
+        printf ',"status":'; json_string "$status"
+        printf ',"log":'; json_string "$log"; printf '}'; comma=,
+    done < <(tail -n "$count" "$STORE_DIR/activity.tsv")
+    printf ']\n'
+}
+show_logs() {
+    local name=$1 log latest=
+    valid_name "$name" || { fail "Invalid image name."; return 1; }
+    if [[ -f $STORE_DIR/activity.tsv ]]; then
+        # The chronological journal names each finished operation's log, so one
+        # pass finds the newest and "foo-bar" logs never count as "foo" logs.
+        while IFS= read -r log; do
+            if [[ $log == "$LOG_DIR/"* && $log != *..* && -f $log && ! -L $log ]]; then latest=$log; fi
+        done < <(awk -F '\t' -v name="$name" '$3 == name {print $5}' "$STORE_DIR/activity.tsv")
+    else
+        for log in "$LOG_DIR/$name-"*.log; do
+            [[ -f $log && ! -L $log ]] || continue
+            [[ -n $latest && ! $log -nt $latest ]] || latest=$log
+        done
+    fi
+    [[ -n $latest ]] || { printf 'No completed operation logs for %s yet.\n' "$name"; return 0; }
+    printf 'Log: %s\n\n' "$latest"
+    tail -n 200 -- "$latest"
+}
+list_exports() {
+    local format=${1:-text} archive base size created checksum comma=
+    [[ $format != json ]] || printf '['
+    for archive in "$EXPORT_DIR/"*.tar.gz; do
+        [[ -f $archive && ! -L $archive ]] || continue
+        base=${archive##*/}
+        size=$(stat -c%s -- "$archive") || continue
+        created=$(date -r "$archive" --iso-8601=seconds) || created=unknown
+        checksum=
+        if [[ -f $archive.sha256 && ! -L $archive.sha256 && -r $archive.sha256 ]]; then read -r checksum _ <"$archive.sha256" || true; fi
+        if [[ $format != json ]]; then
+            printf '%s\t%s\t%s\n' "$base" "$(human_bytes "$size")" "$created"
+            continue
+        fi
+        printf '%s{"file":' "$comma"; json_string "$base"
+        # NAME-YYYYmmdd-HHMMSS-TOKEN.tar.gz; the token never contains a hyphen.
+        base=${base%.tar.gz}
+        printf ',"workspace":'; json_string "${base%-*-*-*}"
+        printf ',"path":'; json_string "$archive"
+        printf ',"created_at":'; json_string "$created"
+        printf ',"sha256":'; if [[ -n $checksum ]]; then json_string "$checksum"; else printf null; fi
+        printf ',"size_bytes":%s}' "$size"; comma=,
+    done
+    [[ $format != json ]] || printf ']\n'
+    return 0
+}
+# Leftovers of operations that died without cleaning up (power loss, kill -9).
+# Each belongs to a workspace name; if that name's lock is free, no operation
+# is still writing it (new operations always pick fresh file names).
+stale_files() {
+    local file base name descriptor
+    for file in "$IMAGE_DIR"/.*.partial* "$IMAGE_DIR"/*.img.meta.?????? "$EXPORT_DIR"/.*.partial* \
+        "$SNAPSHOT_DIR"/*/.*.partial* "$SNAPSHOT_DIR"/*/*.img.meta.??????; do
+        [[ -f $file && ! -L $file ]] || continue
+        base=${file##*/}
+        if [[ $file == "$SNAPSHOT_DIR"/* ]]; then name=${file#"$SNAPSHOT_DIR/"}; name=${name%%/*}
+        elif [[ $base == .* ]]; then name=${base#.}; name=${name%.??????.partial*}
+        else name=${base%.img.meta.??????}; fi
+        valid_name "$name" || continue
+        ( try_lock_image "$IMAGE_DIR/$name.img" descriptor ) || continue
+        printf '%s\n' "$file"
+    done
+}
+cleanup_store() (
+    local apply=${1:-} file allocated bytes=0; local -a files=()
+    mapfile -t files < <(stale_files)
+    if (( ${#files[@]} == 0 )); then info "No leftover files from interrupted operations."; return 0; fi
+    for file in "${files[@]}"; do
+        allocated=$(allocated_bytes "$file") || allocated=0
+        bytes=$((bytes + allocated))
+        printf '%s\t%s\n' "$(human_bytes "$allocated")" "$file"
+    done
+    if [[ $apply != --yes ]]; then
+        info "${#files[@]} leftover files use $(human_bytes "$bytes"). Remove them with: sudo $0 --cleanup --yes"
+        return 0
+    fi
+    begin_operation cleanup store || return
+    printf '%s\n' "${files[@]}" >>"$OP_LOG"
+    rm -f -- "${files[@]}" || return
+    info "Removed ${#files[@]} leftover files ($(human_bytes "$bytes"))."
+)
+doctor() {
+    local command missing=0 fs namespace partials=0 file
+    printf 'CHROOTABLE / Host health\n\n'
+    printf 'Host: %s / %s\nStore: %s\nDebian: %s from %s\n\n' "$(uname -s)" "$(uname -m)" "$STORE_DIR" "$DEBIAN_SUITE" "$DEBIAN_MIRROR"
+    if (( EUID == 0 )); then printf '[OK] Running as root.\n'
+    else printf '[INFO] Not running as root; workspace operations need sudo.\n'; fi
+    for command in "${REQUIRED_COMMANDS[@]}"; do
+        command -v "$command" >/dev/null 2>&1 && continue
+        if [[ $command == whiptail ]]; then printf '[INFO] whiptail is missing; only the menu needs it.\n'; continue; fi
+        printf '[MISSING] %-14s install %s\n' "$command" "$(package_for_command "$command")"
+        missing=$((missing + 1))
+    done
+    (( missing != 0 )) || printf '[OK] Host commands are available.\n'
+    if ! valid_suite "$DEBIAN_SUITE" || ! valid_mirror "$DEBIAN_MIRROR"; then
+        printf '[MISSING] CHROOTABLE_DEBIAN_SUITE or CHROOTABLE_DEBIAN_MIRROR is malformed.\n'; missing=$((missing + 1))
+    elif ! debootstrap_knows_suite "$DEBIAN_SUITE"; then
+        printf '[MISSING] debootstrap has no script for suite %s.\n' "$DEBIAN_SUITE"; missing=$((missing + 1))
+    else printf '[OK] Debian suite and mirror settings are valid.\n'; fi
+    for fs in ext4 overlay; do
+        if awk -v fs="$fs" '$NF==fs {found=1} END {exit !found}' /proc/filesystems; then printf '[OK] Kernel filesystem: %s\n' "$fs"
+        else printf '[INFO] %s is not loaded; it may be available as a kernel module.\n' "$fs"; fi
+    done
+    for namespace in mnt uts ipc pid net; do
+        if [[ -e /proc/self/ns/$namespace ]]; then printf '[OK] Namespace: %s\n' "$namespace"
+        else printf '[MISSING] Namespace: %s\n' "$namespace"; missing=$((missing + 1)); fi
+    done
+    if [[ -e /dev/loop-control ]]; then printf '[OK] Loop device control exists.\n'
+    else printf '[INFO] /dev/loop-control is unavailable; image mounts may be blocked.\n'; fi
+    if [[ -d $STORE_DIR ]]; then
+        if [[ -r $STORE_DIR && -x $STORE_DIR ]]; then
+            printf '[OK] Store is readable.\n'
+            for file in "$IMAGE_DIR"/.*.partial "$EXPORT_DIR"/.*.partial "$SNAPSHOT_DIR"/*/.*.partial; do
+                [[ ! -f $file ]] || partials=$((partials + 1))
+            done 2>/dev/null
+            (( partials == 0 )) || printf '[INFO] %s partial files: running operations or leftovers. Review: sudo %s --cleanup\n' "$partials" "$0"
+            df -Ph -- "$STORE_DIR"
+        else printf '[INFO] Store needs root access.\n'; fi
+    else printf '[INFO] Store will be created on the first write operation.\n'; fi
+    printf '\nMount permissions are not tested by this read-only check.\n'
+    (( missing == 0 )) || printf 'Install missing tools: sudo %s --setup\n' "$0"
+    (( missing == 0 ))
+}
+
+ui_init() {
+    [[ -t 0 && -t 1 ]] || { fail "The menu needs a terminal. Use --dashboard, --list, or --help for command-line output."; return 1; }
+    command -v whiptail >/dev/null || { fail "Install whiptail to use the menu (sudo apt-get install whiptail)."; return 1; }
+    local rows columns
+    read -r rows columns < <(stty size 2>/dev/null) || { rows=24; columns=80; }
+    (( rows >= 24 && columns >= 80 )) || { fail "The menu needs at least 80 columns by 24 rows. Enlarge the terminal or use --dashboard."; return 1; }
+    UI_HEIGHT=$((rows - 2)); (( UI_HEIGHT <= 30 )) || UI_HEIGHT=30
+    UI_WIDTH=$((columns - 2)); (( UI_WIDTH <= 104 )) || UI_WIDTH=104
+    export NEWT_COLORS="${NEWT_COLORS:-root=white,black window=white,black border=cyan,black title=cyan,black roottext=cyan,black textbox=white,black acttextbox=white,black entry=white,blue label=cyan,black listbox=white,black actlistbox=black,cyan sellistbox=black,cyan actsellistbox=black,cyan button=black,cyan actbutton=black,white compactbutton=black,cyan checkbox=white,black actcheckbox=black,cyan}"
+    NON_INTERACTIVE=0
+}
+ui() {
+    local backtitle="CHROOTABLE  /  Debian environment workbench  /  $APP_VERSION"
+    (( DEMO == 0 )) || backtitle="CHROOTABLE  /  DEMO - sample workspaces, no mounts or downloads"
+    whiptail --title "$APP_NAME" --backtitle "$backtitle" "$@"
+}
+ui_message() { ui --msgbox "$1" "$UI_HEIGHT" "$UI_WIDTH" --scrolltext; }
+ui_view() {
+    local title=$1 content=$2 temporary status=0
+    temporary=$(mktemp /tmp/chrootable-view.XXXXXX) || return
+    printf '%s\n\n%s\n' "$title" "$content" >"$temporary"
+    ui --textbox "$temporary" "$UI_HEIGHT" "$UI_WIDTH" --scrolltext || status=$?
+    rm -f -- "$temporary"
+    return "$status"
+}
+ui_run() {
+    if (( DEMO )); then ui_message "This is a read-only demo.\n\nRun sudo $0 to create real workspaces and use this action."; return; fi
+    local output marker ticker status=0 heading
+    output=$(mktemp /tmp/chrootable-result.XXXXXX) || return
+    marker=$(mktemp /tmp/chrootable-start.XXXXXX) || { rm -f -- "$output"; return 1; }
+    touch -d '1 second ago' "$marker" 2>/dev/null || true
+    ui_progress "$marker" &
+    ticker=$!
+    "$@" >"$output" 2>&1 || status=$?
+    kill "$ticker" 2>/dev/null || true
+    wait "$ticker" 2>/dev/null || true
+    heading="Operation completed"
+    (( status == 0 )) || heading="Operation failed (status $status)"
+    ui_view "$heading" "$(tail -n 30 "$output")" || true
+    rm -f -- "$output" "$marker"
+}
+# Redraws the progress box every two seconds with the elapsed time and the
+# newest line of the running operation's log, until ui_run stops it.
+ui_progress() {
+    local marker=$1 started=$SECONDS log latest line
+    while kill -0 "$$" 2>/dev/null; do
+        latest=
+        for log in "$LOG_DIR"/*.log; do
+            [[ -f $log && $log -nt $marker ]] || continue
+            [[ -n $latest && ! $log -nt $latest ]] || latest=$log
+        done
+        line=
+        if [[ -n $latest ]]; then line=$(tail -n 1 -- "$latest" 2>/dev/null) || line=; fi
+        line=${line//[[:cntrl:]\\]/}
+        ui --infobox "Working... $((SECONDS - started))s\n\n${line:0:$((UI_WIDTH - 6))}\n\nDetailed logs: $LOG_DIR" 10 "$UI_WIDTH" || true
+        sleep 2
+    done
+}
+ui_session() {
+    local image=$1 lifecycle=$2 network=$3 status=0
+    if (( DEMO )); then ui_message "This preview never mounts an image.\n\nIn a real workspace, this opens a $lifecycle shell with $network networking. Exit returns you to this menu."; return; fi
+    printf '\033[H\033[2J'
+    enter_chrootable "$image" "$lifecycle" "$network" || status=$?
+    (( status == 0 )) || ui_message "The session ended with status $status.\n\nA shell reports the status of its last command. If the session never started, Recent log explains why."
+    return 0
+}
+# NAME, or NAME-2, NAME-3 ... when taken (always a valid name).
+unique_name() {
+    local base=${1:0:60} candidate=${1:0:64} number=2
+    while [[ -e $IMAGE_DIR/$candidate.img || -L $IMAGE_DIR/$candidate.img ]]; do
+        candidate="$base-$number"; number=$((number + 1))
+    done
+    printf '%s\n' "$candidate"
+}
+choose_lifecycle() {
+    ui --menu "How should this workspace remember changes?" 13 "$UI_WIDTH" 2 \
+        persistent "Keep changes after each session" ephemeral "Discard session writes; reuse the base image" 3>&1 1>&2 2>&3
+}
+create_chrootable() {
+    local name profile size lifecycle suggested minimum record; local -a entries=() fields=()
+    for record in "${PROFILES[@]}"; do IFS='|' read -r -a fields <<<"$record"; entries+=("${fields[0]}" "${fields[4]}"); done
+    profile=$(ui --menu "Start with a purpose. Each profile is Debian minbase plus a focused set of tools." 16 "$UI_WIDTH" 4 \
+        "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+    name=$(ui --inputbox "Workspace name (letters, digits, dot, underscore, hyphen):" 10 "$UI_WIDTH" "$(unique_name "$profile-lab")" 3>&1 1>&2 2>&3) || return 0
+    valid_name "$name" || { ui_message "Invalid name. Start with a letter or digit; use at most 64 characters."; return; }
+    [[ ! -e $IMAGE_DIR/$name.img ]] || { ui_message "A workspace named '$name' already exists. Choose another name."; return; }
+    suggested=$(profile_field "$profile" 1); minimum=$(profile_field "$profile" 2)
+    size=$(ui --inputbox "Image capacity in MiB. Suggested for $profile: $suggested MiB (minimum $minimum).\nThe image is fully allocated when created." 11 "$UI_WIDTH" "$suggested" 3>&1 1>&2 2>&3) || return 0
+    valid_size_mib "$size" && (( size >= minimum )) || { ui_message "Enter a whole number from $minimum to $MAX_SIZE_MIB MiB."; return; }
+    lifecycle=$(choose_lifecycle) || return 0
+    ui --yesno "Create $name?\n\nDebian: $DEBIAN_SUITE\nProfile: $profile\nCapacity: $size MiB\nSessions: $lifecycle\n\nThis downloads Debian and the selected profile packages." 17 "$UI_WIDTH" || return 0
+    ui_run create_image "$name" "$size" "$lifecycle" "$profile"
+    [[ ! -f $IMAGE_DIR/$name.img ]] || image_action_menu "$IMAGE_DIR/$name.img"
+}
+ui_import() {
+    local archive choice name size lifecycle bytes; local -a entries=()
+    for archive in "$EXPORT_DIR/"*.tar.gz; do
+        [[ -f $archive && ! -L $archive ]] || continue
+        entries+=("${archive##*/}" "$(human_bytes "$(stat -c%s -- "$archive")")")
+    done
+    entries+=(/path "Enter the full path of another archive")
+    choice=$(ui --cancel-button Back --menu "Import a workspace from a root filesystem archive.\nExports of this store are listed; .tar, .tar.gz, .tar.xz and .tar.zst all work." \
+        "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 10))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+    if [[ $choice == /path ]]; then
+        archive=$(ui --inputbox "Full path of the archive:" 10 "$UI_WIDTH" 3>&1 1>&2 2>&3) || return 0
+    else archive="$EXPORT_DIR/$choice"; fi
+    [[ -f $archive && -r $archive ]] || { ui_message "Archive not found or unreadable:\n$archive"; return; }
+    # Suggest the exported workspace's name: NAME-YYYYmmdd-HHMMSS-TOKEN.tar.gz.
+    name=${archive##*/}; name=${name%%.tar*}
+    [[ ! $name =~ -[0-9]{8}-[0-9]{6}-[A-Za-z0-9]+$ ]] || name=${name%-*-*-*}
+    name=${name//[^A-Za-z0-9._-]/-}
+    while [[ $name == [._-]* ]]; do name=${name:1}; done
+    name=${name:-imported}
+    name=$(ui --inputbox "Name for the imported workspace:" 10 "$UI_WIDTH" "$(unique_name "$name")" 3>&1 1>&2 2>&3) || return 0
+    valid_name "$name" || { ui_message "Invalid name. Start with a letter or digit; use at most 64 characters."; return; }
+    [[ ! -e $IMAGE_DIR/$name.img ]] || { ui_message "A workspace named '$name' already exists. Choose another name."; return; }
+    bytes=$(stat -c%s -- "$archive") || bytes=0
+    size=$(( (bytes * 4 / 1048576 + 1023) / 1024 * 1024 )); (( size >= 2048 )) || size=2048; (( size <= MAX_SIZE_MIB )) || size=$MAX_SIZE_MIB
+    size=$(ui --inputbox "Image capacity in MiB. It must hold the unpacked files, often several times the archive size." 10 "$UI_WIDTH" "$size" 3>&1 1>&2 2>&3) || return 0
+    valid_size_mib "$size" || { ui_message "Enter a whole number from 1 to $MAX_SIZE_MIB MiB."; return; }
+    lifecycle=$(choose_lifecycle) || return 0
+    ui_run import_image "$name" "$archive" "$size" "$lifecycle"
+    [[ ! -f $IMAGE_DIR/$name.img ]] || image_action_menu "$IMAGE_DIR/$name.img"
+}
+ui_cleanup() {
+    ui_view "Leftovers of interrupted operations" "$(cleanup_store 2>&1)" || true
+    ui --defaultno --yesno "Remove the files listed?\n\nThey belong to operations that stopped without cleaning up; no running operation uses them." 11 "$UI_WIDTH" || return 0
+    ui_run cleanup_store --yes
+}
+ui_snapshots() {
+    local name=$1 image="$IMAGE_DIR/$1.img" snapshot label choice action
+    local -a entries=()
+    while true; do
+        entries=()
+        [[ ! -f $image ]] || entries=(/new "Save the current workspace")
+        for snapshot in "$SNAPSHOT_DIR/$name/"*.img; do
+            [[ -f $snapshot && ! -L $snapshot ]] || continue
+            entries+=("$(basename "$snapshot" .img)" "$(metadata_value "$snapshot" snapshot_at unknown) / $(image_size_mib "$snapshot") MiB")
+        done
+        if (( ${#entries[@]} == 0 )); then ui_message "No recovery points remain for $name."; return 0; fi
+        choice=$(ui --cancel-button Back --menu "$name / Recovery points\n\nRestoring saves the current image as a recovery snapshot first." "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 11))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+        if [[ $choice == /new ]]; then
+            label=$(ui --inputbox "Snapshot label:" 10 "$UI_WIDTH" "checkpoint-$(date +%Y%m%d-%H%M%S)" 3>&1 1>&2 2>&3) || continue
+            ui_run snapshot_image "$image" "$label"
+        else
+            action=$(ui --cancel-button Back --menu "$name / $choice" 13 "$UI_WIDTH" 2 restore "Restore this recovery point" delete "Delete this snapshot" 3>&1 1>&2 2>&3) || continue
+            case $action in
+                restore)
+                    ui --defaultno --yesno "Restore '$choice'?\n\nThe current image will be saved as a before-restore snapshot. The selected snapshot stays available." 12 "$UI_WIDTH" || continue
+                    ui_run restore_image "$name" "$choice" ;;
+                delete)
+                    ui --defaultno --yesno "Permanently delete snapshot '$choice'?\n\nThis removes only this recovery point." 11 "$UI_WIDTH" || continue
+                    ui_run drop_snapshot "$name" "$choice" ;;
+            esac
+        fi
+    done
+}
+image_action_menu() {
+    local image=$1 choice value name lifecycle details lines current list_height
+    name=$(basename "$image" .img)
+    while [[ -f $image ]]; do
+        lifecycle=$(image_lifecycle "$image")
+        details=$(image_details "$image")
+        # The details text grows with optional lines; the list takes what is left.
+        lines=${details//[!$'\n']/}
+        list_height=$(( UI_HEIGHT - ${#lines} - 8 )); (( list_height >= 3 )) || list_height=3
+        choice=$(ui --cancel-button Back --menu "$details" "$UI_HEIGHT" "$UI_WIDTH" "$list_height" \
+            enter "Open a $lifecycle root shell" try "Try changes in a disposable session" offline "Open a shell without host network access" \
+            snapshots "Save or restore recovery points" clone "Create an independent copy" rename "Give this workspace a new name" \
+            describe "Add or change a short description" resize "Expand image capacity" \
+            mode "Switch persistent / ephemeral sessions" export "Export filesystem as .tar.gz" logs "Read the latest operation log" \
+            repair "Check and repair the ext4 filesystem" delete "Delete image (retain snapshots and exports)" 3>&1 1>&2 2>&3) || return 0
+        case $choice in
+            enter) ui_session "$image" "$lifecycle" shared ;;
+            try) ui_session "$image" ephemeral shared ;;
+            offline) ui_session "$image" "$lifecycle" isolated ;;
+            snapshots) ui_snapshots "$name" ;;
+            clone)
+                value=$(ui --inputbox "Name for the new copy:" 10 "$UI_WIDTH" "${name:0:59}-copy" 3>&1 1>&2 2>&3) || continue
+                ui_run clone_image "$image" "$value" ;;
+            rename)
+                value=$(ui --inputbox "New name for '$name':" 10 "$UI_WIDTH" "$name" 3>&1 1>&2 2>&3) || continue
+                ui_run rename_image "$image" "$value"
+                if [[ ! -e $image && -f $IMAGE_DIR/$value.img ]]; then image="$IMAGE_DIR/$value.img"; name=$value; fi ;;
+            describe)
+                value=$(ui --inputbox "Short description (leave empty to clear):" 10 "$UI_WIDTH" "$(metadata_value "$image" description '')" 3>&1 1>&2 2>&3) || continue
+                ui_run describe_image "$image" "$value" ;;
+            resize)
+                current=$(image_size_mib "$image")
+                value=$((current + 1024)); (( value <= MAX_SIZE_MIB )) || value=$MAX_SIZE_MIB
+                value=$(ui --inputbox "New capacity in MiB (expansion only):\nCurrent: $current MiB" 11 "$UI_WIDTH" "$value" 3>&1 1>&2 2>&3) || continue
+                ui_run resize_image "$image" "$value" ;;
+            mode) value=$(choose_lifecycle) || continue; ui_run set_lifecycle "$image" "$value" ;;
+            export) ui_run export_image "$image" ;;
+            logs) ui_view "$name / Recent log" "$(show_logs "$name")" || true ;;
+            repair)
+                ui --defaultno --yesno "Run forced ext4 repair on '$name'?\n\nRepair can change filesystem data. Save a snapshot first if you need a recovery point." 12 "$UI_WIDTH" || continue
+                ui_run repair_image "$image" ;;
+            delete)
+                value=$(ui --inputbox "Type $name to permanently delete its image.\nSnapshots and exports will be retained." 11 "$UI_WIDTH" 3>&1 1>&2 2>&3) || continue
+                [[ $value == "$name" ]] || { ui_message "The name did not match. Nothing was deleted."; continue; }
+                ui_run delete_image "$image" ;;
+        esac
+    done
+}
+select_chrootable() {
+    local image name choice filter=; local -a entries=()
+    while true; do
+        entries=(/search "Filter workspaces by name")
+        for image in "$IMAGE_DIR/"*.img; do
+            [[ -f $image && ! -L $image ]] || continue
+            name=$(basename "$image" .img); valid_name "$name" || continue
+            [[ ${name,,} == *"${filter,,}"* ]] || continue
+            entries+=("$name" "$(image_status "$image") / $(image_lifecycle "$image") / $(image_size_mib "$image") MiB / $(metadata_value "$image" profile minimal)")
+        done
+        choice=$(ui --cancel-button Back --menu "Your workspaces\nFilter: ${filter:-all}  |  Choose a workspace to open its tools." "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 10))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+        if [[ $choice == /search ]]; then
+            filter=$(ui --inputbox "Name contains (leave empty to show all):" 10 "$UI_WIDTH" "$filter" 3>&1 1>&2 2>&3) || filter=
+        else image_action_menu "$IMAGE_DIR/$choice.img"; fi
+    done
+}
+recovery_library() {
+    local directory name choice; local -a entries=()
+    for directory in "$SNAPSHOT_DIR/"*/; do
+        [[ -d $directory && ! -L ${directory%/} ]] || continue
+        name=${directory%/}; name=${name##*/}
+        [[ $(snapshot_count "$name") != 0 ]] || continue
+        entries+=("$name" "$(snapshot_count "$name") snapshots")
+    done
+    if (( ${#entries[@]} == 0 )); then ui_message "No snapshots yet.\n\nOpen a workspace and choose Snapshots to save your first recovery point."; return; fi
+    choice=$(ui --cancel-button Back --menu "Recovery library\nIncludes snapshots of deleted workspaces." "$UI_HEIGHT" "$UI_WIDTH" "$((UI_HEIGHT - 10))" "${entries[@]}" 3>&1 1>&2 2>&3) || return 0
+    ui_snapshots "$choice"
+}
+main_menu() {
+    local choice hint; local -a extra=() leftovers=()
+    while true; do
+        hint="Build something. Break things. Keep a recovery point."
+        [[ -d $IMAGE_DIR ]] && compgen -G "$IMAGE_DIR/*.img" >/dev/null || hint="Start with New workspace. Choose a profile; make it your own."
+        extra=()
+        if (( DEMO == 0 )); then
+            mapfile -t leftovers < <(stale_files)
+            (( ${#leftovers[@]} == 0 )) || extra=(cleanup "Remove ${#leftovers[@]} leftover files of interrupted operations")
+        fi
+        choice=$(ui --cancel-button Quit --menu "$(workspace_summary)\n\n$hint" "$UI_HEIGHT" "$UI_WIDTH" 9 \
+            workspaces "Open your workspace library" new "Create a workspace from a profile" import "Create a workspace from an exported archive" \
+            recovery "Browse snapshots, including deleted workspaces" activity "See recent operations" health "Check host tools and kernel support" \
+            profiles "Explore development profiles" help "Shortcuts, workflows and isolation notes" "${extra[@]}" 3>&1 1>&2 2>&3) || return 0
+        case $choice in
+            workspaces) select_chrootable ;; new) create_chrootable ;; import) ui_import ;; recovery) recovery_library ;;
+            activity) ui_view "Workspace activity" "$(activity)" || true ;;
+            health) ui_view "Host health" "$(doctor || true)" || true ;;
+            profiles) ui_view "Start with a purpose" "$(list_profiles)" || true ;;
+            help) ui_view "Field guide" "$(field_guide)" || true ;;
+            cleanup) ui_cleanup ;;
+        esac
+    done
+}
+# Text for --textbox, which shows "\n" literally: real newlines only.
+field_guide() {
+    usage
+    printf '\n%s\n\n%s\n\n%s\n' \
+        'Sessions run as host root and expose host devices. Chroots are development environments, not a security sandbox.' \
+        'Use --try to discard filesystem changes; add --isolated to remove host network access. Host device writes remain possible.' \
+        'Navigate: arrows select, Enter opens, Tab changes button, Escape goes back.'
+}
+
+cleanup_demo() {
+    local name
+    for name in build-lab python-playground network-kit; do
+        rm -f -- "$IMAGE_DIR/$name.img" "$IMAGE_DIR/$name.img.meta"
+    done
+    rm -f -- "$SNAPSHOT_DIR/build-lab/clean-base.img" "$SNAPSHOT_DIR/build-lab/clean-base.img.meta"
+    rmdir "$SNAPSHOT_DIR/build-lab" "$IMAGE_DIR" "$LOG_DIR" "$EXPORT_DIR" "$SNAPSHOT_DIR" "$STORE_DIR"
+}
+run_demo() (
+    DEMO=1
+    STORE_DIR=$(mktemp -d /tmp/chrootable-demo.XXXXXX) || return
+    configure_paths
+    trap cleanup_demo EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    init_store || return
+    local name profile lifecycle size
+    for name in build-lab python-playground network-kit; do
+        case $name in
+            build-lab) profile=build; lifecycle=persistent; size=4096 ;;
+            python-playground) profile=python; lifecycle=ephemeral; size=4096 ;;
+            network-kit) profile=network; lifecycle=ephemeral; size=2048 ;;
+        esac
+        truncate -s "${size}M" "$IMAGE_DIR/$name.img" || return
+        write_metadata "$IMAGE_DIR/$name.img" "$lifecycle" stable "$(host_architecture)" "$size" "$(timestamp)" never "$profile" || return
+        metadata_set "$IMAGE_DIR/$name.img" release 'Debian GNU/Linux 13 (trixie)' || return
+    done
+    metadata_set "$IMAGE_DIR/build-lab.img" description 'Compiler toolchain for the firmware project' || return
+    install -d -m 0700 "$SNAPSHOT_DIR/build-lab" || return
+    truncate -s 4096M "$SNAPSHOT_DIR/build-lab/clean-base.img" || return
+    copy_metadata "$IMAGE_DIR/build-lab.img" "$SNAPSHOT_DIR/build-lab/clean-base.img" || return
+    metadata_set "$SNAPSHOT_DIR/build-lab/clean-base.img" snapshot_at "$(timestamp)" || return
+    if [[ ${1:-} == --dashboard ]]; then
+        printf 'DEMO / sample workspaces / no mounts or downloads\n'
+        dashboard
+    else ui_init && main_menu; fi
+)
+
+usage() {
+    printf '%s\n' "Chrootable Manager $APP_VERSION - Debian environment workbench" '
+Usage: chrootable-manager [COMMAND]
+No command opens the terminal dashboard (root required).
+
+Explore (no root required when the store is readable)
+  --dashboard                       Workspace overview and storage usage
+  --list [--json]                   Inventory; TSV by default
+  --inspect NAME [--json]           Image details and metadata
+  --profiles [--json]               Creation profiles with suggested sizes
+  --snapshots NAME [--json]         Recovery points, even after deletion
+  --exports [--json]                Exported archives and their checksums
+  --activity [COUNT] [--json]       Recent operation history (default 20)
+  --logs NAME                       Last completed operation log (200 lines)
+  --doctor                          Read-only host readiness checks
+  --demo [--dashboard]              Explore sample workspaces without root
+  --help | --version
+
+Create and use (root required)
+  --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
+  --import NAME ARCHIVE SIZE_MIB persistent|ephemeral
+                                    New workspace from an export or rootfs tarball
+  --enter NAME [--isolated]         Open a root shell; --isolated drops host network
+  --enter-isolated NAME             Same as --enter NAME --isolated
+  --exec NAME [--isolated] -- COMMAND [ARG...]
+  --try NAME [--isolated] [-- COMMAND [ARG...]]
+                                    Disposable session, regardless of image mode
+  --clone NAME NEW_NAME             Independent copy (reflink when available)
+  --rename NAME NEW_NAME            New name for a workspace and its snapshots
+  --describe NAME TEXT              Short description; empty TEXT clears it
+  --mode NAME persistent|ephemeral  Change the default session lifecycle
+  --resize NAME SIZE_MIB            Expand only; no shrinking
+  --export NAME                     Export a .tar.gz with a .sha256; print its path
+
+Recovery and maintenance (root required)
+  --snapshot NAME LABEL             Save an offline recovery point
+  --restore NAME LABEL --yes        Save current state, then restore snapshot
+  --drop-snapshot NAME LABEL --yes  Permanently delete one snapshot
+  --repair NAME --yes               Forced ext4 repair
+  --delete NAME --yes               Delete image; keep snapshots and exports
+  --cleanup [--yes]                 List (or remove) leftovers of interrupted operations
+  --setup                           Install missing host dependencies
+
+Profiles: minimal (default), build, python, network; --profiles shows minimum sizes.
+Sizes are MiB, up to 1048576 (1 TiB). Creation fully allocates the image.
+
+Examples
+  sudo chrootable-manager --create compiler 4096 persistent build
+  sudo chrootable-manager --snapshot compiler clean
+  sudo chrootable-manager --try compiler -- bash -lc "apt-get update"
+  sudo chrootable-manager --exec compiler -- gcc --version
+  sudo chrootable-manager --restore compiler clean --yes
+  sudo chrootable-manager --import compiler-2 /srv/compiler.tar.gz 4096 persistent
+
+Configuration
+  sudo CHROOTABLE_HOME=/srv/chrootables chrootable-manager
+  CHROOTABLE_DEBIAN_SUITE=stable
+  CHROOTABLE_DEBIAN_MIRROR=http://deb.debian.org/debian
+  CHROOTABLE_AUTO_INSTALL=0         Fail instead of installing missing tools
+  CHROOTABLE_FALLBACK_DNS="1.1.1.1 8.8.8.8"
+                                    Resolvers when the host has only a local stub
+  CHROOTABLE_EPHEMERAL_SIZE=50%     Cap for disposable session writes (in RAM)
+
+These are host-root development environments, not security sandboxes.
+Ephemeral sessions discard filesystem writes but still expose host devices.'
+}
+# Points at the command's own usage line, not only at --help.
+usage_error() {
+    local line
+    fail "Invalid arguments. Run $0 --help for usage." || true
+    if [[ ${1:-} == --* ]]; then
+        while IFS= read -r line; do
+            if [[ $line == "  $1 "* ]]; then printf 'Usage: chrootable-manager %s\n' "${line#  }" >&2; fi
+        done < <(usage)
+    fi
+    return 2
+}
+validate_activity_arguments() {
+    case $# in
+        1) return 0 ;;
+        2) [[ $2 == --json || $2 =~ ^[1-9][0-9]{0,5}$ ]] ;;
+        3) [[ $2 =~ ^[1-9][0-9]{0,5}$ && $3 == --json ]] ;;
+        *) return 1 ;;
+    esac
+}
+validate_session_arguments() {
+    local operation=$1
+    shift 2
+    [[ ${1:-} != --isolated ]] || shift
+    if (( $# == 0 )); then [[ $operation == --try ]]; return; fi
+    [[ $1 == -- && $# -ge 2 ]]
+}
+validate_cli() {
+    case ${1:-} in
+        --help|-h|--version|--dashboard|--doctor|--setup) [[ $# == 1 ]] ;;
+        --list|--profiles|--exports) [[ $# == 1 || ( $# == 2 && $2 == --json ) ]] ;;
+        --activity) validate_activity_arguments "$@" ;;
+        --cleanup) [[ $# == 1 || ( $# == 2 && $2 == --yes ) ]] ;;
+        --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
+        --inspect|--snapshots) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
+        --logs|--enter-isolated|--export) [[ $# == 2 ]] && valid_name "$2" ;;
+        --enter) [[ $# == 2 || ( $# == 3 && $3 == --isolated ) ]] && valid_name "$2" ;;
+        --create) [[ $# == 4 || $# == 5 ]] && valid_name "$2" && valid_size_mib "$3" && valid_lifecycle "$4" && valid_profile "${5:-minimal}" ;;
+        --import) [[ $# == 5 && -n $3 ]] && valid_name "$2" && valid_size_mib "$4" && valid_lifecycle "$5" ;;
+        --clone|--snapshot|--rename) [[ $# == 3 ]] && valid_name "$2" && valid_name "$3" ;;
+        --describe) [[ $# == 3 ]] && valid_name "$2" && valid_description "$3" ;;
+        --mode) [[ $# == 3 ]] && valid_name "$2" && valid_lifecycle "$3" ;;
+        --resize) [[ $# == 3 ]] && valid_name "$2" && valid_size_mib "$3" ;;
+        --restore|--drop-snapshot) [[ $# == 4 && $4 == --yes ]] && valid_name "$2" && valid_name "$3" ;;
+        --repair|--delete) [[ $# == 3 && $3 == --yes ]] && valid_name "$2" ;;
+        --exec|--try) [[ $# -ge 2 ]] && valid_name "$2" && validate_session_arguments "$@" ;;
+        *) return 1 ;;
+    esac
+}
+run_cli() {
+    local image operation=$1 network=shared lifecycle count=20
+    case $operation in
+        --help|-h) usage ;; --version) printf '%s\n' "$APP_VERSION" ;;
+        --profiles) list_profiles "${2:+json}" ;; --doctor) doctor ;; --demo) run_demo "${2:-}" ;;
+        --dashboard) dashboard ;; --list) list_images "${2:+json}" ;; --exports) list_exports "${2:+json}" ;;
+        --activity)
+            shift
+            if [[ ${1:-} =~ ^[0-9]+$ ]]; then count=$1; shift; fi
+            activity "$count" "${1:+json}" ;;
+        --logs) show_logs "$2" ;; --snapshots) list_snapshots "$2" "${3:+json}" ;;
+        --setup) info "All host dependencies are available." ;;
+        --cleanup) cleanup_store "${2:-}" ;;
+        --create) create_image "$2" "$3" "$4" "${5:-minimal}" ;;
+        --import) import_image "$2" "$3" "$4" "$5" ;;
+        --restore) restore_image "$2" "$3" ;;
+        --drop-snapshot) drop_snapshot "$2" "$3" ;;
+        *)
+            image=$(resolve_image "$2") || return
+            case $operation in
+                --inspect) if [[ ${3:-} == --json ]]; then image_json "$image"; printf '\n'; else image_details "$image"; fi ;;
+                --clone) clone_image "$image" "$3" ;; --resize) resize_image "$image" "$3" ;;
+                --rename) rename_image "$image" "$3" ;; --describe) describe_image "$image" "$3" ;;
+                --repair) repair_image "$image" ;; --delete) delete_image "$image" ;; --export) export_image "$image" ;;
+                --snapshot) snapshot_image "$image" "$3" ;; --mode) set_lifecycle "$image" "$3" ;;
+                --enter|--enter-isolated)
+                    [[ $operation != --enter-isolated && ${3:-} != --isolated ]] || network=isolated
+                    enter_chrootable "$image" "$(image_lifecycle "$image")" "$network" ;;
+                --exec|--try)
+                    shift 2
+                    lifecycle=$(image_lifecycle "$image")
+                    [[ $operation != --try ]] || lifecycle=ephemeral
+                    if [[ ${1:-} == --isolated ]]; then network=isolated; shift; fi
+                    [[ ${1:-} != -- ]] || shift
+                    enter_chrootable "$image" "$lifecycle" "$network" "$@" ;;
+            esac ;;
+    esac
+}
+main() {
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH
+    umask 077
+    SCRIPT_PATH=$(readlink -f -- "$SCRIPT_PATH") || return
+    if [[ ${1:-} == --worker ]]; then
+        [[ $# -ge 5 ]] || return 2
+        shift; worker_main "$@"; return
+    fi
+    if (( $# == 0 )); then
+        NON_INTERACTIVE=0
+        (( EUID == 0 )) || { fail "The menu needs root: sudo $0. Without root, try $0 --demo or $0 --dashboard."; return 1; }
+        check_prerequisites && init_store && ui_init && main_menu
+        return
+    fi
+    validate_cli "$@" || { usage_error "$1"; return 2; }
+    case $1 in
+        --help|-h|--version|--profiles|--demo) ;;
+        --doctor) resolve_store || true ;;
+        --dashboard|--list|--inspect|--activity|--logs|--snapshots|--exports) check_readable_store || return ;;
+        *)
+            [[ $1 != --setup ]] || NON_INTERACTIVE=0
+            require_root && check_prerequisites && init_store || return ;;
+    esac
+    run_cli "$@"
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

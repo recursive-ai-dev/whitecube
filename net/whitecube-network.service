@@ -10,7 +10,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cube-net run
+ExecStart=/usr/bin/cube-net run
 Restart=always
 RestartSec=5
 RestartSteps=4

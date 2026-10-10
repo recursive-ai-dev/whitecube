@@ -1,0 +1,27 @@
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  getSettings: () => ipcRenderer.invoke('settings:get'),
+  saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+  testSettings: (settings) => ipcRenderer.invoke('settings:test', settings),
+  clearKey: () => ipcRenderer.invoke('settings:clear-key'),
+  listModels: () => ipcRenderer.invoke('models:list'),
+  selectModel: (id) => ipcRenderer.invoke('models:select', id),
+  renameModel: (id, name) => ipcRenderer.invoke('models:rename', { id, name }),
+  onModelsChanged: (cb) => ipcRenderer.on('models:changed', (evt, payload) => cb(payload)),
+  newChat: () => ipcRenderer.invoke('chat:new'),
+  cancel: () => ipcRenderer.invoke('chat:cancel'),
+  sendMessage: (text) => ipcRenderer.invoke('chat:send', text),
+  respondConfirm: (requestId, approved) => ipcRenderer.send('chat:confirm-response', { requestId, approved }),
+  hidePanel: () => ipcRenderer.send('panel:hide'),
+  showPanel: () => ipcRenderer.send('panel:show'),
+  copyText: (text) => ipcRenderer.send('clipboard:write', String(text)),
+
+  onEvent: (cb) => ipcRenderer.on('chat:event', (evt, payload) => cb(payload)),
+  onDone: (cb) => ipcRenderer.on('chat:done', () => cb()),
+  onConfirmRequest: (cb) => ipcRenderer.on('chat:confirm-request', (evt, payload) => cb(payload)),
+  onConfirmCancelled: (cb) => ipcRenderer.on('chat:confirm-cancelled', () => cb()),
+  onCleared: (cb) => ipcRenderer.on('chat:cleared', () => cb()),
+  onShown: (cb) => ipcRenderer.on('panel:shown', () => cb()),
+  onSettingsOpen: (cb) => ipcRenderer.on('settings:open', () => cb())
+});

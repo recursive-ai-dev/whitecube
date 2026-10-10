@@ -1,0 +1,33 @@
+Package: whitecube-desktop
+Version: @VERSION@
+Architecture: amd64
+Section: x11
+Priority: optional
+Installed-Size: @SIZE@
+Maintainer: Whitecube <whitecube@localhost>
+Depends: @DEPENDS@
+Recommends: fnott, ufw, dconf-cli, pipewire, wireplumber, pipewire-pulse, qemu-system-x86, qemu-system-gui, ovmf
+Suggests: python3-torch, python3-numpy
+Description: Whitecube - Wayland desktop with native image and model training studios
+ A compositor (whitecube), top bar (cube-status), settings, living cube wallpaper (cube-ca),
+ a native Wi-Fi controller (cube-net), a workspace suite and small apps.
+ Cube Editor adds a GTK4 workspace for inspecting, extracting, customizing and
+ rebuilding Linux ISO images, with project recipes, build reports and optional
+ QEMU testing. System image changes run through an explicit privileged worker.
+ Chrootables manages Debian chroot workspaces: debootstrap images with profiles,
+ persistent or disposable sessions, snapshots, clones, exports and imports, from a
+ GTK4 window or the chrootable-manager command line.
+ The wc-* command suite (start with wc-help) opens apps and reports or changes audio,
+ network, power and system state from a terminal, with shell completions.
+ Whitecube Trainer adds a native GTK4 workspace for local 1M, 2M, 5M and 10M
+ language models, with resumable training, checkpoint previews and Desktop Chat
+ integration. Training uses a configured PyTorch environment; the complete model
+ pipeline is included. Existing CUDA environments can be reused.
+ .
+ Everything is installed system-wide. Each account keeps only its own settings, in ~/.config/whitecube
+ and the usual dotfiles; /etc/skel carries the defaults for new accounts.
+ .
+ X-free wlroots and cairo are bundled in /usr/lib/whitecube for the native compositor
+ and desktop panels. GTK applications use their own distribution runtime libraries.
+ Desktop Chat includes a private Electron runtime and runs through Ozone Wayland.
+ Starts from the "Whitecube" Wayland session entry, or from a tty with: exec whitecube-session

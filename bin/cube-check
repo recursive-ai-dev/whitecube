@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Run Whitecube's health report without starting applications or networking."""
+from pathlib import Path
+import sys
+base = Path('/usr/share/whitecube/workspace')
+if not (base / 'health.py').is_file():
+    base = Path(__file__).resolve().parent.parent / 'workspace'
+sys.path.insert(0, str(base))
+from health import main
+raise SystemExit(main())

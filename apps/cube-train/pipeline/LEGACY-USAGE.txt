@@ -1,0 +1,128 @@
+Model-size presets for the folder command:
+  train --1m    # 1,005,768 parameters (default)
+  train --2m    # 1,981,512 parameters
+  train --4m    # 3,936,648 parameters
+  train --8m    # 7,980,920 parameters
+
+These read ~/train-in and create a new run under ~/train-out. The flags select
+model parameter counts; context stays at 256 byte tokens and the corpus cap
+stays at 20M tokens. Choose only one size flag. Larger models use more memory.
+Resume with train --resume ~/train-out/<run>; the saved size is automatic.
+A conflicting size flag is rejected. To change model size, start a new run.
+The same flags work with bash train.sh (which needs --data or --data-dir).
+
+The installed train command uses ~/.local/share/tensegrity, a separate copy.
+To sync this workspace's changes, including the previous training fixes:
+  bash /home/woez/Downloads/tensegrity-local/install_train.sh
+Do this between training runs. It updates program files, not datasets or runs.
+
+Talking to a finished run:
+  tg-serve                    # OpenAI-compatible server over ~/train-out, :8791
+  tg-serve --device cuda      # same, on the GPU (default is CPU)
+  tg-serve --format labels    # keep system:/user:/assistant: lines in the prompt
+  curl -s localhost:8791/v1/models
+Only 127.0.0.1 is served; it is a local tool, not a shared one.
+
+In cube-chat (Alt+T): /runs lists the runs in ~/train-out, /run <name> points
+the chat at one, /back returns to the endpoint you were on. cube-chat starts
+tg-serve by itself when it is not already running, so there is nothing to
+launch first.
+
+These checkpoints have a 256-byte window end to end, so prompt and reply share
+one small context: the server drops cube-chat's long system prompt, keeps the
+newest bytes of the conversation, and caps a reply at half the window. They are
+document continuation models rather than instruction models - short prompts in
+the style of the training corpus read best, and the output is a continuation,
+not an answer.
+
+Server tests: python -m unittest discover -s tests -p 'test_serve.py'
+
+Tensegrity local: 1,005,768 parameters
+
+This folder adapts Downloads/tensegrity_v0_7_6.ipynb for local PyTorch training.
+The original notebook is preserved. This is a 1M-PARAMETER model, with 256
+byte tokens of context. It is not a one-million-token context configuration.
+The custom architecture trains directly in PyTorch, outside Studio's model picker.
+
+From a terminal:
+  cd ~/Downloads/tensegrity-local
+  bash train.sh --smoke-test
+  bash train.sh --data ~/Downloads/my_training_documents.jsonl --steps 100
+
+Replace my_training_documents.jsonl with your local corpus. Text and JSONL work without
+extra data-reader packages; Parquet needs pyarrow. Use multiple distinct documents, with enough text for both splits to contain
+at least 258 byte tokens. A TXT/Markdown file is one document; a JSONL or
+Parquet row is one document. A single TXT file cannot form both splits.
+
+For a Parquet corpus (pyarrow is installed):
+  bash prepare_parquet.sh ~/Downloads/stories.parquet --column text --max-tokens 2000000 --out-dir data/parquet2m
+  bash train.sh --data-dir data/parquet2m --out-dir runs/parquet2m --steps 100
+
+Use the actual text column name, such as story or content. Without --column,
+the extractor checks text, content, story, then body. It reads rows in source
+order, takes at most the token cap including EOS separators and validation,
+and truncates the last document if necessary. Its default cap is 2M byte
+tokens; this is a starter dataset size, not a GPU safety threshold. Each UTF-8
+byte is one token in Tensegrity. The output report is corpus.json.
+
+Batch size and sequence length control training VRAM; total corpus size does
+not. The extractor avoids loading the full dataset, although Parquet decoder
+memory still depends on row groups and individual row size. Reduce --batch-rows
+to 1 for unusually large rows. It will not overwrite an existing output folder.
+
+To continue the same run to 1,000 total steps:
+  bash train.sh --data-dir data/local1m --resume --steps 1000
+
+Checkpoints and loss logs are stored in runs/local1m. Checkpoints save every
+50 steps and at normal completion. Existing checkpoints are protected from
+accidental restart; use --resume or choose a different --out-dir.
+
+Defaults: batch size 4, accumulation 4, BF16 on CUDA, AdamW, no torch.compile.
+Start small and watch GPU behavior before increasing workload.
+
+Notebook: tensegrity_local_1m.ipynb
+Select the Tensegrity (Unsloth Python) kernel in your notebook editor.
+Set CORPUS to an existing local file before running the data preparation cell.
+
+Unsloth Studio:
+  ~/.local/bin/unsloth studio -H 127.0.0.1 -p 8888
+  http://127.0.0.1:8888
+Initial username: unsloth
+Initial password file: ~/.unsloth/studio/auth/.bootstrap_password
+
+Your downloaded document dataset is prepared in data/documents2m:
+  1,900,000 training tokens + 100,000 validation tokens.
+  Source: train-00000-of-00287.parquet, document.html, HTML markup removed.
+  All nine downloaded shards validated; the first shard alone fills this cap.
+The local notebook now selects this prepared corpus automatically.
+To start a 100-step run on this corpus:
+  bash train.sh --data-dir data/documents2m --out-dir runs/documents1m --steps 100
+To continue it to 1,000 total steps:
+  bash train.sh --data-dir data/documents2m --out-dir runs/documents1m --resume --steps 1000
+
+To extract a different nested HTML column or token budget into a new directory:
+  bash prepare_parquet.sh ~/Downloads/train-00001-of-00287.parquet --column document.html --strip-html --batch-rows 1 --max-tokens 2000000 --out-dir data/documents-next2m
+
+The GPU smoke test verifies forward/backward, finite validation loss, saving,
+and resuming for four total training steps on a synthetic corpus. It does not
+establish stability under sustained training or language-model quality.
+
+Training improvements (October 2026):
+- New preparation uses seeded document-hash groups, keeping exact duplicate
+  documents in the same split. Validation targets 5% of tokens, but whole
+  documents mean the actual fraction can differ. This does not deduplicate
+  documents or sample across shards. Existing .bin corpora are unchanged;
+  rebuild into a NEW data directory to use document-level splits.
+- Validation uses 20 fixed batches, without advancing the training sampler.
+- New checkpoints preserve the learning-rate schedule. --steps controls when
+  training stops; extending it alone retains the saved decay horizon and
+  holds the minimum LR after that horizon. To deliberately change the horizon:
+    bash train.sh --data-dir data/local1m --resume --steps 2000 --schedule-steps 2000
+  This can raise the learning rate. Both local and folder trainers accept
+  --schedule-steps. Set the intended horizon at the start for staged runs.
+- Legacy checkpoints lack the original schedule: resume prints a notice,
+  defaults the horizon to completed steps, and resets best validation loss.
+  Supply --schedule-steps to choose a different horizon explicitly.
+- Local checks:
+    OMP_NUM_THREADS=1 bash train.sh --smoke-test --device cpu
+    /home/woez/.unsloth/studio/unsloth_studio/bin/python -m unittest discover -s tests -v

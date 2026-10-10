@@ -1,0 +1,37 @@
+cube-editor — Whitecube ISO customization editor
+
+Cubic provenance
+----------------
+This program adapts the ISO customization workflow of Cubic (Custom Ubuntu
+ISO Creator), Copyright (C) 2015, 2020 PJ Singh <psingh.cubic@gmail.com>.
+The examined upstream distribution is Cubic-Focal-2022.01.70-x86_64.AppImage.
+Its original file remains at ~/cubic/program/appimage/; the complete local
+extraction and its SHA-256 provenance are recorded under upstream/.
+
+Cubic source headers permit redistribution and modification under the GNU
+General Public License, version 3 or (at your option) any later version.
+The complete GPL version 3 text is included in COPYING. Corresponding source
+for cube-editor is maintained in this directory in the Whitecube repository.
+Upstream authorship and license notices remain in the extracted source.
+
+Workflow adaptation
+-------------------
+The adapted workflow analyzes the source ISO and boot metadata, extracts its
+compressed live filesystem, edits a project root, regenerates squashfs and
+filesystem metadata, and exports a bootable customized ISO with checksums.
+The application shell, navigation, project model, jobs, diagnostics, recipes,
+and cube-editor branding are Whitecube changes. The preserved Cubic source
+provides an inspectable reference for the adaptation.
+
+Artwork
+-------
+Upstream Cubic icons are identified as Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 in its package copyright file.
+They are retained only in the upstream reference extraction. cube-editor uses
+new Whitecube cube artwork rather than redistributing the Cubic application
+icon as its branding. Other bundled upstream assets retain their original
+licenses in the upstream extraction; that full AppImage runtime is a reference
+artifact rather than a cube-editor runtime dependency.
+
+No endorsement by the Cubic author is implied. GNU GPL software is supplied
+without warranty; see COPYING for the full license terms.

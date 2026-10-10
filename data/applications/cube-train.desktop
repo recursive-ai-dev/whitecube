@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Whitecube Trainer
+GenericName=Small Model Training
+Comment=Train, resume, preview and chat with small local language models
+Exec=/usr/bin/cube-train
+TryExec=/usr/bin/cube-train
+Icon=cube-train
+Terminal=false
+Categories=Development;Science;ArtificialIntelligence;
+Keywords=AI;Model;Train;Training;Checkpoint;Tensegrity;2M;5M;10M;
+StartupNotify=true
+StartupWMClass=org.whitecube.Trainer
+X-Wayland-Native=true

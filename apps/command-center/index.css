@@ -1,0 +1,53 @@
+@import "tailwindcss";
+@config "./tailwind.config.js";
+@font-face {
+  font-family: 'Material Symbols Outlined Variable';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 700;
+  src: url('./node_modules/@fontsource-variable/material-symbols-outlined/files/material-symbols-outlined-latin-wght-normal.woff2') format('woff2');
+}
+
+:root {
+  --wc-bg: #04070d; --wc-ink: #ff3b3b; --wc-ink-hi: #ff7a7a; --wc-glass: rgba(4, 7, 13, 0.62);
+}
+body {
+  background-color: var(--wc-bg);
+  color: #f2d9d9;
+}
+
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined Variable';
+  font-weight: normal;
+  font-style: normal;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  white-space: nowrap;
+  display: inline-block;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+  -webkit-font-feature-settings: 'liga';
+  font-feature-settings: 'liga';
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #06080d; }
+::-webkit-scrollbar-thumb { background: #1b2230; border-radius: 4px; border: 2px solid #06080d; }
+::-webkit-scrollbar-thumb:hover { background: #ff3b3b; }
+
+.glass-panel {
+  background: var(--wc-glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* Whitecube look: smoked glass over the wallpaper canvas, red terminal text like foot-ca. */
+.wc-terminal { color: var(--wc-ink); }
+.wc-terminal .text-white, .wc-terminal .text-white\/90 { color: var(--wc-ink-hi); }
+::selection { background: var(--wc-ink); color: #04070d; }
+
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #ff7a7a; outline-offset: 3px; }
+select option { background: #141a24; color: #f5f5f5; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; scroll-behavior: auto !important; }
+}

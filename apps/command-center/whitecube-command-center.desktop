@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Whitecube Command Center
+Comment=Wayland command center for system monitoring and control
+Exec=whitecube-command-center
+TryExec=whitecube-command-center
+Icon=whitecube-command-center
+Terminal=false
+Categories=System;Monitor;
+StartupWMClass=whitecube-command-center

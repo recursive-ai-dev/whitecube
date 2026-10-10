@@ -1,0 +1,29 @@
+Desktop Chat local checkpoints (whitecube-desktop 0.5.1)
+
+Open Chat from the panel. Use Talk to to select an exact checkpoint from
+~/train-out. Best and Latest are separate choices; saved ckpt_*.pt snapshots
+also appear. Selecting a different model starts a new conversation.
+
+Rename changes the selected checkpoint's display name. Names and selection
+persist in Desktop Chat's private config.json; files and training run folders
+stay in place. An empty name restores the default label. Refresh updates the
+list after training creates or removes checkpoints.
+
+The local server starts on demand and loads the selected checkpoint on CPU.
+It uses the existing tg-serve Python interpreter and Tensegrity modules, listens
+only on loopback using an automatically assigned port, and stops when Chat quits.
+It keeps one checkpoint warm and reloads it when training replaces the file.
+The separate tg-serve used by cube-chat can continue using its own port.
+
+Local inference needs no API key. Selecting API restores the endpoint, model
+and key configured in Settings. These settings are preserved while using local
+checkpoints, and the external API key is not sent to the local server.
+
+Current models are small byte-level prose models, with a 256-byte context.
+They continue text and do not have filesystem tools or an instruction model's
+chat capabilities. Keep prompts short. Context/parameter metadata is displayed
+when available. Best and Latest can contain identical weights at some steps.
+
+Overrides: WHITECUBE_TRAIN_OUT, WHITECUBE_TENSEGRITY_DIR,
+WHITECUBE_MODEL_PYTHON (absolute path to Python with torch installed).
+Log: ~/.local/state/whitecube/local-model-server.log

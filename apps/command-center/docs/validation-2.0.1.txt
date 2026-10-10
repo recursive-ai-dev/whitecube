@@ -1,0 +1,48 @@
+Whitecube Command Center 2.0.1 — validation (2026-10-10)
+
+Source: /home/woez/whitecube/command-center
+Previous source: /home/woez/Projects/ubuntu-lab
+Product: Whitecube Command Center
+Backlog: IMPROVEMENTS.txt contains 48 proposed improvements with priorities and completion criteria.
+The backlog is future work; only relocation, rebranding, and installation maintenance were performed.
+
+Verification
+- npm run verify passed: TypeScript, 34 JavaScript tests, 4 Python boot-image tests, production build.
+- Installed app passed all 46 end-to-end checks in an isolated headless Whitecube Wayland session.
+- Final package passed all 12 installed-runtime smoke checks, reporting version 2.0.1, Electron 44.7.0, and the correct product title.
+- Both installed-app runs used CC_TEST_SANDBOX=system. No --no-sandbox or --disable-setuid-sandbox flag was passed.
+- User namespaces are unavailable on this host. Installation uses the matching root-owned 4755 helper at /opt/ubuntu-command-center/chrome-sandbox through a runtime symlink.
+- Launcher checks helper version/ownership/mode and can follow the new /opt/whitecube-command-center helper after a system package migration.
+- The final package checksum matches installation.json; selected installed runtime files match the staged package.
+- A deliberately corrupted package was rejected before any user installation files were created.
+- Source and installed desktop entries validate; launcher shell syntax and git diff --check pass.
+- Original staged Git entries and all 54 backed-up profile files were verified unchanged.
+- The old system desktop-menu entry is hidden for this account; legacy commands point to the new user launcher.
+
+Installation
+Scope: current account; system dpkg still reports ubuntu-command-center 2.0.0 installed.
+Launcher: /home/woez/.local/bin/whitecube-command-center
+Aliases: /home/woez/.local/bin/command-center and /home/woez/.local/bin/ubuntu-lab
+Runtime: /home/woez/.local/opt/whitecube-command-center/current
+Profile retained: /home/woez/.config/Command Center
+Artifact: /home/woez/whitecube/command-center/release/whitecube-command-center_2.0.1_amd64.deb
+SHA-256: 7163ac08071837c60e7fe12f171870a2aaa6d825be72eaacb81a68903791da8e
+Backup: /home/woez/.local/state/whitecube/command-center-migration-20261010-122533
+
+System installation requires authentication: sudo -n reports that a password is required.
+The apt simulation replaces ubuntu-command-center with whitecube-command-center;
+it proposes no other installs, removals, or upgrades.
+Run /home/woez/Documents/install-whitecube-command-center.sh in an interactive terminal
+for the system-wide replacement. It verifies checksum, package identity, version,
+and architecture before apt, then verifies the installed dpkg version/status.
+The previous Documents/install-ubuntu-lab.sh delegates to this installer.
+
+Test boundaries
+The running desktop was not restarted. Tests used a scratch HOME and an explicit
+scratch user-data profile. The system D-Bus socket is unavailable in this session;
+service panels report that limitation. Tests did not perform OS upgrades, live
+sysctl changes, bootloader changes, or real service mutations. Native import/save
+dialogs were not exercised interactively. A pre-existing Python image test emitted
+a ResourceWarning for an unclosed image file; all four tests still passed.
+
+Logs and screenshots: test-artifacts/ (ignored by Git).

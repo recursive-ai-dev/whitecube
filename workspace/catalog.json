@@ -1,0 +1,102 @@
+{
+  "projects": [
+    {
+      "id": "hypernode",
+      "name": "Cognitive Ledger",
+      "description": "Your local notes and idea graph.",
+      "path": "hypernode/dist",
+      "kind": "studio"
+    },
+    {
+      "id": "dodgeball",
+      "name": "Knockout Court",
+      "description": "Your 3D dodgeball game, directly in the browser.",
+      "path": "dodgeball/dist",
+      "kind": "game"
+    },
+    {
+      "id": "antagonist",
+      "name": "Emergence",
+      "description": "Your narrative adventure and world.",
+      "path": "antagonist/dist",
+      "kind": "game"
+    },
+    {
+      "id": "wintergrep",
+      "name": "Cold Snap",
+      "description": "Your Three.js winter survival world.",
+      "path": "wintergrep/dist",
+      "kind": "game"
+    },
+    {
+      "id": "ludic-lexicon",
+      "name": "Ludic Lexicon",
+      "description": "Your combinatorial oracle and writing playground.",
+      "path": "ludic-lexicon/dist",
+      "kind": "studio"
+    }
+  ],
+  "scripts": [
+    {
+      "id": "system-status",
+      "name": "System stream",
+      "description": "Looping CPU, memory, load and uptime output.",
+      "builtin": "system-status.sh"
+    },
+    {
+      "id": "network-status",
+      "name": "Dongle status",
+      "description": "Read-only live status for your 2001:3329 USB adapter.",
+      "builtin": "network-status.sh"
+    },
+    {
+      "id": "deep-space",
+      "name": "Deep Space Scavenger",
+      "description": "Your Bash space RPG. Needs at least 80 columns × 24 rows.",
+      "path": "bash-games/deep-space-001/deep-space-001.sh",
+      "game": true
+    },
+    {
+      "id": "outpost-42",
+      "name": "Outpost 42",
+      "description": "Your interactive Bash outpost game.",
+      "path": "bash-games/outpost-42/outpost-42.sh",
+      "game": true
+    },
+    {
+      "id": "iron-shore",
+      "name": "Iron Shore",
+      "description": "Your modular Bash adventure, launched from its project directory.",
+      "path": "bash-renew/iron-shore/game.sh",
+      "game": true
+    },
+    {
+      "id": "lab-bash",
+      "name": "Bash Lab · 8 GiB",
+      "description": "Bash games and terminal tools.",
+      "builtin": "lab-bash.sh",
+      "lab": "bash"
+    },
+    {
+      "id": "lab-web",
+      "name": "Web Lab · 8 GiB",
+      "description": "Node, npm and Python workspace.",
+      "builtin": "lab-web.sh",
+      "lab": "web"
+    },
+    {
+      "id": "lab-build",
+      "name": "Build Lab · 8 GiB",
+      "description": "C/C++ build tools, Git and CMake.",
+      "builtin": "lab-build.sh",
+      "lab": "build"
+    },
+    {
+      "id": "lab-clean",
+      "name": "Clean Lab · 8 GiB",
+      "description": "Minimal Debian test environment.",
+      "builtin": "lab-clean.sh",
+      "lab": "clean"
+    }
+  ]
+}

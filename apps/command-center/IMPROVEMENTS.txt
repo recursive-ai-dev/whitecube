@@ -1,0 +1,178 @@
+Whitecube Command Center — 48 proposed improvements
+Reviewed: 2026-10-10 against the existing 2.0.0 implementation.
+
+This is a future-work backlog, not a claim that these features are implemented.
+The relocation and 2.0.1 rebrand are separate maintenance changes.
+P1 = address first; P2 = next; P3 = optional expansion.
+Each entry identifies an implementation area and a concrete completion check.
+
+Reliability and recovery
+
+1. P1 — Retain the last successful monitoring snapshot on refresh failure.
+   Area: hooks.ts and monitoring panels. Done when a transient failure shows
+   cached values, their age, and an error instead of replacing the whole view.
+2. P1 — Refresh one-shot panels when a hidden window becomes visible.
+   Area: hooks.ts. Done when Settings and Packages finish loading after opening
+   while minimized, without requiring a reload or recurring polling.
+3. P1 — Cancel backend inspection when its view is left.
+   Area: electron/main.cjs, system.cjs, hooks.ts. Done when an abandoned request
+   stops its child process and cannot overwrite the next view's results.
+4. P1 — Make all persisted state durable across interrupted writes.
+   Area: electron/activity.cjs and main.cjs. Done when window state uses atomic
+   replacement too, and activity writes flush the file and parent directory.
+5. P1 — Explain unsupported host capabilities in one place.
+   Area: diagnostics, services, network. Done when missing systemd, missing
+   utilities, and denied permissions each give a specific recovery action.
+6. P2 — Make refresh frequency a user preference with sensible limits.
+   Area: hooks.ts, SettingsPanel.tsx. Done when changing the interval updates
+   polling and persists across restarts, with hidden-window polling suspended.
+
+Whitecube desktop integration
+
+7. P1 — Read Whitecube's native settings schema for desktop status.
+   Area: DisplayPanel.tsx and a new read-only IPC adapter. Done when the app
+   reports the same values as cube-preferences without editing settings files.
+8. P2 — Open cube-settings at the relevant settings section.
+   Area: command palette and desktop IPC. Done when display, sound, network,
+   and privacy links open a detected native tool or explain its absence.
+9. P2 — Show Whitecube runtime and session-log locations.
+   Area: DisplayPanel.tsx. Done when the active socket and current session log
+   can be inspected through a read-only action without restarting the session.
+10. P2 — Add a local wallpaper picker and reusable cached background.
+    Area: WallpaperCanvas.tsx, electron/web.cjs, SettingsPanel.tsx. Done when
+    a user-selected image survives restart and works with network access off.
+11. P2 — Offer a configurable Whitecube launcher shortcut.
+    Area: desktop integration. Done when an explicit preview explains which
+    compositor binding will change, detects collisions, and supports undo.
+12. P2 — Use the Whitecube palette and font preferences consistently.
+    Area: index.css and tailwind.config.js. Done when UI and terminal styles
+    follow native preferences while keeping readable contrast and a fallback.
+
+Monitoring and processes
+
+13. P2 — Extend the CPU history chart with memory and network trends.
+    Area: Overview.tsx and snapshot sampling. Done when all three have selectable
+    time windows, survive panel navigation, and distinguish missing samples.
+14. P2 — Show per-core CPU usage and per-interface traffic.
+    Area: electron/parse.cjs, system.cjs, Overview.tsx. Done when users can
+    identify one busy core or interface without aggregate values hiding it.
+15. P2 — Calculate process CPU over a recent interval.
+    Area: ProcessesPanel.tsx and process sampling. Done when process CPU is
+    clearly labeled and reflects a recent sample rather than lifetime average.
+16. P2 — Add process details with executable, parent, and start time.
+    Area: ProcessesPanel.tsx and validated IPC. Done when selecting a process
+    opens details and handles a process exiting during inspection gracefully.
+17. P1 — Check process identity again immediately before signaling.
+    Area: electron/system.cjs. Done when a recycled PID cannot receive a signal
+    intended for the previously displayed process; verify using a mock fixture.
+18. P2 — Add pause for table polling, manual refresh, and configurable columns.
+    Area: ProcessesPanel.tsx. Done when users can inspect a stable table and
+    keep their sorting and chosen columns after returning to the view.
+
+Storage, network, and diagnostics
+
+19. P2 — Explain relationships between mounts, partitions, and encryption.
+    Area: StoragePanel.tsx and inspector.cjs. Done when a mount can be traced
+    to its mapped device and physical disk, including unavailable information.
+20. P2 — Add opt-in SMART health inspection with tool detection.
+    Area: StoragePanel.tsx and a read-only backend. Done when supported disks
+    report health and unsupported or unauthorized devices remain unknown.
+21. P2 — Add a bounded directory-size scan with progress and cancellation.
+    Area: StoragePanel.tsx. Done when users choose a directory, can stop its
+    scan, and see errors without crossing filesystem boundaries by default.
+22. P2 — Show route and DNS configuration beside interface addresses.
+    Area: NetworkPanel.tsx and system.cjs. Done when default routes and resolver
+    sources appear with useful fallbacks when NetworkManager is unavailable.
+23. P2 — Add separate DNS and HTTPS connectivity probes.
+    Area: NetworkPanel.tsx and validated backend probes. Done when the UI can
+    distinguish local-link, name-resolution, and remote-server failures.
+24. P1 — Add a redacted diagnostics export preview.
+    Area: DiagnosticsPanel.tsx and inspector.cjs. Done when users can omit
+    hostnames, usernames, IP addresses, home paths, and private mount names.
+
+Services, journal, and package updates
+
+25. P2 — Show unit status, dependencies, and unit-file source.
+    Area: ServicesPanel.tsx and system.cjs. Done when a selected service has
+    read-only details, with distinct missing-unit and unavailable-bus states.
+26. P1 — Track a changed service until its transition settles.
+    Area: ServicesPanel.tsx. Done when the existing refresh also verifies the
+    target state, shows transition progress, and reports a bounded timeout.
+27. P2 — Add journal time ranges and a persistent cursor.
+    Area: JournalPanel.tsx, system.cjs, parse.cjs. Done when users can inspect
+    a chosen time window and resume live reading without repeated entries.
+28. P2 — Preserve journal scroll position while new entries arrive.
+    Area: JournalPanel.tsx. Done when inspecting older rows prevents automatic
+    jumps, while a separate follow control returns to the newest entry.
+29. P1 — Preview the apt transaction before confirming an upgrade.
+    Area: UpdatesPanel.tsx. Done when proposed installs, upgrades, removals,
+    held packages, and download size are visible before the real command runs.
+30. P2 — Show package-index age and per-package changelog links.
+    Area: UpdatesPanel.tsx and PackagesPanel.tsx. Done when stale indices are
+    explicit and users can inspect the changes for a selected installed package.
+
+Commands, terminal, and keyboard use
+
+31. P2 — Add a PTY mode for interactive commands.
+    Area: electron/runner.cjs and Terminal.tsx. Done when password prompts,
+    terminal resize, and Ctrl+C behave correctly without persisting passwords.
+32. P2 — Show live elapsed time and cancellation progress for commands.
+    Area: Terminal.tsx. Done when the existing Stop control shows a pending
+    stop, confirms group termination, and leaves a readable final duration.
+33. P1 — Support redaction of sensitive command arguments in history.
+    Area: ActivityPanel.tsx and electron/activity.cjs. Done when marked secrets
+    never reach persisted activity records or exported command metadata.
+34. P2 — Add folders or tags and pinned commands to the library.
+    Area: storage.ts, ScriptCard.tsx, Sidebar.tsx. Done when saved organization
+    persists, search includes tags, and existing libraries upgrade cleanly.
+35. P2 — Add an opt-in sequential command queue.
+    Area: App.tsx and runner.cjs. Done when each command has its own result,
+    confirmation is retained, and users can cancel pending or active work.
+36. P1 — Detect duplicate or reserved shortcuts before saving groups.
+    Area: ShortcutGroupsEditor.tsx and App.tsx. Done when a collision explains
+    the conflicting binding and cannot silently override another group.
+
+Accessibility and interface
+
+37. P1 — Add keyboard navigation and focus restoration to all modal flows.
+    Area: ConfigModal, command palette, shortcut overlay, import preview.
+    Done when Tab stays within an open modal and closing returns to its trigger.
+38. P1 — Label search, filter, and icon-only controls consistently.
+    Area: all panels. Done when controls have meaningful accessible names and
+    a keyboard/screen-reader review can complete the main inspection flows.
+39. P1 — Pair status colors with text and accessible contrast.
+    Area: shared Panel components and tables. Done when success, warning, and
+    failure remain distinguishable without color, including focused controls.
+40. P2 — Support narrow windows with a collapsible sidebar and terminal.
+    Area: App.tsx, Sidebar.tsx, main.cjs. Done when a small display can reach
+    every action without clipped controls or forcing a 960-pixel minimum width.
+41. P2 — Persist each view's filters, sort order, and selected scope.
+    Area: panel state and storage.ts. Done when returning to a view restores
+    its context, with safe defaults for removed or renamed filter values.
+42. P3 — Add a searchable shortcut/help panel and contextual empty states.
+    Area: command palette and panel headings. Done when users can discover
+    shortcuts and see a useful next action for empty or unavailable results.
+
+Backups, packaging, and verification
+
+43. P1 — Make import recovery reversible with a pre-merge library snapshot.
+    Area: SettingsPanel.tsx and backup.ts. Done when a merge can be undone
+    without losing the library that existed immediately before import.
+44. P2 — Add encrypted optional backups and explicit retention controls.
+    Area: backup/export flow. Done when encryption is opt-in, the password is
+    never stored, and incorrect passwords cannot partially import data.
+45. P1 — Make the full user-install transaction atomic and recoverable.
+    Area: scripts/install-user.cjs. Done when a failure updating aliases, icons,
+    or desktop entries rolls back the runtime link and previous launcher too.
+46. P1 — Verify release provenance and generate a dependency inventory.
+    Area: package-deb.cjs and release tooling. Done when each release includes
+    checksums, build metadata, a software bill of materials, and a signed record.
+47. P2 — Automate clean-install, rename, upgrade, and rollback checks.
+    Area: install scripts and integration tests. Done when tests cover old
+    profiles, legacy aliases, corrupted artifacts, and both sandbox routes.
+48. P2 — Add repeatable arm64 and Linux capability test coverage.
+    Area: verification pipeline. Done when Debian/Ubuntu, systemd/no-systemd,
+    Wayland, unavailable tools, and arm64 packaging have recorded results.
+
+Suggested first batch: 1, 2, 4, 17, 24, 29, 33, 36, 37, 45.
+Estimate and approve feature implementation separately from this backlog.

@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "$#" -eq 0 ]; then set -- open; fi
+base=/usr/share/whitecube/workspace
+[ -f "$base/server.py" ] || base=$(dirname -- "$(readlink -f -- "$0")")/../workspace
+exec /usr/bin/python3 "$base/server.py" "$@"

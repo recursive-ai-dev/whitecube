@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""Searchable native script/project picker with literal arguments and run history."""
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+
+base = Path('/usr/share/whitecube/workspace')
+if not (base/'server.py').is_file():
+    base = Path(__file__).resolve().parent.parent / 'workspace'
+sys.path.insert(0, str(base))
+import server as workspace
+from workspace_data import RunStore, arguments
+catalog = workspace.Catalog(workspace.discover_projects())
+runs = RunStore(workspace.runtime_dir())
+search = ''
+
+def launch(argv, cwd, ident, name, args):
+    record = runs.start(ident, name, args, None, argv, cwd)
+    # Child runner handles terminal interrupts and records the actual exit code.
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        subprocess.run([sys.executable,str(base/'run_job.py'),str(record)],cwd=cwd)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    result = RunStore.public(record)
+    print(f"\n[script finished: {result['exit_code']}]")
+
+while True:
+    catalog.reload()
+    scripts = [x for x in catalog.public(8788)['scripts'] if search.lower() in (' '.join(str(x.get(k,'')) for k in ('id','name','description','tags'))).lower()]
+    print('\033[H\033[2J\033[1;37mWHITECUBE / SCRIPTS\033[0m\n')
+    print('Alt+B hide/show  ·  Alt+F maximize  ·  Ctrl+C interrupt a script\n')
+    print(f'Filter: {search or "all scripts"}  (/words to search, / to clear)\n')
+    for n, item in enumerate(scripts, 1):
+        print(f"  {n}. {item['name']}\n     {item['description']}")
+    print('\n  h. Run history   p. Project commands   b. Interactive Bash\n  w. Browser workspace   c. First-boot checks   q. Close panel\n')
+    try:
+        choice = input('Launch › ').strip()
+        if choice == 'q':
+            break
+        if choice.startswith('/'):
+            search = choice[1:]
+            continue
+        if choice == 'w':
+            subprocess.run([sys.executable,str(base/'server.py'),'open'])
+        elif choice == 'b':
+            subprocess.run(['/bin/bash','--noprofile','--norc','-i'])
+        elif choice == 'c':
+            subprocess.run(['/usr/bin/cube-check'])
+        elif choice == 'h':
+            for item in runs.history()[:30]:
+                print(f"{item['started_at'][:19]}  {item['name']} {shlex.join(item['args'])}\n  {item['status']} · exit {item['exit_code'] if item['exit_code'] is not None else '—'}")
+        elif choice == 'p':
+            projects = [x for x in catalog.projects.values() if x.get('kind') == 'command']
+            for n, item in enumerate(projects, 1):
+                print(f"  {n}. {item['name']} ({item.get('container') or 'host'})")
+            if not projects:
+                print('Add whitecube.project.json to a project directory. See workspace MANIFESTS.txt.')
+            else:
+                index = input('Project number (Enter cancels) › ')
+                if index.isdigit() and 1 <= int(index) <= len(projects):
+                    item = projects[int(index)-1]
+                    argv = list(item['command'])
+                    if item.get('container'):
+                        argv = ['sudo','/usr/bin/cube-lab','enter',item['container'],'--project',item['project_dir'],'--command',*argv]
+                    if item.get('url'):
+                        print(f"Browser URL: {item['url']}")
+                    launch(argv, item['cwd'], 'project:'+item['id'], item['name'], [])
+        elif choice.isdigit() and 1 <= int(choice) <= len(scripts):
+            item = scripts[int(choice)-1]
+            if item.get('argument_help'):
+                print(item['argument_help'])
+            for argument in item.get('arguments', []) if isinstance(item.get('arguments'), list) else []:
+                if isinstance(argument, dict):
+                    print(f"  {argument.get('name','argument')}: {argument.get('description','')}")
+            defaults = shlex.join(item.get('args', []))
+            raw = input(f'Arguments [{defaults}] (shell quoting, no expansion) › ')
+            args = arguments(shlex.split(raw) if raw else item.get('args', []))
+            script = catalog.script(item['id'])
+            launch(['/bin/bash', str(script), *args], script.parent, item['id'], item['name'], args)
+        else:
+            continue
+        input('\nPress Enter to return to scripts…')
+    except KeyboardInterrupt:
+        print('\n')
+    except EOFError:
+        break
+    except (OSError, ValueError, RuntimeError, workspace.Problem) as exc:
+        print(f'Could not launch: {exc}')
+        input('Press Enter to return…')

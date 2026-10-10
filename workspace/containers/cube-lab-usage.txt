@@ -1,0 +1,159 @@
+CUBE LAB / Debian 13 workspaces
+
+After installing the bundle and booting the NVMe normally:
+  cube-lab plan
+  cube-lab status
+  sudo cube-lab provision --install-tools
+  sudo cube-lab enter bash
+  sudo cube-lab enter web
+  sudo cube-lab enter build
+  sudo cube-lab enter clean
+
+Provisioning creates four separate preallocated 8 GiB ext4 images (32 GiB
+combined) in /var/lib/whitecube-labs. Allow at least another 512 MiB of free
+space as an allocation margin. ext4 metadata uses part of each image's 8 GiB.
+Images have fixed maximum virtual disk sizes; they are not dynamic sparse disks.
+An existing completed profile is validated and skipped. Provisioning a subset
+is supported: sudo cube-lab provision web build --install-tools
+
+--install-tools permits only the reviewed new host packages debootstrap,
+distro-info, and systemd-container. APT is simulated first; unexpected packages,
+upgrades, removals, kernels, firmware and DKMS are refused. It does not run
+apt-get update. If the host indexes need refreshing, review/update them yourself
+and retry; every retry is checked again. Guest role packages are installed only
+inside the new root filesystem. Debian archive signatures and HTTPS are required.
+
+Only already-installed loop/ext4 support for the running kernel may be loaded,
+with module blacklists respected. Deleted modules are never restored. User
+namespaces are mandatory; there is no fallback to a privileged guest.
+
+Entering a lab runs its root shell mapped to private host UIDs. Initially it
+uses the host network, with network-administration and raw-network capabilities
+dropped. Save a per-lab preference or override one launch:
+  cube-lab network-mode web
+  sudo cube-lab network-mode web offline
+  sudo cube-lab network-mode web shared
+  sudo cube-lab enter web --offline
+
+The preference is stored separately from the role's completed profile, and
+applies at the next launch. Changing it while that lab is running is refused.
+Offline creates only a private loopback namespace. Shared uses the host network;
+neither mode installs or needs veth, bridge or additional dongle modules.
+
+By default no host project directory is mounted. A project launcher can opt in
+to one read-only directory at /project:
+  sudo cube-lab enter web --project /home/woez/Projects/MyProject --command python3 server.py
+The directory must be an immediate real child of /home/woez/Projects; symlinks,
+paths outside that directory and colon/newline characters are refused. The
+controller pins each directory component without following symlinks and holds
+the final directory descriptor throughout the session. The bind uses that
+descriptor through the parent's /proc path, so a later rename/symlink cannot
+redirect it. Submounts are excluded. The command starts in /project.
+Host source permissions must allow reading by the
+guest's mapped UIDs. Source ownership and permissions are never changed. To
+install dependencies or build while keeping the default read-only share, copy
+readable /project files into a writable guest workspace first. Alternatively,
+deliberately authorize the entire selected project to be writable:
+  sudo cube-lab enter build --project /home/woez/Projects/MyProject --project-mode rw --command make
+
+Writable scope is exactly the selected immediate project directory at /project;
+the CLI prints that scope before launching. The mount uses norbind,rootidmap,
+mapping guest root to the project owner on that mount without changing source
+ownership. Existing escaping absolute/relative symlinks, nested mount points,
+special files and multiply linked files are refused. Directory components stay
+pinned and symlinks resolve within the guest mount namespace. The host home,
+other projects and credentials are not bound. If the filesystem cannot support
+idmapped mounts, the launch fails; no unsafe UID or ownership fallback is used.
+Manifests may explicitly choose project_mode rw for a selected lab command; ro
+is the default. Review the project and keep a backup before granting writes.
+
+You can also clone or create projects inside each lab. Exit the shell to stop
+that session. Only one cube-lab session may
+use a given image at a time. Run a specific guest command with:
+  sudo cube-lab enter web --command python3 --version
+
+Plan and status are read-only JSON; status is usable without root. To inspect
+the mounted NVMe while still in the live environment:
+  cube-lab status --root /mnt/nvme_root
+
+Named snapshots and safe restore:
+  cube-lab snapshots web
+  sudo cube-lab snapshot web before-experiment
+  sudo cube-lab restore web before-experiment
+
+Stop the lab first. Snapshots reject a busy role lock or external loop attachment.
+Names use 1–48 lowercase letters, digits, underscores or hyphens and start with
+a letter/digit. Existing names are never overwritten. Each completed snapshot
+reserves an additional 8 GiB; creation requires 8 GiB plus 512 MiB free. No
+periodic snapshots run automatically and old snapshots are never auto-deleted.
+
+Restore requires 16 GiB plus 512 MiB free temporarily: one complete replacement
+image and one automatically named before-restore recovery snapshot of the
+current contents. It verifies the role profile, filesystem UUID and full SHA256
+content checksum before replacing anything. An interrupted copy retains a
+partial file for inspection and leaves the current image unchanged. The final
+image replacement is atomic and retains the same filesystem identity/profile.
+After success the old contents remain in an 8 GiB recovery snapshot. Restoring
+that recovery snapshot uses the same process and space requirements.
+
+Snapshot storage is /var/lib/whitecube-labs/snapshots/wc-LAB/NAME/. Image files
+stay root-only; public metadata exposes names, size, time and validity. Partial
+snapshot directories appear as incomplete and are never offered for restore.
+Snapshot hashes are checked on restore, not on each desktop status refresh.
+
+A failed bootstrap retains a uniquely named .ROLE.UUID.partial.raw image and
+matching .partial.json journal. It attempts to unmount only its own private
+mount tree. Failed unmounts retain that directory; the controller never
+recursively deletes it. An incomplete image is never presented as ready and
+is never automatically overwritten or reformatted. Inspect the journal and
+mount state before manually deciding whether to retain or remove those exact
+partial files. Provisioning refuses that role until its incomplete data has
+been resolved. Existing ready images are untouched by another role's failure.
+
+Controller tests cover fixed capacities,
+profiles, package-plan restrictions, module guards, nonroot status permissions,
+identity checks, image publication/validation, and failed-bootstrap/unmount
+recovery using mocked privileged operations. No actual image was bootstrapped
+or entered in this read-only, restricted live session. All four statuses remain
+not-provisioned until provisioning succeeds on the booted NVMe.
+Additional small-image tests cover complete snapshot/restore/recovery roundtrips,
+busy locks, disk-space refusal, interruption, corruption, UUID mismatch, unique
+names, saved networking preferences and explicit read-only project arguments.
+
+Official reference:
+https://manpages.debian.org/trixie/systemd-container/systemd-nspawn.1.en.html
+https://manpages.debian.org/trixie/debootstrap/debootstrap.8.en.html
+
+Per-lab CPU/RAM limits and live accounting:
+  cube-lab resources web
+  sudo cube-lab resources web --cpu 1.5 --memory-mib 1024
+  cube-lab status
+
+Defaults are 2 CPU cores and 2048 MiB RAM per lab. CPU accepts 0.1–128 cores;
+RAM accepts integer 128–65536 MiB. Settings persist separately from profiles in
+wc-LAB.resources.json and apply to the next launch. A running role lock refuses
+changes. Every normal enter command, including a project command, runs in an
+existing systemd-run scope with CPUQuota, MemoryMax, MemorySwapMax=0, accounting,
+MemoryOOMGroup and OOMPolicy=stop. The disk image stays exactly 8 GiB. No package
+is added for resource controls: systemd-run/systemctl and cgroup v2 are already
+on the inspected target. Provisioning retains its separate audited tool checks.
+
+Status exposes bounded live CPU percentage (100% equals one full CPU), cumulative
+CPU time, current and peak RAM, and memory.events OOM/process-kill counts. The
+last run's exit status and OOM result are retained in wc-LAB.last-run.json.
+An OOM prints an explicit message; it never reports a successful run merely
+because nspawn exited. A vanished cgroup can still report systemd's oom-kill
+result. Unavailable counters remain unknown. Inspect the last result, increase
+RAM or reduce the job, then relaunch deliberately. No job is rerun automatically.
+
+Offline regression tests cover persisted limits, busy-lock refusal, literal
+scope argv, cgroup accounting/OOM parsing, vanished-cgroup result retention,
+read-only defaults, scoped writable arguments, nested directory checks and
+symlink/hardlink rejection. Actual scope enforcement, terminal interaction,
+idmapped project writes and real OOM handling need the booted NVMe; the four
+images were freshly inspected and remain not-provisioned in this session.
+
+Resource and ID-mapping implementation references (systemd 257):
+https://github.com/systemd/systemd/blob/v257/man/systemd-run.xml
+https://github.com/systemd/systemd/blob/v257/man/systemd-nspawn.xml
+https://github.com/systemd/systemd/blob/v257/src/core/scope.c

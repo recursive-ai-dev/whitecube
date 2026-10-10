@@ -25,7 +25,7 @@ FILES=(
   "net/cube-net-dns|usr/local/libexec/cube-net-dns|0755"
   "net/dhcpcd.conf|etc/whitecube/network/dhcpcd.conf|0644"
   "net/whitecube-network.service|etc/systemd/system/whitecube-network.service|0644"
-  "cube-settings-helper|usr/local/libexec/cube-settings-helper|0755"
+  "libexec/cube-settings-helper|usr/local/libexec/cube-settings-helper|0755"
 )
 
 die() { printf 'apply.sh: %s\n' "$*" >&2; exit 1; }

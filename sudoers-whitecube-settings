@@ -1,7 +1,0 @@
-# cube-settings: status reads, Wi-Fi, brightness and power need no password.
-# Every other change made through the helper asks for the user's password.
-Cmnd_Alias CUBE_FREE = /usr/local/libexec/cube-settings-helper services, /usr/local/libexec/cube-settings-helper firewall, /usr/local/libexec/cube-settings-helper net-scan, /usr/local/libexec/cube-settings-helper net-add, \
-	/usr/local/libexec/cube-settings-helper net-reconnect, /usr/local/libexec/cube-settings-helper net-connect *, /usr/local/libexec/cube-settings-helper net-forget *, \
-	/usr/local/libexec/cube-settings-helper brightness *, /usr/local/libexec/cube-settings-helper power-action *
-%sudo ALL=(root) /usr/local/libexec/cube-settings-helper
-%sudo ALL=(root) NOPASSWD: CUBE_FREE

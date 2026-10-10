@@ -5,3 +5,6 @@ __pycache__/
 *.new-*
 build-asan/
 build-cairo/
+packaging/out/
+packaging/out.build.log
+apps/cube-editor/upstream/cubic-*/

@@ -1,0 +1,45 @@
+{
+  "name": "whitecube-command-center",
+  "productName": "Whitecube Command Center",
+  "private": true,
+  "version": "2.0.1",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "description": "Whitecube Wayland desktop command center for Ubuntu and Debian",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test electron/test/*.test.cjs && python3 boot/test_make_boot_bg.py",
+    "e2e": "npm run build && scripts/e2e.sh",
+    "start": "npm run setup:electron && npm run build && ./whitecube-command-center.sh",
+    "package:deb": "npm run setup:electron && npm run verify && node scripts/package-deb.cjs",
+    "verify": "npm run typecheck && npm test && npm run build",
+    "install:deb": "bash scripts/install-deb.sh",
+    "setup:electron": "node node_modules/electron/install.js",
+    "install:user": "node scripts/install-user.cjs"
+  },
+  "dependencies": {
+    "@fontsource-variable/material-symbols-outlined": "^5.2.0",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "^22.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "44.7.0",
+    "postcss": "^8.4.49",
+    "tailwindcss": "4.3.3",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.0"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

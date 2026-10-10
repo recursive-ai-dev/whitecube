@@ -1,0 +1,7 @@
+[Unit]
+Description=Command Center privileged helper daemon
+
+[Service]
+Type=dbus
+BusName=ca.smddev.CommandCenter1
+ExecStart=/usr/local/libexec/command-center/command-center-helperd

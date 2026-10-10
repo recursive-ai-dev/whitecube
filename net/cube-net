@@ -2465,7 +2465,7 @@ def run_service():
         thread.start()
         control = ControlServer(RUNTIME_DIR / "control.sock", station)
         control.start()
-        children.append(subprocess.Popen(["/usr/sbin/dhcpcd", "-4", "-B", "-f", str(CONFIG_DIR / "dhcpcd.conf"), "-c", "/usr/local/libexec/cube-net-dns", iface]))
+        children.append(subprocess.Popen(["/usr/sbin/dhcpcd", "-4", "-B", "-f", str(CONFIG_DIR / "dhcpcd.conf"), "-c", "/usr/libexec/whitecube/cube-net-dns", iface]))
         controller = Controller(runtime, SystemIO(iface, station), time.monotonic(), ever_connected, request)
         while not stopping:
             tick = time.monotonic()

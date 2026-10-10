@@ -1,0 +1,101 @@
+@define-color window_bg_color #eceee9;
+@define-color window_fg_color #151713;
+@define-color view_bg_color #f8faf5;
+@define-color view_fg_color #151713;
+@define-color card_bg_color #f8faf5;
+@define-color card_fg_color #151713;
+@define-color headerbar_bg_color #f8faf5;
+@define-color headerbar_fg_color #151713;
+@define-color accent_bg_color #1c2119;
+@define-color accent_fg_color #d2ff89;
+@define-color accent_color #335814;
+@define-color destructive_bg_color #a42d23;
+@define-color success_color #335814;
+@define-color error_color #a42d23;
+
+* { font-family: 'DejaVu Sans', sans-serif; }
+window { background: #eceee9; color: #151713; }
+headerbar { background: #f8faf5; border-bottom: 1px solid #20251b; box-shadow: none; }
+headerbar .title { font-weight: 800; letter-spacing: -0.6px; }
+button { border-radius: 6px; font-weight: 700; min-height: 28px; box-shadow: none; }
+button.primary { background: #1c2119; color: #d2ff89; padding: 10px 22px; border: 1px solid #1c2119; }
+button.primary:hover { background: #344128; }
+button.secondary { background: #fff; border: 1px solid #a7ae9e; padding: 9px 16px; }
+button:disabled { opacity: .38; }
+.rail { background: #1c2119; color: #eef3e6; border-right: 1px solid #1c2119; padding: 24px 16px; }
+.rail .dim-label { color: #a1ad95; opacity: 1; }
+.rail button { background: transparent; color: #bac5ad; border: 0; border-radius: 6px; padding: 12px; }
+.rail button:hover { background: #2e3627; color: #fff; }
+.rail button.selected { background: #d2ff89; color: #1c2119; }
+.rail button label { font-weight: 700; }
+.rail .rail-name { font-size: 21px; font-weight: 900; letter-spacing: -1px; }
+.rail .rail-caption { font-size: 10px; letter-spacing: 2px; color: #b5c5a3; }
+.rail .rail-project { background: #2e3627; border-radius: 6px; padding: 14px; }
+.rail .project-name { font-size: 13px; font-weight: 700; color: #f0f8e7; }
+.eyebrow { font-size: 10px; font-weight: 800; letter-spacing: 2px; color: #50623e; }
+.hero-title { font-size: 44px; font-weight: 900; letter-spacing: -2px; line-height: 1.05; }
+.page-title { font-size: 29px; font-weight: 900; letter-spacing: -1.1px; }
+.lede { font-size: 13px; color: #68715e; }
+.section-title { font-size: 14px; font-weight: 800; }
+.card { background: #f8faf5; border: 1px solid #c0c8b6; border-radius: 9px; padding: 20px; }
+.hero { background: #d2ff89; border: 1px solid #b0d374; border-radius: 10px; padding: 25px; }
+.hero .eyebrow { color: #354d21; }
+.hero .lede { color: #425d2d; }
+.stat { font-size: 24px; font-weight: 800; letter-spacing: -1px; }
+.muted { color: #747e6b; font-size: 11px; }
+.chip { padding: 4px 9px; background: #e5ebdc; color: #405331; font-size: 10px; font-weight: 800; border-radius: 4px; }
+.chip.ready { background: #d2ff89; color: #26391b; }
+.chip.warn { background: #ffe5b8; color: #774810; }
+.recipe-title { font-size: 13px; font-weight: 800; }
+.recipe-icon { font-size: 24px; }
+.recipe { padding: 14px; background: #f8faf5; border: 1px solid #c0c8b6; border-radius: 7px; }
+.recipe:hover { border-color: #536b3d; background: #fff; }
+entry, textview { background: #fff; color: #20251b; }
+entry { border: 1px solid #b6bfab; border-radius: 5px; padding: 8px 10px; min-height: 25px; }
+entry:focus-within { border-color: #415e26; outline-color: #87b553; }
+textview { font-family: 'DejaVu Sans Mono', monospace; font-size: 11px; border-radius: 4px; }
+textview text { background: #fff; color: #20251b; }
+.code-wrap { border: 1px solid #b6bfab; border-radius: 5px; }
+.console { background: #1c2119; border-radius: 7px; padding: 14px; }
+.console textview, .console textview text { background: #1c2119; color: #d4e6bd; font-family: 'DejaVu Sans Mono', monospace; font-size: 11px; }
+.statusbar { background: #f8faf5; border-top: 1px solid #c0c8b6; padding: 8px 18px; }
+.statusbar label { font-size: 11px; }
+progressbar trough { border-radius: 3px; min-height: 5px; background: #dbe2d2; }
+progressbar progress { background: #5a852d; border-radius: 3px; }
+list.boxed-list { border: 1px solid #c0c8b6; border-radius: 7px; }
+list.boxed-list row { padding: 6px; }
+list.boxed-list row:not(:first-child) { border-top: 1px solid #dce2d4; }
+.help { font-size: 11px; color: #68715e; }
+.danger { color: #a42d23; }
+.shortcut { font-family: 'DejaVu Sans Mono', monospace; font-size: 10px; color: #8b977e; }
+.palette { padding: 24px; }
+
+/* Chrootables additions: same palette as Cube Editor. */
+.page { padding: 30px 34px 34px 34px; }
+.hero { padding: 22px 26px; }
+.hero .stat { color: #1c2119; }
+.hero .muted { color: #425d2d; }
+.lock { background: #1c2119; color: #eef3e6; border-radius: 10px; padding: 25px; }
+.lock .section-title { color: #f0f8e7; font-size: 17px; }
+.lock .lede { color: #b5c5a3; }
+.lock entry, .lock passwordentry { background: #f8faf5; }
+.workspace-row { padding: 10px 12px; }
+.workspace-name { font-size: 14px; font-weight: 800; letter-spacing: -0.2px; }
+list.boxed-list row:selected { background: #e2f2c4; }
+list.boxed-list row:selected .workspace-name { color: #1c2119; }
+.detail-name { font-size: 27px; font-weight: 900; letter-spacing: -1px; }
+.meta-key { font-size: 9px; font-weight: 800; letter-spacing: 1.6px; color: #50623e; }
+.meta-value { font-size: 12px; }
+.mono { font-family: 'DejaVu Sans Mono', monospace; font-size: 11px; }
+.chip.busy { background: #ffe5b8; color: #774810; }
+.chip.ephemeral { background: #dfe9f7; color: #24405f; }
+button.destructive { color: #a42d23; }
+button.secondary.destructive { border-color: #d9a7a2; }
+button.option { background: #f8faf5; border: 1px solid #c0c8b6; border-radius: 7px; padding: 14px; font-weight: 400; }
+button.option:hover { border-color: #536b3d; background: #fff; }
+button.option:checked { background: #fff; border-color: #1c2119; box-shadow: inset 0 0 0 1px #1c2119; color: #151713; }
+button.option:checked .recipe-title { color: #26391b; }
+spinbutton { background: #fff; border: 1px solid #b6bfab; border-radius: 5px; }
+passwordentry { background: #fff; border: 1px solid #b6bfab; border-radius: 5px; padding: 8px 10px; }
+.console textview { min-height: 360px; }
+.list-row { padding: 4px 6px; }

@@ -44,7 +44,7 @@ def load(name, path):
 net = load("cube_net", HERE / "cube-net")
 legacy = load("cube_net_v1", HERE / "legacy" / "cube-net.v1")
 dns_hook = load("cube_net_dns", HERE / "cube-net-dns")
-helper = load("cube_settings_helper", REPO / "cube-settings-helper")
+helper = load("cube_settings_helper", REPO / "libexec" / "cube-settings-helper")
 
 
 # ------------------------------------------------------------------ the incident
@@ -839,7 +839,7 @@ class ProfileRegression(unittest.TestCase):
 
 class FileTests(unittest.TestCase):
     def test_python_files_parse_at_the_targets_language_level(self):
-        for path in (HERE / "cube-net", HERE / "cube-net-dns", REPO / "cube-settings-helper", HERE / "test_cube_net.py"):
+        for path in (HERE / "cube-net", HERE / "cube-net-dns", REPO / "libexec" / "cube-settings-helper", HERE / "test_cube_net.py"):
             ast.parse(path.read_text(), filename=str(path), feature_version=(3, 13))
 
     def test_python_entry_points_use_the_isolated_interpreter(self):
@@ -851,7 +851,7 @@ class FileTests(unittest.TestCase):
         settings = dict(l.split("=", 1) for l in lines if "=" in l and not l.startswith("#"))
         self.assertEqual(settings["Restart"], "always")
         self.assertEqual(settings["StartLimitIntervalSec"], "0")
-        self.assertEqual(settings["ExecStart"], "/usr/local/bin/cube-net run")
+        self.assertEqual(settings["ExecStart"], "/usr/bin/cube-net run")
         for key, value in {"NoNewPrivileges": "yes", "ProtectHome": "yes", "ProtectSystem": "full", "PrivateTmp": "yes",
                            "ProtectKernelModules": "yes", "RestrictNamespaces": "yes"}.items():
             self.assertEqual(settings[key], value, key)
@@ -892,7 +892,7 @@ class FileTests(unittest.TestCase):
     def test_dhcpcd_is_started_with_the_config_the_unit_protects(self):
         source = (HERE / "cube-net").read_text()
         self.assertIn('"/usr/sbin/dhcpcd", "-4", "-B", "-f", str(CONFIG_DIR / "dhcpcd.conf")', source)
-        self.assertIn('"-c", "/usr/local/libexec/cube-net-dns"', source)
+        self.assertIn('"-c", "/usr/libexec/whitecube/cube-net-dns"', source)
 
 
 # ------------------------------------------------------------------ settings helper

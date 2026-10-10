@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2a3324"/>
+      <stop offset="1" stop-color="#11150e"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0" y1="0" x2="0.8" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dfe6d6"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="118" height="118" rx="29" fill="url(#tile)"/>
+  <!-- a stack of images: two thin slabs under a cube -->
+  <path d="M64 86 101 66v6L64 92 27 72v-6Z" fill="#6f7f5e"/>
+  <path d="M64 96 101 76v6L64 102 27 82v-6Z" fill="#4b5a3d"/>
+  <path d="M64 22 101 42 64 62 27 42Z" fill="url(#top)"/>
+  <path d="M27 47 61 66v18L27 65Z" fill="#b9c5aa"/>
+  <path d="M67 66 101 47v18L67 84Z" fill="#eef4e6"/>
+  <!-- a prompt on the light face -->
+  <path d="m74 63 8 3-8 7" fill="none" stroke="#1c2119" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m85 69 8-4" stroke="#1c2119" stroke-width="3.2" stroke-linecap="round"/>
+  <circle cx="99" cy="99" r="17" fill="#d2ff89" stroke="#1c2119" stroke-width="3"/>
+  <path d="m91 99 6 6 11-12" fill="none" stroke="#1c2119" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

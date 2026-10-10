@@ -1,0 +1,1107 @@
+#!/usr/bin/env python3
+"""Four Debian 13 workspace containers. Plan/status never provision anything."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import time
+import uuid
+
+IMAGE_BYTES = 8 * 1024**3
+STORE = Path('/var/lib/whitecube-labs')
+SUITE = 'trixie'
+ARCH = 'amd64'
+MIRROR = 'https://deb.debian.org/debian'
+KEYRING = Path('/usr/share/keyrings/debian-archive-keyring.gpg')
+FORMAT_VERSION = 1
+DEFAULT_RESOURCES = {'cpu': 2.0, 'memory_mib': 2048}
+# A dash-free slice name lives directly below cgroup root. A name such as
+# whitecube-labs.slice would create an extra whitecube.slice parent.
+CGROUP_SLICE = 'whitecubelabs.slice'
+TARGET_MACHINE_HASH = 'f90edfb1a671958f6cf1855d6c2eff8e5bd086db8936a947d8c61f542803f156'
+HOST_REQUEST = ('debootstrap', 'systemd-container')
+HOST_ALLOWLIST = frozenset(('debootstrap', 'distro-info', 'systemd-container'))
+DROP_CAPS = 'CAP_NET_ADMIN,CAP_NET_RAW,CAP_SYS_MODULE,CAP_SYS_RAWIO,CAP_SYS_TIME'
+PROFILES = {
+    'bash': {'title': 'Bash games and utilities',
+             'packages': ['bash-completion', 'less', 'nano', 'procps', 'ncurses-bin', 'bc', 'jq', 'dialog']},
+    'web': {'title': 'Web development', 'packages': ['nodejs', 'npm', 'python3', 'python3-venv', 'git']},
+    'build': {'title': 'Native builds', 'packages': ['build-essential', 'git', 'cmake', 'pkg-config']},
+    'clean': {'title': 'Clean minbase shell', 'packages': []},
+}
+SAFE_ENV = dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL='C', DEBIAN_FRONTEND='noninteractive')
+
+
+class LabError(RuntimeError):
+    pass
+
+
+def role_name(role):
+    if role not in PROFILES:
+        raise LabError('Unknown lab. Choose bash, web, build, or clean.')
+    return 'wc-' + role
+
+
+def profile(role):
+    role_name(role)
+    return {'schema': FORMAT_VERSION, 'role': role, 'suite': SUITE, 'arch': ARCH,
+            'size_bytes': IMAGE_BYTES, 'mirror': MIRROR, 'variant': 'minbase',
+            'bootstrap_packages': ['ca-certificates'], 'packages': PROFILES[role]['packages'],
+            'private_users': 'pick', 'private_users_ownership': 'auto'}
+
+
+def signature(role):
+    return hashlib.sha256(json.dumps(profile(role), sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+
+
+def location(root=Path('/')):
+    root = Path(root).resolve()
+    return root / STORE.relative_to('/')
+
+
+def paths(role, root=Path('/')):
+    name = role_name(role)
+    base = location(root)
+    return base / (name + '.raw'), base / (name + '.json')
+
+
+def protected_path(path, directory=False, allow_absent=False):
+    """Refuse symlink components and writable/unowned host control paths."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise LabError(f'Expected an absolute path: {path}')
+    components = list(reversed(path.parents)) + [path]
+    for part in components:
+        try:
+            st = part.lstat()
+        except FileNotFoundError:
+            if allow_absent:
+                continue
+            raise LabError(f'Missing path: {part}')
+        if stat.S_ISLNK(st.st_mode):
+            raise LabError(f'Refusing symlink in lab path: {part}')
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            raise LabError(f'Lab path must be owned by root and not group/world writable: {part}')
+        if part != path and not stat.S_ISDIR(st.st_mode):
+            raise LabError(f'Not a directory: {part}')
+        if part == path and directory and not stat.S_ISDIR(st.st_mode):
+            raise LabError(f'Not a directory: {part}')
+    return path
+
+
+def parse_os_release(path):
+    result = {}
+    for line in path.read_text().splitlines():
+        key, sep, value = line.partition('=')
+        if sep and not key.startswith('#'):
+            result[key] = value.strip('"\'')
+    return result
+
+
+def require_booted_target():
+    if os.geteuid() != 0:
+        raise LabError('Run this command with sudo on the booted NVMe system.')
+    release = parse_os_release(Path('/etc/os-release'))
+    if release.get('ID') != 'debian' or release.get('VERSION_CODENAME') != SUITE:
+        raise LabError('Provision/enter is restricted to the booted Debian 13 NVMe system.')
+    actual = hashlib.sha256(Path('/etc/machine-id').read_bytes().strip()).hexdigest()
+    if actual != TARGET_MACHINE_HASH:
+        raise LabError('This is not the inspected NVMe system (machine identity differs).')
+    if not os.path.samefile('/', '/proc/1/root'):
+        raise LabError('Boot the NVMe normally; provisioning from a chroot is unsupported.')
+    if os.uname().machine != 'x86_64':
+        raise LabError('These labs require the inspected amd64 host.')
+
+
+def require_tools(names):
+    missing = [name for name in names if not shutil.which(name, path=SAFE_ENV['PATH'])]
+    if missing:
+        raise LabError('Missing tools: ' + ', '.join(missing) +
+                       '. Provision can add only audited userspace dependencies with --install-tools; no modules are restored.')
+
+
+def execute(argv, capture=False):
+    """Run provision commands in a cancellable process group."""
+    proc = subprocess.Popen([str(a) for a in argv], env=SAFE_ENV, start_new_session=True,
+                            stdout=subprocess.PIPE if capture else None,
+                            stderr=subprocess.STDOUT if capture else None, text=True)
+    try:
+        output, _ = proc.communicate()
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        except ProcessLookupError:
+            pass
+        raise
+    if proc.returncode:
+        detail = '\n' + output[-5000:] if capture and output else ''
+        raise LabError(f'Command failed ({proc.returncode}): {argv[0]}{detail}')
+    return output or ''
+
+
+def check_apt_plan(output):
+    """Accept only audited new host userspace packages; never upgrade/remove."""
+    installs = {}
+    for line in output.splitlines():
+        if line.startswith(('Remv ', 'Purg ')):
+            raise LabError('APT proposed removing a host package; refused.')
+        if not line.startswith('Inst '):
+            continue
+        match = re.match(r'^Inst ([a-z0-9][a-z0-9+.-]*)(?::([a-z0-9]+))? (.*)$', line)
+        if not match:
+            raise LabError('Unrecognized APT install plan; refused.')
+        package, architecture, tail = match.groups()
+        if package not in HOST_ALLOWLIST or architecture not in (None, ARCH):
+            raise LabError(f'APT proposed unexpected host package {package}; refused.')
+        if tail.startswith('['):
+            raise LabError(f'APT proposed upgrading {package}; refused.')
+        version = re.match(r'^\(([^\s()]+)\s', tail)
+        if not version or not re.fullmatch(r'[a-zA-Z0-9.+:~_-]+', version.group(1)):
+            raise LabError('Unrecognized APT version; refused.')
+        installs[package] = version.group(1)
+    if re.search(r'\b[1-9][0-9]* to remove\b', output):
+        raise LabError('APT proposed host removals; refused.')
+    return installs
+
+
+def install_host_tools():
+    require_tools(['apt-get'])
+    common = ['apt-get', '--no-install-recommends', '--no-upgrade', '--no-remove',
+              '-o', 'APT::Get::AutomaticRemove=false']
+    result = execute(common + ['--simulate', 'install', *HOST_REQUEST], capture=True)
+    installs = check_apt_plan(result)
+    print(result, end='', flush=True)
+    if installs:
+        # Pin every reviewed package to prevent the real operation choosing a
+        # newer candidate than the immediately preceding simulation.
+        pins = [name + '=' + version for name, version in sorted(installs.items())]
+        execute(common + ['--assume-yes', 'install', *pins])
+
+
+def module_active(name):
+    if name == 'ext4':
+        return bool(re.search(r'\bext4\s*$', Path('/proc/filesystems').read_text(), re.MULTILINE))
+    return Path('/sys/module/' + name).exists() and Path('/dev/loop-control').exists()
+
+
+def ensure_existing_module(name):
+    if name not in ('loop', 'ext4'):
+        raise LabError('Only existing loop and ext4 support may be loaded.')
+    if module_active(name):
+        return
+    require_tools(['modinfo', 'modprobe'])
+    filename = execute(['modinfo', '-F', 'filename', name], capture=True).strip()
+    if not filename or filename == '(builtin)' or '\n' in filename:
+        raise LabError(f'{name} is unavailable; no deleted module will be restored.')
+    module_root = (Path('/lib/modules') / os.uname().release).resolve(strict=True)
+    module = Path(filename)
+    resolved = module.resolve(strict=True)
+    if module.is_symlink() or not resolved.is_relative_to(module_root):
+        raise LabError(f'{name} module filename escapes the running kernel module tree.')
+    protected_path(resolved)
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise LabError(f'{name} module must be an existing protected regular file.')
+    # Respect the owner's blacklists and never ask APT to restore a module.
+    execute(['modprobe', '--use-blacklist', name])
+    if not module_active(name):
+        raise LabError(f'{name} remains inactive (possibly blacklisted); no override or restoration attempted.')
+
+
+def namespace_preflight():
+    require_tools(['unshare', 'mount', 'umount', 'mkfs.ext4', 'losetup', 'debootstrap', 'systemd-nspawn', 'dpkg-query', 'dpkg', 'sync'])
+    ensure_existing_module('loop')
+    ensure_existing_module('ext4')
+    for key in ('/proc/sys/user/max_user_namespaces', '/proc/sys/user/max_mnt_namespaces'):
+        if Path(key).exists() and int(Path(key).read_text()) <= 0:
+            raise LabError(f'Namespaces are disabled at {key}; no insecure fallback is used.')
+    version = execute(['systemd-nspawn', '--version'], capture=True)
+    match = re.search(r'systemd (\d+)', version)
+    if not match or int(match.group(1)) < 257:
+        raise LabError('The audited runtime requires systemd-nspawn 257 or newer.')
+    # Feature probe only: creates no networking, storage, or persistent settings.
+    execute(['unshare', '--user', '--map-root-user', '--mount', '--pid', '--fork', 'true'])
+    verify_keyring()
+
+
+def verify_keyring():
+    if not KEYRING.is_file():
+        raise LabError('Debian archive keyring is missing; signature verification cannot be disabled.')
+    resolved = KEYRING.resolve()
+    if not resolved.is_relative_to(Path('/usr/share/keyrings')):
+        raise LabError('Debian keyring unexpectedly points outside /usr/share/keyrings.')
+    metadata = resolved.stat()
+    if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+        raise LabError('Debian keyring must be root owned and not group/world writable.')
+    result = execute(['dpkg-query', '-W', '-f=${Status}', 'debian-archive-keyring'], capture=True)
+    if result.strip() != 'install ok installed':
+        raise LabError('The Debian archive keyring package is not installed.')
+    result = execute(['dpkg', '--verify', 'debian-archive-keyring'], capture=True)
+    if result.strip():
+        raise LabError('Debian archive keyring package verification differs; inspect it before bootstrapping.')
+
+
+def read_superblock(image):
+    fd = os.open(image, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size != IMAGE_BYTES:
+            raise LabError('Lab image must be a regular file of exactly 8 GiB.')
+        raw = os.pread(fd, 1024, 1024)
+    finally:
+        os.close(fd)
+    if len(raw) < 120 or raw[56:58] != b'\x53\xef':
+        raise LabError('Lab image does not contain the expected ext4 superblock.')
+    return str(uuid.UUID(bytes=raw[104:120]))
+
+
+def validate_record(data, role, image_stat, filesystem_uuid=None):
+    if not isinstance(data, dict):
+        raise LabError('Manifest must be a JSON object.')
+    expected = dict(profile(role), state='ready', name=role_name(role), profile_sha256=signature(role))
+    if any(data.get(key) != value for key, value in expected.items()):
+        raise LabError('Manifest is incomplete or does not match the requested lab profile.')
+    if not stat.S_ISREG(image_stat.st_mode) or image_stat.st_size != IMAGE_BYTES:
+        raise LabError('Image is not a regular file of exactly 8 GiB.')
+    try:
+        str(uuid.UUID(data['filesystem_uuid']))
+    except (ValueError, KeyError, TypeError):
+        raise LabError('Manifest has no valid filesystem identity.')
+    if filesystem_uuid is not None and filesystem_uuid != data['filesystem_uuid']:
+        raise LabError('Image filesystem identity differs from its manifest.')
+
+
+def inspect_role(role, root=Path('/'), verify_image=False):
+    image, manifest = paths(role, root)
+    result = {'id': role, 'name': role_name(role), 'role': PROFILES[role]['title'],
+              'state': 'not-provisioned', 'size_bytes': IMAGE_BYTES, 'image': str(image),
+              'detail': 'No completed image exists.', 'network_mode': 'shared',
+              'snapshots': [], 'snapshot_count': 0,
+              'storage_detail': 'Each snapshot reserves another 8 GiB; restoring also keeps an 8 GiB recovery snapshot.'}
+    try:
+        result['resources'] = resources(role, root)
+        result['usage'] = resource_usage(role, root)
+        result['network_mode'] = network_mode(role, root)
+        result['snapshots'] = snapshots(role, root)
+        result['snapshot_count'] = sum(item['state'] == 'ready' for item in result['snapshots'])
+        if image.is_symlink() or manifest.is_symlink():
+            return dict(result, state='invalid', detail='Image/manifest symlinks are refused.')
+        partials = sorted(str(p) for p in image.parent.glob('.' + role + '.*.partial.raw'))
+        if not image.exists() and not manifest.exists():
+            if partials:
+                return dict(result, state='incomplete', detail='Retained partial image requires inspection.', partials=partials)
+            return result
+        if not image.is_file() or not manifest.is_file():
+            return dict(result, state='incomplete', detail='Both a completed image and manifest are required.', partials=partials)
+        ms = manifest.stat()
+        ims = image.stat()
+        if ms.st_uid != 0 or ms.st_mode & 0o022 or ims.st_uid != 0 or ims.st_mode & 0o022:
+            raise LabError('Image/manifest ownership or write permissions are unsafe.')
+        if ms.st_size > 65536:
+            raise LabError('Manifest is unexpectedly large.')
+        data = json.loads(manifest.read_text())
+        ident = read_superblock(image) if verify_image else None
+        validate_record(data, role, ims, ident)
+        return dict(result, state='ready', filesystem_uuid=data['filesystem_uuid'],
+                    detail='Completed image and profile manifest verified.' if verify_image else
+                           'Completed manifest and image size verified; filesystem checked when entering.')
+    except (OSError, ValueError, LabError, TypeError) as exc:
+        return dict(result, state='invalid', detail=str(exc))
+
+
+def nspawn_args(role, *, image=None, directory=None, offline=False, command=None, project_fd=None, project_mode='ro'):
+    if (image is None) == (directory is None):
+        raise LabError('Choose exactly one image or root directory.')
+    result = ['systemd-nspawn', '--machine=' + role_name(role), '--settings=no', '--register=no',
+              '--keep-unit', '--private-users=pick', '--private-users-ownership=auto', '--as-pid2',
+              '--drop-capability=' + DROP_CAPS, '--link-journal=no', '--resolv-conf=bind-host',
+              '--timezone=off', '--user=root']
+    result += ['--image=' + str(image)] if image is not None else ['--directory=' + str(directory)]
+    if offline:
+        result.append('--private-network')
+    if project_fd is not None:
+        if not isinstance(project_fd, int) or project_fd < 0 or not stat.S_ISDIR(os.fstat(project_fd).st_mode):
+            raise LabError('Project requires a pinned directory descriptor.')
+        # systemd 257 passes bind source paths directly to mount(2), before its
+        # user/PID namespaces. Keep this parent's FD open for the entire session;
+        # do not inherit it into nspawn/the guest. norbind excludes submounts.
+        source = f'/proc/{os.getpid()}/fd/{project_fd}'
+        if project_mode not in ('ro', 'rw'):
+            raise LabError('Project mode must be ro or rw.')
+        # rootidmap grants guest root only the owning host user's identity on
+        # this one mount; it never changes host ownership or maps host root.
+        binding = ('--bind=' + source + ':/project:norbind,rootidmap' if project_mode == 'rw'
+                   else '--bind-ro=' + source + ':/project:norbind')
+        result += [binding, '--chdir=/project']
+    elif project_mode != 'ro':
+        raise LabError('Writable mode requires an explicit project.')
+    result += ['--', *(command or ['/bin/bash', '-l'])]
+    return result
+
+
+def atomic_json(path, value, exclusive=False):
+    temp = path.with_name('.' + path.name + '.' + uuid.uuid4().hex + '.tmp')
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    try:
+        os.fchmod(fd, 0o644)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        if exclusive:
+            os.link(temp, path, follow_symlinks=False)
+            temp.unlink()
+        else:
+            os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+@contextmanager
+def role_lock(role):
+    protected_path(STORE, directory=True)
+    lock = STORE / ('.' + role_name(role) + '.lock')
+    if lock.exists() or lock.is_symlink():
+        protected_path(lock)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LabError(f'{role_name(role)} is already in use by another cube-lab operation.')
+        yield
+    finally:
+        os.close(fd)
+
+
+def create_store():
+    protected_path(STORE.parent, directory=True)
+    try:
+        STORE.mkdir(mode=0o755)
+        STORE.chmod(0o755)
+    except FileExistsError:
+        pass
+    protected_path(STORE, directory=True)
+
+
+def allocate_image(path):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        os.posix_fallocate(fd, 0, IMAGE_BYTES)
+        if os.fstat(fd).st_size != IMAGE_BYTES:
+            raise LabError('Image allocation did not produce exactly 8 GiB.')
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def mountpoints_under(directory):
+    def unescape(value):
+        return re.sub(r'\\([0-7]{3})', lambda m: chr(int(m.group(1), 8)), value)
+    found = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 6:
+            mountpoint = Path(unescape(fields[4]))
+            if mountpoint == directory or mountpoint.is_relative_to(directory):
+                found.append(mountpoint)
+    return sorted(set(found), key=lambda p: len(p.parts), reverse=True)
+
+
+def unmount_owned(directory):
+    for point in mountpoints_under(directory):
+        execute(['umount', '--', point])
+    if mountpoints_under(directory):
+        raise LabError('Owned mount remains busy; mount directory and image have been retained.')
+    # Never recursively delete a mount tree. rmdir succeeds only after the
+    # filesystem is detached and the original empty mount directory is visible.
+    directory.rmdir()
+
+
+def guest_file(root, relative, content, mode=0o644):
+    rel = Path(relative)
+    if rel.is_absolute() or '..' in rel.parts:
+        raise LabError('Invalid guest configuration path.')
+    path = root / rel
+    parent = root
+    for part in rel.parts[:-1]:
+        parent = parent / part
+        if parent.is_symlink():
+            raise LabError('Guest configuration parent unexpectedly contains a symlink.')
+        parent.mkdir(exist_ok=True)
+    if path.is_symlink():
+        raise LabError('Guest configuration file unexpectedly is a symlink.')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'w') as stream:
+        stream.write(content)
+    path.chmod(mode)
+
+
+def configure_guest(root, role):
+    guest_file(root, 'etc/apt/sources.list',
+               'deb https://deb.debian.org/debian trixie main\n'
+               'deb https://deb.debian.org/debian trixie-updates main\n'
+               'deb https://security.debian.org/debian-security trixie-security main\n')
+    guest_file(root, 'usr/sbin/policy-rc.d', '#!/bin/sh\nexit 101\n', 0o755)
+    guest_file(root, 'etc/apt/apt.conf.d/90whitecube',
+               'APT::Install-Recommends "false";\nAPT::Install-Suggests "false";\n')
+    guest_file(root, 'etc/hostname', role_name(role) + '\n')
+    guest_file(root, 'etc/motd', f'WHITECUBE / {role.upper()} — Debian 13 workspace\n'
+               '8 GiB image; root is mapped into a private user namespace.\n'
+               'Host projects are not mounted. Exit the shell to stop this session.\n')
+    guest_file(root, 'etc/profile.d/whitecube.sh',
+               'export PS1="[wc-' + role + '] \\u:\\w\\$ "\n')
+
+
+def worker(role):
+    require_booted_target()
+    if os.stat('/proc/self/ns/mnt').st_ino == os.stat('/proc/1/ns/mnt').st_ino:
+        raise LabError('Internal provisioning requires a private mount namespace.')
+    protected_path(STORE, directory=True)
+    with role_lock(role):
+        current = inspect_role(role, verify_image=True)
+        if current['state'] == 'ready':
+            print(f'{role_name(role)} already matches its completed profile; skipped.', flush=True)
+            return
+        if current['state'] != 'not-provisioned':
+            raise LabError(current['detail'] + ' Existing/partial images are never overwritten; inspect status.')
+        free = shutil.disk_usage(STORE).free
+        if free < IMAGE_BYTES + 512 * 1024**2:
+            raise LabError('Less than 8.5 GiB free; refusing to create another fixed-size image.')
+        token = uuid.uuid4().hex
+        image, manifest = paths(role)
+        partial = STORE / ('.' + role + '.' + token + '.partial.raw')
+        journal = STORE / ('.' + role + '.' + token + '.partial.json')
+        mountdir = STORE / ('.mount-' + role + '-' + token)
+        fs_uuid = str(uuid.uuid4())
+        progress = {'role': role, 'state': 'allocating', 'image': str(partial), 'mount': str(mountdir),
+                    'size_bytes': IMAGE_BYTES, 'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+        atomic_json(journal, progress, exclusive=True)
+        mounted = False
+        succeeded = False
+        try:
+            allocate_image(partial)
+            # O_EXCL creation above is the only source of a format target.
+            execute(['mkfs.ext4', '-q', '-F', '-m', '0', '-L', role_name(role), '-U', fs_uuid,
+                     '-E', 'nodiscard,lazy_itable_init=0,lazy_journal_init=0', partial])
+            mountdir.mkdir(mode=0o700)
+            execute(['mount', '-t', 'ext4', '-o', 'loop,nosuid', '--', partial, mountdir])
+            mounted = True
+            progress['state'] = 'debootstrap'
+            atomic_json(journal, progress)
+            execute(['debootstrap', '--variant=minbase', '--arch=' + ARCH, '--components=main',
+                     '--include=ca-certificates', '--keyring=' + str(KEYRING), '--force-check-gpg',
+                     SUITE, mountdir, MIRROR])
+            configure_guest(mountdir, role)
+            progress['state'] = 'guest-packages'
+            atomic_json(journal, progress)
+            packages = PROFILES[role]['packages']
+            # Arguments remain separate: role package names never become shell code.
+            setup = ('set -eu; . /etc/os-release; test "$VERSION_CODENAME" = trixie; '
+                     'if [ "$#" -gt 0 ]; then apt-get update; '
+                     'apt-get -y --no-install-recommends install "$@"; fi; '
+                     'apt-get clean; audit=$(dpkg --audit); test -z "$audit" || { printf "%s\\n" "$audit"; exit 1; }; '
+                     'test -x /bin/bash; printf "guest profile complete\\n"')
+            execute(nspawn_args(role, directory=mountdir,
+                                 command=['/bin/sh', '-c', setup, 'cube-lab-setup', *packages]))
+            execute(['sync', '-f', mountdir])
+            unmount_owned(mountdir)
+            mounted = False
+            if read_superblock(partial) != fs_uuid:
+                raise LabError('New image filesystem identity failed final validation.')
+            # Link rather than rename so an unexpected existing destination can
+            # never be overwritten. Image publication precedes completion record.
+            os.link(partial, image, follow_symlinks=False)
+            partial.unlink()
+            record = dict(profile(role), name=role_name(role), state='ready',
+                          profile_sha256=signature(role), filesystem_uuid=fs_uuid,
+                          completed_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+            atomic_json(manifest, record, exclusive=True)
+            journal.unlink()
+            succeeded = True
+            print(f'{role_name(role)} ready: {image} (8 GiB).', flush=True)
+        finally:
+            if not succeeded:
+                progress['state'] = 'incomplete'
+                progress['image'] = str(partial if partial.exists() else image)
+                try:
+                    if mounted or (mountdir.exists() and mountpoints_under(mountdir)):
+                        unmount_owned(mountdir)
+                    elif mountdir.exists():
+                        mountdir.rmdir()
+                    progress['mount_cleanup'] = 'complete'
+                except BaseException as cleanup_error:
+                    progress['mount_cleanup'] = 'failed; retained'
+                    progress['cleanup_error'] = str(cleanup_error)
+                    print('Cleanup retained mount/image: ' + str(cleanup_error), file=sys.stderr)
+                atomic_json(journal, progress)
+                print('Incomplete image retained for inspection: ' + progress['image'], file=sys.stderr)
+
+
+def provision(roles, install_tools=False):
+    require_booted_target()
+    if install_tools:
+        install_host_tools()
+    namespace_preflight()
+    create_store()
+    pending = []
+    for role in roles:
+        state = inspect_role(role, verify_image=True)
+        if state['state'] == 'ready':
+            print(f'{role_name(role)} already ready; skipped.', flush=True)
+        elif state['state'] == 'not-provisioned':
+            pending.append(role)
+        else:
+            raise LabError(f'{role_name(role)}: {state["detail"]} Inspect existing data before retrying.')
+    required = len(pending) * IMAGE_BYTES + (512 * 1024**2 if pending else 0)
+    if shutil.disk_usage(STORE).free < required:
+        raise LabError(f'Need {required} free bytes for the remaining preallocated images and margin.')
+    for role in pending:
+        print(f'Provisioning {role_name(role)} in a private mount namespace…', flush=True)
+        execute(['unshare', '--mount', '--propagation', 'private', '--', sys.executable,
+                 str(Path(__file__).resolve()), '_provision', role])
+
+
+def projects_base():
+    """The invoking account's ~/Projects: SUDO_USER's when run through sudo, else the current user's.
+    Never a path the caller supplies, so a project can only come from that one directory."""
+    import pwd
+    name = os.environ.get('SUDO_USER') if os.geteuid() == 0 else None
+    entry = pwd.getpwnam(name) if name else pwd.getpwuid(os.getuid())
+    if entry.pw_uid == 0:
+        raise LabError('Run cube-lab with sudo from your own account, so it knows whose Projects directory to share.')
+    return Path(entry.pw_dir, 'Projects').resolve(strict=True)
+
+
+def validate_project(project):
+    base = projects_base()
+    candidate = Path(project)
+    if any(char in str(candidate) for char in (':', '\n', '\r', '\0')):
+        raise LabError('Project path contains unsupported characters.')
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_dir() or resolved.parent != base or candidate != resolved:
+        raise LabError(f'Project must be an immediate real directory inside {base}; symlinks are refused.')
+    return resolved
+
+
+@contextmanager
+def pinned_project(project):
+    if project is None:
+        yield None
+        return
+    path = validate_project(project)
+    # Resolve each component relative to its pinned parent. A rename or symlink
+    # replacement after validation cannot redirect the root bind outside it.
+    flags = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open('/', flags)
+    try:
+        for component in path.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def verify_writable_project(fd):
+    """Reject escaping links, shared inodes and special files before a writable bind.
+
+    Walk relative to pinned directory FDs, never following symlink components.
+    Within the guest, symlinks are also resolved in its mount namespace, so later
+    host edits cannot make a symlink reach an unmounted host directory.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    source_device = os.fstat(fd).st_dev
+    visited = 0
+    def walk(parent_fd, relative):
+        nonlocal visited
+        for name in os.listdir(parent_fd):
+            visited += 1
+            if visited > 100000:
+                raise LabError('Writable project exceeds 100000 entries; narrow the shared project first.')
+            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            here = relative / name
+            if entry.st_dev != source_device:
+                raise LabError(f'Writable project contains a nested mount: {here}')
+            if stat.S_ISLNK(entry.st_mode):
+                target = os.readlink(name, dir_fd=parent_fd)
+                normalized = os.path.normpath(str(relative / target))
+                if os.path.isabs(target) or normalized == '..' or normalized.startswith('../'):
+                    raise LabError(f'Writable project has an escaping symlink: {here}')
+            elif stat.S_ISDIR(entry.st_mode):
+                child = os.open(name, flags, dir_fd=parent_fd)
+                try:
+                    walk(child, here)
+                finally:
+                    os.close(child)
+            elif not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise LabError(f'Writable project has a special file or shared hardlink: {here}')
+    # O_PATH cannot be listed directly; open its pinned inode, not the pathname.
+    reader = os.open(f'/proc/{os.getpid()}/fd/{fd}', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        walk(reader, Path('.'))
+    finally:
+        os.close(reader)
+
+
+def resource_unit(role):
+    return 'whitecube-lab-' + role_name(role) + '.scope'
+
+
+def validate_resources(cpu, memory_mib):
+    if isinstance(cpu, bool) or not isinstance(cpu, (int, float)) or not 0.1 <= cpu <= 128:
+        raise LabError('CPU limit must be between 0.1 and 128 CPU cores.')
+    if isinstance(memory_mib, bool) or not isinstance(memory_mib, int) or not 128 <= memory_mib <= 65536:
+        raise LabError('RAM limit must be a whole number from 128 to 65536 MiB.')
+    return {'cpu': float(cpu), 'memory_mib': memory_mib}
+
+
+def resources(role, root=Path('/')):
+    path = location(root) / (role_name(role) + '.resources.json')
+    if not path.exists() and not path.is_symlink():
+        return DEFAULT_RESOURCES.copy()
+    protected_path(path)
+    if not path.is_file() or path.stat().st_size > 4096:
+        raise LabError('Invalid resource preference file.')
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or value.get('schema') != 1 or value.get('role') != role:
+        raise LabError('Resource preference does not match this lab.')
+    return validate_resources(value.get('cpu'), value.get('memory_mib'))
+
+
+def set_resources(role, cpu=None, memory_mib=None):
+    require_booted_target()
+    create_store()
+    with role_lock(role):
+        old = resources(role)
+        value = validate_resources(old['cpu'] if cpu is None else cpu,
+                                   old['memory_mib'] if memory_mib is None else memory_mib)
+        path = STORE / (role_name(role) + '.resources.json')
+        protected_path(path, allow_absent=True)
+        atomic_json(path, dict(value, schema=1, role=role))
+    print(json.dumps({'id': role, 'resources': value, 'size_bytes': IMAGE_BYTES,
+                      'detail': 'Limits apply on the next launch; stop the lab before changing them.'}))
+
+
+def resource_scope_args(role, args):
+    value = resources(role)
+    return ['systemd-run', '--scope', '--quiet', '--unit=' + resource_unit(role),
+            '--slice=' + CGROUP_SLICE, '--property=CPUAccounting=yes', '--property=MemoryAccounting=yes',
+            '--property=CPUQuota=' + format(value['cpu'] * 100, '.6g') + '%',
+            '--property=MemoryMax=' + str(value['memory_mib']) + 'M', '--property=MemorySwapMax=0',
+            '--property=MemoryOOMGroup=yes', '--property=OOMPolicy=stop', '--', *args]
+
+
+def resource_usage(role, root=Path('/')):
+    group = root / 'sys/fs/cgroup' / CGROUP_SLICE / resource_unit(role)
+    result = {'state': 'stopped', 'cpu_usage_usec': None, 'cpu_percent': None, 'memory_current_bytes': None,
+              'memory_peak_bytes': None, 'oom_events': 0, 'oom_kills': 0, 'out_of_memory': False,
+              'exit_code': None, 'finished_utc': None}
+    try:
+        path = location(root) / (role_name(role) + '.last-run.json')
+        if path.exists() or path.is_symlink():
+            protected_path(path)
+            if path.is_file() and path.stat().st_size <= 4096:
+                last = json.loads(path.read_text())
+                if isinstance(last, dict) and last.get('role') == role:
+                    for key in result:
+                        if key in last:
+                            result[key] = last[key]
+        if group.is_dir():
+            def counters(name):
+                return dict(line.split()[:2] for line in (group / name).read_text().splitlines() if len(line.split()) >= 2)
+            cpu, events = counters('cpu.stat'), counters('memory.events')
+            sampled_at = time.monotonic()
+            time.sleep(0.02)
+            newer_cpu = counters('cpu.stat')
+            duration = time.monotonic() - sampled_at
+            cpu_percent = max(0.0, (int(newer_cpu['usage_usec']) - int(cpu['usage_usec'])) / (duration * 10000))
+            result.update(state='running', cpu_usage_usec=int(cpu['usage_usec']),
+                          cpu_percent=round(cpu_percent, 1),
+                          memory_current_bytes=int((group / 'memory.current').read_text()),
+                          memory_peak_bytes=int((group / 'memory.peak').read_text()),
+                          oom_events=int(events.get('oom', 0)), oom_kills=int(events.get('oom_kill', 0)),
+                          exit_code=None, finished_utc=None)
+            result['out_of_memory'] = bool(result['oom_events'] or result['oom_kills'])
+        result['detail'] = (f'RAM limit reached: {result["oom_events"]} OOM events, {result["oom_kills"]} process kills. Increase RAM or reduce the job before relaunching.'
+                            if result['out_of_memory'] else 'Live cgroup accounting.' if result['state'] == 'running'
+                            else 'Last recorded run; no commands are started by status.')
+    except (OSError, ValueError, KeyError, TypeError, LabError):
+        result.update(state='unavailable', detail='Resource accounting could not be read; no usage is inferred.')
+    return result
+
+
+def finish_resource_run(role, exit_code, sampled):
+    final = dict(sampled, state='stopped', role=role, exit_code=exit_code,
+                 finished_utc=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+    try:
+        result = subprocess.run(['systemctl', 'show', resource_unit(role), '--property=Result',
+                                 '--property=CPUUsageNSec', '--property=MemoryPeak'],
+                                env=SAFE_ENV, capture_output=True, text=True, timeout=5)
+        values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
+        if values.get('Result') == 'oom-kill':
+            final['out_of_memory'] = True
+            final['oom_kills'] = max(1, final.get('oom_kills', 0))
+        for field, key, divisor in [('CPUUsageNSec', 'cpu_usage_usec', 1000), ('MemoryPeak', 'memory_peak_bytes', 1)]:
+            if values.get(field, '').isdigit() and int(values[field]) < 2**64 - 1:
+                final[key] = int(values[field]) // divisor
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    if final.get('out_of_memory'):
+        print('cube-lab: OUT OF MEMORY: this lab exceeded its RAM limit; inspect cube-lab status before relaunching.', file=sys.stderr)
+    atomic_json(STORE / (role_name(role) + '.last-run.json'), final)
+
+
+def enter(role, offline=None, command=None, project=None, project_mode='ro'):
+    require_booted_target()
+    require_tools(['systemd-nspawn', 'systemd-run', 'systemctl'])
+    protected_path(STORE, directory=True)
+    with role_lock(role), pinned_project(project) as project_fd:
+        if project_mode == 'rw':
+            if project_fd is None:
+                raise LabError('Writable mode requires an explicit project.')
+            verify_writable_project(project_fd)
+            print('Writable project scope: only /project maps to ' + str(project) + '; host files in that project may change.', file=sys.stderr)
+        state = inspect_role(role, verify_image=True)
+        if state['state'] != 'ready':
+            raise LabError(f'{role_name(role)} is {state["state"]}. Run sudo cube-lab provision first. {state["detail"]}')
+        image, manifest = paths(role)
+        protected_path(image)
+        protected_path(manifest)
+        ensure_existing_module('loop')
+        ensure_existing_module('ext4')
+        args = nspawn_args(role, image=image,
+                           offline=network_mode(role) == 'offline' if offline is None else offline,
+                           command=command, project_fd=project_fd, project_mode=project_mode)
+        # Keep this lock-owning parent until the interactive nspawn session exits.
+        # Its terminal is inherited; nspawn supplies the guest PTY and stub init.
+        # A failed scope from a previous OOM is reset without altering services.
+        subprocess.run(['systemctl', 'reset-failed', resource_unit(role)], env=SAFE_ENV,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        proc = subprocess.Popen(resource_scope_args(role, args), env=SAFE_ENV)
+        sampled = dict(resource_usage(role), oom_events=0, oom_kills=0, out_of_memory=False,
+                       cpu_usage_usec=None, cpu_percent=None, memory_current_bytes=None, memory_peak_bytes=None)
+        try:
+            while True:
+                try:
+                    code = proc.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    value = resource_usage(role)
+                    if value['state'] == 'running':
+                        sampled = value
+            finish_resource_run(role, code, sampled)
+            return code
+        except BaseException:
+            proc.terminate()
+            try:
+                proc.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            finish_resource_run(role, proc.returncode, sampled)
+            raise
+
+
+def network_mode(role, root=Path('/')):
+    path = location(root) / (role_name(role) + '.network.json')
+    if not path.exists() and not path.is_symlink():
+        return 'shared'
+    protected_path(path)
+    if not path.is_file() or path.stat().st_size > 4096:
+        raise LabError('Invalid network preference file.')
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict) or data.get('role') != role or data.get('mode') not in ('shared', 'offline'):
+        raise LabError('Invalid network preference; choose shared or offline explicitly.')
+    return data['mode']
+
+
+def set_network_mode(role, mode):
+    require_booted_target()
+    if mode not in ('shared', 'offline'):
+        raise LabError('Network mode must be shared or offline.')
+    create_store()
+    with role_lock(role):
+        path = STORE / (role_name(role) + '.network.json')
+        protected_path(path, allow_absent=True)
+        atomic_json(path, {'schema': 1, 'role': role, 'mode': mode})
+    print(json.dumps({'id': role, 'network_mode': mode, 'detail': 'Applies on the next lab launch.'}))
+
+
+def snapshot_name(name):
+    if not isinstance(name, str) or not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,47}', name):
+        raise LabError('Snapshot name must be 1–48 lowercase letters, digits, underscores or hyphens.')
+    return name
+
+
+def snapshot_base(role, root=Path('/')):
+    return location(root) / 'snapshots' / role_name(role)
+
+
+def snapshot_record(role, directory, verify_image=False):
+    protected_path(directory, directory=True)
+    manifest, image = directory / 'snapshot.json', directory / 'image.raw'
+    protected_path(manifest)
+    protected_path(image)
+    if not manifest.is_file() or manifest.stat().st_size > 65536:
+        raise LabError('Snapshot metadata is missing or too large.')
+    data = json.loads(manifest.read_text())
+    if not isinstance(data, dict) or data.get('schema') != 1 or data.get('name') != directory.name:
+        raise LabError('Snapshot metadata does not match its directory.')
+    snapshot_name(data['name'])
+    validate_record(data.get('profile'), role, image.stat(), read_superblock(image) if verify_image else None)
+    if not isinstance(data.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', data['sha256']):
+        raise LabError('Snapshot checksum is missing or invalid.')
+    return data
+
+
+def snapshots(role, root=Path('/')):
+    base = snapshot_base(role, root)
+    if not base.exists() and not base.is_symlink():
+        return []
+    protected_path(base, directory=True)
+    result = []
+    for directory in sorted(base.iterdir()):
+        item = {'name': directory.name, 'state': 'incomplete', 'size_bytes': IMAGE_BYTES,
+                'created_utc': None, 'detail': 'Unpublished snapshot; inspect before removing.'}
+        try:
+            if directory.name.startswith('.'):
+                result.append(item)
+                continue
+            data = snapshot_record(role, directory)
+            item.update(state='ready', created_utc=data.get('created_utc'),
+                        detail='Completed snapshot; full checksum checked before restore.')
+        except (LabError, ValueError, OSError, TypeError) as exc:
+            item.update(state='invalid', detail=str(exc))
+        result.append(item)
+    return result
+
+
+def fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def require_snapshot_space(copies=1):
+    required = copies * IMAGE_BYTES + 512 * 1024**2
+    if shutil.disk_usage(STORE).free < required:
+        raise LabError(f'Need {required} free bytes ({copies} additional 8 GiB image(s) plus 512 MiB margin).')
+
+
+def stopped_image(role):
+    current = inspect_role(role, verify_image=True)
+    if current['state'] != 'ready':
+        raise LabError(f'{role_name(role)} is {current["state"]}: {current["detail"]}')
+    image, manifest = paths(role)
+    protected_path(image)
+    protected_path(manifest)
+    # The role lock guards cube-lab sessions; this also refuses external loop mounts.
+    for backing in Path('/sys/block').glob('loop*/loop/backing_file'):
+        if Path('/' + backing.read_text().strip().lstrip('/')).resolve() == image.resolve():
+            raise LabError('Image is attached to a loop device; stop/unmount it before taking or restoring snapshots.')
+    return image, json.loads(manifest.read_text())
+
+
+def copy_image(source, destination):
+    """Reserve and checksum every byte; interrupted copies never replace live data."""
+    allocate_image(destination)
+    digest = hashlib.sha256()
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    target_fd = os.open(destination, os.O_WRONLY | os.O_NOFOLLOW)
+    try:
+        if os.fstat(source_fd).st_size != IMAGE_BYTES:
+            raise LabError('Source image size changed.')
+        with os.fdopen(source_fd, 'rb', closefd=False) as inp, os.fdopen(target_fd, 'wb', closefd=False) as out:
+            while chunk := inp.read(4 * 1024**2):
+                digest.update(chunk)
+                out.write(chunk)
+            out.flush()
+            os.fsync(target_fd)
+    finally:
+        os.close(source_fd)
+        os.close(target_fd)
+    if destination.stat().st_size != IMAGE_BYTES:
+        raise LabError('Copied image size differs from 8 GiB.')
+    return digest.hexdigest()
+
+
+def snapshot_locked(role, name, image, record):
+    name = snapshot_name(name)
+    base = snapshot_base(role)
+    for directory in (base.parent, base):
+        protected_path(directory.parent, directory=True)
+        protected_path(directory, directory=True, allow_absent=True)
+        directory.mkdir(mode=0o755, exist_ok=True)
+        directory.chmod(0o755)
+        protected_path(directory, directory=True)
+    final = base / name
+    if final.exists() or final.is_symlink():
+        raise LabError('Snapshot already exists; choose a new name. Snapshots are never overwritten.')
+    require_snapshot_space()
+    temporary = base / ('.' + name + '.' + uuid.uuid4().hex + '.partial')
+    temporary.mkdir(mode=0o755)
+    temporary.chmod(0o755)
+    digest = copy_image(image, temporary / 'image.raw')
+    if read_superblock(temporary / 'image.raw') != record['filesystem_uuid']:
+        raise LabError('Snapshot filesystem identity differs from its source.')
+    data = {'schema': 1, 'name': name, 'profile': record, 'sha256': digest,
+            'size_bytes': IMAGE_BYTES, 'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+    atomic_json(temporary / 'snapshot.json', data, exclusive=True)
+    fsync_directory(temporary)
+    # Protected parent and role lock prevent another operation creating final.
+    temporary.rename(final)
+    fsync_directory(base)
+    return data
+
+
+def take_snapshot(role, name):
+    require_booted_target()
+    snapshot_name(name)
+    protected_path(STORE, directory=True)
+    with role_lock(role):
+        image, record = stopped_image(role)
+        data = snapshot_locked(role, name, image, record)
+    print(json.dumps({'id': role, 'snapshot': name, 'size_bytes': IMAGE_BYTES, 'state': 'ready',
+                      'created_utc': data['created_utc']}))
+
+
+def restore_snapshot(role, name):
+    require_booted_target()
+    snapshot_name(name)
+    protected_path(STORE, directory=True)
+    with role_lock(role):
+        image, current = stopped_image(role)
+        directory = snapshot_base(role) / name
+        data = snapshot_record(role, directory, verify_image=True)
+        if data['profile']['filesystem_uuid'] != current['filesystem_uuid']:
+            raise LabError('Snapshot belongs to a different filesystem incarnation; refusing restore.')
+        # One full replacement image and one recovery snapshot are required.
+        require_snapshot_space(2)
+        temporary = STORE / ('.' + role + '.' + uuid.uuid4().hex + '.restore.partial.raw')
+        digest = copy_image(directory / 'image.raw', temporary)
+        if digest != data['sha256'] or read_superblock(temporary) != current['filesystem_uuid']:
+            raise LabError('Snapshot content checksum or filesystem identity failed; current image is unchanged.')
+        recovery = 'before-restore-' + time.strftime('%Y%m%d-%H%M%S', time.gmtime()) + '-' + uuid.uuid4().hex[:8]
+        snapshot_locked(role, recovery, image, current)
+        # Metadata and filesystem identity are the same. Replacing only this file
+        # makes the commit atomic: interruption exposes either complete old/new image.
+        os.replace(temporary, image)
+        fsync_directory(STORE)
+    print(json.dumps({'id': role, 'restored': name, 'recovery_snapshot': recovery,
+                      'state': 'ready', 'detail': 'Current image restored; previous contents retained in recovery snapshot.'}))
+
+
+def plan(root=Path('/')):
+    return {'suite': SUITE, 'arch': ARCH, 'store': str(location(root)),
+            'image_bytes': IMAGE_BYTES, 'image_count': 4, 'total_image_bytes': IMAGE_BYTES * 4,
+            'allocation': 'preallocated', 'filesystem': 'ext4', 'variant': 'minbase',
+            'host_packages_requested': list(HOST_REQUEST), 'host_packages_allowlist': sorted(HOST_ALLOWLIST),
+            'host_package_changes': 'Only with provision --install-tools; simulate, reject upgrades/removals, pin versions.',
+            'network': 'host network; enter --offline creates only an isolated loopback namespace',
+            'kernel_modules_installed': [], 'existing_modules_may_load': ['loop', 'ext4'],
+            'module_policy': 'Only protected module files for the running kernel; blacklists respected; no deleted modules restored.',
+            'host_project_mounts': [],
+            'labs': [dict(profile(role), id=role, name=role_name(role), title=PROFILES[role]['title']) for role in PROFILES]}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    for name in ('plan', 'status'):
+        sub = commands.add_parser(name)
+        sub.add_argument('--root', type=Path, default=Path('/'), help='Read-only inspection of a mounted target root')
+    sub = commands.add_parser('provision', help='Build all four images on the booted NVMe')
+    sub.add_argument('labs', nargs='*', choices=list(PROFILES), metavar='LAB')
+    sub.add_argument('--install-tools', action='store_true', help='Permit only the audited minimal host userspace packages')
+    sub = commands.add_parser('enter', help='Open a real interactive shell in one ready image')
+    sub.add_argument('lab', choices=list(PROFILES))
+    sub.add_argument('--offline', action='store_true', default=None, help='Override saved preference with isolated loopback-only networking')
+    sub.add_argument('--project', type=Path, help='Bind one real directory from your ~/Projects read-only at /project')
+    sub.add_argument('--project-mode', choices=('ro', 'rw'), default='ro',
+                     help='Explicit writable sharing changes files only inside the selected /project; default ro')
+    sub.add_argument('--command', nargs=argparse.REMAINDER, help='Optional guest command instead of bash')
+    sub = commands.add_parser('snapshots', help='Read-only snapshot inventory as JSON')
+    sub.add_argument('lab', choices=list(PROFILES))
+    sub.add_argument('--root', type=Path, default=Path('/'))
+    sub = commands.add_parser('resources', help='Read or set per-lab CPU cores and RAM MiB; disk remains 8 GiB')
+    sub.add_argument('lab', choices=list(PROFILES))
+    sub.add_argument('--cpu', type=float)
+    sub.add_argument('--memory-mib', type=int)
+    sub.add_argument('--root', type=Path, default=Path('/'))
+    for action in ('snapshot', 'restore'):
+        sub = commands.add_parser(action)
+        sub.add_argument('lab', choices=list(PROFILES))
+        sub.add_argument('name', type=snapshot_name)
+    sub = commands.add_parser('network-mode', help='Read or set persistent shared/offline preference')
+    sub.add_argument('lab', choices=list(PROFILES))
+    sub.add_argument('mode', choices=('shared', 'offline'), nargs='?')
+    sub.add_argument('--root', type=Path, default=Path('/'))
+    sub = commands.add_parser('_provision', help=argparse.SUPPRESS)
+    sub.add_argument('lab', choices=list(PROFILES))
+    args = parser.parse_args(argv)
+    if args.action == 'plan':
+        print(json.dumps(plan(args.root), indent=2))
+    elif args.action == 'status':
+        print(json.dumps([inspect_role(role, args.root) for role in PROFILES], indent=2))
+    elif args.action == 'provision':
+        provision(list(dict.fromkeys(args.labs or PROFILES)), args.install_tools)
+    elif args.action == '_provision':
+        worker(args.lab)
+    elif args.action == 'enter':
+        return enter(args.lab, args.offline, args.command, args.project, args.project_mode)
+    elif args.action == 'snapshots':
+        print(json.dumps(snapshots(args.lab, args.root), indent=2))
+    elif args.action == 'snapshot':
+        take_snapshot(args.lab, args.name)
+    elif args.action == 'restore':
+        restore_snapshot(args.lab, args.name)
+    elif args.action == 'network-mode':
+        if args.mode:
+            if args.root != Path('/'):
+                raise LabError('--root is available for read-only inspection only.')
+            set_network_mode(args.lab, args.mode)
+        else:
+            print(json.dumps({'id': args.lab, 'network_mode': network_mode(args.lab, args.root)}))
+    elif args.action == 'resources':
+        if args.cpu is not None or args.memory_mib is not None:
+            if args.root != Path('/'):
+                raise LabError('--root is available for read-only inspection only.')
+            set_resources(args.lab, args.cpu, args.memory_mib)
+        else:
+            print(json.dumps({'id': args.lab, 'resources': resources(args.lab, args.root),
+                              'size_bytes': IMAGE_BYTES, 'usage': resource_usage(args.lab, args.root)}))
+    return 0
+
+
+if __name__ == '__main__':
+    # Raising causes each owned command group and private mount to unwind.
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGHUP, interrupted)
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print('cube-lab: interrupted; inspect status before retrying provisioning.', file=sys.stderr)
+        sys.exit(130)
+    except (LabError, OSError, ValueError, KeyError) as exc:
+        print('cube-lab: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

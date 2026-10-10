@@ -1,0 +1,277 @@
+#!/usr/bin/python3 -I
+"""whitecube-migrate: switch this machine from the old loose installs to the whitecube-desktop package.
+
+Run it AFTER installing the package (sudo apt install ./whitecube-desktop_*.deb).
+
+  whitecube-migrate                       show what would change (dry run, no root needed)
+  sudo whitecube-migrate --apply          do it; everything it moves or edits is backed up first
+  sudo whitecube-migrate --rollback DIR   put everything back from a backup directory
+  options: --user NAME (default: the account that ran sudo)  --restart-network (see below)
+
+What it does, in this order:
+  1. Network unit: /etc/systemd/system/whitecube-network.service is replaced by the packaged unit in
+     /usr/lib/systemd (drop-ins in whitecube-network.service.d are kept). Nothing is restarted unless you
+     pass --restart-network; then the service is restarted and, if Wi-Fi does not return with an address
+     and a default route within 90 s, the old unit and files are put back and the service restarted again.
+  2. Old copies are MOVED (not deleted) into the backup: /usr/local/bin/{whitecube*,cube-*}, the old helper
+     in /usr/local/libexec, /usr/local/share/whitecube-workspace, and the per-user copies in ~/.local/bin,
+     ~/.local/share/whitecube and the per-user desktop entries. Those would otherwise shadow the package.
+  3. sudoers: /etc/sudoers.d/whitecube-settings keeps every rule you have; only the helper's path changes.
+     It is checked with visudo first and never installed if it does not parse.
+  4. Dotfiles: ~/.bash_profile and ~/.config/whitecube/config get their old absolute paths rewritten.
+It never deletes anything, never stops the compositor, and never touches your saved networks.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+PACKAGE = 'whitecube-desktop'
+SYSTEM_COMMANDS = ('whitecube', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'cube-chat', 'cube-check', 'cube-lab',
+                   'cube-scripts', 'whitecube-desktop', 'whitecube-next-wallpaper', 'whitecube-session', 'whitecube-terminal',
+                   'whitecube-web')
+USER_COMMANDS = ('whitecube', 'cube-status', 'cube-settings', 'cube-ca', 'cube-privacy', 'cube-preferences', 'whitecube-session',
+                 'cube-lock', 'cube-pdf', 'cube-hash', 'cube-rename', 'desktop-chat')
+USER_ENTRIES = ('cube-settings.desktop', 'desktop-chat.desktop', 'dev.woez.CubeLock.desktop', 'dev.woez.CubePdf.desktop',
+                'dev.woez.CubeHash.desktop', 'dev.woez.CubeRename.desktop')
+OLD_HELPER = '/usr/local/libexec/cube-settings-helper'
+NEW_HELPER = '/usr/libexec/whitecube/cube-settings-helper'
+UNIT = 'etc/systemd/system/whitecube-network.service'
+PACKAGED_UNIT = 'usr/lib/systemd/system/whitecube-network.service'
+
+
+class Migration:
+    def __init__(self, root=Path('/'), home=None, user=None, run=None, visudo=None, wait=None):
+        self.root, self.home, self.user = Path(root), Path(home) if home else None, user
+        self.run = run or (lambda argv, **kw: subprocess.run(argv, capture_output=True, text=True, **kw))
+        self.visudo = visudo or (lambda path: self.run(['visudo', '-cf', str(path)]).returncode == 0)
+        self.wait = wait or self.default_wait
+        self.steps = []          # (description, callable) in order
+        self.backup = None
+        self.log = []
+
+    # ----- helpers
+    def at(self, path):
+        return self.root / str(path).lstrip('/')
+
+    def installed_version(self):
+        done = self.run(['dpkg-query', '-W', '-f=${Version}', PACKAGE])
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    def keep(self, path):
+        """Move PATH into the backup (preserving its place in the tree) and remember it."""
+        path = Path(path)
+        target = self.backup / 'files' / str(path).lstrip('/')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(path), str(target))
+        self.log.append({'moved': str(path), 'to': str(target)})
+
+    def keep_copy(self, path):
+        """Copy PATH into the backup before it is edited in place."""
+        path = Path(path)
+        target = self.backup / 'files' / str(path).lstrip('/')
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, target, follow_symlinks=False)
+        self.log.append({'edited': str(path), 'copy': str(target)})
+
+    @staticmethod
+    def default_wait(seconds):
+        """True when a Wi-Fi interface has an IPv4 address and a default route."""
+        deadline = time.time() + seconds
+        while True:
+            done = subprocess.run(['ip', '-4', 'route', 'show', 'default'], capture_output=True, text=True)
+            if done.returncode == 0 and done.stdout.strip():
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(3)
+
+    # ----- planning
+    def plan(self, restart_network=False):
+        self.steps.clear()
+        if self.home is None:
+            raise SystemExit('whitecube-migrate: cannot tell whose home directory to migrate; use --user NAME')
+        packaged = self.at(PACKAGED_UNIT)
+        have_unit = self.at(UNIT)
+        if packaged.exists() and have_unit.exists() and not have_unit.is_symlink():
+            self.steps.append(('replace /etc/systemd/system/whitecube-network.service with the packaged unit (drop-ins kept)',
+                               lambda: self.swap_unit(restart_network)))
+        for name in SYSTEM_COMMANDS:
+            for old in sorted(self.at('usr/local/bin').glob(name + '*')):
+                if re.fullmatch(re.escape(name) + r'(\.bak-\d+|\.round\d+)?', old.name):
+                    self.steps.append((f'move {old.relative_to(self.root)} into the backup', lambda p=old: self.keep(p)))
+        for pattern in ('cube-net-dns*', 'cube-settings-helper*'):
+            for old in sorted(self.at('usr/local/libexec').glob(pattern)):
+                self.steps.append((f'move {old.relative_to(self.root)} into the backup', lambda p=old: self.keep(p)))
+        workspace = self.at('usr/local/share/whitecube-workspace')
+        if workspace.is_dir():
+            self.steps.append(('move /usr/local/share/whitecube-workspace into the backup', lambda: self.keep(workspace)))
+        entry = self.at('usr/local/share/applications/whitecube-workspace.desktop')
+        if entry.exists():
+            self.steps.append(('move /usr/local/share/applications/whitecube-workspace.desktop into the backup', lambda: self.keep(entry)))
+        for name in USER_COMMANDS:
+            old = self.home / '.local/bin' / name
+            if old.is_symlink() or old.is_file():
+                self.steps.append((f'move ~/.local/bin/{name} into the backup (it would shadow /usr/bin/{name})', lambda p=old: self.keep(p)))
+        schemas = self.home / '.local/share/whitecube/schemas'
+        if schemas.is_dir():
+            self.steps.append(('move ~/.local/share/whitecube/schemas into the backup (the package ships the schema)', lambda: self.keep(schemas)))
+        for name in USER_ENTRIES:
+            old = self.home / '.local/share/applications' / name
+            if old.is_file():
+                self.steps.append((f'move ~/.local/share/applications/{name} into the backup', lambda p=old: self.keep(p)))
+        for old in sorted((self.home / '.local/share/icons/hicolor/scalable/apps').glob('cube-*.svg')):
+            self.steps.append((f'move ~/.local/share/icons/.../{old.name} into the backup', lambda p=old: self.keep(p)))
+        sudoers = self.at('etc/sudoers.d/whitecube-settings')
+        if sudoers.is_file() and OLD_HELPER in sudoers.read_text():
+            self.steps.append((f'sudoers: point /etc/sudoers.d/whitecube-settings at {NEW_HELPER} (rules unchanged, visudo-checked)',
+                               lambda: self.edit_sudoers(sudoers)))
+        profile = self.home / '.bash_profile'
+        if profile.is_file() and re.search(r'\.local/bin/whitecube-session', profile.read_text()):
+            self.steps.append(('~/.bash_profile: start /usr/bin/whitecube-session', lambda: self.edit_text(
+                profile, lambda t: re.sub(r'"?(?:\$HOME|~|/home/[^/\s"]+)/\.local/bin/whitecube-session"?', '/usr/bin/whitecube-session', t))))
+        config = self.home / '.config/whitecube/config'
+        if config.is_file() and re.search(r'/usr/local/bin/|\.local/bin/', config.read_text()):
+            self.steps.append(('~/.config/whitecube/config: rewrite old absolute command paths', lambda: self.edit_text(config, self.rewrite_config)))
+        return self.steps
+
+    @staticmethod
+    def rewrite_config(text):
+        text = text.replace('/usr/local/bin/', '/usr/bin/')
+        return re.sub(r'(?:/home/[^/\s]+|\$HOME|~)/\.local/bin/(cube-[a-z-]+|whitecube[a-z-]*|desktop-chat)', r'/usr/bin/\1', text)
+
+    # ----- actions
+    def edit_text(self, path, transform):
+        self.keep_copy(path)
+        old = path.read_text()
+        new = transform(old)
+        if new != old:
+            mode = path.stat().st_mode & 0o7777
+            temporary = path.with_name(path.name + f'.new-{os.getpid()}')
+            temporary.write_text(new)
+            temporary.chmod(mode)
+            os.replace(temporary, path)
+
+    def edit_sudoers(self, path):
+        new = path.read_text().replace(OLD_HELPER, NEW_HELPER)
+        temporary = path.with_name(path.name + f'.new-{os.getpid()}')
+        temporary.write_text(new)
+        temporary.chmod(0o440)
+        if not self.visudo(temporary):
+            temporary.unlink()
+            raise RuntimeError('the edited sudoers rule does not parse; left unchanged')
+        self.keep_copy(path)
+        os.replace(temporary, path)
+
+    def swap_unit(self, restart):
+        have = self.at(UNIT)
+        self.keep_copy(have)
+        old_text = have.read_text()
+        was_enabled = self.run(['systemctl', 'is-enabled', 'whitecube-network.service']).stdout.strip() == 'enabled'
+        have.unlink()
+        self.run(['systemctl', 'daemon-reload'])
+        if was_enabled:
+            self.run(['systemctl', 'enable', 'whitecube-network.service'])
+        self.log.append({'unit': True, 'was_enabled': was_enabled})
+        if not restart:
+            self.log.append({'note': 'whitecube-network.service was not restarted; the running process keeps working'})
+            return
+        self.run(['systemctl', 'restart', 'whitecube-network.service'])
+        if not self.wait(90):
+            have.write_text(old_text)
+            self.run(['systemctl', 'daemon-reload'])
+            self.run(['systemctl', 'restart', 'whitecube-network.service'])
+            raise RuntimeError('Wi-Fi did not return with the packaged unit; the old unit was restored and the service restarted')
+
+    def apply(self, restart_network=False):
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        self.backup = self.at('var/backups/whitecube-migrate') / stamp
+        self.backup.mkdir(parents=True, mode=0o700)
+        done = []
+        try:
+            for description, action in self.plan(restart_network):
+                action()
+                done.append(description)
+        finally:
+            (self.backup / 'manifest.json').write_text(json.dumps({'done': done, 'log': self.log, 'user': self.user,
+                                                                  'home': str(self.home)}, indent=2) + '\n')
+        return done
+
+    def rollback(self, backup):
+        backup = Path(backup)
+        manifest = json.loads((backup / 'manifest.json').read_text())
+        restored = []
+        for entry in reversed(manifest['log']):
+            if 'moved' in entry:
+                src, dst = Path(entry['to']), Path(entry['moved'])
+                if src.exists() and not dst.exists():
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    restored.append(str(dst))
+            elif 'edited' in entry:
+                src, dst = Path(entry['copy']), Path(entry['edited'])
+                if src.exists():
+                    temporary = dst.with_name(dst.name + f'.restore-{os.getpid()}')
+                    shutil.copy2(src, temporary, follow_symlinks=False)   # atomic replace: works on 0440 files too
+                    os.replace(temporary, dst)
+                    restored.append(str(dst))
+        if any(e.get('unit') for e in manifest['log']):
+            self.run(['systemctl', 'daemon-reload'])
+        return restored
+
+
+def main(argv=None, migration=None):
+    parser = argparse.ArgumentParser(description='Switch this machine from loose installs to the whitecube-desktop package.')
+    parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--rollback', metavar='DIR')
+    parser.add_argument('--user')
+    parser.add_argument('--root', type=Path, default=Path('/'))
+    parser.add_argument('--restart-network', action='store_true', help='restart Wi-Fi now, with automatic rollback if it does not return')
+    args = parser.parse_args(argv)
+    if migration is None:
+        name = args.user or os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name
+        entry = pwd.getpwnam(name)
+        migration = Migration(args.root, Path(entry.pw_dir), name)
+    if args.rollback:
+        if os.geteuid() != 0 and args.root == Path('/'):
+            parser.error('--rollback needs root: sudo whitecube-migrate --rollback DIR')
+        for path in migration.rollback(args.rollback):
+            print('restored', path)
+        print('Rolled back. Log out and back in if the desktop was affected.')
+        return 0
+    version = migration.installed_version()
+    if version is None:
+        print(f'The {PACKAGE} package is not installed, so there is nothing to migrate to yet.\n'
+              f'Build and install it first:  packaging/build-deb.sh && sudo apt install ./packaging/out/{PACKAGE}_*.deb')
+        return 1
+    steps = migration.plan(args.restart_network)
+    print(f'{PACKAGE} {version} is installed. Migration plan for {migration.user}:')
+    for description, _ in steps:
+        print('  -', description)
+    if not steps:
+        print('  (nothing to do: this machine already runs only the package)')
+    if not args.apply:
+        print('\nDry run. Apply with:  sudo whitecube-migrate --apply' + ('' if args.restart_network else '   (add --restart-network to restart Wi-Fi too)'))
+        return 0
+    if os.geteuid() != 0 and args.root == Path('/'):
+        parser.error('--apply needs root: sudo whitecube-migrate --apply')
+    try:
+        done = migration.apply(args.restart_network)
+    except RuntimeError as exc:
+        print('STOPPED:', exc, file=sys.stderr)
+        print(f'Undo what was done with:  sudo whitecube-migrate --rollback {migration.backup}', file=sys.stderr)
+        return 1
+    print(f'\nDone: {len(done)} step(s). Backup: {migration.backup}')
+    print(f'Undo with:  sudo whitecube-migrate --rollback {migration.backup}')
+    print('Log out and back in (Alt+Shift+Esc) to start the packaged desktop.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

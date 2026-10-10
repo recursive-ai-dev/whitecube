@@ -1,0 +1,145 @@
+WHITECUBE PROJECTS AND SCRIPT LIBRARY
+
+Put whitecube.project.json in an immediate directory under ~/Projects. Open or
+refresh the project library to discover it. Discovery reads JSON only; a command
+runs when you select Launch. Invalid manifests appear in /api/catalog's
+manifest_errors and cube-check. Existing built projects remain available.
+Examples are installed in /usr/share/whitecube/workspace/examples.
+
+STATIC BROWSER APP
+
+  {"version":1,"id":"my-app","name":"My App","dist":"dist"}
+
+Only that built directory is served. It must contain index.html. Paths cannot
+escape the project, and hidden files/source extensions are not served.
+
+COMMAND WITH A BROWSER VIEW
+
+  {"version":1,"id":"my-server","name":"My Server",
+   "launch":{"command":["python3","-m","http.server","8790",
+                        "--bind","127.0.0.1","--directory","dist"],
+             "url":"http://127.0.0.1:8790/"}}
+
+Use a separate loopback port, never 8787 or 8788. Bind the project's server to
+127.0.0.1. The command runs as your desktop user, in the project's directory.
+An optional relative launch.cwd changes that directory. Arguments are literal;
+there is no implicit shell expansion. If a shell is needed, name /bin/bash and
+its arguments explicitly. Browser view opens separately from its output terminal;
+reload the view after a slow server starts. New URL ports added while the browser
+is already open need a workspace page reload to update its frame policy.
+Keep the terminal open while using the app; Ctrl+C stops its foreground server.
+Projects may prohibit embedding through their own HTTP headers; use their local
+URL in a separate browser tab in that case.
+
+CONTAINER COMMAND
+
+  {"version":1,"id":"project-check","name":"Project check in Build Lab",
+   "launch":{"container":"build","command":["/bin/bash","check.sh"]}}
+
+Containers are bash, web, build or clean. An immediate real project directory is
+bound read-only at /project, and the command starts there. Symlink project roots,
+paths outside /home/woez/Projects, colons and newlines are refused by cube-lab.
+For writable builds, deliberately add top-level "project_mode":"rw" to this
+project manifest; it permits changes to the entire selected project at /project.
+The default remains "ro". Path escapes, escaping symlinks, hardlinks to other
+files, special files and nested mounts are refused. Writable binds use the
+existing systemd 257 rootidmap to map guest root to the project owner, without
+changing project ownership. If your project does not meet these checks, copy
+files into a guest directory first, for
+example command ["/bin/bash","-lc","cp -a /project /root/work && cd /root/work && make"].
+Existing lab network mode applies. A loopback browser server works only in shared
+network mode; offline labs cannot publish a browser endpoint to the host.
+The terminal handles sudo authentication. Whitecube's browser service is not root.
+
+SCRIPT LIBRARY
+
+A project's manifest may include scripts:
+
+  "scripts":[{"id":"my-check","name":"Project check","path":"check.sh",
+              "description":"Check a selected input file.",
+              "args":["sample.txt"],
+              "arguments":[{"name":"file","description":"Input file path"}]}]
+
+A script path is relative to that project. For independent library entries,
+put a version:1 JSON file in ~/.config/whitecube/scripts.d/; its path is relative
+to ~/Projects. The script example in examples illustrates this format. Scripts
+run under Bash from the directory containing the script. IDs use lowercase ASCII
+letters/digits/hyphens (maximum64). Project/script ids can override built-in catalog
+entries deliberately. Names, descriptions and tags are searchable.
+
+In the browser, enter ONE LITERAL ARGUMENT PER LINE. Spaces, dollar signs and
+semicolons stay part of that argument. Native cube-scripts instead accepts shell
+quoting through shlex; it performs no variable expansion or command substitution.
+At most64 arguments/32KiB total are accepted. An empty argument list overrides
+manifest defaults. Treat arguments as visible history: do not put passwords there.
+
+HISTORY AND STATE
+
+Initial script/project/control launches record start time, literal arguments,
+finish time and actual exit code in ~/.local/state/whitecube/runs (private files).
+Ctrl+C is recorded as130 when the program exits from SIGINT. The interactive Bash
+prompt remains after the selected script finishes. Commands later typed at that
+prompt are not recorded. Interruptions without a known exit code are labelled
+interrupted; no successful result is invented. Up to1000 finished runs are kept.
+Native and browser launches share this history. Password prompts for network or
+sudo stay in the PTY and are never stored in run metadata.
+
+BUILD, TEST AND PREVIEW
+
+A project may define commands before a dist directory exists. Discovery never
+executes them. The browser's Build/Test/Preview controls run one selected action
+in a new durable PTY and show its actual job exit status separately from Bash.
+Commands can be an argv array or an object with command, cwd, container and url:
+
+  {"version":1,"id":"orbit","name":"Orbit",
+   "project_mode":"ro",
+   "commands":{
+      "build":{"command":["make"],"container":"build"},
+      "test":{"command":["python3","-m","unittest"]},
+      "preview":{"command":["python3","-m","http.server","8790",
+                             "--bind","127.0.0.1","--directory","dist"],
+                 "url":"http://127.0.0.1:8790/"}}}
+
+The manifest container is the default; choose Host or a provisioned lab when
+running. Container actions start at /project; omit cwd for those actions. Builds
+in ro lab mounts must copy to guest storage; project_mode:"rw" is the deliberate
+option for writing into that chosen project. Writable selection applies to every
+lab action for this project, and the browser shows its full-project scope.
+No packages are installed by Build/Test/Preview. Launch only existing executables.
+
+Preview URLs use a separate loopback HTTP port (never 8787/8788), with no embedded
+credentials. Every two seconds the PTY owner makes a bounded HEAD probe with
+redirects disabled; a failed/interrupted run cannot advertise ready. A successful
+finite command (exit0) or live server and HTTP2xx readiness opens the browser view.
+CSP origins come from discovered manifest URLs; refresh workspace after changing
+ports. Offline lab servers are isolated from the host and cannot publish previews.
+
+NAMED WORKFLOWS AND QUEUE
+
+Save definitions from the Workflows tab, or include a workflows array in a project
+manifest. A definition references registered script IDs, never interpolated shell
+text. Definitions saved in the UI live in private workflows.json and are backed up.
+
+  {"id":"verify-orbit","name":"Verify Orbit","stop_on_failure":true,
+   "notify":false,"steps":[
+      {"id":"prepare","script":"orbit-prepare","args":["two words","$literal"]},
+      {"id":"check","script":"orbit-check","args":[],"depends_on":["prepare"]}]}
+
+Each step has its own run history, literal argv, exit code and bounded output log.
+Omitting args uses the script manifest defaults; [] overrides them. Dependencies
+must reference other unique steps; cycles and unknown IDs are rejected before
+queueing. Up to64 steps/definition and32 waiting workflows are accepted. The
+queue executes one workflow/step at a time in the independent PTY supervisor.
+Declared order is retained where dependencies allow it. A failed dependency skips
+its dependent steps even when stop_on_failure:false permits independent work.
+Cancel terminates the running PTY/process groups and marks pending steps cancelled.
+Closing/reloading the browser or restarting the workspace process preserves queue
+work. Restarting the PTY broker marks unfinished queue records interrupted and
+never reruns them. Optional completion notifications require an explicit browser
+permission click; in-app completion messages work without notification permission.
+
+Queue disk records retain100 finished workflows; the UI lists active and20 latest
+finished, with a total bounded log excerpt budget. Each step retains at most16KiB
+of its output tail. Full terminal replay keeps at most4MiB; output can be truncated.
+Run histories retain literal args; do not pass credentials as arguments. Backups
+exclude all run records, queue logs, broker credentials and terminal transcripts.

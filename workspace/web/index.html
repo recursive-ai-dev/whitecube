@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Whitecube · Orbital desktop</title>
+  <link rel="stylesheet" href="./vendor/xterm.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <a class="skip-link" href="#terminal-button">Skip to desktop applications</a>
+  <canvas id="universe" aria-label="Live cellular automaton: white cubes evolving in space"></canvas>
+  <div class="vignette"></div>
+  <header class="topbar">
+    <a class="brand" href="#" id="home-button" aria-label="Return to desktop"><span class="brand-cube">◇</span> WHITECUBE <span class="edition">/ ORBITAL</span></a>
+    <div class="top-center"><span class="status-dot" id="connection-dot"></span><span id="connection-status">CONNECTING</span><span class="divider">/</span><span id="network-label">LOCAL WORKSPACE</span></div>
+    <nav class="workspace-switcher" aria-label="Cube workspaces"><button data-workspace="0" class="selected" aria-pressed="true" title="Coding · Ctrl+Alt+1">01 <span>Coding</span></button><button data-workspace="1" aria-pressed="false" title="Play · Ctrl+Alt+2">02 <span>Play</span></button><button data-workspace="2" aria-pressed="false" title="Monitor · Ctrl+Alt+3">03 <span>Monitor</span></button><button data-workspace="3" aria-pressed="false" title="Browse · Ctrl+Alt+4">04 <span>Browse</span></button></nav><div class="top-actions"><span id="clock">--:--</span><button class="icon-button" id="help-button" title="Keyboard shortcuts" aria-label="Keyboard shortcuts">?</button></div>
+  </header>
+
+  <main id="desktop">
+    <section class="desktop-heading">
+      <p class="eyebrow">YOUR SPACE. STILL EVOLVING.</p>
+      <h1>White<br><span>cube.</span></h1>
+      <p class="desktop-description">A living desktop for things you make.</p><p id="workspace-purpose" class="workspace-purpose">CODING / build something that lasts</p>
+      <div class="simulation-meta"><span class="pulse-mark"></span><span id="rule-label">CONWAY’S LIFE</span><span id="generation-label">GEN 000000</span></div>
+    </section>
+    <section class="spatial-label" aria-hidden="true"><span>01 / LIVING SYSTEM</span><span class="spatial-line"></span><span>FINITE RULES<br>ENDLESS POSSIBILITIES</span></section>
+    <aside class="simulation-controls" aria-label="Cellular automaton controls">
+      <div class="control-heading"><span class="eyebrow">CELLULAR FIELD</span><span class="live-label" id="life-state"><i></i> LIVE</span></div>
+      <div class="population"><strong id="population">0</strong><span>living cells</span><span id="simulation-rule">B3 / S23</span></div>
+      <div class="dimension-buttons" role="group" aria-label="Simulation dimension"><button id="mode-plane" class="selected" aria-pressed="true">2D field</button><button id="mode-volume" aria-pressed="false">3D volume</button></div><div class="rule-buttons" role="group" aria-label="Choose cellular automaton rule">
+        <button data-rule="life" class="selected" aria-pressed="true">Life</button><button data-rule="highlife" aria-pressed="false">HighLife</button><button data-rule="seeds" aria-pressed="false">Seeds</button>
+      </div>
+      <div class="speed-row"><label for="speed">Evolution</label><input id="speed" type="range" min="1" max="16" value="5"><output id="speed-value" for="speed">5 / s</output></div>
+      <div class="simulation-actions"><button id="pause-button"><span id="pause-icon">Ⅱ</span> <span id="pause-text">Pause</span></button><button id="reseed-button"><span>↻</span> Reseed</button><button id="step-button" title="Advance one generation">Step →</button></div>
+      <details class="field-tools"><summary>Plant, shape &amp; replay</summary>
+      <div class="tool-row"><label for="paint-tool">Canvas tool</label><select id="paint-tool"><option value="orbit">Orbit / inspect</option><option value="draw">Draw cells</option><option value="erase">Erase cells</option><option value="glider">Stamp glider</option><option value="blinker">Stamp blinker</option><option value="pulsar">Stamp pulsar</option><option value="crystal">Stamp 3D crystal</option></select></div>
+      <div id="volume-tools" hidden><div class="tool-row"><label for="slice">Edit layer</label><input id="slice" type="range" min="0" max="11" value="6"><output id="slice-value">6</output></div><label class="check-label"><input id="slice-only" type="checkbox"> Show only this layer</label><div class="tool-row"><label for="orbit-angle">Rotation</label><input id="orbit-angle" type="range" min="-180" max="180" value="35"></div></div>
+      <div class="seed-row"><input id="seed-name" maxlength="40" placeholder="Name this seed" aria-label="Seed name"><button id="seed-save">Save</button></div>
+      <div class="seed-row"><select id="saved-seeds" aria-label="Saved seeds"><option value="">Saved seeds…</option></select><button id="seed-load">Load</button><button id="seed-delete" title="Delete saved seed" aria-label="Delete saved seed">×</button></div>
+      <div class="tool-actions"><button id="replay-button">↺ Replay seed</button><button id="clear-field">Clear field</button></div>
+      <div class="cell-editor"><label>Cell X <input id="cell-x" type="number" min="0" max="59" value="0"></label><label>Y <input id="cell-y" type="number" min="0" max="35" value="0"></label><button id="cell-plant" class="small-button">Plant cell</button><button id="cell-erase" class="small-button">Erase cell</button></div>
+      <label class="check-label"><input id="auto-loop" type="checkbox" checked> Automatically reseed quiet fields</label>
+      <p class="field-note">Drawing pauses evolution. In 3D, edits land on the selected layer. Drag the volume to orbit.</p></details>
+      <p class="field-note" id="field-note">A real simulation · edges wrap through space</p><p class="field-note" id="performance-note">Balanced · 30 FPS</p>
+    </aside>
+    <div class="desktop-footer"><span id="workspace-label">WORKSPACE 01 / CODING</span><span>DRIFT INTO SOMETHING GOOD</span></div>
+  </main>
+  <button id="desktop-labs-button" class="desktop-lab-button" aria-label="Open four Debian labs"><span class="cube-glyph" aria-hidden="true">◇</span><span>Enter a lab<small>Four Debian worlds · 8 GiB each</small></span></button>
+
+  <nav class="dock" aria-label="Desktop applications">
+    <button id="library-button" class="dock-button"><span class="dock-icon">▦</span><span>Projects</span></button>
+    <span class="dock-separator"></span>
+    <button id="terminal-button" class="dock-button"><span class="dock-icon terminal-symbol">&gt;_</span><span>Bash</span><i id="terminal-running" hidden></i></button>
+    <button id="games-button" class="dock-button"><span class="dock-icon">✣</span><span>Games & scripts</span></button>
+    <button id="labs-button" class="dock-button"><span class="dock-icon">▣</span><span>Labs</span></button><button id="health-button" class="dock-button"><span class="dock-icon">✓</span><span>System</span></button><span class="dock-separator"></span>
+    <button id="network-button" class="dock-button"><span class="dock-icon network-symbol">⌁</span><span>Network</span></button>
+    <button id="recovery-button" class="dock-button"><span class="dock-icon">↺</span><span>Recovery</span></button><button id="settings-button" class="dock-button"><span class="dock-icon">⚙</span><span>Display</span></button>
+  </nav>
+
+  <section id="library-panel" class="side-panel" hidden aria-labelledby="library-title">
+    <div class="panel-heading"><div><p class="eyebrow">FROM YOUR PROJECTS</p><h2 id="library-title">Your workshop.</h2></div><button class="icon-button close-panel" data-close="library-panel" aria-label="Close project library">×</button></div>
+    <label class="search-box"><span>⌕</span><input id="project-search" type="search" placeholder="Find a project…" autocomplete="off" aria-label="Find a project"></label>
+    <div id="project-list" class="card-list"><p class="empty-state">Loading your projects…</p></div>
+    <div id="project-workflow" hidden><p id="project-workflow-title" class="panel-description"></p><label class="input-label" for="project-lab">Run location</label><select id="project-lab"><option value="">Manifest default</option><option value="host">Host</option><option value="bash">Bash Lab</option><option value="web">Web Lab</option><option value="build">Build Lab</option><option value="clean">Clean Lab</option></select><div class="action-row"><button id="project-build">Build</button><button id="project-test">Test</button><button id="project-preview">Preview</button></div><p id="project-run-status" role="status" class="field-note"></p><button id="project-open-log" class="small-button" hidden>Open command logs</button></div>
+  </section>
+  <section id="scripts-panel" class="side-panel" hidden aria-labelledby="scripts-title">
+    <div class="panel-heading"><div><p class="eyebrow">REAL BASH. REAL INPUT.</p><h2 id="scripts-title">Your script library.</h2></div><button class="icon-button close-panel" data-close="scripts-panel" aria-label="Close games and scripts">×</button></div>
+    <p class="panel-description">Your games and scripts run in a live terminal. Expand it, hide it, and pick up where you left off.</p>
+    <label class="search-box"><span>⌕</span><input id="script-search" type="search" placeholder="Find a game or script…" aria-label="Find a script"></label><div class="script-tabs"><button id="scripts-tab" class="selected">Library</button><button id="history-tab">Run history</button><button id="jobs-tab">Workflows</button></div><div id="run-history" class="card-list" hidden></div><div id="script-list" class="card-list"><p class="empty-state">Loading your scripts…</p></div><div id="jobs-view" class="card-list" hidden><div id="workflow-list"></div><details><summary>Create or edit a workflow</summary><label class="input-label" for="workflow-id">Workflow ID</label><input id="workflow-id" maxlength="64" placeholder="build-and-check"><label class="input-label" for="workflow-name">Name</label><input id="workflow-name" maxlength="120" placeholder="Build and check"><label class="input-label" for="workflow-steps">Steps (JSON)</label><textarea id="workflow-steps" rows="7" spellcheck="false" placeholder='[{"id":"check","script":"my-check","args":["argument with spaces"],"depends_on":[]}]'></textarea><p class="field-note">Each step names a script ID and literal argument array. depends_on lists earlier step IDs. Each run keeps its own history.</p><label class="check-label"><input id="workflow-stop" type="checkbox" checked> Stop on failure</label><label class="check-label"><input id="workflow-notify" type="checkbox"> Notify when finished</label><button id="workflow-save" class="small-button">Save workflow</button></details><button id="jobs-refresh" class="small-button">Refresh queue</button><div id="job-list"></div></div>
+  </section>
+  <section id="network-panel" class="side-panel compact-panel" hidden aria-labelledby="network-title">
+    <div class="panel-heading"><div><p class="eyebrow">YOUR CONNECTION</p><h2 id="network-title">Dongle control.</h2></div><button class="icon-button close-panel" data-close="network-panel" aria-label="Close network information">×</button></div>
+    <div id="network-details" class="network-details"></div>
+    <p class="panel-description" id="network-note">Reading the attached interface…</p><div id="network-diagnostics" role="status"></div><div class="action-row"><button id="network-refresh">Refresh</button><button id="network-scan">Scan</button><button id="network-manage">Manage link</button><button id="network-add">Add Wi-Fi</button><button id="network-reconnect">Reconnect after review</button></div><p class="eyebrow section-label">SAVED WI-FI</p><div id="network-profiles"></div><p class="field-note">Passwords and administrator prompts open in your Bash console.</p>
+  </section>
+
+  <section id="health-panel" class="side-panel" hidden aria-labelledby="health-title"><div class="panel-heading"><div><p class="eyebrow">FIRST BOOT &amp; EVERY DAY</p><h2 id="health-title">System checks.</h2></div><button class="icon-button close-panel" data-close="health-panel" aria-label="Close checks">×</button></div><p id="health-summary" class="panel-description">Checking your Whitecube installation…</p><button id="health-refresh" class="small-button">Run checks again</button><div id="health-checks" class="card-list"></div></section>
+  <section id="labs-panel" class="side-panel" hidden aria-labelledby="labs-title"><div class="panel-heading"><div><p class="eyebrow">FOUR DEBIAN WORLDS</p><h2 id="labs-title">Your labs.</h2></div><button class="icon-button close-panel" data-close="labs-panel" aria-label="Close labs">×</button></div><p class="panel-description">Save a working environment, restore a snapshot, or choose whether a lab can reach the network.</p><button id="labs-refresh" class="small-button">Refresh labs</button><div id="lab-list" class="card-list"></div><p class="field-note">Restoring replaces a stopped lab’s disk and saves its current contents as a recovery snapshot first.</p></section>
+  <section id="recovery-panel" class="side-panel" hidden aria-labelledby="recovery-title"><div class="panel-heading"><div><p class="eyebrow">DESKTOP STATE &amp; RECOVERY</p><h2 id="recovery-title">Your backups.</h2></div><button class="icon-button close-panel" aria-label="Close recovery">×</button></div><p class="panel-description">Back up settings, seeds, manifests and workspace state. Credentials and container disk images are excluded.</p><label class="input-label" for="backup-label">Backup label</label><input id="backup-label" maxlength="80" placeholder="Before a change"><label class="input-label" for="backup-retention">Keep this many verified backups</label><input id="backup-retention" type="number" min="1" max="50" value="10"><div class="action-row"><button id="backup-create">Back up now</button><button id="backup-refresh">Refresh</button></div><div id="backup-list" class="card-list"></div></section>
+  <dialog id="restore-dialog"><button id="restore-close" class="icon-button dialog-close" aria-label="Close restore review">×</button><h2>Review restore.</h2><p class="panel-description">Review the exact files before replacing desktop state. A recovery backup preserves the current state.</p><pre id="restore-review" tabindex="0"></pre><button id="restore-apply" class="primary-button" disabled>Restore reviewed backup</button><p id="restore-status" role="status" class="field-note"></p></dialog>
+  <section id="settings-panel" class="side-panel" hidden aria-labelledby="settings-title"><div class="panel-heading"><div><p class="eyebrow">ACCESSIBILITY &amp; LAYOUT</p><h2 id="settings-title">Your display.</h2></div><button class="icon-button close-panel" aria-label="Close display settings">×</button></div><div class="card-list"><label class="input-label" for="ui-scale">Interface scale</label><input id="ui-scale" type="range" min="80" max="150" value="100"><output id="ui-scale-value">100%</output><label class="input-label" for="terminal-scale">Terminal scale</label><input id="terminal-scale" type="range" min="80" max="200" value="100"><output id="terminal-scale-value">100%</output><label class="check-label"><input id="strong-contrast" type="checkbox"> Stronger contrast</label><label class="check-label"><input id="reduced-motion" type="checkbox"> Reduce motion</label><label class="input-label" for="workspace-name">Current workspace name</label><input id="workspace-name" maxlength="40"><button id="workspace-rename" class="small-button">Rename</button><p class="panel-description">Drag a window title bar to place it. Focus its title bar and use Alt + arrows to move; Alt + Shift + arrows to resize. Pane dividers resize with arrow keys. Layouts restore views without launching commands.</p><button id="layout-save" class="small-button">Save layout now</button><p id="layout-status" role="status" class="field-note"></p></div></section>
+  <dialog id="script-dialog"><button id="script-dialog-close" class="icon-button dialog-close" aria-label="Close script options">×</button><p class="eyebrow">BASH LAUNCHER</p><h2 id="script-dialog-title">Run script</h2><p id="script-dialog-description"></p><p id="script-argument-help" class="panel-description"></p><label class="input-label" for="script-arguments">Arguments · one per line</label><textarea id="script-arguments" rows="5" maxlength="16384" spellcheck="false" placeholder="--example&#10;an argument with spaces"></textarea><p class="field-note">Each line is one argument. Shell expressions are plain text. Arguments appear in run history; enter passwords only at interactive prompts.</p><button id="script-run" class="primary-button">Launch in Bash →</button></dialog>
+  <section id="app-panel" class="app-panel" hidden aria-labelledby="app-title">
+    <div id="app-window-bar" class="window-bar" tabindex="0" aria-label="Project window placement"><div class="window-title"><span class="window-mark">▦</span><span id="app-title">Project</span></div><div class="window-actions"><a id="app-external" class="window-button" target="_blank" rel="noopener noreferrer" title="Open project in its own browser tab">Open separately ↗</a><button id="app-reload" class="window-button" title="Reload project after its server starts" aria-label="Reload project">↻</button><button id="app-maximize" class="window-button" aria-label="Maximize project">□</button><button id="app-close" class="window-button" aria-label="Close project">×</button></div></div>
+    <iframe id="app-frame" title="Project workspace" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-pointer-lock"></iframe>
+  </section>
+
+  <section id="terminal-panel" class="terminal-panel" hidden aria-labelledby="terminal-title">
+    <div id="terminal-window-bar" class="window-bar" tabindex="0" aria-label="Bash window placement"><div class="window-title"><span class="window-mark terminal-symbol">&gt;_</span><span id="terminal-title">Bash console</span><select id="terminal-sessions" aria-label="Choose terminal session" hidden></select><span class="terminal-state" id="terminal-state">READY WHEN YOU ARE</span></div><div class="window-actions"><button id="terminal-split-horizontal" class="window-button" aria-label="Split Bash side by side">◫</button><button id="terminal-split-vertical" class="window-button" aria-label="Split Bash top and bottom">⬒</button><button id="terminal-new" class="window-button" title="New Bash session" aria-label="New Bash session">+</button><button id="terminal-close-session" class="window-button" title="Terminate current shell or game" aria-label="Terminate current shell or game">×</button><button id="terminal-reconnect" class="window-button" title="Reconnect to retained sessions" hidden>Reconnect</button><button id="terminal-hide" class="window-button" title="Hide console · Ctrl+`" aria-label="Hide console">—</button><button id="terminal-maximize" class="window-button" title="Maximize console" aria-label="Maximize console">□</button></div></div>
+    <div id="terminal-empty" class="terminal-empty">Opening your shell…</div>
+    <div id="terminal"></div>
+    <div class="terminal-footer"><span id="terminal-size">PTY / BASH</span><span>CTRL + ` TO HIDE <span class="footer-divider">/</span> CTRL + SHIFT + ENTER TO EXPAND</span></div>
+  </section>
+
+  <dialog id="help-dialog"><button id="help-close" class="icon-button dialog-close" aria-label="Close shortcuts">×</button><p class="eyebrow">MAKE YOURSELF AT HOME</p><h2>A few shortcuts.</h2><dl class="shortcut-list"><div><dt>Show / hide Bash</dt><dd>Ctrl + `</dd></div><div><dt>Expand Bash</dt><dd>Ctrl + Shift + Enter</dd></div><div><dt>Project library</dt><dd>Ctrl + Shift + P</dd></div><div><dt>Switch cube workspace</dt><dd>Ctrl + Alt + 1–4</dd></div><div><dt>Move focused window title</dt><dd>Alt + arrows</dd></div><div><dt>Resize focused window title</dt><dd>Alt + Shift + arrows</dd></div><div><dt>Resize focused pane divider</dt><dd>Arrow keys</dd></div><div><dt>Close a drawer</dt><dd>Escape</dd></div></dl><p>Hiding the console keeps your shell and games running. Shortcuts work while this desktop or Bash has focus; embedded projects handle their own keys. Cellular rules evolve on a wrapping grid; quiet fields are gently reseeded.</p></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="./vendor/xterm.js"></script>
+  <script src="./vendor/addon-fit.js"></script>
+  <script src="./ca.js"></script>
+  <script src="./app.js"></script>
+  <script src="./wallpaper.js"></script>
+</body>
+</html>

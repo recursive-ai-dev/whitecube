@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:" />
+<title>Desktop Chat</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="titlebar">
+      <span id="title">Desktop Chat</span>
+      <div id="titlebar-actions">
+        <button id="btn-new" title="New chat (Ctrl+N)" aria-label="New chat">＋</button>
+        <button id="btn-settings" title="Settings (Ctrl+,)" aria-label="Settings">⚙</button>
+        <button id="btn-hide" title="Hide (Esc)" aria-label="Hide chat">✕</button>
+      </div>
+    </div>
+
+    <div id="model-bar">
+      <div id="model-controls">
+        <label for="model-picker">Talk to</label>
+        <select id="model-picker" aria-describedby="model-detail" title="Switching models starts a new chat"><option value="api">Configured API model</option></select>
+        <button id="btn-model-refresh" title="Refresh checkpoints in ~/train-out" aria-label="Refresh checkpoints">↻</button>
+        <button id="btn-model-rename" disabled>Rename</button>
+      </div>
+      <p id="model-detail" role="status" aria-live="polite">Finding checkpoints…</p>
+    </div>
+    <div id="messages" role="log" aria-label="Chat messages" aria-busy="false"></div>
+    <div id="chat-status"><span id="activity" role="status" aria-live="polite">Ready</span><button id="btn-latest" class="hidden">Jump to latest</button></div>
+
+    <div id="composer">
+      <textarea id="input" aria-label="Message" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <button id="btn-send">Send</button>
+      <button id="btn-stop" class="hidden">Stop</button>
+    </div>
+  </div>
+
+  <div id="settings-overlay" class="hidden">
+    <div id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <h2 id="settings-title">Settings</h2>
+      <p class="hint">API settings apply when “API” is selected in Talk to.</p>
+      <label>API Endpoint (base URL)
+        <input id="s-endpoint" type="text" placeholder="https://api.openai.com/v1" />
+      </label>
+      <label>Model
+        <input id="s-model" type="text" placeholder="gpt-4o-mini" />
+      </label>
+      <label>API Key
+        <input id="s-apikey" type="password" placeholder="sk-…" />
+      </label>
+      <label class="checkbox-row">
+        <input id="s-confirm" type="checkbox" />
+        Confirm before write_file / edit_file / move_file
+      </label>
+      <label>Global hotkey
+        <input id="s-hotkey" type="text" placeholder="CommandOrControl+Shift+T" />
+      </label>
+      <p id="s-keystorage" class="hint"></p>
+      <p id="s-path" class="hint"></p>
+      <p id="s-test-result" class="hint" role="status" aria-live="polite"></p>
+      <div class="settings-actions">
+        <button id="s-test" type="button">Test</button>
+        <button id="s-clear" type="button">Clear key</button>
+        <button id="s-cancel">Cancel</button>
+        <button id="s-save" class="primary">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="rename-overlay" class="hidden">
+    <form id="rename-panel" role="dialog" aria-modal="true" aria-labelledby="rename-title">
+      <h3 id="rename-title">Rename checkpoint</h3>
+      <p id="rename-file" class="hint"></p>
+      <label for="rename-name">Display name</label>
+      <input id="rename-name" type="text" maxlength="80" autocomplete="off" />
+      <p class="hint">Leave blank to restore the original name. Checkpoint files stay in place.</p>
+      <p id="rename-error" role="status" aria-live="polite"></p>
+      <div class="settings-actions">
+        <button id="rename-cancel" type="button">Cancel</button>
+        <button id="rename-save" type="submit" class="primary">Save name</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="confirm-overlay" class="hidden">
+    <div id="confirm-panel" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <h3 id="confirm-title">Run tool?</h3>
+      <pre id="confirm-body"></pre>
+      <div class="settings-actions">
+        <button id="confirm-deny">Deny</button>
+        <button id="confirm-stop">Stop reply</button>
+        <button id="confirm-allow" class="primary">Allow</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="markdown.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

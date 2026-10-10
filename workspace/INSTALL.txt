@@ -1,0 +1,322 @@
+WHITECUBE / ORBITAL UPGRADE — PERSISTENT WORKSPACES AND LABS
+
+Status: built and tested in /home/lubuntu/whitecube-upgrade. The mounted NVMe
+is read-only inside this agent session, so nothing on the NVMe has been changed.
+The session also denies TCP and Unix socket bind/connect, and browser startup; visual browser,
+interactive compositor and actual Wi-Fi association tests need the target OS.
+
+INSTALL FROM THE CURRENT LIVE SESSION, IN YOUR NORMAL TERMINAL
+
+  sudo python3 /home/lubuntu/whitecube-upgrade/install.py --root /mnt/nvme_root --apply
+
+The installer defaults to a dry run without --apply. It refuses read-only targets
+and unexpected changes to the inspected desktop. It backs up replaced files to
+/mnt/nvme_root/var/backups/whitecube/<timestamp>, copies the browser workspace and
+native binaries/sources, and merges the desktop palette/commands into your config.
+No packages, kernel modules, firmware, blacklists or service masks are changed.
+The separate Cubezero source tree is untouched. Run before leaving the live USB;
+/home/lubuntu is not the installed NVMe home. Save whitecube-upgrade.tar.gz if you
+want to keep the complete build/test bundle elsewhere.
+
+If running after booting the NVMe, extract the bundle and use:
+
+sudo python3 /path/to/whitecube-upgrade/install.py --root / --apply
+
+SELECTED IMPROVEMENTS INCLUDED
+
+  1  First-boot checker: graphics, real PTY, project builds, dongle and lab readiness.
+  2  Editable automata: paint, patterns, exact saved seeds and deterministic replay.
+  3  True 3D cell volumes in both native and browser wallpapers.
+  4  Animation budgets reduced during fullscreen games and high temperature/load.
+  7  Searchable scripts, literal launch arguments and durable run/exit history.
+  8  Per-project manifests for static views, host commands or container commands.
+  9  Stopped-container snapshots; restore keeps a recovery copy automatically.
+ 12  Exact-dongle dashboard, saved Wi-Fi profiles, signal/reconnect/error status.
+ 13  Persistent shared/offline networking switches per container.
+ 14  Four keyboard workspaces, with independent windows/panels and focus.
+
+TEN FURTHER IMPROVEMENTS (THIS BUNDLE)
+
+All ten requested improvements are implemented and covered by offline tests.
+The browser also has an animated cube-shaped Enter a lab desktop button and
+per-lab opening feedback; reduced motion disables it. It reports starting until
+the PTY/runtime provides the actual result, rather than claiming a ready lab.
+Detailed controls, state files, limits and validation boundaries: docs/UPGRADE.txt.
+
+1 Persistent sessions: detached per-user broker, automatic reconnect and explicit
+  Terminate. Browser API credentials survive workspace-server restarts privately.
+2 Tiled Bash: side-by-side/top-bottom, keyboard or pointer dividers, move an
+  existing session, maximize any pane, remove panes without killing its session.
+3 Lab resources: persistent CPU/RAM settings, live accounting and OOM outcomes.
+  Defaults 2 cores/2048 MiB; fixed 8 GiB disks. Apply changes while stopped.
+4 Writable sharing: explicit per-project project_mode:"rw" only; default "ro".
+5 Recovery: private bounded settings/seeds/manifests/layout/workflow backups,
+  saved retention, checksums, change review, explicit restore and recovery copies.
+  Credentials, terminal transcripts, project source and images are excluded.
+6 Layouts: browser workspace names, view/window placement, pane sizes, selected
+  projects and visibility; native names/window placement/panels. No saved command
+  starts automatically. Existing live broker sessions may be reattached.
+7 Project actions: manifest build/test/preview argv, host or selected lab, logs
+  and exact run status. A preview opens after successful loopback HTTP readiness.
+8 Diagnostics: exact dongle/driver, association, DHCP, DNS and connectivity stages;
+  recovery suggestions and bounded three-attempt reassociation before pausing.
+9 Accessibility: complete keyboard controls, visible focus, UI/terminal scale,
+  strong contrast, consistent shared reduced-motion setting in native/browser.
+10 Script workflows: names, literal arguments, dependencies, cancellation,
+   stop-on-failure and optional browser completion notifications. Per-step history.
+
+Current actual target inspection: NVMe root read-only; no lab images or snapshots.
+No dependencies were added in this session. Modules, blacklists and masks remain.
+
+USE AFTER LOGGING INTO WHITECUBE
+
+  Alt+B    show/hide Scripts; processes keep running while hidden
+  Alt+F    fullscreen/restore focused window, including the game terminal
+  Alt+V    show desktop/restore windows
+  Alt+W    launch browser workspace (starts local service on demand)
+  Alt+H    complete native shortcut list
+  Alt+A    display/workspace/recovery keyboard console
+  Alt+Shift+arrows move native window; Alt+Ctrl+arrows resize
+  Alt+Shift+Tab reverse window focus
+  Alt+C    automaton controls: paint, patterns, seeds, 2D/3D, rotation and slices
+  Alt+F1..F4          Coding / Play / Monitor / Browse
+  Alt+Shift+F1..F4    move focused window without following it
+
+The native wallpaper computes six real toroidal cellular automata and an
+18-cubed volume with all26 neighbors. The browser has Life, HighLife and Seeds
+and a16x16x12 volume with26 neighbors. These are evolving cells, not looping
+video. White cubes float in starspace. Both support painting, save/replay and
+pause/step; the browser offers drag rotation and editable layers. Native Alt+C
+opens the controls, then use Alt+V to reveal the field while editing. Saved
+native worlds and browser seeds remain in their respective local state stores.
+Native fullscreen/hot sessions reduce the CA tick rate; browser budgets also
+account for CPU load, hidden pages and reduced-motion preferences. Exact native
+controls are in native/keys.txt. The compositor remains primarily single-output.
+
+The Scripts picker provides live system/network output, Deep Space Scavenger,
+Outpost42, Iron Shore and an interactive Bash shell. Both script libraries are
+searchable, take literal arguments, and record the initial script's exit status.
+The native menu uses /words to filter and h for history. Script paths remain in your
+original Projects tree. The browser uses actual PTYs with terminal resize,
+keyboard input, ANSI colors, Ctrl+C and up to eight independent sessions. Hidden
+sessions keep running. Close a session explicitly to stop its processes. Sessions are owned by a separate private per-user PTY broker and survive browser
+reloads and workspace-server process restarts. Reload reconnects to retained
+sessions. No idle timeout kills scripts or games; use Terminate deliberately.
+Host reboot, logout policies that kill all user processes, or killing the broker
+ends these sessions. Broker failure does not silently rerun saved commands. The browser does not automatically read your .bashrc or .bash_profile;
+run source ~/.bashrc when you want that configuration in a browser shell.
+
+Browser shortcuts (while its main window is focused):
+  Ctrl+`                show/hide Bash
+  Ctrl+Shift+Enter      expand/restore Bash
+  Ctrl+Shift+P          project library
+  Ctrl+Alt+1..4         Coding / Play / Monitor / Browse (names can be saved)
+  Tab / Shift+Tab       every control, pane separator, dialog and launcher
+  Arrow keys           resize focused pane separator
+  Alt+arrows           move focused browser window titlebar
+  Alt+Shift+arrows     resize focused browser window titlebar
+
+Each browser workspace preserves its own app view and selected terminal while
+you switch. Native and browser workspaces are independent. Browser seed saving
+uses localStorage; native seeds use ~/.local/state/whitecube-ca.
+
+Browser projects (existing built dist files; no rebuild or package installation):
+  Cognitive Ledger     hypernode/dist
+  Knockout Court       dodgeball/dist
+  Emergence            antagonist/dist
+  Cold Snap            wintergrep/dist
+  Ludic Lexicon        ludic-lexicon/dist
+
+The workspace discovers ~/Projects, /home/woez/Projects or the two NVMe mount
+paths. Missing builds/scripts are omitted. Project saves continue using browser
+storage, now on the local project server origin; previous Electron/browser-origin
+saves are not migrated. Export from the old app first if you want to transfer its
+data. Some projects reference optional remote fonts; core assets are local.
+Add whitecube.project.json to an immediate project directory to declare a build,
+startup argv, optional browser URL and optional container. Independent scripts
+can use ~/.config/whitecube/scripts.d/*.json. Nothing discovered starts by itself.
+Read MANIFESTS.txt for formats and installed examples. Container projects bind read-only at /project by default. To deliberately permit
+changes to that entire project only, set project_mode:"rw" in its manifest.
+The UI displays this scope. Escaping links, shared hardlinks, special files and
+nested mounts are refused; copy into the guest if the project fails those checks.
+Only explicitly listed built directories are exposed by the project asset server.
+
+The terminal service listens on 127.0.0.1:8787. Projects are served from the
+separate 127.0.0.1:8788 origin so they can use localStorage without inheriting the
+terminal token. Launch through whitecube-web open (or Alt+W); a bare URL lacks
+the required API token. State/log files are under ~/.local/state/whitecube.
+The browser/server run as your ordinary desktop user. Do not run them with sudo.
+No npm/pip packages or Internet downloads are needed at runtime.
+
+NETWORK SETUP, WHILE BOOTED INTO THE NVME
+
+The included controller is your custom userspace connection controller over the
+existing Linux network stack. It is scoped to USB 2001:3329, MAC
+88:76:b9:f2:9d:29 and driver rtw88_8822cu. The audited target has the complete
+driver dependency set and firmware. The new service is installed DISABLED,
+pending saved-profile import or entry of your Wi-Fi credentials.
+
+  cube-net check
+  sudo cube-net import-nm
+
+If there is no supported saved WPA2 profile, enter one locally instead:
+
+  sudo cube-net setup
+
+Then activate the scoped controller:
+
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now whitecube-network.service
+  cube-net status
+  sudo cube-net reconnect   # new budget: at most three association attempts
+
+The browser Network drawer shows association/signal/reconnect/error information
+and saved profile names. Add, scan, connect and remove actions open the terminal
+for authentication. Wi-Fi passwords never go in browser request arguments.
+CLI equivalents: sudo cube-net manage, add, scan, connect PROFILE_ID or
+remove PROFILE_ID. Existing profiles are retained when adding another. If an
+older version of this controller is already enabled, reload systemd and restart
+whitecube-network.service after upgrading to enable its public status publisher.
+
+The controller refuses another manager or WPA controller that owns the dongle.
+It never stops other controllers, restores modules or unmasks services. Its
+credentials stay in a root-only local file. WPA2 personal + IPv4 DHCP are provided;
+enterprise Wi-Fi, WPA3-only profiles and DHCPv6 are outside this implementation.
+Carrier status is hardware link status, not proof of Internet access. Details
+and rollback for networking are in network/README.txt.
+
+FOUR DEBIAN CONTAINERS, 8 GiB DISK EACH
+
+After booting the NVMe and establishing Internet access, provision all four:
+
+  sudo cube-lab provision --install-tools
+
+This is a separate step from installing the desktop files. It creates four real
+debootstrapped Debian 13 trixie filesystems with fixed 8 GiB ext4 images (32 GiB
+total capacity), installs each lab's tools, and leaves them ready for interactive
+use. The current restricted session has prepared the setup but has NOT created
+these filesystems. The image filesystem's usable capacity is slightly less than
+8 GiB because ext4 metadata is inside that limit. This is a disk limit, not a RAM
+reservation. Images are created on the NVMe, not in the live USB's 4.7 GiB free
+workspace. Existing completed labs are preserved by repeat provisioning.
+
+  Bash Lab     Bash games, scripts and terminal utilities
+  Web Lab      Node/npm and Python development tools
+  Build Lab    C/C++ build tools, Git, CMake and pkg-config
+  Clean Lab    A small Debian environment for testing
+
+The target currently lacks the bootstrap and container executables. Its offline
+apt simulation needs only debootstrap, distro-info and systemd-container, with
+no upgrades/removals/kernels/firmware. --install-tools authorizes those necessary
+host userspace tools; the controller checks the actual package plan again before
+installation. Guest development packages are installed inside each image. No
+kernel packages or driver modules are restored. Existing loop/ext4 support is
+used; if inactive, only those already-installed modules may be loaded, with
+blacklists respected. Direct nspawn launches share the dongle's host network without bridges or
+veth. An offline/private-network launch is also available. These containers share
+the host kernel; they are not virtual machines with separate networking kernels.
+
+  cube-lab plan
+  cube-lab status
+  sudo cube-lab enter bash
+  sudo cube-lab enter web
+  sudo cube-lab enter build
+  sudo cube-lab enter clean
+  sudo cube-lab resources web --cpu 2 --memory-mib 2048
+
+The same four launchers appear in Whitecube's Games & scripts drawer and native
+Scripts picker. They use the actual terminal for sudo authentication; the web
+service itself still runs as your ordinary user. Exit a lab's shell to stop it.
+Guest root is confined to a separate user namespace. Host projects are not
+automatically mounted into containers; project manifests can bind one explicit
+project read-only. The Labs drawer can save/restore snapshots and set networking.
+
+  sudo cube-lab snapshot bash clean-start
+  cube-lab snapshots bash
+  sudo cube-lab restore bash clean-start
+  sudo cube-lab network-mode web offline
+  sudo cube-lab network-mode web shared
+
+Snapshots require a stopped lab and consume another8GiB each. Restore checks
+the complete image checksum and retains the current state as a recovery snapshot;
+it needs at least16GiB plus512MiB free temporarily. The original remains intact
+if validation/copying fails. Partial copies are retained for inspection; see the
+container guide before cleanup. A shared/offline selection takes effect on next
+launch and never adds veth/bridge modules. Offline means an isolated network
+namespace, not a firewall rule over the host connection.
+
+See containers/README.txt and cube-lab
+--help for runtime details, provisioned paths, exact guest packages and recovery.
+
+Source references for the chosen bootstrap/runtime options:
+https://manpages.debian.org/trixie/debootstrap/debootstrap.8.en.html
+https://manpages.debian.org/trixie/systemd-container/systemd-nspawn.1.en.html
+
+FIRST-BOOT VALIDATION
+
+Whitecube runs cube-check --first-boot once per boot/build and saves the report
+under ~/.local/state/whitecube. The Health drawer reruns read-only checks, showing
+pending for unprovisioned labs and untested runtime behavior. It does not silently
+install tools, configure Wi-Fi or claim that image metadata proves a working lab.
+
+  cube-check
+  sudo cube-check --containers
+
+The second command explicitly tests each provisioned image using a bounded,
+offline Bash probe, then saves root-owned results. It needs the booted NVMe.
+Run it after provisioning; repeat after changing an image. Real compositor/browser
+visual review and successful Wi-Fi association must still be checked on hardware.
+
+ROLLBACK
+
+First, if you enabled the networking service, stop it on the booted target:
+  sudo systemctl disable --now whitecube-network.service
+
+Restore the specific backup (use / as --root when booted into the NVMe):
+  sudo python3 install.py --root /mnt/nvme_root --rollback /mnt/nvme_root/var/backups/whitecube/<timestamp> --apply
+
+Rollback restores replaced files and removes added files. It refuses to erase
+files edited after installation. Run systemctl daemon-reload on the booted
+target after restoring. Log out/in to switch back to the original compositor.
+
+BUILD AND VALIDATION
+
+  native/BUILD.sh /mnt/nvme_root      # uses existing target headers/libraries
+  ./verify.sh                 # all Python and browser checks; reports skips
+  python3 -m unittest discover -s tests -v
+  python3 -m unittest discover -s network -p 'test_*.py' -v
+  node web/ca.test.cjs
+  node web/frontend.test.cjs
+
+Final verification: 209 Python/JavaScript tests passed, one production Unix-socket
+test skipped due to sandbox policy; all three native harnesses passed. Full
+installer/rollback roundtrip verified all 78 planned files in an isolated /tmp
+fixture, restoring 19 existing target-file copies exactly. No NVMe files changed.
+No new test/build dependencies were installed. Both native binaries rebuilt with
+the NVMe toolchain and existing X-free libraries; native workspace/layout/settings
+harnesses and automaton self-tests passed; CA tests and a rendered preview
+passed. PTY tests include job control, resize, interruption, output streaming,
+session isolation and background process cleanup. Deep Space Scavenger was
+smoke-tested in an actual 100x30 PTY, resized to 132x42, and returned to Bash on
+Ctrl+C. Installer backup/restore and interrupted-write rollback tests passed.
+The real supervisor/PTY queue tests use a separate owner process and a test-only
+pipe transport because this sandbox blocks Unix bind/connect. The production
+Unix socket integration test is explicitly skipped here. TCP/visual browser,
+on-hardware Wayland, cgroup enforcement/OOM/idmapped project writes, Wi-Fi
+association/DHCP/DNS/reconnect and actual container provisioning remain untested.
+See VALIDATION.json and verification.log for the final counts and results.
+
+Native wallpaper preview: native/build/cube-space.png
+Browser visual-only preview: web/index.html (open as a file; terminals/apps need
+the local service). Current sandbox cannot launch a browser to verify that view.
+
+THIRD PARTY ASSETS
+
+xterm.js 5.6.0-beta.136 and CSS were reused from your existing Kiro installation,
+not downloaded. MIT license is retained at web/vendor/LICENSE-xterm. The small
+fit adapter is included locally. Upstream API/security references consulted:
+https://xtermjs.org/docs/api/terminal/classes/terminal/
+https://xtermjs.org/docs/guides/security/
+
+Existing project dist files and Bash games stay in their own original folders;
+their existing licenses and source are preserved.
