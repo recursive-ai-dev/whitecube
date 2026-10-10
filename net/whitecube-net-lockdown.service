@@ -1,0 +1,30 @@
+[Unit]
+Description=Restore explicitly requested Whitecube network lockdown
+Documentation=file:/usr/share/doc/whitecube-desktop/NET-SWITCH.txt
+DefaultDependencies=no
+Wants=network-pre.target
+After=local-fs.target systemd-modules-load.service nftables.service ufw.service netfilter-persistent.service
+Before=network-pre.target whitecube-network.service shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/whitecube/whitecube-net-switch boot
+UMask=0077
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=full
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+CapabilityBoundingSet=CAP_NET_ADMIN
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

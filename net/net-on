@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /usr/libexec/whitecube/whitecube-net-switch on "$@"

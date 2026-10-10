@@ -43,7 +43,7 @@ class Tree(unittest.TestCase):
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
-                     'chrootables', 'chrootable-manager'):
+                     'chrootables', 'chrootable-manager', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
@@ -53,7 +53,8 @@ class Tree(unittest.TestCase):
         for name in ('app.py', 'engine.py', 'worker.py', 'pipeline/model_presets.py', 'pipeline/train_folder.py',
                      'pipeline/train_local.py', 'pipeline/train_supervisor.py', 'pipeline/prepare_folder.py',
                      'pipeline/prepare_parquet.py', 'pipeline/corpus_split.py', 'pipeline/tensegrity_lm.py',
-                     'pipeline/tensegrity_nb_lib.py', 'pipeline/tensegrity_serve.py', 'pipeline/preview.py'):
+                     'pipeline/tensegrity_nb_lib.py', 'pipeline/tensegrity_serve.py', 'pipeline/preview.py',
+                     'pipeline/pacing.py', 'pipeline/files.py'):
             self.assertTrue((trainer / name).is_file(), name)
         for name in ('cube-train', 'whitecube-train'):
             self.assertTrue(os.access(self.stage / 'usr/bin' / name, os.X_OK))
@@ -77,6 +78,22 @@ class Tree(unittest.TestCase):
         self.assertIn('Exec=/usr/bin/whitecube-session', session)
         unit = (self.stage / 'usr/lib/systemd/system/whitecube-network.service').read_text()
         self.assertIn('ExecStart=/usr/bin/cube-net run', unit)
+
+    def test_network_lockdown_is_packaged_with_boot_ordering_and_conffile(self):
+        self.assertTrue(os.access(self.stage / 'usr/libexec/whitecube/whitecube-net-switch', os.X_OK))
+        conf = 'etc/whitecube/net-switch.conf'
+        self.assertTrue((self.stage / conf).is_file())
+        self.assertIn('/' + conf, (ROOT / 'packaging/debian/conffiles').read_text().splitlines())
+        units = self.stage / 'usr/lib/systemd/system'
+        restore = units / 'whitecube-net-lockdown.service'
+        self.assertTrue(restore.is_file())
+        self.assertEqual((units / 'multi-user.target.wants/whitecube-net-lockdown.service').resolve(), restore.resolve())
+        dependency = (units / 'whitecube-network.service.d/net-lockdown.conf').read_text()
+        self.assertIn('Requires=whitecube-net-lockdown.service', dependency)
+        self.assertIn('After=whitecube-net-lockdown.service', dependency)
+        self.assertIn('nftables.service ufw.service', restore.read_text())
+        self.assertTrue((self.stage / 'usr/share/doc/whitecube-desktop/NET-SWITCH.txt').is_file())
+        self.assertFalse((self.stage / 'var/lib/whitecube/net-lockdown.json').exists())
 
     def test_cube_editor_runtime_and_desktop_integration_are_shipped(self):
         editor = self.stage / 'usr/share/whitecube/cube-editor'

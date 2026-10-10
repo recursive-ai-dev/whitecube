@@ -125,6 +125,10 @@ def main():
                 'usr/share/whitecube/cube-train/pipeline/train_folder.py',
                 'usr/share/applications/cube-train.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-train.svg',
                 'usr/libexec/whitecube/cube-settings-helper', 'usr/lib/systemd/system/whitecube-network.service',
+                'usr/bin/net-off', 'usr/bin/net-on', 'usr/libexec/whitecube/whitecube-net-switch',
+                'etc/whitecube/net-switch.conf', 'usr/lib/systemd/system/whitecube-net-lockdown.service',
+                'usr/lib/systemd/system/multi-user.target.wants/whitecube-net-lockdown.service',
+                'usr/lib/systemd/system/whitecube-network.service.d/net-lockdown.conf',
                 'usr/share/wayland-sessions/whitecube.desktop', 'usr/share/whitecube/schemas/gschemas.compiled',
                 'etc/whitecube/config'):
         if not (stage / rel).exists():

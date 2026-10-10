@@ -78,7 +78,7 @@ chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-run
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
 runtime=(foot fuzzel swaylock swaybg python3 python3-gi python3-cairo python3-gi-cairo python3-yaml
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
-  dhcpcd-base iproute2 seatd)
+  dhcpcd-base iproute2 nftables seatd)
 for p in "${runtime[@]}"; do pkgs[$p]=1; done
 depends=$(printf '%s\n' "${!pkgs[@]}" | sort | paste -sd',' | sed 's/,/, /g')
 [[ -z ${pkgs[whitecube-desktop]:-} ]] || { echo "build-deb.sh: dependency scanner found an unbundled library owned by whitecube-desktop" >&2; exit 1; }
@@ -95,7 +95,7 @@ find "$stage" -type d -exec chmod 0755 {} +
 python3 -I packaging/check-tree.py "$stage" --sources src
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"
-dpkg-deb --root-owner-group -Zxz --build "$stage" "$deb" > /dev/null
+dpkg-deb --root-owner-group --threads-max="${DPKG_DEB_THREADS_MAX:-2}" -Zxz -z"${DPKG_DEB_COMPRESSION_LEVEL:-3}" --build "$stage" "$deb" > /dev/null
 sha256sum "$deb" > "$deb.sha256"
 echo
 dpkg-deb -I "$deb" | sed -n '1,/^ Description/p' | grep -v '^ new Debian'

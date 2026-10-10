@@ -490,23 +490,25 @@ static void box(cairo_t *cr, struct rect r, double s, const char *border, const 
 	cairo_fill(cr);
 }
 
-// A shaded cube with the app's initial, for apps without a PNG icon.
+// White app cubes keep dark initials and edges in every desktop theme.
+// These colors apply only to fallback app icons, not the surrounding menu.
 static void cube_icon(cairo_t *cr, double x, double y, double size, const char *name, double s) {
+	const char *ink = "0d0d0d";
 	double d = size * 0.24, f = size - d;
 	cairo_set_line_width(cr, 1.5 * s);
 	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
 	cairo_move_to(cr, x, y + d); cairo_line_to(cr, x + d, y); cairo_line_to(cr, x + d + f, y);
 	cairo_line_to(cr, x + f, y + d); cairo_close_path(cr);
-	color(cr, theme.cube_top); cairo_fill_preserve(cr); color(cr, C_INK); cairo_stroke(cr);
+	color(cr, "f5f5f5"); cairo_fill_preserve(cr); color(cr, ink); cairo_stroke(cr);
 	cairo_move_to(cr, x + f, y + d); cairo_line_to(cr, x + f + d, y); cairo_line_to(cr, x + f + d, y + f);
 	cairo_line_to(cr, x + f, y + d + f); cairo_close_path(cr);
-	color(cr, theme.cube_side); cairo_fill_preserve(cr); color(cr, C_INK); cairo_stroke(cr);
+	color(cr, "d9d9d9"); cairo_fill_preserve(cr); color(cr, ink); cairo_stroke(cr);
 	cairo_rectangle(cr, x, y + d, f, f);
-	color(cr, C_SURFACE); cairo_fill_preserve(cr); color(cr, C_INK); cairo_stroke(cr);
+	color(cr, "ffffff"); cairo_fill_preserve(cr); color(cr, ink); cairo_stroke(cr);
 	char initial[8] = "?";
 	if (name[0]) { int n = g_utf8_next_char(name) - name; snprintf(initial, sizeof(initial), "%.*s", n, name); }
 	char *up = g_utf8_strup(initial, -1);
-	text(cr, up, f * 0.55, true, x, y + d, f, f, true, 1, C_INK);
+	text(cr, up, f * 0.55, true, x, y + d, f, f, true, 1, ink);
 	g_free(up);
 }
 

@@ -1,6 +1,7 @@
 #!/bin/sh
 # whitecube-desktop: refresh what the package changed system-wide. Never touches /home, never starts
-# or stops a service, never enables one (the network unit is enabled by you, or by the ISO build).
+# or stops a service. The package ships a boot-only lockdown restore dependency;
+# it does nothing unless net-off --persist previously saved a lockdown.
 set -e
 case "$1" in
 configure)

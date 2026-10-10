@@ -968,6 +968,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
 class EditorApp(Adw.Application):
     def __init__(self, options):
+        GLib.set_prgname('org.whitecube.CubeEditor')
         super().__init__(application_id='org.whitecube.CubeEditor', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.options = options
         self.window = None

@@ -1,2 +1,3 @@
 /etc/whitecube/config
 /etc/whitecube/network/dhcpcd.conf
+/etc/whitecube/net-switch.conf

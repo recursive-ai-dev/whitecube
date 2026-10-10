@@ -1,0 +1,364 @@
+#!/usr/bin/python3 -I
+"""Whitecube's reversible IPv4/IPv6 firewall switch; Python standard library only."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+TABLE = "whitecube_net_lockdown"
+OWNER = "Whitecube net-switch v1"
+PRIORITY = -300
+CONFIG = Path("/etc/whitecube/net-switch.conf")
+STATE = Path("/var/lib/whitecube/net-lockdown.json")
+LOCK = Path("/run/lock/whitecube-net-switch.lock")
+NFT = "/usr/sbin/nft"
+DEFAULTS = {"allow_loopback": True, "interface": "wlan0", "controller": "cube-net"}
+
+
+class SwitchError(Exception):
+    pass
+
+
+class NftRejected(SwitchError):
+    """nft exited unsuccessfully: its atomic transaction did not commit."""
+
+
+def configuration(path=CONFIG):
+    try:
+        values = json.loads(path.read_text())
+    except FileNotFoundError:
+        return DEFAULTS.copy()
+    except (OSError, ValueError) as exc:
+        raise SwitchError(f"Cannot read configuration {path}: {exc}") from exc
+    if not isinstance(values, dict) or set(values) - set(DEFAULTS):
+        raise SwitchError("Configuration must be a JSON object with allow_loopback, interface, controller only")
+    result = DEFAULTS | values
+    if type(result["allow_loopback"]) is not bool:
+        raise SwitchError("allow_loopback must be true or false")
+    for key in ("interface", "controller"):
+        if not isinstance(result[key], str) or not result[key].isascii() or not result[key].replace("-", "").replace("_", "").isalnum():
+            raise SwitchError(f"Invalid descriptive configuration field: {key}")
+    return result
+
+
+def render_rules(allow_loopback=True):
+    """A single native nft transaction; no global flush or foreign-table references."""
+    lines = [f"create table inet {TABLE} {{", f'    comment "{OWNER}";']
+    for chain in ("input", "output", "forward"):
+        lines += [f"    chain {chain} {{", f"        type filter hook {chain} priority {PRIORITY}; policy drop;"]
+        if allow_loopback and chain in ("input", "output"):
+            key = "iifname" if chain == "input" else "oifname"
+            lines.append(f'        {key} "lo" accept')
+        lines += ["        counter drop", "    }"]
+    return "\n".join(lines + ["}", ""])
+
+
+def inspect_table(document):
+    """Return loopback setting only for the complete, expected kernel rule shape."""
+    items = document.get("nftables", [])
+    tables = [item["table"] for item in items if "table" in item]
+    if len(tables) != 1 or tables[0].get("family") != "inet" or tables[0].get("name") != TABLE or tables[0].get("comment") != OWNER:
+        raise SwitchError(f"Refusing to change inet {TABLE}: ownership comment is missing or different")
+    if tables[0].get("flags"):
+        return None
+    if any(set(item) - {"metainfo", "table", "chain", "rule"} for item in items):
+        return None
+    chains = [item["chain"] for item in items if "chain" in item]
+    if len(chains) != 3 or {c.get("name") for c in chains} != {"input", "output", "forward"}:
+        return None
+    loopbacks = []
+    for chain in chains:
+        name = chain["name"]
+        if any(chain.get(k) != v for k, v in {"family": "inet", "table": TABLE, "type": "filter", "hook": name, "prio": PRIORITY, "policy": "drop"}.items()):
+            return None
+        rules = [r["rule"] for r in items if "rule" in r and r["rule"].get("chain") == name]
+        expressions = [r.get("expr") for r in rules]
+        if not expressions:
+            return None
+        last = expressions[-1]
+        if not isinstance(last, list) or len(last) != 2 or set(last[0]) != {"counter"} or last[1] != {"drop": None}:
+            return None
+        if name == "forward":
+            if len(expressions) != 1:
+                return None
+        else:
+            loopbacks.append(len(expressions) == 2)
+            if len(expressions) not in (1, 2):
+                return None
+            if len(expressions) == 2:
+                key = "iifname" if name == "input" else "oifname"
+                expected = [{"match": {"op": "==", "left": {"meta": {"key": key}}, "right": "lo"}}, {"accept": None}]
+                if expressions[0] != expected:
+                    return None
+    if len(set(loopbacks)) != 1:
+        return None
+    if any(r["rule"].get("chain") not in {"input", "output", "forward"} for r in items if "rule" in r):
+        return None
+    return loopbacks[0]
+
+
+def delete_statement(document):
+    table = next(item["table"] for item in document["nftables"] if "table" in item)
+    handle = table.get("handle")
+    if type(handle) is not int or handle < 1:
+        raise SwitchError("nftables did not supply a valid table handle")
+    return f"delete table inet handle {handle}\n"
+
+
+class Nft:
+    def run(self, *args, script=None):
+        try:
+            result = subprocess.run([NFT, *args], input=script, text=True, capture_output=True,
+                                    timeout=20, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SwitchError(f"Cannot run nftables: {exc}") from exc
+        if result.returncode:
+            raise NftRejected("nftables: " + (result.stderr.strip() or f"exit {result.returncode}"))
+        return result.stdout
+
+    def snapshot(self):
+        try:
+            tables = json.loads(self.run("-j", "list", "tables"))["nftables"]
+            present = any(item.get("table", {}).get("family") == "inet" and item["table"].get("name") == TABLE for item in tables)
+            if not present:
+                return None
+            document = json.loads(self.run("-a", "-j", "list", "table", "inet", TABLE))
+            inspect_table(document)  # Ownership is mandatory even when a table needs repair.
+            return document
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SwitchError(f"Invalid nftables response: {exc}") from exc
+
+    def native_snapshot(self):
+        return self.run("list", "table", "inet", TABLE)
+
+    def apply(self, script, check=False):
+        self.run(*(["-c", "-f", "-"] if check else ["-f", "-"]), script=script)
+
+
+def secure_directory(path):
+    path.mkdir(mode=0o755, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise SwitchError(f"Unsafe state directory: {path}")
+
+
+class State:
+    def __init__(self, path=STATE):
+        self.path = Path(path)
+
+    def read(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022 or info.st_size > 4096:
+                raise SwitchError(f"Unsafe persistence file: {self.path}")
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                return stream.read(4097)
+        finally:
+            os.close(fd)
+
+    def write(self, content):
+        if content is None:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                return
+        else:
+            secure_directory(self.path.parent)
+            fd, temporary = tempfile.mkstemp(prefix=".net-lockdown-", dir=self.path.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, self.path)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        directory = os.open(self.path.parent, os.O_DIRECTORY | os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+
+def persistent_setting(content):
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError) as exc:
+        raise SwitchError("Invalid persistent lockdown state; use net-on to clear it") from exc
+    if not isinstance(value, dict) or set(value) != {"version", "allow_loopback"} or type(value["version"]) is not int or value["version"] != 1 or type(value["allow_loopback"]) is not bool:
+        raise SwitchError("Invalid persistent lockdown state; use net-on to clear it")
+    return value["allow_loopback"]
+
+
+def validate_persistence():
+    if not Path("/run/systemd/system").is_dir():
+        raise SwitchError("--persist requires a booted systemd environment")
+    try:
+        result = subprocess.run(["/usr/bin/systemctl", "is-enabled", "whitecube-net-lockdown.service"],
+                                text=True, capture_output=True, timeout=10,
+                                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SwitchError(f"Cannot verify the persistent boot service: {exc}") from exc
+    if result.returncode or result.stdout.strip() != "enabled":
+        raise SwitchError("--persist requires enabled whitecube-net-lockdown.service; install the Whitecube package first")
+
+
+@contextmanager
+def execution_lock(path=LOCK):
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o022:
+            raise SwitchError(f"Unsafe lock file: {path}")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise SwitchError("Another net-off/net-on operation is running") from exc
+        yield
+    finally:
+        os.close(fd)
+
+
+class Switch:
+    def __init__(self, nft=None, state=None):
+        self.nft = nft if nft is not None else Nft()
+        self.state = state if state is not None else State()
+
+    def change(self, off, allow_loopback=True, persist=False, boot=False):
+        previous_state = self.state.read()
+        if boot:
+            if previous_state is None:
+                return "ON: no persistent Whitecube lockdown requested"
+            allow_loopback = persistent_setting(previous_state)
+            off = True
+        before = self.nft.snapshot()
+        previous_rules = self.nft.native_snapshot() if before is not None else ""
+        target_state = (json.dumps({"version": 1, "allow_loopback": allow_loopback}, sort_keys=True) + "\n").encode() if off and (persist or previous_state is not None) else None
+        valid_before = inspect_table(before) if before is not None else None
+        change_rules = (off and (before is None or valid_before is None or valid_before != allow_loopback)) or (not off and before is not None)
+        script = (delete_statement(before) if before is not None else "") + (render_rules(allow_loopback) if off else "")
+        if change_rules:
+            self.nft.apply(script, check=True)
+        touched_rules = False
+        try:
+            if previous_state != target_state:
+                self.state.write(target_state)
+            if change_rules:
+                touched_rules = True  # Even a timeout might have committed in the kernel.
+                try:
+                    self.nft.apply(script)
+                except NftRejected:
+                    touched_rules = False
+                    raise
+                after = self.nft.snapshot()
+                if (off and (after is None or inspect_table(after) is None or inspect_table(after) != allow_loopback)) or (not off and after is not None):
+                    raise SwitchError("Kernel verification failed after applying lockdown change")
+        except BaseException as exc:
+            failures = []
+            if touched_rules:
+                try:
+                    current = self.nft.snapshot()
+                    restore = (delete_statement(current) if current is not None else "") + ("create " + previous_rules if previous_rules else "")
+                    if restore:
+                        self.nft.apply(restore)
+                except BaseException as rollback_error:
+                    failures.append(f"firewall rollback failed: {rollback_error}")
+            try:
+                if previous_state != target_state:
+                    self.state.write(previous_state)
+            except BaseException as rollback_error:
+                failures.append(f"persistence rollback failed: {rollback_error}")
+            if failures:
+                raise SwitchError(f"{exc}; {'; '.join(failures)}. Inspect sudo net-off --status locally") from exc
+            raise
+        if off:
+            mode = "persistent across boot" if target_state else "until reboot or net-on"
+            return f"OFF: IPv4/IPv6 input, output and forwarding blocked; loopback {'allowed' if allow_loopback else 'blocked'}; {mode}"
+        return "ON: Whitecube lockdown removed; existing firewall and network configuration remain in effect"
+
+    def status(self):
+        table = self.nft.snapshot()
+        marker = self.state.read()
+        persistent = persistent_setting(marker) if marker is not None else None
+        if table is None:
+            return "ON: Whitecube lockdown absent" + ("; persistent lockdown is scheduled for next boot" if marker is not None else "; persistence off")
+        loopback = inspect_table(table)
+        if loopback is None:
+            raise SwitchError("Whitecube table exists but does not match a complete lockdown; run net-off to repair or net-on to remove it")
+        mismatch = marker is not None and persistent != loopback
+        return f"OFF: IPv4/IPv6 input, output and forwarding blocked; loopback {'allowed' if loopback else 'blocked'}; persistence {'on' if marker is not None else 'off'}" + (" (next-boot loopback setting differs)" if mismatch else "")
+
+
+def parser():
+    command = argparse.ArgumentParser(description="Reversible Whitecube IPv4/IPv6 lockdown. Leaves UFW, Wi-Fi, DHCP, credentials and sysctls intact.", epilog="Examples: sudo net-off; sudo net-on; net-off --dry-run; sudo net-off --status; sudo net-off --persist. This is an IP firewall, not a physical radio or Ethernet switch.")
+    command.add_argument("action", choices=("off", "on", "status", "boot"))
+    command.add_argument("--status", action="store_true", help="inspect live kernel state (usually requires sudo); never changes it")
+    command.add_argument("-d", "--dry-run", action="store_true", help="print intended change without root, nftables access, locks or writes")
+    command.add_argument("--persist", action="store_true", help="keep lockdown across reboot; net-on also clears persistence")
+    command.add_argument("--no-loopback", action="store_true", help="also block local IPv4/IPv6 traffic (off only)")
+    command.add_argument("-q", "--quiet", action="store_true", help="suppress successful status messages")
+    return command
+
+
+def main(argv=None):
+    arguments = parser().parse_args(argv)
+    action = "status" if arguments.status else arguments.action
+    if (arguments.persist or arguments.no_loopback) and action != "off":
+        parser().error("--persist and --no-loopback apply only to off")
+    try:
+        if action == "off":
+            settings = configuration()
+            allow_loopback = settings["allow_loopback"] and not arguments.no_loopback
+        else:
+            allow_loopback = True
+        if arguments.dry_run:
+            if action == "off":
+                print("# Dry run: atomically replace only our owned table if it exists.")
+                print("# Persistence: " + ("enable for next boot" if arguments.persist else "retain current setting; off by default"))
+                print(f"# Environment: {settings['controller']} on {settings['interface']}; all interfaces are covered.")
+                print(render_rules(allow_loopback), end="")
+            elif action == "on":
+                print("# Dry run: remove only our owned table if it exists, and clear persistence.")
+                print(f"delete table inet {TABLE}")
+            else:
+                print(f"# Dry run: {action} would read live firewall/persistence state; nothing inspected or changed.")
+            return 0
+        if action == "status":
+            message = Switch().status()
+        else:
+            if os.geteuid() != 0:
+                raise SwitchError("Changing networking requires root; use sudo net-off or sudo net-on")
+            with execution_lock():
+                if arguments.persist:
+                    validate_persistence()
+                message = Switch().change(action == "off", allow_loopback, arguments.persist, action == "boot")
+        if not arguments.quiet:
+            print(message)
+        return 0
+    except (SwitchError, OSError, ValueError) as exc:
+        print(f"net-switch: {exc}" + ("; live status UNKNOWN (try sudo net-off --status)" if action == "status" else ""), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("net-switch: interrupted; any in-progress change was rolled back", file=sys.stderr)
+        return 130
+
+
+def terminated(*_):
+    raise InterruptedError("terminated")
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, terminated)
+    sys.exit(main())

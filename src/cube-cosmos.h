@@ -63,8 +63,8 @@ static void cos_line(struct ca *c, uint32_t *p, double x0, double y0, double x1,
 }
 
 // --- state upkeep ---
-static void cos_free(struct ca *c) { free(c->cs.dens); free(c->cs.hmap); free(c->cs.cmap); free(c->cs.layer); free(c->cs.wx); free(c->cs.wy); free(c->cs.wb);
-	c->cs.dens = NULL; c->cs.hmap = NULL; c->cs.cmap = NULL; c->cs.layer = NULL; c->cs.wx = c->cs.wy = c->cs.wb = NULL; c->cs.dw = c->cs.dh = 0; c->cs.layer_n = 0; }
+static void cos_free(struct ca *c) { free(c->cs.dens); free(c->cs.hmap); free(c->cs.cmap); free(c->cs.layer); free(c->cs.wx); free(c->cs.wy); free(c->cs.wb); free(c->cs.gas);
+	c->cs.gas = NULL; c->cs.gas_n = 0; c->cs.dens = NULL; c->cs.hmap = NULL; c->cs.cmap = NULL; c->cs.layer = NULL; c->cs.wx = c->cs.wy = c->cs.wb = NULL; c->cs.dw = c->cs.dh = 0; c->cs.layer_n = 0; }
 
 static float cos_dens_at(const struct cosmos *cs, float u, float v) { // bilinear, wrapped; u,v in turns
 	if (!cs->dens || cs->dw < 2 || cs->dh < 2) return 0;
@@ -84,10 +84,10 @@ static void cos_build_maps(struct ca *c) {
 	if (!cs->hmap || !cs->cmap) return;
 	for (int y = 0; y < COS_MAP_H; y++) for (int x = 0; x < COS_MAP_W; x++) {
 		float u = (float)x / COS_MAP_W, v = (float)y / COS_MAP_H;
-		float continents = cos_fbm(u * 8, v * 4, c->seed, 8);
+		float continents = cos_fbm(u * 8, v * 4, cs->seed, 8);
 		float live = cos_dens_norm(cs, u, v);
 		cs->hmap[y * COS_MAP_W + x] = cos_clamp(.62f * continents + .38f * live, 0, 1);
-		cs->cmap[y * COS_MAP_W + x] = cos_fbm(u * 12, v * 6, c->seed ^ 0x5bd1e995u, 12);
+		cs->cmap[y * COS_MAP_W + x] = cos_fbm(u * 12, v * 6, cs->seed ^ 0x5bd1e995u, 12);
 	}
 }
 static void cos_build_web(struct ca *c) {
@@ -96,7 +96,7 @@ static void cos_build_web(struct ca *c) {
 	cs->wx = malloc(sizeof(float) * COS_WEB_GALAXIES); cs->wy = malloc(sizeof(float) * COS_WEB_GALAXIES); cs->wb = malloc(sizeof(float) * COS_WEB_GALAXIES);
 	if (!cs->wx || !cs->wy || !cs->wb) return;
 	float nx[COS_WEB_NODES], ny[COS_WEB_NODES]; int ea[COS_WEB_NODES * 2], eb[COS_WEB_NODES * 2], ne = 0;
-	unsigned s = c->seed ^ 0xC05305u;
+	unsigned s = cs->seed ^ 0xC05305u;
 	for (int i = 0; i < COS_WEB_NODES; i++) { nx[i] = cos_hash(i, 1, s) * 2 - 1; ny[i] = cos_hash(i, 2, s) * 2 - 1; }
 	for (int i = 0; i < COS_WEB_NODES; i++) { // each node links to its two nearest neighbours: filaments
 		int best[2] = {-1, -1}; float bd[2] = {1e9f, 1e9f};
@@ -124,9 +124,11 @@ static void cosmos_observe(struct ca *c) {
 	struct cosmos *cs = &c->cs;
 	if (c->volume || c->depth != 1) return;
 	if (cs->dw != c->cols || cs->dh != c->rows || !cs->dens) {
-		free(cs->dens); cs->dens = calloc((size_t)c->cols * c->rows, sizeof(float)); cs->dw = c->cols; cs->dh = c->rows;
-		if (!cs->dens) { cs->dw = cs->dh = 0; return; }
-		for (int i = 0; i < c->cols * c->rows; i++) cs->dens[i] = c->grid[i];
+		// A rule change resizes the grid: resample the history instead of restarting it, so the land does not jump.
+		float *d = calloc((size_t)c->cols * c->rows, sizeof(float)); if (!d) return;
+		for (int y = 0; y < c->rows; y++) for (int x = 0; x < c->cols; x++)
+			d[y * c->cols + x] = cs->dens ? cos_dens_at(cs, (x + .5f) / c->cols, (y + .5f) / c->rows) : c->grid[y * c->cols + x];
+		free(cs->dens); cs->dens = d; cs->dw = c->cols; cs->dh = c->rows;
 	}
 	double sum = 0, sq = 0; int n = c->cols * c->rows;
 	for (int i = 0; i < n; i++) { cs->dens[i] = cs->dens[i] * .92f + c->grid[i] * .08f; sum += cs->dens[i]; }
@@ -170,7 +172,7 @@ static void cosmos_advance(struct ca *c, double dt) {
 	if (cs->zoom > 3.3 && cs->zoom < 4.8 && cs->dens) {
 		for (int attempt = 0; attempt < 3; attempt++) {
 			float u = (rnd(c) % 10000) / 10000.f, v = (rnd(c) % 10000) / 10000.f;
-			float g = cos_gas(cs, u, v, c->seed);
+			float g = cos_gas(cs, u, v, cs->seed);
 			if (g > .5f) {
 				struct cosmos_star *s = &cs->stars[cs->star_next % COS_STARS];
 				*s = (struct cosmos_star){ u, v, .35f + (rnd(c) % 1000) / 1540.f, cs->t };
@@ -183,7 +185,7 @@ static void cosmos_advance(struct ca *c, double dt) {
 // --- phases (s = scale about the screen centre; layer is black on entry) ---
 static void cos_cells(struct ca *c, uint32_t *p, double s) {
 	const struct cosmos *cs = &c->cs; (void)cs;
-	double sp = RULES[c->rule].cell * s; if (sp < 1.4) return;
+	double sp = cell_px(c) * s; if (sp < 1.4) return;
 	int r = (int)(sp / 2 - 2 * s);
 	int gx0 = (int)floor(c->cols / 2.0 - (c->W / 2.0) / sp) - 1, gx1 = (int)ceil(c->cols / 2.0 + (c->W / 2.0) / sp) + 1;
 	int gy0 = (int)floor(c->rows / 2.0 - (c->H / 2.0) / sp) - 1, gy1 = (int)ceil(c->rows / 2.0 + (c->H / 2.0) / sp) + 1;
@@ -197,7 +199,7 @@ static void cos_cells(struct ca *c, uint32_t *p, double s) {
 }
 static void cos_geometry(struct ca *c, uint32_t *p, double s) {
 	// Wider than the cell lattice so the torus does not visibly repeat across the screen at full weight.
-	double sp = RULES[c->rule].cell * .8 * s; if (sp < 3) return;
+	double sp = cell_px(c) * .8 * s; if (sp < 3) return;
 	int gx0 = (int)floor(c->cols / 2.0 - (c->W / 2.0) / sp) - 1, gx1 = (int)ceil(c->cols / 2.0 + (c->W / 2.0) / sp) + 1;
 	int gy0 = (int)floor(c->rows / 2.0 - (c->H / 2.0) / sp) - 1, gy1 = (int)ceil(c->rows / 2.0 + (c->H / 2.0) / sp) + 1;
 #define LIVE(X, Y) (c->grid[((((Y) % c->rows) + c->rows) % c->rows) * c->cols + ((((X) % c->cols) + c->cols) % c->cols)])
@@ -298,7 +300,9 @@ static float cos_gas(const struct cosmos *cs, float u, float v, uint32_t seed) {
 // Gas is sampled every 12 px and smoothly upsampled: the noise is the expensive part, the picture is soft anyway.
 static void cos_gas_draw(struct ca *c, uint32_t *p, double wide, double tall, uint32_t seed, float dens_weight, uint32_t c0, uint32_t c1, float gain) {
 	const struct cosmos *cs = &c->cs; const int step = 12;
-	int gw = c->W / step + 2, gh = c->H / step + 2; float *f = malloc(sizeof(float) * gw * gh); if (!f) return;
+	int gw = c->W / step + 2, gh = c->H / step + 2; size_t need = (size_t)gw * gh;
+	if (c->cs.gas_n < need) { free(c->cs.gas); c->cs.gas = malloc(sizeof(float) * need); c->cs.gas_n = c->cs.gas ? need : 0; }
+	float *f = c->cs.gas; if (!f) return;
 	uint32_t lut[64]; for (int i = 0; i < 64; i++) lut[i] = cos_mix(c0, c1, cos_clamp(i / 63.f * 1.3f - .3f, 0, 1));
 	for (int j = 0; j < gh; j++) for (int i = 0; i < gw; i++)
 		f[j * gw + i] = cos_gas_w(cs, (float)((i * step - c->W / 2.0) / wide + .5), (float)((j * step - c->H / 2.0) / tall + .5), seed, dens_weight);
@@ -311,12 +315,11 @@ static void cos_gas_draw(struct ca *c, uint32_t *p, double wide, double tall, ui
 			cos_add(c, p, x, y, lut[(int)(g * 63)], g * g * gain);
 		}
 	}
-	free(f);
 }
 static void cos_stars(struct ca *c, uint32_t *p, double s) {
 	const struct cosmos *cs = &c->cs;
 	double wide = c->W * s, tall = c->W * .6 * s; if (wide < 8) return;
-	cos_gas_draw(c, p, wide, tall, c->seed, .3f, 0xFF243C8C, 0xFFB45AA0, .7f);
+	cos_gas_draw(c, p, wide, tall, cs->seed, .3f, 0xFF243C8C, 0xFFB45AA0, .7f);
 	for (int i = 0; i < cs->nstars; i++) for (int ty = -1; ty <= 1; ty++) for (int tx = -1; tx <= 1; tx++) {
 		const struct cosmos_star *st = &cs->stars[i];
 		double x = c->W / 2.0 + (st->x + tx - .5) * wide, y = c->H / 2.0 + (st->y + ty - .5) * tall;
@@ -330,21 +333,30 @@ static void cos_stars(struct ca *c, uint32_t *p, double s) {
 			cos_line(c, p, x - L, y, x + L, y, col, inten * .5f); cos_line(c, p, x, y - L, x, y + L, col, inten * .5f); }
 	}
 }
+// The galaxy's stars never change, only their angle: hashes, radii and colours are computed once.
+#define COS_GALAXY_STARS 7000
+static struct { float r, th, omega, bright; uint32_t col; } cos_gal[COS_GALAXY_STARS];
+static void cos_galaxy_init(void) {
+	static bool ready; if (ready) return; ready = true;
+	for (int i = 0; i < COS_GALAXY_STARS; i++) {
+		float h1 = cos_hash(i, 1, 77), h2 = cos_hash(i, 2, 77), h3 = cos_hash(i, 3, 77);
+		if (i < 1300) { float r = powf(h1, 2.f) * .2f; cos_gal[i].r = r; cos_gal[i].th = h2 * 6.2832f; cos_gal[i].omega = .15f; cos_gal[i].bright = .6f; cos_gal[i].col = 0xFFFFDDAA; } // bulge
+		else { float r = powf(h1, .7f); cos_gal[i].r = r; cos_gal[i].omega = .5f / (.15f + r) * .05f;
+			cos_gal[i].th = (i & 1) * 3.14159f + r * 5.5f + (h2 - .5f) * .6f * (1.15f - r);
+			cos_gal[i].bright = cos_clamp(.32f + (1 - r) * .5f + h3 * .35f, 0, 1);
+			cos_gal[i].col = cos_mix(0xFFFFD6A0, 0xFFA8C4FF, cos_clamp(r * 1.2f, 0, 1)); }
+	}
+}
 static void cos_galaxy(struct ca *c, uint32_t *p, double s) {
 	const struct cosmos *cs = &c->cs;
 	double Rg = fmin(c->W, c->H) * .62 * s; if (Rg < 4) return;
 	double tilt = .5, ct = cos(tilt), st = sin(tilt), cx = c->W / 2.0, cy = c->H / 2.0;
+	cos_galaxy_init();
 	cos_glow(c, p, cx, cy, Rg * .26, 0xFFFFD9A0, .6f);
-	for (int i = 0; i < 7000; i++) {
-		float h1 = cos_hash(i, 1, 77), h2 = cos_hash(i, 2, 77), h3 = cos_hash(i, 3, 77);
-		float r, th; bool bulge = i < 1300;
-		if (bulge) { r = powf(h1, 2.f) * .2f; th = h2 * 6.2832f + (float)cs->t * .15f; }
-		else { r = powf(h1, .7f); float omega = .5f / (.15f + r) * .05f;
-			th = (i & 1) * 3.14159f + r * 5.5f + (h2 - .5f) * .6f * (1.15f - r) + (float)cs->t * omega; }
+	for (int i = 0; i < COS_GALAXY_STARS; i++) {
+		float r = cos_gal[i].r, th = cos_gal[i].th + (float)cs->t * cos_gal[i].omega, bright = cos_gal[i].bright; uint32_t col = cos_gal[i].col;
 		double gx = r * cos(th), gy = r * sin(th) * .46;
 		double x = cx + (gx * ct - gy * st) * Rg, y = cy + (gx * st + gy * ct) * Rg;
-		float bright = bulge ? .6f : cos_clamp(.32f + (1 - r) * .5f + h3 * .35f, 0, 1);
-		uint32_t col = bulge ? 0xFFFFDDAA : cos_mix(0xFFFFD6A0, 0xFFA8C4FF, cos_clamp(r * 1.2f, 0, 1));
 		cos_add(c, p, (int)x, (int)y, col, bright);
 		if (bright > .6f) { cos_add(c, p, (int)x + 1, (int)y, col, bright * .6f); cos_add(c, p, (int)x, (int)y + 1, col, bright * .6f); cos_add(c, p, (int)x + 1, (int)y + 1, col, bright * .4f); }
 	}
@@ -352,7 +364,7 @@ static void cos_galaxy(struct ca *c, uint32_t *p, double s) {
 static void cos_universe(struct ca *c, uint32_t *p, double s) {
 	const struct cosmos *cs = &c->cs; if (!cs->wx) return;
 	double a = 1 + .014 * cs->uni_t, R = fmin(c->W, c->H) * .5 * s * a, cx = c->W / 2.0, cy = c->H / 2.0, ax = c->W / (double)c->H;
-	cos_gas_draw(c, p, c->W * a * s * 1.6, c->W * .6 * a * s * 1.6, c->seed ^ 0xC0FFEEu, 0.f, 0xFF3A1018, 0xFFB04050, .85f); // relic glow: warm and smooth
+	cos_gas_draw(c, p, c->W * a * s * 1.6, c->W * .6 * a * s * 1.6, cs->seed ^ 0xC0FFEEu, 0.f, 0xFF3A1018, 0xFFB04050, .85f); // relic glow: warm and smooth
 	for (int e = 0; e < cs->nedges; e++)
 		cos_line(c, p, cx + cs->nodex[cs->edge_a[e]] * R * ax, cy + cs->nodey[cs->edge_a[e]] * R, cx + cs->nodex[cs->edge_b[e]] * R * ax, cy + cs->nodey[cs->edge_b[e]] * R, 0xFF7C96C8, .26f);
 	for (int g = 0; g < COS_WEB_GALAXIES; g++) {
@@ -400,8 +412,10 @@ static bool cosmos_set(struct ca *c, bool on) {
 		if (c->volume) { c->volume = false; c->slice = -1; if (!sim_alloc(c)) { c->running = false; return false; } reseed(c); }
 		if (c->cs.speed <= 0) c->cs.speed = 1;
 		c->cs.auto_zoom = true; c->cs.dir = 1; c->cs.dwell = COS_DWELL_S;
-		cosmos_observe(c); cosmos_rebuild(c);
+		c->cs.seed = c->base_seed ? c->base_seed : c->seed | 1; // fixed for the session: rule changes keep the landscape
 	}
+	if (!apply_geometry(c)) return false; // the cosmos draws at buffer scale 1
+	if (on) { cosmos_observe(c); cosmos_rebuild(c); }
 	return true;
 }
 static int cosmos_phase_index(const char *name) {
@@ -429,11 +443,12 @@ static bool cosmos_control(struct ca *c, const char *verb, const char *arg) {
 	return false;
 }
 static void cosmos_config(struct ca *c) {
-	const char *env = getenv("CUBE_CA_COSMOS"); bool want = env && *env == '1';
+	const char *env = getenv("CUBE_CA_COSMOS"); bool want = false;
 	char user[512]; const char *home = getenv("HOME"); const char *paths[2] = { "/etc/whitecube/config", NULL };
 	if (home && snprintf(user, sizeof(user), "%s/.config/whitecube/config", home) < (int)sizeof(user)) paths[1] = user;
 	for (int i = 0; i < 2; i++) { if (!paths[i]) continue; FILE *f = fopen(paths[i], "r"); char line[128]; if (!f) continue;
 		while (fgets(line, sizeof(line), f)) { if (!strncmp(line, "cosmos=", 7)) want = line[7] == '1'; }
 		fclose(f); }
+	if (env && *env) want = *env == '1'; // the environment wins over both config files
 	c->cs.speed = 1; c->cs.want_on = want;
 }

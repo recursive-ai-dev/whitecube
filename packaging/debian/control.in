@@ -11,6 +11,8 @@ Suggests: python3-torch, python3-numpy
 Description: Whitecube - Wayland desktop with native image and model training studios
  A compositor (whitecube), top bar (cube-status), settings, living cube wallpaper (cube-ca),
  a native Wi-Fi controller (cube-net), a workspace suite and small apps.
+ The net-off and net-on commands provide a reversible IPv4/IPv6 lockdown,
+ preserving the existing firewall and local loopback services.
  Cube Editor adds a GTK4 workspace for inspecting, extracting, customizing and
  rebuilding Linux ISO images, with project recipes, build reports and optional
  QEMU testing. System image changes run through an explicit privileged worker.

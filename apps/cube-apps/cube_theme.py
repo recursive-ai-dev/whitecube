@@ -120,6 +120,8 @@ class CubeApp(Adw.Application):
     window_class = None
 
     def __init__(self, app_id: str):
+        # GTK uses the program name for Wayland identity without a session bus.
+        GLib.set_prgname(app_id)
         super().__init__(application_id=app_id,
                          flags=Gio.ApplicationFlags.HANDLES_OPEN)
         self.win = None

@@ -53,6 +53,8 @@ class Monitor:
         if self.target_steps is not None and step >= self.target_steps:
             return False
         def cooling(active):
+            if active and self.device == 'cuda':
+                torch.cuda.synchronize()
             atomic_json(self.path.parent / 'status.json', {
                 'state': 'stopped' if self.stopped else 'cooling' if active else 'training',
                 'device': self.device,

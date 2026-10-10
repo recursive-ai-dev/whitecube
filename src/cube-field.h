@@ -1,34 +1,67 @@
 // Native field controls; included by cube-ca.c to share its simulation and renderer.
 // Runtime controls are private to the user and Wayland display, with no shell parsing.
-static bool runtime_path(char *path, size_t size) {
+static bool control_prefix(char *out, size_t size) {
 	const char *runtime = getenv("XDG_RUNTIME_DIR"), *display = getenv("WAYLAND_DISPLAY");
 	struct stat st;
 	if (!runtime || stat(runtime, &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() || (st.st_mode & 0077)) return false;
 	if (!display) display = "wayland-0";
 	for (const char *p = display; *p; p++) if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '-' || *p == '_')) return false;
-	int n = snprintf(path, size, "%s/cube-ca-%s.sock", runtime, display);
+	int n = snprintf(out, size, "cube-ca-%s", display);
 	return n > 0 && (size_t)n < size;
 }
-static int send_control(const char *command) {
-	struct sockaddr_un addr = {.sun_family = AF_UNIX}, reply = {.sun_family = AF_UNIX};
-	if (!runtime_path(addr.sun_path, sizeof(addr.sun_path))) { fputs("cube-ca: private XDG_RUNTIME_DIR and WAYLAND_DISPLAY required\n", stderr); return 1; }
-	int length = snprintf(reply.sun_path, sizeof(reply.sun_path), "%s/cube-ctl-%ld.sock", getenv("XDG_RUNTIME_DIR"), (long)getpid());
+static void safe_output_name(char *out, size_t size, const char *name) {
+	size_t n = 0;
+	for (; name && *name && n + 1 < size; name++) out[n++] = (*name >= 'a' && *name <= 'z') || (*name >= 'A' && *name <= 'Z') || (*name >= '0' && *name <= '9') || *name == '-' || *name == '_' ? *name : '_';
+	out[n] = 0;
+}
+// One socket per wallpaper process: cube-ca-DISPLAY.sock, or cube-ca-DISPLAY@OUTPUT.sock for a per-output instance.
+static bool runtime_path(char *path, size_t size, const char *output) {
+	char prefix[96], safe[64]; if (!control_prefix(prefix, sizeof(prefix))) return false;
+	safe_output_name(safe, sizeof(safe), output);
+	int n = snprintf(path, size, "%s/%s%s%s.sock", getenv("XDG_RUNTIME_DIR"), prefix, *safe ? "@" : "", safe);
+	return n > 0 && (size_t)n < size;
+}
+// Sends to every wallpaper on this display (one per output), or only to @target. Replies are printed per output.
+static int send_control(const char *target, const char *command) {
+	char prefix[96], want[64] = "";
+	if (!control_prefix(prefix, sizeof(prefix))) { fputs("cube-ca: private XDG_RUNTIME_DIR and WAYLAND_DISPLAY required\n", stderr); return 1; }
+	if (target) safe_output_name(want, sizeof(want), target);
+	const char *runtime = getenv("XDG_RUNTIME_DIR");
+	struct sockaddr_un reply = {.sun_family = AF_UNIX};
+	int length = snprintf(reply.sun_path, sizeof(reply.sun_path), "%s/cube-ctl-%ld.sock", runtime, (long)getpid());
 	if (length < 0 || (size_t)length >= sizeof(reply.sun_path)) return 1;
+	DIR *dir = opendir(runtime); if (!dir) { perror(runtime); return 1; }
 	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-	if (fd < 0) { perror("cube-ca controls"); return 1; }
+	if (fd < 0) { perror("cube-ca controls"); closedir(dir); return 1; }
 	mode_t old = umask(0077); int rc = bind(fd, (struct sockaddr *)&reply, sizeof(reply)); umask(old);
-	if (rc) { perror("cube-ca control reply"); close(fd); return 1; }
-	ssize_t n = sendto(fd, command, strlen(command), 0, (struct sockaddr *)&addr, sizeof(addr));
-	if (n != (ssize_t)strlen(command)) { perror("cube-ca: wallpaper control socket"); close(fd); unlink(reply.sun_path); return 1; }
-	struct pollfd event = {.fd=fd, .events=POLLIN}; char response[256]; rc = 1;
-	if (poll(&event, 1, 3000) > 0 && (n = recv(fd, response, sizeof(response)-1, 0)) > 0) {
-		response[n] = 0; puts(response); rc = strncmp(response, "OK ", 3) != 0;
-	} else fputs("cube-ca: wallpaper did not acknowledge the command\n", stderr);
-	close(fd); unlink(reply.sun_path); return rc;
+	if (rc) { perror("cube-ca control reply"); close(fd); closedir(dir); return 1; }
+	int sent = 0, failed = 0; size_t pl = strlen(prefix); struct dirent *e;
+	while ((e = readdir(dir))) {
+		const char *name = e->d_name; size_t nl = strlen(name); char label[64] = "";
+		if (strncmp(name, prefix, pl) || nl < pl + 5 || strcmp(name + nl - 5, ".sock")) continue;
+		if (name[pl] == '@' && nl - pl - 6 < sizeof(label)) snprintf(label, sizeof(label), "%.*s", (int)(nl - pl - 6), name + pl + 1);
+		else if (strcmp(name + pl, ".sock")) continue;
+		if (target && strcmp(label, want)) continue;
+		struct sockaddr_un addr = {.sun_family = AF_UNIX};
+		if (snprintf(addr.sun_path, sizeof(addr.sun_path), "%s/%s", runtime, name) >= (int)sizeof(addr.sun_path)) continue;
+		ssize_t n = sendto(fd, command, strlen(command), 0, (struct sockaddr *)&addr, sizeof(addr));
+		if (n < 0 && (errno == ECONNREFUSED || errno == ENOENT)) continue; // left behind by an instance that has exited
+		sent++;
+		if (n != (ssize_t)strlen(command)) { perror("cube-ca: wallpaper control socket"); failed++; continue; }
+		struct pollfd event = {.fd=fd, .events=POLLIN}; char response[256];
+		if (poll(&event, 1, 3000) > 0 && (n = recv(fd, response, sizeof(response)-1, 0)) > 0) {
+			response[n] = 0;
+			if (*label) printf("%s: %s\n", label, response); else puts(response);
+			if (strncmp(response, "OK ", 3)) failed++;
+		} else { fprintf(stderr, "cube-ca: wallpaper%s%s did not acknowledge the command\n", *label ? " on " : "", label); failed++; }
+	}
+	closedir(dir); close(fd); unlink(reply.sun_path);
+	if (!sent) { fprintf(stderr, target ? "cube-ca: no wallpaper is running on %s\n" : "cube-ca: no wallpaper is running%s\n", target ? target : ""); return 1; }
+	return failed != 0;
 }
 static int open_control(struct ca *c) {
 	struct sockaddr_un addr = {.sun_family = AF_UNIX};
-	if (!runtime_path(addr.sun_path, sizeof(addr.sun_path))) return -1;
+	if (!runtime_path(addr.sun_path, sizeof(addr.sun_path), c->want_output)) return -1;
 	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
 	if (fd < 0) { perror("cube-ca controls"); return -1; }
 	struct stat st;
@@ -64,19 +97,19 @@ static bool paint_cell(struct ca *c, double px, double py, int value) {
 		int ox = (c->W - c->cols * cell) / 2, oy = (c->H - c->rows * cell) / 2;
 		x = (int)floor((px - ox) / cell); y = (int)floor((py - oy) / cell); z = c->slice;
 	} else {
-		x = (int)floor(px / RULES[c->rule].cell); y = (int)floor(py / RULES[c->rule].cell);
+		x = (int)floor(px / cell_px(c)); y = (int)floor(py / cell_px(c));
 	}
 	if (x < 0 || y < 0 || x >= c->cols || y >= c->rows || z >= c->depth) return false;
 	size_t i = ((size_t)z * c->rows + y) * c->cols + x;
-	c->grid[i] = value != 0; c->age[i] = 0; c->manual = true;
+	c->grid[i] = value != 0; c->age[i] = 0; c->manual = true; c->dirty = true;
 	return true;
 }
 static void pointer_enter(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *s, wl_fixed_t x, wl_fixed_t y) {
-	struct ca *c = data; c->pointer_x = wl_fixed_to_double(x); c->pointer_y = wl_fixed_to_double(y);
+	struct ca *c = data; c->pointer_x = wl_fixed_to_double(x) * scale_of(c); c->pointer_y = wl_fixed_to_double(y) * scale_of(c);
 }
 static void pointer_leave(void *data, struct wl_pointer *p, uint32_t serial, struct wl_surface *s) { ((struct ca *)data)->draw_button = 0; }
 static void pointer_motion(void *data, struct wl_pointer *p, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-	struct ca *c = data; c->pointer_x = wl_fixed_to_double(x); c->pointer_y = wl_fixed_to_double(y);
+	struct ca *c = data; c->pointer_x = wl_fixed_to_double(x) * scale_of(c); c->pointer_y = wl_fixed_to_double(y) * scale_of(c);
 	if (c->edit && c->draw_button) paint_cell(c, c->pointer_x, c->pointer_y, c->draw_button == BTN_LEFT);
 }
 static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
@@ -88,7 +121,7 @@ static void pointer_button(void *data, struct wl_pointer *p, uint32_t serial, ui
 static void pointer_axis(void *data, struct wl_pointer *p, uint32_t time, uint32_t axis, wl_fixed_t value) {
 	struct ca *c = data;
 	if (c->volume && c->edit && axis == WL_POINTER_AXIS_VERTICAL_SCROLL) {
-		c->slice = (c->slice + (value > 0 ? 1 : c->depth - 1)) % c->depth;
+		c->slice = (c->slice + (value > 0 ? 1 : c->depth - 1)) % c->depth; c->dirty = true;
 	}
 }
 static void pointer_frame(void *data, struct wl_pointer *p) {}
@@ -124,14 +157,17 @@ static bool seed_path(char *path, size_t size, const char *name) {
 	n = snprintf(path, size, "%s/%s.seed", dir, name);
 	return n > 0 && (size_t)n < size;
 }
+// WCUBE3 adds the birth/survival masks so B/S rules replay too; WCUBE2 files still load.
 static bool seed_save(struct ca *c, const char *name) {
 	char path[1200], temp[1280]; if (!seed_path(path, sizeof(path), name)) return false;
 	snprintf(temp, sizeof(temp), "%s.tmp-%ld", path, (long)getpid());
 	int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd < 0) return false;
 	FILE *f = fdopen(fd, "wb"); if (!f) { close(fd); unlink(temp); return false; }
-	bool ok = fprintf(f, "WCUBE2 %d %d %d %u %u %.9f %d\n", c->cols, c->rows, c->depth, c->rule, c->seed, c->yaw, c->slice) > 0;
+	const struct rule *r = rule_of(c);
+	bool ok = fprintf(f, "WCUBE3 %d %d %d %u %u %.9f %d %u %u\n", c->cols, c->rows, c->depth, c->rule, c->seed, c->yaw, c->slice, (unsigned)r->birth, (unsigned)r->surv) > 0;
 	ok = ok && fwrite(c->grid, 1, sim_count(c), f) == sim_count(c) && fwrite(c->age, 1, sim_count(c), f) == sim_count(c);
+	ok = ok && fflush(f) == 0 && fsync(fd) == 0;
 	if (fclose(f)) ok = false;
 	if (ok && !rename(temp, path)) return true;
 	unlink(temp); return false;
@@ -140,10 +176,14 @@ static bool seed_replay(struct ca *c, const char *name) {
 	char path[1200]; if (!seed_path(path, sizeof(path), name)) return false;
 	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return false;
 	FILE *f = fdopen(fd, "rb"); if (!f) { close(fd); return false; }
-	struct ca saved = {0}; char line[256], extra; bool ok = fgets(line, sizeof(line), f) &&
-		sscanf(line, "WCUBE2 %d %d %d %u %u %lf %d %c", &saved.cols, &saved.rows, &saved.depth, &saved.rule, &saved.seed, &saved.yaw, &saved.slice, &extra) == 7;
+	struct ca saved = {0}; char line[256], extra; unsigned birth = 0, surv = 0;
+	bool ok = fgets(line, sizeof(line), f) != NULL;
+	if (ok) ok = sscanf(line, "WCUBE3 %d %d %d %u %u %lf %d %u %u %c", &saved.cols, &saved.rows, &saved.depth, &saved.rule, &saved.seed, &saved.yaw, &saved.slice, &birth, &surv, &extra) == 9 ||
+		(sscanf(line, "WCUBE2 %d %d %d %u %u %lf %d %c", &saved.cols, &saved.rows, &saved.depth, &saved.rule, &saved.seed, &saved.yaw, &saved.slice, &extra) == 7 && saved.rule < NRULES);
 	ok = ok && saved.cols > 0 && saved.cols <= 1024 && saved.rows > 0 && saved.rows <= 1024 &&
-		(saved.depth == 1 || (saved.depth == 18 && saved.cols == 18 && saved.rows == 18)) && saved.rule < NRULES && saved.seed && isfinite(saved.yaw) && saved.slice >= -1 && saved.slice < saved.depth;
+		(saved.depth == 1 || (saved.depth == 18 && saved.cols == 18 && saved.rows == 18)) && saved.rule <= NRULES && saved.seed && isfinite(saved.yaw) && saved.slice >= -1 && saved.slice < saved.depth;
+	ok = ok && (saved.rule < NRULES || (birth > 1 && birth < 512 && !(birth & 1) && surv < 512));
+	ok = ok && !(c->cs.on && saved.depth > 1); // the cosmos needs the 2D field, as with '3d'
 	if (ok) ok = alloc_grid(&saved);
 	if (ok) ok = fread(saved.grid, 1, sim_count(&saved), f) == sim_count(&saved) && fread(saved.age, 1, sim_count(&saved), f) == sim_count(&saved) && fgetc(f) == EOF;
 	if (ok) for (size_t i = 0; i < sim_count(&saved); i++) if (saved.grid[i] > 1) { ok = false; break; }
@@ -151,34 +191,47 @@ static bool seed_replay(struct ca *c, const char *name) {
 	if (!ok) { free(saved.grid); free(saved.next); free(saved.age); return false; }
 	free(c->grid); free(c->next); free(c->age);
 	c->grid = saved.grid; c->next = saved.next; c->age = saved.age;
-	c->cols = saved.cols; c->rows = saved.rows; c->depth = saved.depth; c->rule = saved.rule; c->seed = saved.seed;
+	c->cols = saved.cols; c->rows = saved.rows; c->depth = saved.depth; c->rule = saved.rule; c->seed = c->base_seed = saved.seed;
+	if (saved.rule == NRULES) set_custom_rule(c, (uint16_t)birth, (uint16_t)surv);
 	c->volume = saved.depth > 1; c->slice = saved.slice; c->yaw = saved.yaw;
 	c->tick = 0; c->manual = true; c->paused = false; c->edit = false; update_input(c);
 	return true;
+}
+static void field_status(struct ca *c, char *out, size_t size) {
+	const char *rule = c->volume ? "3D B5/S4,5" : rule_of(c)->name;
+	if (c->cs.on) snprintf(out, size, "OK cosmos %s z=%.2f / %s / %s / rule %s / seed %u / generation %llu", COS_NAMES[(int)lround(c->cs.zoom) < COS_PHASES ? (int)lround(c->cs.zoom) : COS_PHASES - 1], c->cs.zoom, c->cs.auto_zoom ? "auto" : "hold", c->paused ? "paused" : "running", rule, c->base_seed, (unsigned long long)c->tick);
+	else snprintf(out, size, "OK %s / %s / generation %llu / %s / seed %u / slice %d%s / %d fps%s", rule, c->manual ? "manual" : "loop", (unsigned long long)c->tick, c->paused ? "paused" : "running", c->base_seed, c->slice,
+		c->volume ? (c->spin ? " / spin" : " / still") : "", c->effective_fps, c->on_battery ? " (battery)" : "");
 }
 static bool apply_control(struct ca *c, const char *command) {
 	char verb[32], arg[64] = {0}, extra;
 	int count = sscanf(command, "%31s %63s %c", verb, arg, &extra);
 	if (count < 1 || count > 2 || !c->configured) return false;
-	if (!strcmp(verb, "pause")) c->paused = !c->paused;
+	if (!strcmp(verb, "status")) return true;
+	else if (!strcmp(verb, "pause")) c->paused = !c->paused;
 	else if (!strcmp(verb, "step")) { c->paused = true; c->manual = true; sim_step(c); }
-	else if (!strcmp(verb, "loop")) { c->manual = !c->manual; c->rule_start_ms = now_ms(); }
+	else if (!strcmp(verb, "loop")) { c->manual = !c->manual; c->active_ms = 0; }
 	else if (!strcmp(verb, "cosmos") || !strcmp(verb, "phase") || !strcmp(verb, "zoom") || !strcmp(verb, "speed")) return cosmos_control(c, verb, arg);
 	else if (!strcmp(verb, "edit")) { if (c->cs.on) return false; c->edit = !c->edit; c->paused = c->edit; c->manual = true; if (c->volume && c->edit && c->slice < 0) c->slice = c->depth / 2; update_input(c); }
 	else if (!strcmp(verb, "clear")) { memset(c->grid, 0, sim_count(c)); memset(c->age, 0, sim_count(c)); c->manual = true; c->paused = true; }
 	else if (!strcmp(verb, "2d") || !strcmp(verb, "3d")) { if (c->cs.on && !strcmp(verb, "3d")) return false; c->volume = !strcmp(verb, "3d"); c->slice = -1; c->edit = false; c->paused = false; c->manual = false; update_input(c); if (!sim_alloc(c)) { c->running = false; return false; } reseed(c); }
 	else if (!strcmp(verb, "rotate")) { if (!c->volume) return false; c->slice = -1; c->yaw += !strcmp(arg, "left") ? -.20 : .20; }
-	else if (!strcmp(verb, "slice")) {
+	else if (!strcmp(verb, "spin")) {
+		if (!*arg) c->spin = !c->spin;
+		else if (!strcmp(arg, "on") || !strcmp(arg, "off")) c->spin = !strcmp(arg, "on");
+		else return false;
+	} else if (!strcmp(verb, "slice")) {
 		if (!c->volume) return false;
 		if (!strcmp(arg, "all")) c->slice = -1;
 		else if (!strcmp(arg, "next")) c->slice = (c->slice + 1) % c->depth;
 		else { char *end; long z = strtol(arg, &end, 10); if (!*arg || *end || z < 0 || z >= c->depth) return false; c->slice = (int)z; }
 	} else if (!strcmp(verb, "seed")) {
-		if (*arg) { char *end; unsigned long seed = strtoul(arg, &end, 10); if (*end || seed == 0 || seed > UINT32_MAX) return false; c->seed = (unsigned)seed; }
-		reseed(c);
+		if (*arg) { char *end; unsigned long seed = strtoul(arg, &end, 10); if (*end || seed == 0 || seed > UINT32_MAX) return false; reseed_from(c, (unsigned)seed); }
+		else reseed(c);
 	} else if (!strcmp(verb, "rule")) {
+		if (c->volume) return false;
 		unsigned r; for (r = 0; r < NRULES; r++) if (!strcmp(arg, RULES[r].name)) break;
-		if (r == NRULES || c->volume) return false;
+		if (r == NRULES) { uint16_t birth, surv; char name[24]; if (!parse_rule(arg, &birth, &surv, name, sizeof(name))) return false; set_custom_rule(c, birth, surv); }
 		c->rule = r; if (!sim_alloc(c)) { c->running = false; return false; } reseed(c); c->manual = true;
 	} else if (!strcmp(verb, "glider") || !strcmp(verb, "blinker")) {
 		if (c->volume) return false;
@@ -200,33 +253,35 @@ static void receive_control(struct ca *c) {
 		if (n <= 0) break;
 		command[n] = 0;
 		bool ok = apply_control(c, command);
-		if (ok && c->cs.on) snprintf(response, sizeof(response), "OK cosmos %s z=%.2f / %s / %s / rule %s / generation %llu", COS_NAMES[(int)lround(c->cs.zoom) < COS_PHASES ? (int)lround(c->cs.zoom) : COS_PHASES - 1], c->cs.zoom, c->cs.auto_zoom ? "auto" : "hold", c->paused ? "paused" : "running", RULES[c->rule].name, (unsigned long long)c->tick);
-		else if (ok) snprintf(response, sizeof(response), "OK %s / %s / generation %llu / %s / slice %d", c->volume ? "3D B5/S4,5" : RULES[c->rule].name, c->manual ? "manual" : "loop", (unsigned long long)c->tick, c->paused ? "paused" : "running", c->slice);
+		if (ok) { c->dirty = true; field_status(c, response, sizeof(response)); }
 		else snprintf(response, sizeof(response), "ERROR: invalid control, incompatible mode, or seed could not be saved/replayed");
 		if (size > sizeof(sa_family_t)) sendto(c->control_fd, response, strlen(response), 0, (struct sockaddr *)&sender, size);
 	}
 	arm_timer(c);
 }
 static int control_menu(void) {
-	puts("WHITE CUBE FIELD\nCommands: 2d | 3d | pause | step | edit | clear | loop\n"
+	puts("WHITE CUBE FIELD\nCommands: 2d | 3d | pause | step | edit | clear | loop | status\n"
 		"  cosmos on|off|toggle            Cosmic zoom: cells > geometry > land > planet > stars > galaxy > universe\n"
 		"  phase cells|geometry|land|planet|stars|galaxy|universe|0..6   Glide to a phase and hold\n"
 		"  zoom auto|hold|0..6             Resume the automatic journey, freeze, or set the exact zoom\n"
 		"  speed 0.1..8                    Pace of the automatic journey\n"
 		"  glider | blinker                 Plant a 2D pattern at the center\n"
-		"  rule life|highlife|diamoeba|daynight|anneal|seeds\n"
-		"  seed [number]                   Randomize, optionally deterministically\n"
-		"  rotate left|right               Rotate the real 18x18x18 volume\n"
+		"  rule life|highlife|diamoeba|daynight|anneal|seeds|B36/S23   Named or any birth/survival rule\n"
+		"  seed [number]                   Randomize; 'status' shows the seed to replay a field you liked\n"
+		"  rotate left|right | spin [on|off]   Rotate the real 18x18x18 volume, or its slow drift\n"
 		"  slice 0..17|next|all             View or paint a volume layer\n"
 		"  save [name] | replay [name]      Save exact cells, rule and random state\n"
+		"  @OUTPUT command                  Send to one monitor only (e.g. @HDMI-A-1 pause)\n"
 		"  quit                            Close controls\n\n"
 		"After 'edit', Alt+V exposes the field: drag left to paint, right to erase.\n"
 		"Scroll changes 3D layers. Alt+V returns here; 'edit' again runs the field.\n"
 		"Painted/saved worlds stay on their rule. 'loop' toggles automatic reseeding.\n"
-		"Fullscreen applications or temperatures >=75 C limit the field to 2 ticks/s.\n");
+		"Fullscreen applications or temperatures >=75 C limit the field to 2 ticks/s;\n"
+		"on battery it runs at two thirds speed, and a hidden field does not run at all.\n");
 	char line[256]; while (fputs("cube> ", stdout), fflush(stdout), fgets(line, sizeof(line), stdin)) {
 		line[strcspn(line, "\r\n")] = 0; if (!strcmp(line, "quit")) break;
-		if (*line) send_control(line);
+		if (*line == '@') { char *space = strchr(line, ' '); if (!space) { puts("Usage: @OUTPUT command"); continue; } *space = 0; send_control(line + 1, space + 1); }
+		else if (*line) send_control(NULL, line);
 	}
 	return 0;
 }
@@ -241,6 +296,7 @@ static int field_self_test(void) {
 	memset(c.grid, 0, sim_count(&c)); c.grid[0]=1; sim_step(&c); if (c.grid[0]) return 3;
 	if (!apply_control(&c, "2d") || !apply_control(&c, "clear") || !paint_cell(&c, 25, 25, 1) || !c.grid[c.cols + 1]) return 4;
 	if (!apply_control(&c, "3d") || !apply_control(&c, "slice 8") || apply_control(&c, "slice 18")) return 5;
+	if (!apply_control(&c, "spin off") || c.spin || !apply_control(&c, "spin") || !c.spin || apply_control(&c, "spin fast") || !apply_control(&c, "status")) return 5;
 	// Seed roundtrip and deterministic evolution through the persistence format.
 	char scratch[] = "/tmp/cube-ca-test-XXXXXX"; if (!mkdtemp(scratch)) return 6;
 	const char *old = getenv("XDG_STATE_HOME"); char *oldcopy = old ? strdup(old) : NULL;
@@ -252,7 +308,20 @@ static int field_self_test(void) {
 	ok = ok && seed_replay(&c, "roundtrip");
 	for (int i=0; i<7; i++) sim_step(&c);
 	ok = ok && !memcmp(expected, c.grid, count);
-	char path[1200]; if (seed_path(path,sizeof(path),"roundtrip")) unlink(path);
+	// A 3D world cannot be replayed into a running cosmos.
+	c.cs.on = true; ok = ok && !seed_replay(&c, "roundtrip"); c.cs.on = false;
+	// Custom B/S rules survive save and replay, and evolve identically afterwards.
+	ok = ok && apply_control(&c, "2d") && apply_control(&c, "rule B36/S23") && c.rule == NRULES && !strcmp(rule_of(&c)->name, "B36/S23") && !apply_control(&c, "rule B0/S1");
+	ok = ok && seed_save(&c, "custom");
+	free(expected); count = sim_count(&c); expected = malloc(count);
+	for (int i=0; i<5; i++) sim_step(&c);
+	if (expected) memcpy(expected, c.grid, count); else ok = false;
+	ok = ok && apply_control(&c, "rule life") && seed_replay(&c, "custom") && c.rule == NRULES && rule_of(&c)->birth == ((1u<<3)|(1u<<6));
+	for (int i=0; i<5; i++) sim_step(&c);
+	ok = ok && expected && !memcmp(expected, c.grid, count);
+	char path[1200];
+	if (seed_path(path,sizeof(path),"roundtrip")) unlink(path);
+	if (seed_path(path,sizeof(path),"custom")) unlink(path);
 	snprintf(path,sizeof(path),"%s/whitecube-ca",scratch); rmdir(path); rmdir(scratch);
 	if (oldcopy) { setenv("XDG_STATE_HOME",oldcopy,1); free(oldcopy); } else unsetenv("XDG_STATE_HOME");
 	free(expected); free(c.grid); free(c.next); free(c.age);

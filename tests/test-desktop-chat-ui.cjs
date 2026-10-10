@@ -106,7 +106,13 @@ async function main() {
         for (const checkpoint of [latest, best]) {
           const launched = spawnSync(process.env.CHAT_TEST_LAUNCHER, ['--show', '--checkpoint', checkpoint.id], { env: process.env, timeout: 15000 });
           assert.equal(launched.status, 0, launched.stderr?.toString());
-          await until(`modelData?.checkpointId === ${JSON.stringify(checkpoint.id)} && modelPicker.value === ${JSON.stringify(checkpoint.id)}`);
+          try {
+            await until(`modelData?.checkpointId === ${JSON.stringify(checkpoint.id)} && modelPicker.value === ${JSON.stringify(checkpoint.id)}`);
+          } catch (error) {
+            console.error('CLI handoff state:', await evaluate('({modelData,picker:modelPicker.value,errors:Array.from(document.querySelectorAll(".msg.error")).map(e=>e.textContent)})'));
+            console.error('Saved selection:', await evaluate('window.api.getSettings().then(s=>({checkpointId:s.checkpointId,chatSource:s.chatSource}))'));
+            throw error;
+          }
         }
         console.log('PASS: first CLI checkpoint selection and repeat-launch Chat handoff update the actual model picker');
       }

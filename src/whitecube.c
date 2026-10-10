@@ -1656,6 +1656,22 @@ static void server_new_output(struct wl_listener *l, void *data) {
 	output_manager_update(s);
 	wc_retile(s);
 }
+static void wc_restore_window(struct wc_toplevel *t) {
+	/* A saved placement must never hide a newly opened window or send it to
+	 * another workspace. Restore its geometry and presentation on the current
+	 * workspace, even if the user switched while the client was starting. */
+	t->workspace = t->server->workspace;
+	t->hidden = false;
+	t->saved_index = g_remember_layout ? wc_state_match(&t->server->layout,
+		t->xdg_toplevel->app_id, t->xdg_toplevel->title, t->workspace) : -1;
+	if (t->saved_index < 0) return;
+	struct wc_saved_window *saved = &t->server->layout.windows[t->saved_index];
+	saved->claimed = true;
+	t->fullscreen = saved->fullscreen; t->maximized = saved->maximized;
+	t->layout_x = saved->x; t->layout_y = saved->y;
+	t->layout_w = saved->w; t->layout_h = saved->h;
+}
+
 static void t_map(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, map);
 	t->mapped = true;
@@ -1669,17 +1685,13 @@ static void t_map(struct wl_listener *l, void *data) {
 	}
 	wl_list_remove(&t->link);
 	wl_list_insert(&t->server->toplevels, &t->link);
-	t->saved_index = g_remember_layout ? wc_state_match(&t->server->layout, t->xdg_toplevel->app_id, t->xdg_toplevel->title, t->workspace) : -1;
+	wc_restore_window(t);
 	if (t->saved_index >= 0) {
-		struct wc_saved_window *saved = &t->server->layout.windows[t->saved_index];
-		saved->claimed = true; t->workspace = saved->workspace; t->hidden = saved->hidden;
-		t->fullscreen = saved->fullscreen; t->maximized = saved->maximized;
-		t->layout_x = saved->x; t->layout_y = saved->y; t->layout_w = saved->w; t->layout_h = saved->h;
 		wlr_xdg_toplevel_set_fullscreen(t->xdg_toplevel, t->fullscreen);
 		wlr_xdg_toplevel_set_maximized(t->xdg_toplevel, t->maximized);
 	}
 	if (!is_scripts(t)) t->server->saved_normal[t->workspace] = t;
-	if (!t->hidden && t->workspace == t->server->workspace && !t->server->desktop_visible) wc_focus(t);
+	wc_focus(t);
 	wc_retile(t->server);
 }
 static void t_unmap(struct wl_listener *l, void *data) {

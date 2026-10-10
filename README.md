@@ -54,10 +54,15 @@ testing. See [the editor guide](apps/cube-editor/README.md). The original extrac
 retained locally under `apps/cube-editor/upstream/` and excluded from the Debian package.
 
 The panel groups windows under one **N tabs** button (Alt+G opens its list), and **Chat** sits beside networking.
+New windows open visibly on the active workspace, keeping their saved size and position.
+Previously hidden windows and placements from other workspaces cannot hide a fresh launch.
 Desktop Chat includes a private Electron runtime, its sandbox helper and required library dependencies.
 **Whitecube Trainer** (`cube-train`) is a native GTK4 app for local 1M, 2M, 5M and 10M models.
 It selects datasets, saves named runs in `~/train-out`, monitors progress/loss/temperature,
 supports Stop/Resume, previews checkpoints, and opens them directly in Chat.
+Optional timed cooling breaks, lower training priority, and CPU/GPU temperature
+limits help manage heat. Runs or individual checkpoints can be moved to Trash
+after confirmation; restoring Latest restores the ability to resume.
 The complete model pipeline lives in `apps/cube-train/pipeline` and ships with the deb.
 `whitecube-train --5m` uses the same pipeline from the command line. Training uses the
 configured PyTorch Python environment; system GTK remains independent of that environment.

@@ -329,6 +329,32 @@ static void test_tab_overflow(void) {
 	assert(g.rows == 1 && g.h > 0 && wc_panel_row_at(&g, 0, 0, 120, 48) == -1);
 }
 
+static void test_reopened_window_is_visible(void) {
+	config_defaults();
+	struct wc_server server = {.workspace = 2, .desktop_visible = true};
+	struct wlr_xdg_toplevel xdg = {.app_id = "editor", .title = "Project"};
+	struct wc_toplevel window = {.server = &server, .xdg_toplevel = &xdg, .workspace = 1, .hidden = true};
+	server.layout.count = 1;
+	server.layout.windows[0] = (struct wc_saved_window){.workspace = 0, .hidden = true,
+		.maximized = true, .x = 60, .y = 40, .w = 800, .h = 700};
+	snprintf(server.layout.windows[0].app, 128, "editor");
+	snprintf(server.layout.windows[0].title, 256, "Project");
+	wc_restore_window(&window);
+	assert(window.workspace == 2 && !window.hidden && window.saved_index == 0);
+	assert(window.maximized && window.layout_x == 60 && window.layout_w == 800);
+	assert(server.layout.windows[0].claimed);
+	/* Another instance cannot consume an already claimed placement. */
+	struct wc_toplevel second = {.server = &server, .xdg_toplevel = &xdg};
+	wc_restore_window(&second);
+	assert(second.workspace == 2 && !second.hidden && second.saved_index == -1);
+	/* The same visibility rule applies with persistence disabled. */
+	g_remember_layout = false;
+	server.workspace = 3;
+	wc_restore_window(&second);
+	assert(second.workspace == 3 && !second.hidden && second.saved_index == -1);
+	config_defaults();
+}
+
 int main(void) {
 	test_applied_keyboard();
 	test_reload_defaults();
@@ -336,6 +362,7 @@ int main(void) {
 	test_caps_lock_binding();
 	test_pointer_placement();
 	test_privacy_settings();
+	test_reopened_window_is_visible();
 	test_lock_isolation();
 	test_idle_lock();
 	test_lock_output_geometry();

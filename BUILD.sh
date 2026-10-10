@@ -96,6 +96,7 @@ fi
 # Network controller (cube-net, DHCP hook, unit, helper): pure Python, needs no root, radio or network.
 python3 -I net/test_cube_net.py
 python3 -I net/test_cube_wifi.py
+python3 -I net/test_net_switch.py
 python3 -I tests/test-privacy.py
 python3 -I tests/test-doctor.py
 python3 -I tests/test-sudoers.py
@@ -112,6 +113,7 @@ python3 -I tests/test-cube-train-ui.py
 python3 -I -m unittest discover -s apps/cube-editor/tests -v
 python3 -I tests/test-cube-editor-ui.py
 python3 -I tests/test-chrootables.py
+python3 -I tests/test-app-launch.py
 # The wc suite tests run wrappers from temporary homes, which a noexec /tmp would refuse.
 TMPDIR="$native_dir/$out" python3 -I -m unittest discover -s apps/wc-suite -p test_suite.py
 bash -n net/apply.sh

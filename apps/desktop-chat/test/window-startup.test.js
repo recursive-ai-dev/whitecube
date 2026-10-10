@@ -30,7 +30,7 @@ async function start(args, overrides = {}) {
   }
   const app = new EventEmitter();
   app.commandLine = { appendSwitch() {} };
-  app.requestSingleInstanceLock = () => true;
+  app.requestSingleInstanceLock = data => { app.launchData = data; return true; };
   app.whenReady = () => Promise.resolve();
   app.quit = () => {};
   const ipcMain = new EventEmitter();
@@ -115,11 +115,17 @@ test('trainer checkpoint launches select the model on first and existing instanc
   first.win.webContents.emit('did-finish-load');
   assert.equal(first.handlers.get('settings:get')().checkpointId, 'run/ckpt_best.pt');
   assert.equal(first.handlers.get('settings:get')().chatSource, 'local');
+  assert.equal(first.app.launchData.whitecubeArgs.at(-1), 'run/ckpt_best.pt');
   const existing = await start(['--hide']);
   existing.win.webContents.emit('did-finish-load');
   existing.app.emit('second-instance', {}, ['electron', 'desktop-chat', '--checkpoint=run/ckpt_best.pt']);
   assert.equal(existing.win.isVisible(), true);
   assert.ok(existing.win.sent.includes('models:changed'));
+  existing.handlers.get('models:select')({ sender: { send() {} } }, 'api');
+  existing.app.emit('second-instance', {}, ['electron', 'desktop-chat', '--checkpoint', '/normalized/ckpt_best.pt'], '/other',
+                   { whitecubeArgs: ['desktop-chat', '--show', '--checkpoint', 'run/ckpt_best.pt'] });
+  assert.equal(existing.handlers.get('settings:get')().checkpointId, 'run/ckpt_best.pt');
+  assert.equal(existing.handlers.get('settings:get')().chatSource, 'local');
 });
 
 test('missing key emits an error and always completes the send', async () => {

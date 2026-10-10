@@ -1,0 +1,60 @@
+Whitecube network switch
+=======================
+
+  sudo net-off                 block IP networking until net-on or reboot
+  sudo net-on                  remove Whitecube's block and saved boot setting
+  sudo net-off --status        inspect the live firewall and persistent setting
+  net-off --dry-run            preview without root or any changes
+  sudo net-off --persist       also restore the block on subsequent boots
+  sudo net-off --no-loopback   include local IPv4/IPv6 traffic in the block
+  net-on --help               show the common command options
+
+The package installs both commands by default. Installation does not run net-off.
+The default /etc/whitecube/net-switch.conf is JSON, configured for this machine's
+cube-net controller and wlan0 interface. These two labels describe the environment;
+the firewall covers ALL interfaces, including VPNs and interfaces added later.
+allow_loopback defaults to true so desktop IPC and localhost applications work.
+
+The switch owns one nftables table, inet whitecube_net_lockdown. Its input, output
+and forward chains cover IPv4 and IPv6 and drop existing as well as new connections.
+It does not flush or restore UFW, Docker, iptables, or other nftables tables. net-on
+removes ONLY this table and clears Whitecube's persistence file; all existing
+firewall policy remains effective. ON means this block is absent, not that Wi-Fi
+or the Internet is working. Changes use an atomic nftables transaction, preflight
+checking, live validation, and rollback of only the owned table on failure. Both
+commands share a nonblocking execution lock. A same-named table without Whitecube's
+ownership comment is refused, and a modified owned table is reported by --status.
+
+This is an IP firewall, not a radio/physical kill switch. The radio remains
+associated; Ethernet ARP, Wi-Fi authentication/EAPOL, packet sockets and hardware
+offload are outside this tool's guarantee. Existing hardware/flowtable-offloaded
+forwarding must be disabled separately if used. No such forwarding is configured
+for this Whitecube desktop. Long periods offline may expire leases; cube-net/dhcpcd
+can take time to reacquire connectivity after net-on. The switch does not stop or
+restart services, change interface state, edit Wi-Fi credentials, or alter sysctls.
+An active remote session is interrupted by net-off: run net-on from a local terminal
+to remove the block. Automatic timed restoration is not provided.
+
+Persistence is opt-in. net-off --persist first verifies that the installed systemd
+boot service is enabled. Its root-only /var/lib/whitecube/net-lockdown.json stores
+only the loopback setting, never credentials. A later net-off keeps an existing
+persistent setting and updates its loopback option. net-on always clears it.
+whitecube-net-lockdown.service runs after existing firewall loaders and before
+whitecube-network.service. The network controller requires successful restoration,
+so an invalid saved setting or failed nftables restore prevents its startup.
+Without a saved setting the boot service succeeds without inspecting the firewall.
+Reloading another firewall with a global flush ruleset can remove the lockdown:
+--status reads live kernel state and reports any difference from boot persistence.
+
+Help and dry runs require no privilege and do not access nftables, create locks,
+write backups, or change state. Status is read-only but normally needs sudo for
+CAP_NET_ADMIN; it reports UNKNOWN on inspection errors instead of claiming ON.
+Off/on return 0 on success, 2 on a failure, or 130 on an interruption. A failure
+message explicitly reports any rollback problem; inspect locally before retrying.
+
+Tests (no root, radio, live firewall, or network required):
+  python3 -I net/test_net_switch.py
+The old net-off.sh globally flushed rules, modified sysctls, silently preserved
+established traffic and always persisted changes. It must not be used alongside
+this replacement. Existing blocks left by that old script are foreign firewall
+policy and net-on deliberately does not erase them.

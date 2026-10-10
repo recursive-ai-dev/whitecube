@@ -1199,6 +1199,7 @@ class ChrootablesWindow(Adw.ApplicationWindow):
 
 class ChrootablesApp(Adw.Application):
     def __init__(self, options, manager=None):
+        GLib.set_prgname('org.whitecube.Chrootables')
         super().__init__(application_id='org.whitecube.Chrootables', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.options = options
         self.manager = manager or backend.Manager()

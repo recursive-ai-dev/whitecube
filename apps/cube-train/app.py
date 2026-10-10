@@ -619,6 +619,7 @@ class TrainerWindow(Adw.ApplicationWindow):
 
 class TrainerApp(Adw.Application):
     def __init__(self, options, trainer=None):
+        GLib.set_prgname('org.whitecube.Trainer')
         super().__init__(application_id='org.whitecube.Trainer', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.options = options
         self.trainer = trainer or engine.Trainer()

@@ -45,9 +45,13 @@ Alt+C opens a command panel for the wallpaper:
   pause / step  Toggle running or advance exactly one generation
   edit          Toggle painting (pauses); Alt+V then reveals the field
   clear         Erase the field; glider / blinker plants a 2D pattern
-  seed 123      Reproducible random starting field
-  rule life     Also highlife, diamoeba, daynight, anneal, seeds
+  seed 123      Reproducible random starting field; 'status' shows the current seed
+  rule life     Also highlife, diamoeba, daynight, anneal, seeds, or any B/S rule
+                such as 'rule B36/S23' (B0 is refused: it would strobe)
   rotate left   Rotate 3D positions; 'rotate right' goes the other way
+  spin          The 3D volume drifts slowly; 'spin off' holds it still
+  status        Show rule, seed, generation and speed without changing anything
+  @HDMI-A-1 ... Send a command to one monitor only (each monitor has its own field)
   slice 8       View layer 0..17; 'slice next' or 'slice all'
   save name     Save exact cells, rule and random state
   replay name   Restore the saved world and start its evolution
@@ -65,13 +69,18 @@ a layer. Alt+V returns to the control panel; 'edit' again resumes simulation.
 Saved worlds live under ~/.local/state/whitecube-ca (or XDG_STATE_HOME).
 After edits/replays, automatic rule changes are disabled until 'loop'.
 The volume uses all 26 neighbours, B5/S4,5; its geometry rotates in 3D.
-Fullscreen applications or temperature >=75 C reduce animation to 2 ticks/s.
-Otherwise 2D runs at 10-14 ticks/s and 3D at 8. No missed-tick CPU bursts.
+Fullscreen applications or temperature >=75 C reduce animation to 2 ticks/s;
+on battery everything runs at two thirds speed. Otherwise 2D runs at 10-14 ticks/s
+and 3D at 8. A covered or switched-off screen does not simulate or draw at all,
+and a paused field draws nothing. Rule changes crossfade; cubes cool from white
+toward steel blue the longer they survive. HiDPI screens get sharp cubes (the
+cosmos stays at scale 1). Every monitor runs its own field; set CUBE_CA_SINGLE=1
+for the old single-surface behaviour.
 The cosmos runs at 20 frames/s (2 under pressure, 1 with reduced motion). The cell
 field keeps evolving underneath: its density shapes the land and gas, and live
 cells are the lights on land and on the planet's night side. 3D and edit are
 unavailable while it runs. Start with it on: cosmos=1 in the whitecube config
-or CUBE_CA_COSMOS=1. The automatic journey takes about four minutes, then rewinds.
+or CUBE_CA_COSMOS=1 (CUBE_CA_COSMOS=0 overrides the config). The automatic journey takes about four minutes, then rewinds.
 
 Scripts is a real foot terminal with a PTY. Alt+B hides it without closing
 scripts; Alt+F resizes the same PTY for curses/bash games. Cube tabs can also

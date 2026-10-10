@@ -39,15 +39,24 @@ for f in bin/*; do
   [[ -f $f ]] && install -m 0755 "$f" "$bin/$(basename "$f")"
 done
 install -m 0755 net/cube-net "$bin/cube-net"
+install -m 0755 net/net-off net/net-on "$bin/"
 install -m 0755 tools/whitecube-migrate "$bin/whitecube-migrate"
 
 # --- root helpers
 install -m 0755 libexec/cube-settings-helper "$lib/cube-settings-helper"
 install -m 0755 net/cube-net-dns "$lib/cube-net-dns"
+install -m 0755 net/whitecube-net-switch "$lib/whitecube-net-switch"
 
 # --- network service and its default configuration
 install -m 0644 net/whitecube-network.service "$dest/usr/lib/systemd/system/whitecube-network.service"
 install -m 0644 net/dhcpcd.conf "$dest/etc/whitecube/network/dhcpcd.conf"
+install -m 0644 net/net-switch.conf "$dest/etc/whitecube/net-switch.conf"
+install -m 0644 net/whitecube-net-lockdown.service "$dest/usr/lib/systemd/system/whitecube-net-lockdown.service"
+# Restore only an explicitly saved lockdown at boot. Installing the package
+# does not start this service or change the live firewall/network connection.
+install -d -m 0755 "$dest/usr/lib/systemd/system/multi-user.target.wants" "$dest/usr/lib/systemd/system/whitecube-network.service.d"
+ln -s ../whitecube-net-lockdown.service "$dest/usr/lib/systemd/system/multi-user.target.wants/whitecube-net-lockdown.service"
+install -m 0644 net/whitecube-network.net-lockdown.conf "$dest/usr/lib/systemd/system/whitecube-network.service.d/net-lockdown.conf"
 install -m 0644 data/config.example "$dest/etc/whitecube/config"
 
 # --- shared data
@@ -121,6 +130,7 @@ install -m 0644 LICENSE NOTICE "$doc/"
 install -m 0644 packaging/debian/copyright "$doc/copyright"
 install -m 0644 data/sudoers/whitecube-settings "$doc/sudoers-whitecube-settings.example"
 install -m 0644 data/sudoers/whitecube-settings.hardened "$doc/sudoers-whitecube-settings.hardened.example"
+install -m 0644 net/NET-SWITCH.txt "$doc/NET-SWITCH.txt"
 [[ -f README.md ]] && install -m 0644 README.md "$doc/README.md"
 
 # Source workspaces can use umask 077. Installed shared apps, launchers, icons

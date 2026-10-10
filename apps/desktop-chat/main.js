@@ -178,12 +178,15 @@ function registerHotkey() {
   }
 }
 
-const gotLock = app.requestSingleInstanceLock();
+// Electron/Chromium may normalize or reorder argv on a repeat launch. Carry
+// the original arguments as additional data so checkpoint IDs stay exact.
+const gotLock = app.requestSingleInstanceLock({ whitecubeArgs: process.argv.slice(1) });
 if (!gotLock) {
   app.quit();
 } else {
-  app.on('second-instance', (evt, argv) => {
-    const a = parseArgs(argv || []);
+  app.on('second-instance', (evt, argv, workingDirectory, additionalData) => {
+    const original = additionalData?.whitecubeArgs;
+    const a = parseArgs(Array.isArray(original) && original.every(value => typeof value === 'string') ? original : argv || []);
     if (a.quit) { isQuitting = true; app.quit(); }
     else if (a.checkpoint) { requestCheckpoint(a.checkpoint); showWindow(false); }
     else if (a.settings) openSettings();
