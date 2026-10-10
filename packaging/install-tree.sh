@@ -117,6 +117,8 @@ install -m 0644 data/fnott.ini "$dest/etc/skel/.config/fnott/fnott.ini"
 
 # --- documentation and examples
 cp -a docs/. "$doc/"
+install -m 0644 LICENSE NOTICE "$doc/"
+install -m 0644 packaging/debian/copyright "$doc/copyright"
 install -m 0644 data/sudoers/whitecube-settings "$doc/sudoers-whitecube-settings.example"
 install -m 0644 data/sudoers/whitecube-settings.hardened "$doc/sudoers-whitecube-settings.hardened.example"
 [[ -f README.md ]] && install -m 0644 README.md "$doc/README.md"

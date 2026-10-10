@@ -1,6 +1,7 @@
 {
   "name": "desktop-chat",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "Global-hotkey AI chat panel with filesystem tool access",
   "main": "main.js",
   "private": true,

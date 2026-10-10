@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authenticated, private-namespace image operations. GPL-3.0-or-later.
+"""Authenticated, private-namespace image operations. Apache-2.0.
 
 Based on the ISO-editing workflow of Cubic, Copyright 2015, 2020 PJ Singh.
 Privilege is requested per operation through sudo in an interactive terminal.

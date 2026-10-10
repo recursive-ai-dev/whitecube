@@ -110,9 +110,10 @@ mount namespace.
 
 ## Source and licensing
 
-`COPYING` contains the GNU GPL version 3. `NOTICE` identifies Cubic and the
-workflow adaptation. `upstream/extraction.json` records the original AppImage’s
-SHA256 and extraction offset; `upstream/cubic-2022.01.70/` contains the preserved
-AppDir. The upstream extraction and tests are excluded from the installed
-runtime. Cubic’s original artwork has a separate CC-BY-NC-SA license; cube-editor
-uses fresh Whitecube cube branding.
+cube-editor is licensed under the Apache License 2.0 (`COPYING`). `NOTICE`
+credits Cubic, whose workflow it follows; cube-editor contains no Cubic code.
+`upstream/extraction.json` records the SHA256 and extraction offset of a Cubic
+AppImage kept locally for reference. The extraction itself
+(`upstream/cubic-2022.01.70/`) is neither committed nor installed and keeps
+Cubic’s GPL-3.0 and CC-BY-NC-SA licenses; cube-editor uses fresh Whitecube cube
+branding.

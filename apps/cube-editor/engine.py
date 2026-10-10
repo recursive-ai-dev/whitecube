@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cube Editor's project and process API. GPL-3.0-or-later.
+"""Cube Editor's project and process API. Apache-2.0.
 
 ISO workflow informed by Cubic, Copyright 2015, 2020 PJ Singh.
 The original sources and copyright notices are retained in upstream/.

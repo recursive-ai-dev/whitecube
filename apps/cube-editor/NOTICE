@@ -1,37 +1,19 @@
 cube-editor — Whitecube ISO customization editor
+Copyright 2026 recursive-ai-dev
+Licensed under the Apache License, Version 2.0 (see COPYING).
 
-Cubic provenance
-----------------
-This program adapts the ISO customization workflow of Cubic (Custom Ubuntu
-ISO Creator), Copyright (C) 2015, 2020 PJ Singh <psingh.cubic@gmail.com>.
-The examined upstream distribution is Cubic-Focal-2022.01.70-x86_64.AppImage.
-Its original file remains at ~/cubic/program/appimage/; the complete local
-extraction and its SHA-256 provenance are recorded under upstream/.
+Credit
+------
+cube-editor follows the ISO customization workflow of Cubic (Custom Ubuntu ISO
+Creator) by PJ Singh: analyze a source ISO and its boot metadata, extract the
+compressed live filesystem, edit a project root, regenerate squashfs and
+filesystem metadata, and export a bootable ISO with checksums. cube-editor is an
+independent implementation and contains no Cubic code or artwork.
 
-Cubic source headers permit redistribution and modification under the GNU
-General Public License, version 3 or (at your option) any later version.
-The complete GPL version 3 text is included in COPYING. Corresponding source
-for cube-editor is maintained in this directory in the Whitecube repository.
-Upstream authorship and license notices remain in the extracted source.
+A Cubic AppImage extraction may be kept locally under upstream/ as a reference;
+upstream/extraction.json records its SHA-256 and extraction offset. The
+extraction is neither part of this repository nor of the package, and it keeps
+Cubic's own licenses: GPL-3.0-or-later for its code and CC BY-NC-SA 4.0 for its
+icons.
 
-Workflow adaptation
--------------------
-The adapted workflow analyzes the source ISO and boot metadata, extracts its
-compressed live filesystem, edits a project root, regenerates squashfs and
-filesystem metadata, and exports a bootable customized ISO with checksums.
-The application shell, navigation, project model, jobs, diagnostics, recipes,
-and cube-editor branding are Whitecube changes. The preserved Cubic source
-provides an inspectable reference for the adaptation.
-
-Artwork
--------
-Upstream Cubic icons are identified as Creative Commons
-Attribution-NonCommercial-ShareAlike 4.0 in its package copyright file.
-They are retained only in the upstream reference extraction. cube-editor uses
-new Whitecube cube artwork rather than redistributing the Cubic application
-icon as its branding. Other bundled upstream assets retain their original
-licenses in the upstream extraction; that full AppImage runtime is a reference
-artifact rather than a cube-editor runtime dependency.
-
-No endorsement by the Cubic author is implied. GNU GPL software is supplied
-without warranty; see COPYING for the full license terms.
+No endorsement by the Cubic author is implied.

@@ -1,0 +1,26 @@
+Whitecube
+Copyright 2026 recursive-ai-dev
+
+Licensed under the Apache License, Version 2.0 (see LICENSE). Every part of this
+repository written for Whitecube uses it: the compositor, panels and settings,
+the network controller, the workspace suite, Cube Editor, Chrootables and
+chrootable-manager, Whitecube Trainer, Desktop Chat, Command Center, cube-apps
+and the wc command suite.
+
+Third-party files in this repository keep their own licenses:
+
+- workspace/web/vendor/ (xterm.js, xterm.css, addon-fit.js): the xterm.js
+  authors, MIT License; see workspace/web/vendor/LICENSE-xterm.
+- data/wallpapers/cube-*-Alejandro_Escamilla.jpg: photographs by Alejandro
+  Escamilla, obtained through Lorem Picsum from Unsplash, under the Unsplash
+  License (https://unsplash.com/license).
+
+Cube Editor follows the ISO customization workflow of Cubic by PJ Singh. It is
+an independent implementation and contains no Cubic code or artwork.
+
+The Debian package additionally bundles, under their own licenses:
+
+- wlroots (MIT) and cairo (LGPL-2.1 or MPL-1.1), in /usr/lib/whitecube;
+- the Electron runtime of Desktop Chat (MIT, with the Chromium component
+  licenses listed in LICENSES.chromium.html in
+  /usr/lib/whitecube/desktop-chat-runtime).

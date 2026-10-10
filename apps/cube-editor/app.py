@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""cube-editor: a native Whitecube image studio. GPL-3.0-or-later."""
+"""cube-editor: a native Whitecube image studio. Apache-2.0."""
 from __future__ import annotations
 
 import argparse

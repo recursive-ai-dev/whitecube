@@ -84,3 +84,8 @@ The same engine is the `chrootable-manager` command, with its own menu and JSON 
 The `wc-*` command suite (`apps/wc-suite`; start with `wc-help`) is installed as `wc-*` commands in `/usr/bin`,
 with its module in `/usr/lib/wc-suite` and completions for bash, zsh and fish. `python3 apps/wc-suite/install.py`
 still installs a per-user copy into `~/.local`, which takes precedence on PATH.
+
+## License
+
+Apache License 2.0; see [LICENSE](LICENSE). [NOTICE](NOTICE) lists the third-party files that keep their own
+licenses (xterm.js, the photographic wallpapers) and the libraries the package bundles.
