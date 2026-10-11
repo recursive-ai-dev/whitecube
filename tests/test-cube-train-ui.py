@@ -9,6 +9,7 @@ import tempfile
 import time
 import traceback
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -24,6 +25,8 @@ def inside(fixture, screenshots):
     engine.atomic_json(run / 'run.json', {'steps': 10, 'model_size': '5m', 'parameters': 4_987_448,
                                           'display_name': 'Native fixture', 'batch_size': 1, 'grad_accum_steps': 1})
     engine.atomic_json(run / 'result.json', {'completed_steps': 4, 'best_val_loss': 2.4, 'stopped_early': True})
+    engine.atomic_json(run / 'progress.json', {'completed_steps': 4, 'loss': 4.5, 'tokens_per_second': 1234,
+                                             'tokens_processed': 4096, 'gradient_norm': 0.8, 'eta_seconds': 65})
     for split in ('train', 'val'): (run / 'data' / f'{split}.bin').write_bytes(b'UI fixture data')
     (run / 'ckpt_best.pt').write_bytes(b'Never loaded or executed')
     (run / 'ckpt_latest.pt').write_bytes(b'Latest UI fixture')
@@ -56,6 +59,58 @@ def inside(fixture, screenshots):
             assert '2.4000' in w.run_detail.get_text()
             assert w.resume_steps.get_value() > 4
             assert 'Fixture log' in w.last_log and len(w.losses) == 3
+            assert '1,234 tokens/s' in w.metrics_label.get_text() and '4,096 tokens processed' in w.metrics_label.get_text()
+            assert 'Gradient norm 0.8' in w.metrics_label.get_text()
+            w.run_search.set_text('no matching run'); w.filter_runs()
+            assert '0 of 1' in w.run_count.get_text()
+            assert not w.run_list.get_row_at_index(0).get_visible()
+            w.run_search.set_text('NATIVE'); w.filter_runs()
+            assert '1 of 1' in w.run_count.get_text()
+            w.run_filter.set_selected(2); assert '0 of 1' in w.run_count.get_text()
+            w.run_filter.set_selected(1); assert '1 of 1' in w.run_count.get_text()
+            w.run_filter.set_selected(0); w.run_search.set_text(''); w.filter_runs()
+            w.resume_steps.set_value(4)
+            assert not w.resume_button.get_sensitive() and 'above 4' in w.resume_hint.get_text()
+            w.resume_steps.set_value(20)
+            assert w.resume_button.get_sensitive() and '16 additional' in w.resume_hint.get_text()
+            w.use_run_settings()
+            assert w.form['name'].get_text() == 'Native fixture (copy)'
+            assert w.size_picker.get_selected() == 2 and w.form['batch_size'].get_value() == 1
+            w.save_draft(); assert trainer.preferences()['draft_name'] == 'Native fixture (copy)'
+            w.form['batch_size'].set_value(2); w.form['grad_accum_steps'].set_value(3)
+            assert '1,536 byte tokens' in w.batch_summary.get_text()
+            with patch.object(app.engine, 'read_metrics', wraps=app.engine.read_metrics) as read:
+                w.refresh(); w.refresh(); assert read.call_count == 0
+                with (run / 'train_log.jsonl').open('a') as metrics:
+                    metrics.write('\n' + json.dumps({'step': 4, 'total_loss': 4.4}))
+                w.refresh(); assert read.call_count == 1 and len(w.losses) == 4
+            w.stack.set_visible_child_name('activity')
+            assert not w.key_pressed(None, app.Gdk.KEY_Return, 0, app.Gdk.ModifierType.CONTROL_MASK)
+            assert w.key_pressed(None, app.Gdk.KEY_f, 0, app.Gdk.ModifierType.CONTROL_MASK)
+            w.log_search.set_text('fixture'); w.find_log(restart=True)
+            assert 'line 1' in w.log_search_status.get_text() and not w.follow.get_active()
+            w.log_search.set_text('absent'); w.find_log(restart=True)
+            assert 'No matches' in w.log_search_status.get_text()
+            w.log_search.set_text(''); w.find_log(restart=True); w.follow.set_active(True)
+            exports = []
+            with patch.object(w, 'choose_export', side_effect=lambda title, name, produce: exports.append((name, produce()))):
+                w.export_log(); w.export_metrics(); w.export_report()
+            assert 'Fixture log' in exports[0][1] and 'total_loss' in exports[1][1]
+            assert json.loads(exports[2][1])['configuration']['model_size'] == '5m'
+            for name, text in exports:
+                app.write_export(fixture / name, text)
+                assert (fixture / name).read_bytes().decode('utf-8') == text
+            moved = fixture / 'temporarily-moved-run'
+            run.rename(moved); w.sample_output.set_text('Old preview'); w.refresh()
+            assert w.selected_id is None and not w.losses and not w.sample_output.get_text()
+            assert 'Choose a run' in w.run_detail.get_text() and not w.resume_button.get_sensitive()
+            moved.rename(run); w.refresh()
+            assert w.selected_id == 'fixture-run' and len(w.losses) == 4
+            w.sample_kind.set_selected(1); assert w.sample_button.get_sensitive()
+            (run / 'ckpt_best.pt').rename(run / 'best-backup')
+            w.refresh(True); assert w.sample_button.get_sensitive()
+            w.sample_kind.set_selected(0); assert not w.sample_button.get_sensitive()
+            (run / 'best-backup').rename(run / 'ckpt_best.pt'); w.refresh(True)
             w.copy_path(); assert w.get_display().get_clipboard().get_formats().to_string()
             w.rename()
             dialog = w.get_visible_dialog(); assert dialog
@@ -112,7 +167,7 @@ def inside(fixture, screenshots):
         def capture_next(self):
             try: self.page = next(self.pages)
             except StopIteration:
-                print('PASS: native model options, run selection, rename, resume targets, deletion confirmation, cooling controls, loss graph, logs, saved settings, shortcuts, report and Chat commands, invalid-start recovery')
+                print('PASS: native model options, run selection/search/filters, rename, resume validation, run-settings reuse, deletion confirmation, cooling controls, effective batch summary, cached loss graph, log search/follow, draft names, contextual shortcuts, atomic report/metrics/log exports, checkpoint choices, Chat commands, invalid-start recovery')
                 self.quit(); return False
             self.window.stack.set_visible_child_name(self.page)
             app.GLib.timeout_add(350, self.capture); return False

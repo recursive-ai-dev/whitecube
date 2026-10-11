@@ -11,7 +11,7 @@ each account keeps only its own settings in `~/.config/whitecube` and the usual 
 | `src/` | C sources: compositor `whitecube.c`, bar `cube-status.c`, `cube-settings.c`, `cube-ca.c`, `tab-panel.h`; `src/protocols/`, `src/cube-audio/` |
 | `bin/` | commands: session, terminal, web, doctor, scripts, lab, privacy, preferences ... |
 | `libexec/` | root helper `cube-settings-helper` |
-| `net/` | native Wi-Fi/DHCP controller `cube-net`, its systemd unit, apply script, tests |
+| `net/` | native Wi-Fi/DHCP controller `cube-net`, reversible `net-off`/`net-on`, units, tests |
 | `data/` | config example, key list, schemas, wallpapers, `.desktop` entries, sudoers examples, skel dotfiles |
 | `workspace/` | Python workspace suite (served by `whitecube-web`) |
 | `apps/` | `desktop-chat`, `cube-apps`, `cube-editor`, `cube-train`, `chrootables` (packaged); `command-center` (own product, not packaged) |
@@ -36,6 +36,16 @@ tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube
 (bundled X-free wlroots and cairo), `/etc/whitecube` (conffiles) and `/etc/skel`. The package starts no
 service and edits no home directory. The sudoers rule is **not** installed; examples are in
 `/usr/share/doc/whitecube-desktop/`.
+
+## Network switch
+
+`sudo net-off` blocks IPv4/IPv6 on every interface while retaining localhost for local apps.
+`sudo net-on` removes that block and clears its saved boot setting. Both commands preserve the existing
+firewall, native Wi-Fi controller and credentials. Preview with `net-off --dry-run`; inspect actual
+kernel state with `sudo net-off --status`. Use `sudo net-off --persist` to restore the block at boot,
+or `--no-loopback` to also block localhost. Installation leaves the current connection running.
+Defaults in `/etc/whitecube/net-switch.conf` describe this machine's `cube-net`/`wlan0` setup.
+See [net/NET-SWITCH.txt](net/NET-SWITCH.txt) for recovery, scope and persistence details.
 
 ## Moving a machine from the old per-user install
 

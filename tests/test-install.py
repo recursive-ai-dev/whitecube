@@ -10,11 +10,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parent.parent / 'tools' / 'INSTALL-USER.py'
+ROOT = Path(__file__).resolve().parent.parent
+SCRIPT = ROOT / 'tools' / 'INSTALL-USER.py'
+# /tmp may be mounted noexec and the installer checks X_OK: keep scratch files in build/.
+SCRATCH = ROOT / 'build' if (ROOT / 'build').is_dir() else None
 
 class InstallTest(unittest.TestCase):
     def test_install_preserves_config_and_records_originals(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(prefix='install-test-', dir=SCRATCH) as directory:
             root = Path(directory)
             project, account = root / 'project', root / 'account'
             (project / 'build').mkdir(parents=True)

@@ -1,6 +1,7 @@
 """Native trainer's process and run management (stdlib only; no torch in GTK)."""
 import fcntl
 import json
+import math
 import os
 import re
 import shlex
@@ -8,6 +9,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from urllib.parse import quote
 from datetime import datetime, timezone
@@ -19,13 +21,42 @@ sys.path.insert(0, str(PIPELINE))
 from files import atomic_json
 from model_presets import MODEL_PRESETS, DESKTOP_SIZES
 
+LIMITS = {'steps': (1, 10_000_000), 'max_tokens': (6000, 10_000_000_000),
+          'batch_size': (1, 256), 'grad_accum_steps': (1, 256), 'cpu_threads': (1, 128),
+          'max_temp': (50, 90), 'max_cpu_temp': (50, 95), 'schedule_steps': (0, 10_000_000),
+          'burst_seconds': (1, 3600), 'cooldown_seconds': (1, 600)}
 
-def read_json(path):
+
+def finite_number(value):
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def nonnegative_int(value, default=0):
+    return int(value) if finite_number(value) and value >= 0 and value == int(value) else default
+
+
+def strict_json(text):
+    def invalid(value):
+        raise ValueError(f'Nonfinite JSON value: {value}')
+    def number(value):
+        result = float(value)
+        if not math.isfinite(result):
+            return invalid(value)
+        return result
+    return json.loads(text, parse_constant=invalid, parse_float=number)
+
+
+def read_json(path, max_bytes=1024 * 1024):
     try:
         path = Path(path)
-        value = json.loads(path.read_text()) if path.stat().st_size < 1024 * 1024 else {}
+        with path.open('rb') as handle:
+            data = handle.read(max_bytes + 1)
+        value = strict_json(data.decode('utf-8')) if len(data) <= max_bytes else {}
         return value if isinstance(value, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError, RecursionError):
         return {}
 
 
@@ -34,10 +65,9 @@ def now():
 
 
 def friendly_name(value):
-    value = str(value).strip()
-    if len(value) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+    if not isinstance(value, str) or len(value.strip()) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in value):
         raise ValueError('Use a name of up to 80 characters without line breaks.')
-    return value
+    return value.strip()
 
 
 def default_python():
@@ -61,17 +91,29 @@ def probe_runtime(executable):
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError('Choose an absolute path to a Python executable with PyTorch and NumPy installed.')
     code = "import json,torch,numpy,importlib.util; print(json.dumps({'torch':torch.__version__,'cuda':torch.cuda.is_available(),'gpu':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,'parquet':importlib.util.find_spec('pyarrow') is not None}))"
-    result = subprocess.run([str(executable), '-c', code], capture_output=True, text=True, timeout=30)
+    try:
+        result = subprocess.run([str(executable), '-I', '-c', code], capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as error:
+        raise ValueError('Python runtime check timed out after 30 seconds. Check the selected environment.') from error
+    except OSError as error:
+        raise ValueError(f'Unable to start the Python training environment: {error}') from error
     if result.returncode:
         raise ValueError('This Python environment needs PyTorch and NumPy. Choose your training environment, or install python3-torch and python3-numpy for CPU training.\n' + result.stderr[-700:])
     try:
-        return json.loads(result.stdout.splitlines()[-1])
-    except (ValueError, IndexError) as error:
+        info = strict_json(result.stdout.splitlines()[-1])
+        if (not isinstance(info, dict) or not isinstance(info.get('torch'), str)
+                or not isinstance(info.get('cuda'), bool) or not isinstance(info.get('parquet'), bool)
+                or not (info.get('gpu') is None or isinstance(info['gpu'], str))):
+            raise ValueError('Unexpected runtime response')
+        return info
+    except (ValueError, IndexError, TypeError) as error:
         raise ValueError('Python did not return usable runtime information.') from error
 
 
 def process_identity(pid):
     try:
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            return None
         stat = Path(f'/proc/{int(pid)}/stat').read_text().rsplit(')', 1)[1].split()
         if stat[0] == 'Z':
             return None
@@ -81,7 +123,9 @@ def process_identity(pid):
 
 
 def job_running(job):
-    return bool(job.get('pid') and process_identity(job['pid']) == job.get('identity'))
+    identity = job.get('identity')
+    return bool(isinstance(identity, dict) and identity.get('start_ticks') and identity.get('boot_id')
+                and process_identity(job.get('pid')) == identity)
 
 
 def tail_text(path, limit=48_000):
@@ -90,7 +134,7 @@ def tail_text(path, limit=48_000):
             handle.seek(0, 2)
             handle.seek(max(0, handle.tell() - limit))
             return handle.read().decode('utf-8', errors='replace')
-    except OSError:
+    except (OSError, ValueError, TypeError):
         return ''
 
 
@@ -99,29 +143,54 @@ class Trainer:
         self.home = Path(home or Path.home())
         self.state = Path(state or os.environ.get('XDG_STATE_HOME', self.home / '.local/state')) / 'whitecube/trainer'
         self.config = Path(config or os.environ.get('XDG_CONFIG_HOME', self.home / '.config')) / 'whitecube/trainer.json'
-        self.runs_dir = Path(os.environ.get('WHITECUBE_TRAIN_OUT', self.home / 'train-out')).expanduser()
+        self.runs_dir = Path(os.environ.get('WHITECUBE_TRAIN_OUT', self.home / 'train-out')).expanduser().resolve()
         self.children = []
         self.pending_jobs = {}
 
     def preferences(self):
-        return {'python': default_python(), 'dataset': str(self.home / 'train-in'),
+        defaults = {'python': default_python(), 'dataset': str(self.home / 'train-in'), 'draft_name': '',
                 'model_size': '2m', 'steps': 1000, 'max_tokens': 20_000_000, 'batch_size': 4,
                 'grad_accum_steps': 4, 'device': 'cuda', 'cpu_threads': 2, 'max_temp': 70,
                 'max_cpu_temp': 85, 'column': '', 'schedule_steps': 0,
                 'stagger_training': False, 'burst_seconds': 30, 'cooldown_seconds': 10,
-                'low_priority': False, **read_json(self.config)}
+                'low_priority': False}
+        saved = read_json(self.config)
+        for key, default in defaults.items():
+            value = saved.get(key, default)
+            if key in LIMITS:
+                low, high = LIMITS[key]
+                if not (finite_number(value) and value == int(value) and low <= value <= high):
+                    continue
+                value = int(value)
+            elif type(value) is not type(default):
+                continue
+            if key == 'model_size' and value not in MODEL_PRESETS:
+                continue
+            if key == 'device' and value not in ('cuda', 'cpu'):
+                continue
+            defaults[key] = value
+        return defaults
 
     def save_preferences(self, values):
-        atomic_json(self.config, {**self.preferences(), **values})
+        current = self.preferences()
+        atomic_json(self.config, {**current, **{key: value for key, value in values.items() if key in current}})
 
     def jobs(self):
         for child in self.children[:]:
             if child.poll() is not None:
                 self.children.remove(child)
+        self.pending_jobs = {path: entry for path, entry in self.pending_jobs.items()
+                             if entry['child'].poll() is None}
         jobs = []
         for path in (self.state / 'jobs').glob('*.json'):
             job = read_json(path)
-            if not job:
+            if not job or any(not isinstance(job.get(key), str) or not job[key].strip()
+                              or '\0' in job[key] or not Path(job[key]).is_absolute()
+                              for key in ('run', 'log')):
+                continue
+            try:
+                job['run'] = str(Path(job['run']).resolve())
+            except (OSError, ValueError, RuntimeError):
                 continue
             job['path'] = str(path)
             pending = self.pending_jobs.get(str(path))
@@ -131,13 +200,13 @@ class Trainer:
             if not job['running'] and job.get('state') in ('queued', 'starting', 'running', 'stopping'):
                 job['state'] = 'interrupted'
             jobs.append(job)
-        return sorted(jobs, key=lambda item: item.get('started_at', ''), reverse=True)
+        return sorted(jobs, key=lambda item: str(item.get('started_at', '')), reverse=True)
 
     def active_job(self):
         return next((job for job in self.jobs() if job['running']), None)
 
     def list_runs(self):
-        jobs = {job.get('run'): job for job in reversed(self.jobs())}
+        jobs = {job['run']: job for job in reversed(self.jobs())}
         runs = []
         if not self.runs_dir.is_dir():
             return runs
@@ -148,23 +217,43 @@ class Trainer:
             result = read_json(directory / 'result.json')
             progress = read_json(directory / 'progress.json')
             status = read_json(directory / 'status.json')
-            job = jobs.get(str(directory))
+            job = jobs.get(str(directory.resolve()))
             prepared = all((directory / 'data' / f'{split}.bin').is_file() for split in ('train', 'val'))
-            size = meta.get('model_size') or next((name for name, preset in MODEL_PRESETS.items() if preset['parameters'] == meta.get('parameters')), '1m')
-            completed = max(result.get('completed_steps', 0), progress.get('completed_steps', 0))
+            size = meta.get('model_size')
+            if not isinstance(size, str) or size not in MODEL_PRESETS:
+                size = next((name for name, preset in MODEL_PRESETS.items() if preset['parameters'] == meta.get('parameters')), '1m')
+            completed = max(nonnegative_int(result.get('completed_steps')), nonnegative_int(progress.get('completed_steps')))
             phase = status.get('state') or ('completed' if result and not result.get('stopped_early') else 'stopped' if result else 'prepared' if prepared else 'incomplete')
             if job:
                 if job['running']:
                     phase = 'stopping' if job.get('state') == 'stopping' else status.get('state', 'starting')
                 elif job.get('state') in ('failed', 'interrupted', 'stopped'):
                     phase = job['state']
-            runs.append({'id': directory.name, 'directory': str(directory), 'name': meta.get('display_name') or directory.name,
-                         'size': size, 'parameters': meta.get('parameters'), 'steps': meta.get('steps', 0),
-                         'completed_steps': completed, 'loss': progress.get('loss'),
-                         'val_loss': result.get('best_val_loss'), 'phase': phase, 'prepared': prepared,
+            if phase in ('starting', 'preparing', 'training', 'cooling', 'stopping') and not (job and job['running']):
+                # CLI jobs have no desktop job record: respect their shared lock.
+                if not self.pipeline_busy():
+                    phase = 'interrupted'
+            if not isinstance(phase, str):
+                phase = 'incomplete'
+            name = meta.get('display_name')
+            runs.append({'id': directory.name, 'directory': str(directory), 'name': name if isinstance(name, str) and name else directory.name,
+                         'size': size, 'parameters': nonnegative_int(meta.get('parameters')) or None, 'steps': nonnegative_int(meta.get('steps')),
+                         'completed_steps': completed, 'loss': progress.get('loss') if finite_number(progress.get('loss')) else None,
+                         'val_loss': result.get('best_val_loss') if finite_number(result.get('best_val_loss')) else None, 'phase': phase, 'prepared': prepared,
                          'best': (directory / 'ckpt_best.pt').is_file(), 'latest': (directory / 'ckpt_latest.pt').is_file(),
-                         'detail': status.get('detail', ''), 'job': job, 'meta': meta})
+                         'detail': str(status.get('detail') or (job or {}).get('detail') or ''), 'job': job, 'meta': meta})
         return runs
+
+    def pipeline_busy(self):
+        path = self.home / '.local/state/tensegrity/train.lock'
+        try:
+            with path.open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            pass
+        return False
 
     def find_run(self, run_id):
         run = next((run for run in self.list_runs() if run['id'] == run_id), None)
@@ -214,23 +303,36 @@ class Trainer:
             return destination
 
     def validate(self, values, resume_id=None):
-        values = dict(values)
+        values = {**self.preferences(), **values}
         values['name'] = friendly_name(values.get('name', ''))
-        if values['model_size'] not in MODEL_PRESETS:
+        if not isinstance(values['model_size'], str) or values['model_size'] not in MODEL_PRESETS:
             raise ValueError('Choose a supported model size.')
-        for key, low, high in [('steps', 1, 10_000_000), ('max_tokens', 6000, 10_000_000_000),
-                               ('batch_size', 1, 256), ('grad_accum_steps', 1, 256), ('cpu_threads', 1, 128),
-                               ('max_temp', 50, 90), ('max_cpu_temp', 50, 95), ('schedule_steps', 0, 10_000_000),
-                               ('burst_seconds', 1, 3600), ('cooldown_seconds', 1, 600)]:
-            values[key] = int(values[key])
-            if not low <= values[key] <= high:
+        for key, (low, high) in LIMITS.items():
+            value = values[key]
+            try:
+                integer = int(value)
+                if isinstance(value, bool) or (not isinstance(value, str) and value != integer):
+                    raise ValueError('Not a whole number')
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError(f'{key.replace("_", " ").capitalize()} must be a whole number.') from None
+            if not low <= integer <= high:
                 raise ValueError(f'{key.replace("_", " ").capitalize()} must be between {low:,} and {high:,}.')
+            values[key] = integer
+        for key in ('stagger_training', 'low_priority'):
+            if not isinstance(values[key], bool):
+                raise ValueError(f'{key.replace("_", " ").capitalize()} must be enabled or disabled.')
         if values['device'] not in ('cuda', 'cpu'):
             raise ValueError('Choose GPU or CPU.')
+        if not isinstance(values['python'], str) or not values['python'].strip():
+            raise ValueError('Choose a Python executable with PyTorch installed.')
         python = Path(values['python']).expanduser()
         if not python.is_absolute() or not python.is_file() or not os.access(python, os.X_OK):
             raise ValueError('Choose a Python executable with PyTorch installed.')
         values['python'] = str(python)
+        column = values.get('column', '')
+        if not isinstance(column, str) or (column.strip() and any(not part or any(ord(c) < 32 for c in part) for part in column.strip().split('.'))):
+            raise ValueError('Use a text field name or a dotted path such as document.html.')
+        values['column'] = column.strip()
         if resume_id:
             run = self.find_run(resume_id)
             if not run['prepared'] or not run['meta']:
@@ -240,6 +342,8 @@ class Trainer:
             if values['steps'] <= run['completed_steps']:
                 raise ValueError(f'Resume needs a total step target above {run["completed_steps"]:,}.')
         else:
+            if not isinstance(values['dataset'], str) or not values['dataset'].strip():
+                raise ValueError('Choose an existing corpus file or folder.')
             dataset = Path(values['dataset']).expanduser()
             if not dataset.exists():
                 raise ValueError('Choose an existing corpus file or folder.')
@@ -248,6 +352,9 @@ class Trainer:
                 raise ValueError('The corpus needs TXT, Markdown, JSONL, or Parquet files.')
             if info['empty_files']:
                 raise ValueError('The corpus contains empty or unfinished files: ' + ', '.join(info['empty_files'][:3]))
+            if info['errors']:
+                raise ValueError('Unable to read corpus files: ' + '; '.join(info['errors'][:3]))
+            values['dataset'] = str(dataset.resolve())
             target = self.runs_dir
             while not target.exists():
                 target = target.parent
@@ -259,6 +366,17 @@ class Trainer:
         return values
 
     def start(self, values, *, resume_id=None, prepare_only=False):
+        self.state.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Serialize launch through worker registration, including other app windows.
+        fd = os.open(self.state / 'launch.lock', os.O_WRONLY | os.O_CREAT, 0o600)
+        with os.fdopen(fd, 'a') as launch_lock:
+            try:
+                fcntl.flock(launch_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise ValueError('Another training job is being started. Wait for it to register.') from error
+            return self._start(values, resume_id=resume_id, prepare_only=prepare_only)
+
+    def _start(self, values, *, resume_id=None, prepare_only=False):
         if self.active_job():
             raise ValueError('A training job is already running. Stop it or let it finish.')
         lockdir = self.home / '.local/state/tensegrity'
@@ -295,17 +413,38 @@ class Trainer:
         if values.get('low_priority'):
             command += ['--low-priority']
         job = {'run': str(run), 'command': command, 'log': str(log), 'state': 'queued',
-               'started_at': now(), 'prepare_only': prepare_only, 'stop_requested': False}
+               'started_at': now(), 'prepare_only': prepare_only, 'stop_requested': False,
+               'schema_version': 1}
+        self.save_preferences({key: value for key, value in values.items() if key != 'name'})
         atomic_json(job_path, job)
-        with os.fdopen(os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), 'a') as output:
-            child = subprocess.Popen(['/usr/bin/python3', '-I', str(HERE / 'worker.py'), str(job_path)],
-                                     stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            with os.fdopen(os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600), 'a') as output:
+                child = subprocess.Popen(['/usr/bin/python3', '-I', str(HERE / 'worker.py'), str(job_path)],
+                                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as error:
+            atomic_json(job_path, {**job, 'state': 'failed', 'detail': str(error), 'finished_at': now(), 'exit_code': 1})
+            raise ValueError(f'Unable to start the training worker: {error}') from error
         self.children.append(child)
         job.update(pid=child.pid, identity=process_identity(child.pid))
         self.pending_jobs[str(job_path)] = {'child': child, 'identity': job['identity']}
         # The worker owns subsequent state writes. Never overwrite its progress.
-        self.save_preferences({key: value for key, value in values.items() if key != 'name'})
-        return {**job, 'path': str(job_path), 'running': True}
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            registered = read_json(job_path)
+            if registered.get('pid') == child.pid and registered.get('identity'):
+                return {**registered, 'path': str(job_path), 'running': job_running(registered)}
+            if child.poll() is not None:
+                break
+            time.sleep(.02)
+        if child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill(); child.wait()
+        detail = tail_text(log, 2000) or 'The training worker did not register within five seconds.'
+        atomic_json(job_path, {**job, 'state': 'failed', 'detail': detail, 'finished_at': now(), 'exit_code': child.returncode or 1})
+        raise ValueError(detail)
 
     def stop(self, job):
         latest = read_json(job['path'])
@@ -313,7 +452,10 @@ class Trainer:
             latest = {**latest, 'pid': job.get('pid'), 'identity': job.get('identity')}
         if not job_running(latest):
             raise ValueError('This training job has already stopped.')
-        os.kill(latest['pid'], signal.SIGTERM)
+        try:
+            os.kill(latest['pid'], signal.SIGTERM)
+        except ProcessLookupError as error:
+            raise ValueError('This training job has already stopped.') from error
 
     def chat_command(self, run_id, kind):
         run = self.find_run(run_id)
@@ -324,37 +466,56 @@ class Trainer:
     def report(self, run_id):
         run = self.find_run(run_id)
         directory = Path(run['directory'])
-        return {'application': 'Whitecube Trainer', 'exported_at': now(),
+        corpus_path = directory / 'data/corpus.json'
+        corpus = read_json(corpus_path, max_bytes=16 * 1024 * 1024)
+        warnings = []
+        if corpus_path.exists() and not corpus:
+            warnings.append('Corpus metadata could not be read: it is invalid, unreadable, or exceeds the 16 MiB export limit.')
+        return {'application': 'Whitecube Trainer', 'schema_version': 1, 'exported_at': now(),
                 'run': {key: value for key, value in run.items() if key not in ('job', 'meta')},
                 'configuration': run['meta'], 'model_config': read_json(directory / 'local_config.json'),
-                'corpus': read_json(directory / 'data/corpus.json'), 'result': read_json(directory / 'result.json'),
+                'corpus': corpus, 'report_warnings': warnings, 'result': read_json(directory / 'result.json'),
+                'status': read_json(directory / 'status.json'), 'failure': read_json(directory / 'failure.json'),
+                'progress': read_json(directory / 'progress.json'), 'telemetry': latest_telemetry(directory),
                 'checkpoint_files': [str(path) for path in sorted(directory.glob('ckpt_*.pt'))],
                 'metrics': read_metrics(directory)}
 
 
 def dataset_info(source):
-    source = Path(source)
+    source = Path(source).expanduser()
     extensions = ('.txt', '.md', '.jsonl', '.parquet')
-    files = [source] if source.is_file() and source.suffix.lower() in extensions else list(source.rglob('*')) if source.is_dir() else []
-    supported, empty, size = [], [], 0
+    files = [source] if source.is_file() and source.suffix.lower() in extensions else sorted(source.rglob('*')) if source.is_dir() else []
+    supported, empty, errors, size = [], [], [], 0
+    formats = {}
     for path in files:
-        if path.is_file() and path.suffix.lower() in extensions:
+        if path.suffix.lower() not in extensions:
+            continue
+        try:
+            if not path.is_file():
+                continue
             stat = path.stat()
+            with path.open('rb') as handle:
+                handle.read(1)
             supported.append(str(path))
             size += stat.st_size
+            formats[path.suffix.lower()] = formats.get(path.suffix.lower(), 0) + 1
             if not stat.st_size:
                 empty.append(path.name)
-    return {'files': supported, 'empty_files': empty, 'bytes': size}
+        except OSError as error:
+            errors.append(f'{path}: {error.strerror}')
+    return {'files': supported, 'empty_files': empty, 'bytes': size, 'errors': errors, 'formats': formats}
 
 
 def read_metrics(directory):
     result = []
     for line in tail_text(Path(directory) / 'train_log.jsonl', 200_000).splitlines():
         try:
-            item = json.loads(line)
-            if isinstance(item.get('step'), (int, float)):
-                result.append(item)
-        except (ValueError, TypeError):
+            item = strict_json(line)
+            if isinstance(item, dict) and finite_number(item.get('step')) and item['step'] >= 0:
+                result.append({key: value for key, value in item.items()
+                               if key not in ('total_loss', 'val_loss', 'ce_loss', 'homeo_loss', 'lr', 'tok_s', 'grad_norm')
+                               or finite_number(value)})
+        except (ValueError, TypeError, RecursionError):
             continue
     return result[-1500:]
 
@@ -362,7 +523,11 @@ def read_metrics(directory):
 def latest_telemetry(directory):
     for line in reversed(tail_text(Path(directory) / 'gpu.jsonl', 6000).splitlines()):
         try:
-            return json.loads(line)
-        except ValueError:
+            item = strict_json(line)
+            if isinstance(item, dict):
+                return {key: value for key, value in item.items()
+                        if key not in ('temperature_c', 'cpu_temperature_c', 'memory_used_mib', 'memory_total_mib', 'utilization_pct')
+                        or value is None or finite_number(value)}
+        except (ValueError, TypeError, RecursionError):
             continue
     return {}

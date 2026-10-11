@@ -28,8 +28,8 @@ ownership comment is refused, and a modified owned table is reported by --status
 This is an IP firewall, not a radio/physical kill switch. The radio remains
 associated; Ethernet ARP, Wi-Fi authentication/EAPOL, packet sockets and hardware
 offload are outside this tool's guarantee. Existing hardware/flowtable-offloaded
-forwarding must be disabled separately if used. No such forwarding is configured
-for this Whitecube desktop. Long periods offline may expire leases; cube-net/dhcpcd
+forwarding must be disabled separately if used. Long periods offline may expire
+leases; cube-net/dhcpcd
 can take time to reacquire connectivity after net-on. The switch does not stop or
 restart services, change interface state, edit Wi-Fi credentials, or alter sysctls.
 An active remote session is interrupted by net-off: run net-on from a local terminal

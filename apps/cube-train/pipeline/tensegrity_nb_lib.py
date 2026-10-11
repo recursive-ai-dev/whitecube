@@ -11,6 +11,7 @@ import os
 import json
 import dataclasses
 import time
+import math
 import numpy as np
 import torch
 from files import atomic_json
@@ -49,15 +50,22 @@ def get_batch_mixed(data_dirs, weights, split, batch_size, block_size, device):
     keeps seeing examples of what it already learned (replay-based retention).
     """
     w = np.asarray(weights, dtype=np.float64)
+    if not data_dirs or w.ndim != 1 or len(w) != len(data_dirs):
+        raise ValueError('Provide one sampling weight per nonempty data directory list')
+    if not np.isfinite(w).all() or (w < 0).any() or not np.isfinite(w.sum()) or w.sum() <= 0:
+        raise ValueError('Sampling weights must be finite, nonnegative, and have a positive sum')
+    if split not in ('train', 'val') or any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 1
+                                            for value in (batch_size, block_size)):
+        raise ValueError('Use train/val split and positive integer batch_size and block_size')
     w = w / w.sum()
 
     arrs = []
     for d in data_dirs:
         path = os.path.join(d, f"{split}.bin")
         arr = _get_memmap(path)
-        if len(arr) <= block_size + 1:
+        if len(arr) < block_size + 1:
             raise ValueError(
-                f"{path} has only {len(arr)} tokens, need > block_size+1 ({block_size + 1})."
+                f"{path} has only {len(arr)} tokens, need at least block_size+1 ({block_size + 1})."
             )
         arrs.append(arr)
 
@@ -73,7 +81,7 @@ def get_batch_mixed(data_dirs, weights, split, batch_size, block_size, device):
     for row in range(batch_size):
         arr = arrs[choices[row]]
         max_start = len(arr) - block_size - 1
-        starts[row] = np.random.randint(0, max_start)
+        starts[row] = np.random.randint(0, max_start + 1)
 
     offsets = np.arange(block_size)
     x = np.empty((batch_size, block_size), dtype=np.int64)
@@ -676,17 +684,44 @@ def run_training(model, optimizer, cfg, out_dir, device,
 
     Returns (final_step, best_val_loss).
     """
-    assert init_from in ("scratch", "resume"), (
-        f"init_from must be 'scratch' or 'resume', got {init_from!r}"
-    )
-    assert schedule in ("cosine", "wsd"), f"schedule must be 'cosine' or 'wsd', got {schedule!r}"
+    if init_from not in ('scratch', 'resume'):
+        raise ValueError("init_from must be 'scratch' or 'resume'")
+    if schedule not in ('cosine', 'wsd'):
+        raise ValueError("schedule must be 'cosine' or 'wsd'")
+    integer_settings = {'max_steps': max_steps, 'warmup_steps': warmup_steps,
+                        'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                        'log_interval': log_interval, 'eval_interval': eval_interval, 'eval_iters': eval_iters}
+    if schedule_steps is not None:
+        integer_settings['schedule_steps'] = schedule_steps
+    for name, value in integer_settings.items():
+        minimum = 0 if name == 'warmup_steps' else 1
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+            raise ValueError(f'{name} must be an integer >= {minimum}')
+    if isinstance(start_step, bool) or not isinstance(start_step, (int, np.integer)) or start_step < 0:
+        raise ValueError('start_step must be a nonnegative integer')
+    for name, value in {'learning_rate': learning_rate, 'min_lr': min_lr,
+                        'grad_clip': grad_clip, 'ewc_lambda': ewc_lambda}.items():
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f'{name} must be finite and nonnegative')
+    if learning_rate <= 0 or min_lr > learning_rate:
+        raise ValueError('learning_rate must be positive and min_lr must not exceed it')
+    if ewc_lambda > 0 and (ewc_fisher is None or ewc_old_params is None):
+        raise ValueError('Positive ewc_lambda requires fisher and old parameter anchors')
     if schedule == "wsd":
-        assert stable_steps is not None and decay_steps is not None, (
-            "schedule='wsd' requires stable_steps and decay_steps"
-        )
-    assert grad_accum_steps >= 1, (
-        f"grad_accum_steps must be >= 1, got {grad_accum_steps!r}"
-    )
+        if warmup_steps < 1 or not isinstance(stable_steps, int) or stable_steps < 0 or not isinstance(decay_steps, int) or decay_steps < 1:
+            raise ValueError("schedule='wsd' requires positive warmup/decay and nonnegative stable_steps")
+    if isinstance(data_dirs, (str, os.PathLike)):
+        data_dirs = [os.fspath(data_dirs)]
+    else:
+        data_dirs = [os.fspath(path) for path in data_dirs]
+    if not data_dirs:
+        raise ValueError('At least one prepared data directory is required')
+    if data_weights is None:
+        data_weights = [1.0] * len(data_dirs)
+    weights = np.asarray(data_weights, dtype=np.float64)
+    if weights.ndim != 1 or len(weights) != len(data_dirs) or not np.isfinite(weights).all() or (weights < 0).any() or not np.isfinite(weights.sum()) or weights.sum() <= 0:
+        raise ValueError('Provide finite nonnegative data_weights with a positive sum, one per data directory')
+    device = str(device)
 
     os.makedirs(out_dir, exist_ok=True)
     device_type = "cuda" if "cuda" in device else ("mps" if device == "mps" else "cpu")
@@ -722,8 +757,9 @@ def run_training(model, optimizer, cfg, out_dir, device,
             model.load_state_dict(ckpt_resume["model_state_dict"])
             optimizer.load_state_dict(ckpt_resume["optimizer_state_dict"])
             restore_rng_state(ckpt_resume.get("rng_state"))
-            if ckpt_resume.get("scaler_state_dict") is not None:
-                scaler.load_state_dict(ckpt_resume["scaler_state_dict"])
+            saved_scaler = ckpt_resume.get('scaler_state_dict')
+            if scaler.is_enabled() and saved_scaler:
+                scaler.load_state_dict(saved_scaler)
 
             # Checkpoints are saved with the step number that was just completed
             # (see the save_checkpoint calls below, before `step += 1`), so resuming
@@ -732,6 +768,9 @@ def run_training(model, optimizer, cfg, out_dir, device,
             best_val_loss = ckpt_resume["best_val_loss"]
             saved_training = ckpt_resume.get("training_state")
             if saved_training:
+                batching = {'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps}
+                if saved_training.get('batching', batching) != batching:
+                    raise ValueError('Resume batch_size and grad_accum_steps must match the saved training plan')
                 plan = saved_training["schedule"]
                 schedule = plan["kind"]
                 warmup_steps = plan["warmup_steps"]
@@ -757,11 +796,10 @@ def run_training(model, optimizer, cfg, out_dir, device,
             print(f"[resume] no checkpoint found at {latest_path}; starting from scratch "
                   f"(start_step={start_step}, best_val_loss={best_val_loss})")
 
-    if isinstance(data_dirs, str):
-        data_dirs = [data_dirs]
-    if data_weights is None:
-        data_weights = [1.0] * len(data_dirs)
-    assert len(data_weights) == len(data_dirs)
+    if max_steps < start_step:
+        raise ValueError(f'max_steps ({max_steps}) cannot be below completed steps ({start_step})')
+    if len(base_lrs) != len(optimizer.param_groups) or any(not math.isfinite(lr) or lr < 0 for lr in base_lrs):
+        raise ValueError('Saved learning rates must match optimizer groups and be finite and nonnegative')
 
     training_state = {
         "schedule": {"kind": schedule, "warmup_steps": warmup_steps,
@@ -769,6 +807,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
                      "decay_steps": decay_steps, "learning_rate": learning_rate,
                      "min_lr": min_lr, "base_lrs": base_lrs},
         "evaluation": {"version": 1, "seed": 2026, "iters": eval_iters},
+        'batching': {'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps},
     }
     log_path = os.path.join(out_dir, "train_log.jsonl")
     log_file = open(log_path, "a")
@@ -783,8 +822,12 @@ def run_training(model, optimizer, cfg, out_dir, device,
         model.train()
         optimizer.zero_grad(set_to_none=True)
         step = start_step
-        t0 = time.time()
+        t0 = time.monotonic()
         last_losses = None
+        last_progress = {}
+        last_evaluated_step = None
+        overflow_retries = 0
+        tokens_per_step = batch_size * grad_accum_steps * cfg.block_size
 
         while step < max_steps:
             if schedule == "wsd":
@@ -821,10 +864,29 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 accum_total += total.item() / grad_accum_steps
                 last_losses = losses
 
-            if grad_clip > 0.0:
-                if scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            if scaler.is_enabled():
+                scaler.unscale_(optimizer)
+            # Reject corrupt gradients before optimizer state or weights are changed.
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), grad_clip if grad_clip > 0 else float('inf'),
+                error_if_nonfinite=not scaler.is_enabled())
+            if scaler.is_enabled() and not torch.isfinite(gradient_norm).item():
+                # GradScaler can recover fp16 overflow by lowering its scale. A
+                # skipped update must not advance the schedule or completed steps.
+                # A norm reduction can overflow even when every individual
+                # gradient is finite. GradScaler's found-inf flag then stays
+                # clear, so calling scaler.step() would still update weights.
+                # Lower the scale explicitly and never step on an invalid norm.
+                scaler.update(new_scale=scaler.get_scale() * scaler.get_backoff_factor())
+                optimizer.zero_grad(set_to_none=True)
+                overflow_retries += 1
+                if overflow_retries >= 16:
+                    raise RuntimeError(f'Persistent nonfinite gradients at step {step}; checkpoint was not replaced')
+                print(f'[train] fp16 overflow at step {step}; retrying with scale {scaler.get_scale():g}', flush=True)
+                if stop_requested is not None and stop_requested(step):
+                    break
+                continue
+            overflow_retries = 0
 
             if scaler.is_enabled():
                 scaler.step(optimizer)
@@ -834,7 +896,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
             optimizer.zero_grad(set_to_none=True)
 
             if step % log_interval == 0:
-                dt = time.time() - t0
+                dt = time.monotonic() - t0
                 ce = last_losses["ce_loss"].item()
                 homeo = last_losses["homeo_loss"].item()
                 conf = last_losses.get("confidence_loss")
@@ -847,19 +909,29 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 lr0 = optimizer.param_groups[0]["lr"]
                 print(f"step {step:6d} | lr {lr0:.2e} (mult {lr_mult:.3f}) | total {accum_total:.4f} "
                       f"(ce {ce:.4f} homeo {homeo:.4f}{conf_str}) | {dt:.1f}s")
+                last_progress = {
+                    'completed_steps': step + 1, 'planned_steps': max_steps,
+                    'loss': accum_total, 'learning_rate': lr0, 'elapsed_seconds': dt,
+                    'tokens_processed': (step + 1) * tokens_per_step,
+                    'tokens_per_second': (step + 1 - start_step) * tokens_per_step / max(dt, 1e-9),
+                    'gradient_norm': float(gradient_norm),
+                    'eta_seconds': max_steps and max(0, max_steps - step - 1) * dt / (step + 1 - start_step),
+                }
                 log_file.write(json.dumps({
                     "step": step, "lr": lr0, "lr_mult": lr_mult, "total_loss": accum_total,
                     "ce_loss": ce, "homeo_loss": homeo, "time": dt,
+                    'gradient_norm': last_progress['gradient_norm'],
+                    'tokens_per_second': last_progress['tokens_per_second'],
                 }) + "\n")
                 log_file.flush()
 
-                atomic_json(os.path.join(out_dir, 'progress.json'), {
-                    'completed_steps': step + 1, 'planned_steps': max_steps,
-                    'loss': accum_total, 'learning_rate': lr0, 'elapsed_seconds': dt,
-                })
+                atomic_json(os.path.join(out_dir, 'progress.json'), last_progress)
 
-            if step > 0 and step % eval_interval == 0:
+            if (step + 1) % eval_interval == 0:
                 val_loss = evaluate(model, data_dirs[0], cfg, device, device_type, amp_dtype, use_amp, eval_iters)
+                if not math.isfinite(val_loss):
+                    raise RuntimeError('Nonfinite validation loss; checkpoint was not replaced')
+                last_evaluated_step = step + 1
                 print(f"step {step:6d} | val_loss[{os.path.basename(data_dirs[0])}] {val_loss:.4f}")
                 log_file.write(json.dumps({"step": step, "val_loss": val_loss, "val_dir": data_dirs[0]}) + "\n")
                 log_file.flush()
@@ -883,7 +955,10 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 print(f"[train] stopping after {step} completed steps; saving checkpoint")
                 break
 
-        val_loss = evaluate(model, data_dirs[0], cfg, device, device_type, amp_dtype, use_amp, eval_iters)
+        if last_evaluated_step != step:
+            val_loss = evaluate(model, data_dirs[0], cfg, device, device_type, amp_dtype, use_amp, eval_iters)
+        if not math.isfinite(val_loss):
+            raise RuntimeError('Nonfinite validation loss; checkpoint was not replaced')
         rng_state = capture_rng_state()
         improved = val_loss < best_val_loss
         best_val_loss = min(best_val_loss, val_loss)
@@ -893,9 +968,18 @@ def run_training(model, optimizer, cfg, out_dir, device,
             save_checkpoint(os.path.join(out_dir, "ckpt_best.pt"), model, optimizer, cfg, step - 1, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
         print(f"[train] done. step={step} final_val_loss[{os.path.basename(data_dirs[0])}]={val_loss:.4f} "
               f"best_val_loss={best_val_loss:.4f}")
+        elapsed = time.monotonic() - t0
+        log_file.write(json.dumps({'step': step - 1, 'completed_steps': step, 'val_loss': val_loss,
+                                   'best_val_loss': best_val_loss, 'event': 'finished'}) + '\n')
+        log_file.flush()
         atomic_json(os.path.join(out_dir, 'progress.json'), {
+            **last_progress,
             'completed_steps': step, 'planned_steps': max_steps, 'best_val_loss': best_val_loss,
-            'elapsed_seconds': time.time() - t0,
+            'elapsed_seconds': elapsed, 'tokens_processed': step * tokens_per_step,
+            'tokens_per_second': (step - start_step) * tokens_per_step / max(elapsed, 1e-9),
+            'loss': accum_total if step > start_step else last_progress.get('loss'),
+            'learning_rate': optimizer.param_groups[0]['lr'],
+            'eta_seconds': 0 if step >= max_steps else last_progress.get('eta_seconds'),
         })
         return step, best_val_loss
     finally:

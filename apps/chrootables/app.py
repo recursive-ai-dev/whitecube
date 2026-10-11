@@ -516,7 +516,8 @@ class ChrootablesWindow(Adw.ApplicationWindow):
             return
         self.set_status('Checking the password with sudo…')
         self.background(lambda: self.manager.authenticate(password),
-                        lambda ok, _error: self.refresh() if ok else self.set_status('Wrong password, or sudo does not allow this account.'))
+                        lambda ok, error: self.refresh() if ok else self.set_status(
+                            str(error) if error else 'Wrong password, or sudo does not allow this account.'))
 
     def ask_password(self, heading, then, retry=False):
         body = ('Chrootables runs chrootable-manager through sudo. Your password goes to sudo once and is never stored.'
@@ -548,10 +549,12 @@ class ChrootablesWindow(Adw.ApplicationWindow):
             return
         self.set_status('Checking the password with sudo…')
 
-        def checked(ok, _error):
+        def checked(ok, error):
             if ok:
                 self.set_status('Unlocked.')
                 then()
+            elif error:
+                self.set_status(str(error))
             else:
                 self.ask_password(heading, then, retry=True)
         self.background(lambda: self.manager.authenticate(password), checked)

@@ -56,13 +56,17 @@ done
 '''
 
 # A stand-in for sudo: -S -v accepts "secret" and remembers it; -n refuses until then.
+# Like real sudo (timestamp.c: "time stamp record sid mismatch") the memory only
+# counts for callers in the same session; FAKE_SUDO_NO_CACHE models timestamp_timeout=0.
 FAKE_SUDO = r'''#!/bin/sh
 marker="$FAKE_SUDO_DIR/authenticated"
+sid=$(cut -d' ' -f6 /proc/$$/stat)
 case "$1" in
-    -S) read -r password; [ "$password" = secret ] && : >"$marker" && exit 0
+    -S) read -r password
+        if [ "$password" = secret ]; then [ -n "$FAKE_SUDO_NO_CACHE" ] || echo "$sid" >"$marker"; exit 0; fi
         echo "Sorry, try again." >&2; exit 1 ;;
     -n) shift
-        if [ ! -e "$marker" ]; then echo "sudo: a password is required" >&2; exit 1; fi
+        if [ "$(cat "$marker" 2>/dev/null)" != "$sid" ]; then echo "sudo: a password is required" >&2; exit 1; fi
         [ "$1" = -v ] && exit 0
         [ "$1" = -- ] && shift
         printf '%s\n' "$*" >"$FAKE_SUDO_DIR/last-command"
@@ -223,7 +227,13 @@ class SudoFlow(unittest.TestCase):
                 self.assertEqual(len(manager.workspaces()), 3)
                 # sudo resets the environment: a custom store is passed explicitly.
                 self.assertIn(f'/usr/bin/env CHROOTABLE_HOME={private} ', (temp / 'last-command').read_text())
+                # A sudo that never keeps the password must not send the window round the dialog again.
+                (temp / 'authenticated').unlink()
+                os.environ['FAKE_SUDO_NO_CACHE'] = '1'
+                with self.assertRaisesRegex(backend.ManagerError, 'will not remember'):
+                    manager.authenticate('secret')
             finally:
+                os.environ.pop('FAKE_SUDO_NO_CACHE', None)
                 private.chmod(0o700)
                 for key, value in saved.items():
                     if value is None:

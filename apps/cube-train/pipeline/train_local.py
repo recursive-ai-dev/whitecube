@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 import tempfile
+import sys
 
 import numpy as np
 import torch
@@ -12,6 +13,7 @@ from tensegrity_lm import TensegrityConfig, TensegrityLM, prepare_data, load_che
 from tensegrity_nb_lib import run_training
 from prepare_folder import prepare_folder
 from model_presets import MODEL_PRESETS
+from files import atomic_json, file_sha256
 
 ROOT = Path(__file__).resolve().parent
 
@@ -37,6 +39,12 @@ def local_config(model_size="1m"):
 
 def train(data_dir, out_dir, *, steps=1000, batch_size=4,
           grad_accum_steps=4, device="cuda", resume=False, stop_requested=None, schedule_steps=None, model_size=None):
+    for name, value in {'steps': steps, 'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                        **({'schedule_steps': schedule_steps} if schedule_steps is not None else {})}.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f'{name} must be a positive integer')
+    if device not in ('cpu', 'cuda'):
+        raise ValueError('device must be cpu or cuda')
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Select --device cpu or check the NVIDIA setup.")
     torch.manual_seed(1337)
@@ -53,21 +61,48 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
                              "Resume without a size flag or start a new run.")
     elif ckpt_path.exists():
         raise FileExistsError("This run has a checkpoint. Use --resume or a new --out-dir.")
+    manifest_path = Path(data_dir) / 'corpus.json'
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        if not isinstance(manifest, dict):
+            raise ValueError(f'{manifest_path} must contain a corpus metadata object')
+        if manifest.get('token_dtype', 'uint16') != 'uint16' or manifest.get('byte_order', sys.byteorder) != sys.byteorder:
+            raise ValueError(f'{manifest_path} uses an incompatible token format or byte order')
+        artifacts = manifest.get('artifacts')
+        if artifacts is not None:
+            if not isinstance(artifacts, dict):
+                raise ValueError(f'{manifest_path} artifacts must be an object')
+            for split in ('train.bin', 'val.bin'):
+                expected = artifacts.get(split)
+                path = Path(data_dir) / split
+                if not isinstance(expected, dict) or not isinstance(expected.get('sha256'), str) or not path.is_file():
+                    raise ValueError(f'{path} is missing a valid corpus integrity record or token file')
+                if path.stat().st_size != expected.get('bytes') or file_sha256(path) != expected['sha256']:
+                    raise ValueError(f'{path} failed corpus integrity verification; restore the prepared corpus or start a new run')
+    for split in ("train", "val"):
+        path = Path(data_dir) / f"{split}.bin"
+        if not path.is_file() or path.stat().st_size // 2 < cfg.block_size + 1:
+            raise ValueError(f"{path} must contain at least {cfg.block_size + 1} tokens")
+        if path.stat().st_size % 2:
+            raise ValueError(f'{path} has an odd byte length; uint16 token data is truncated')
+        tokens = np.memmap(path, dtype=np.uint16, mode='r')
+        try:
+            for offset in range(0, len(tokens), 1_000_000):
+                if np.max(tokens[offset:offset + 1_000_000]) >= cfg.vocab_size:
+                    raise ValueError(f'{path} contains token IDs outside the vocabulary (0-{cfg.vocab_size - 1})')
+        finally:
+            tokens._mmap.close()
     model = TensegrityLM(cfg).to(device)
     count = sum(p.numel() for p in model.parameters())
     if not resume and count != MODEL_PRESETS[model_size or "1m"]["parameters"]:
         raise ValueError(f"Unexpected parameter count: {count:,}")
     print(f"Parameters: {count:,}; context: {cfg.block_size} byte tokens", flush=True)
-    for split in ("train", "val"):
-        path = Path(data_dir) / f"{split}.bin"
-        if not path.is_file() or path.stat().st_size // 2 <= cfg.block_size + 1:
-            raise ValueError(f"{path} must contain at least {cfg.block_size + 2} tokens")
     optimizer = model.configure_optimizer(
         weight_decay=0.1, learning_rate=3e-4, betas=(0.9, 0.95),
         device_type=device, use_muon=False,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "local_config.json").write_text(json.dumps(asdict(cfg), indent=2) + "\n")
+    atomic_json(out_dir / 'local_config.json', asdict(cfg))
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
@@ -78,7 +113,7 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
         batch_size=batch_size, grad_accum_steps=grad_accum_steps,
         log_interval=1 if steps <= 10 else 10,
         eval_interval=50, eval_iters=20,
-        dtype="bfloat16" if device == "cuda" else "float32",
+        dtype="auto",
         init_from="resume" if resume else "scratch",
         stop_requested=stop_requested, schedule_steps=schedule_steps,
     )

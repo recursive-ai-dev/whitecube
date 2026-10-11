@@ -76,7 +76,7 @@ fi
 # though Chat is launched with Ozone Wayland. Native desktop binaries stay X-free.
 chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-runtime)
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
-runtime=(foot fuzzel swaylock swaybg python3 python3-gi python3-cairo python3-gi-cairo python3-yaml
+runtime=(foot fuzzel swaylock swaybg python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
   dhcpcd-base iproute2 nftables seatd)
 for p in "${runtime[@]}"; do pkgs[$p]=1; done

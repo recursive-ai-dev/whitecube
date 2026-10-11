@@ -1,10 +1,14 @@
 #!/usr/bin/python3 -I
 """Whitecube Trainer: GTK4 controls for small local Tensegrity models."""
 import argparse
+import csv
+import io
 import json
 import math
+import os
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -14,7 +18,70 @@ sys.path.insert(0, str(HERE.parent / 'cube-apps'))
 import engine
 from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 
-VERSION = '0.6.1'
+VERSION = '0.7.0'
+
+
+def finite_number(value):
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def format_duration(seconds):
+    if not finite_number(seconds) or seconds < 0:
+        return '—'
+    seconds = int(seconds)
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if days: return f'{days}d {hours}h'
+    if hours: return f'{hours}h {minutes}m'
+    if minutes: return f'{minutes}m {seconds}s'
+    return f'{seconds}s'
+
+
+def loss_series(metrics, key, limit=1200):
+    """Keep malformed telemetry out of Cairo and bound redraw work."""
+    points = sorted((item['step'], item[key]) for item in metrics
+                    if isinstance(item, dict) and finite_number(item.get('step'))
+                    and item['step'] >= 0 and finite_number(item.get(key)))
+    if len(points) <= limit:
+        return points
+    # Preserve peaks and troughs in each bucket, including the final step.
+    bucket = max(1, math.ceil(len(points) / max(1, limit // 2)))
+    sampled = []
+    for offset in range(0, len(points), bucket):
+        chunk = points[offset:offset + bucket]
+        sampled.extend(sorted(set((min(chunk, key=lambda p: p[1]), max(chunk, key=lambda p: p[1])))))
+    return sorted(set([points[0], *sampled, points[-1]]))
+
+
+def metrics_csv(metrics):
+    fields = ['step', *sorted({key for item in metrics if isinstance(item, dict) for key in item if key != 'step'})]
+    stream = io.StringIO(newline='')
+    writer = csv.writer(stream)
+    def spreadsheet_text(value):
+        # Spreadsheet programs may ignore whitespace before formula prefixes.
+        if isinstance(value, str) and value.lstrip().startswith(('=', '+', '-', '@')):
+            return "'" + value
+        return value
+    writer.writerow([spreadsheet_text(field) for field in fields])
+    for item in metrics:
+        if isinstance(item, dict):
+            writer.writerow([spreadsheet_text(item.get(field, '')) for field in fields])
+    return stream.getvalue()
+
+
+def write_export(path, text):
+    path = Path(path)
+    descriptor, staging = tempfile.mkstemp(prefix=f'.{path.name}-', dir=path.parent)
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8', newline='') as handle:
+            handle.write(text); handle.flush(); os.fsync(handle.fileno())
+        os.replace(staging, path)
+    finally:
+        Path(staging).unlink(missing_ok=True)
 
 
 def label(text='', css=None):
@@ -53,6 +120,15 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.last_log = None
         self.save_source = None
         self.runtime_info = None
+        self.closed = False
+        self.inspect_request = 0
+        self.preview_request = 0
+        self.metrics_signature = None
+        self.observed_active = None
+        self.active_job_info = None
+        self.displayed_id = None
+        self.runs = []
+        self.stop_requested = False
         self.toast = Adw.ToastOverlay()
         self.set_content(self.toast)
         layout = box(spacing=0)
@@ -89,7 +165,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.add_controller(controller)
         self.connect('close-request', self.closing)
         self.refresh(True)
-        GLib.timeout_add(1000, self.tick)
+        self.tick_source = GLib.timeout_add(1000, self.tick)
         if not application.options.no_probe:
             GLib.idle_add(self.check_runtime)
 
@@ -104,7 +180,9 @@ class TrainerWindow(Adw.ApplicationWindow):
 
     def field(self, page, title, control, hint=None):
         row = box(spacing=5)
-        row.append(label(title, 'heading'))
+        caption = label(title, 'heading')
+        caption.set_mnemonic_widget(control)
+        row.append(caption)
         row.append(control)
         if hint:
             row.append(label(hint, 'dim-label'))
@@ -113,6 +191,10 @@ class TrainerWindow(Adw.ApplicationWindow):
     def entry(self, key, placeholder=''):
         entry = Gtk.Entry(text=str(self.values.get(key, '')), placeholder_text=placeholder, hexpand=True)
         entry.connect('changed', lambda *_: self.queue_save())
+        if key == 'dataset':
+            entry.connect('changed', self.dataset_changed)
+        if key == 'python':
+            entry.connect('changed', self.runtime_changed)
         self.form[key] = entry
         return entry
 
@@ -138,13 +220,15 @@ class TrainerWindow(Adw.ApplicationWindow):
         corpus.append(self.entry('dataset', '~/train-in'))
         corpus.append(button('Folder…', lambda: self.choose_dataset(True)))
         corpus.append(button('File…', lambda: self.choose_dataset(False)))
-        corpus.append(button('Inspect', self.inspect_dataset))
+        self.inspect_button = button('Inspect', self.inspect_dataset)
+        corpus.append(self.inspect_button)
         self.field(page, 'Corpus', corpus)
         self.dataset_info = label('Choose one corpus file or a folder of shards.', 'dim-label')
         page.append(self.dataset_info)
         row = box(False, 14)
         names = box(); names.set_hexpand(True)
-        self.form['name'] = Gtk.Entry(placeholder_text='e.g. Whitecube stories')
+        self.form['name'] = Gtk.Entry(placeholder_text='e.g. Whitecube stories', text=str(self.values.get('draft_name', '')), max_length=80)
+        self.form['name'].connect('changed', lambda *_: self.queue_save())
         self.field(names, 'Run name', self.form['name'])
         sizes = box(); sizes.set_hexpand(True)
         self.size_picker = Gtk.DropDown.new_from_strings([f'{size.upper()} · {engine.MODEL_PRESETS[size]["parameters"] / 1e6:.2f}M parameters' for size in engine.DESKTOP_SIZES])
@@ -193,12 +277,16 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.field(options, title, self.spin(key, low, high))
         self.field(options, 'Text field override (optional)', self.entry('column', 'text or document.html'))
         advanced.set_child(options); page.append(advanced)
+        self.batch_summary = label('', 'dim-label'); page.append(self.batch_summary)
+        for key in ('batch_size', 'grad_accum_steps'):
+            self.form[key].connect('value-changed', lambda *_: self.update_batch_summary())
+        self.update_batch_summary()
         actions = box(False, 10)
         self.train_actions = actions
         self.prepare_button = button('Prepare corpus only', lambda: self.start(True))
         self.start_button = button('Start training', self.start, True)
         actions.append(self.prepare_button); actions.append(self.start_button); page.append(actions)
-        page.append(label('Runs are saved in ~/train-out. Stop saves a checkpoint after the current step. Training continues when this window closes.', 'dim-label'))
+        page.append(label(f'Runs are saved in {self.trainer.runs_dir}. Stop saves a checkpoint after the current step. Training continues when this window closes.', 'dim-label'))
 
     def footer_actions(self):
         visible = self.stack.get_visible_child_name() == 'train'
@@ -207,6 +295,13 @@ class TrainerWindow(Adw.ApplicationWindow):
     def build_runs(self):
         page = self.page('runs', 'Runs & checkpoints')
         page.append(label('Training runs', 'title-1'))
+        filters = box(False, 8)
+        self.run_search = Gtk.SearchEntry(placeholder_text='Search name, model size, or run ID', hexpand=True)
+        self.run_search.connect('search-changed', lambda *_: self.filter_runs())
+        self.run_filter = Gtk.DropDown.new_from_strings(['All runs', 'With checkpoints', 'Prepared only', 'Needs attention'])
+        self.run_filter.connect('notify::selected', lambda *_: self.filter_runs())
+        filters.append(self.run_search); filters.append(self.run_filter); page.append(filters)
+        self.run_count = label('', 'dim-label'); page.append(self.run_count)
         self.run_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.run_list.add_css_class('boxed-list')
         self.run_list.connect('row-selected', self.run_selected)
@@ -215,7 +310,9 @@ class TrainerWindow(Adw.ApplicationWindow):
         page.append(self.run_detail)
         self.resume_steps = Gtk.SpinButton.new_with_range(1, 10_000_000, 1)
         self.resume_steps.set_value(2000)
+        self.resume_steps.connect('value-changed', lambda *_: self.update_resume_action())
         self.field(page, 'Resume to this total step count', self.resume_steps, 'The saved model size, prepared corpus, batch and accumulation are reused.')
+        self.resume_hint = label('', 'dim-label'); page.append(self.resume_hint)
         actions = box(False, 8)
         self.resume_button = button('Resume run', self.resume, True)
         self.rename_button = button('Rename', self.rename)
@@ -225,6 +322,13 @@ class TrainerWindow(Adw.ApplicationWindow):
         for widget in (self.resume_button, self.rename_button, self.report_button, self.copy_button, self.delete_button):
             actions.append(widget)
         page.append(actions)
+        utilities = box(False, 8)
+        self.duplicate_button = button('Use run settings', self.use_run_settings)
+        self.open_button = button('Open folder', self.open_folder)
+        self.metrics_button = button('Export plotted metrics…', self.export_metrics)
+        for widget in (self.duplicate_button, self.open_button, self.metrics_button):
+            utilities.append(widget)
+        page.append(utilities)
         chats = box(False, 8)
         self.best_button = button('Chat with Best', lambda: self.chat('best'))
         self.latest_button = button('Chat with Latest', lambda: self.chat('latest'))
@@ -232,9 +336,14 @@ class TrainerWindow(Adw.ApplicationWindow):
         page.append(label('Checkpoint preview', 'heading'))
         sample_row = box(False, 8)
         self.sample_prompt = Gtk.Entry(placeholder_text='Short prompt…', text='Once upon a time', hexpand=True)
-        self.sample_button = button('Preview Best', self.sample)
-        sample_row.append(self.sample_prompt); sample_row.append(self.sample_button); page.append(sample_row)
+        self.sample_prompt.connect('activate', lambda *_: self.sample() if self.sample_button.get_sensitive() else None)
+        self.sample_kind = Gtk.DropDown.new_from_strings(['Best', 'Latest'])
+        self.sample_kind.connect('notify::selected', lambda *_: self.refresh())
+        self.sample_button = button('Preview', self.sample)
+        sample_row.append(self.sample_prompt); sample_row.append(self.sample_kind); sample_row.append(self.sample_button); page.append(sample_row)
         self.sample_output = label('', 'cube-hash'); page.append(self.sample_output)
+        self.copy_sample_button = button('Copy preview', self.copy_preview)
+        self.copy_sample_button.set_sensitive(False); page.append(self.copy_sample_button)
 
     def build_activity(self):
         page = self.page('activity', 'Progress & logs')
@@ -244,10 +353,19 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.chart.set_draw_func(self.draw_loss)
         self.chart.set_tooltip_text('Training loss (black) and validation loss (blue), against optimizer steps.')
         page.append(self.chart)
+        page.append(label('Black: training loss · Blue: validation loss · Lower is better', 'dim-label'))
         controls = box(False, 8)
         controls.append(button('Copy log', self.copy_log))
+        self.export_log_button = button('Export displayed log…', self.export_log); controls.append(self.export_log_button)
         self.follow = Gtk.CheckButton(label='Follow latest output', active=True)
+        self.follow.connect('toggled', lambda *_: self.scroll_to_end() if self.follow.get_active() else None)
         controls.append(self.follow); page.append(controls)
+        search = box(False, 8)
+        self.log_search = Gtk.SearchEntry(placeholder_text='Find in displayed log', hexpand=True)
+        self.log_search.connect('activate', lambda *_: self.find_log())
+        self.log_search.connect('search-changed', lambda *_: self.find_log(restart=True))
+        search.append(self.log_search); search.append(button('Find next', self.find_log)); page.append(search)
+        self.log_search_status = label('', 'dim-label'); page.append(self.log_search_status)
         self.log_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.log_scroll = Gtk.ScrolledWindow(hexpand=True, min_content_height=260, vexpand=True)
         self.log_scroll.set_child(self.log_view); page.append(self.log_scroll)
@@ -266,43 +384,64 @@ class TrainerWindow(Adw.ApplicationWindow):
         return values
 
     def queue_save(self):
+        if self.closed:
+            return
         if self.save_source:
             GLib.source_remove(self.save_source)
         self.save_source = GLib.timeout_add(500, self.save_draft)
 
     def save_draft(self):
+        if self.save_source:
+            GLib.source_remove(self.save_source)
         self.save_source = None
         if hasattr(self, 'device_picker'):
             try:
-                self.trainer.save_preferences({key: value for key, value in self.form_values().items() if key != 'name'})
+                values = self.form_values()
+                values['draft_name'] = values.pop('name')
+                self.trainer.save_preferences(values)
             except (OSError, ValueError) as error:
                 self.notify(str(error))
         return False
 
     def closing(self, *_):
+        if self.save_source:
+            GLib.source_remove(self.save_source)
+            self.save_source = None
         self.save_draft()
+        self.closed = True
+        if self.tick_source:
+            GLib.source_remove(self.tick_source)
+            self.tick_source = None
+        self.get_application().window = None
         return False
 
     def notify(self, text):
         self.toast.add_toast(Adw.Toast(title=str(text)[:500]))
 
     def background(self, function, done):
+        def deliver(value, error):
+            if not self.closed:
+                done(value, error)
+            return False
         def work():
             try:
                 value, error = function(), None
             except Exception as exception:
                 value, error = None, exception
-            GLib.idle_add(done, value, error)
+            GLib.idle_add(deliver, value, error)
         threading.Thread(target=work, daemon=True).start()
 
     def check_runtime(self):
-        if self.probing:
+        if self.probing or self.closed:
             return False
         self.probing = True; self.check_button.set_sensitive(False)
         self.runtime_label.set_text('Checking PyTorch, GPU, and Parquet support…')
         executable = self.form['python'].get_text()
         def done(info, error):
             self.probing = False; self.check_button.set_sensitive(True)
+            if executable != self.form['python'].get_text():
+                self.runtime_label.set_text('Python environment changed. Check this runtime before training.')
+                return False
             if error:
                 self.runtime_info = None; self.runtime_label.set_text(str(error))
             else:
@@ -314,6 +453,17 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.background(lambda: engine.probe_runtime(executable), done)
         return False
 
+    def runtime_changed(self, *_):
+        self.runtime_info = None
+        if hasattr(self, 'runtime_label'):
+            self.runtime_label.set_text('Python environment changed. Check this runtime before training.')
+
+    def dataset_changed(self, *_):
+        self.inspect_request += 1
+        if hasattr(self, 'dataset_info'):
+            self.dataset_info.set_text('Corpus changed. Inspect it to check supported files and size.')
+            self.inspect_button.set_sensitive(True)
+
     def choose_dataset(self, folder):
         chooser = Gtk.FileChooserNative(title='Choose corpus folder' if folder else 'Choose corpus file', transient_for=self,
                                         action=Gtk.FileChooserAction.SELECT_FOLDER if folder else Gtk.FileChooserAction.OPEN,
@@ -323,16 +473,33 @@ class TrainerWindow(Adw.ApplicationWindow):
             for pattern in ('*.txt', '*.md', '*.jsonl', '*.parquet'):
                 filt.add_pattern(pattern)
             chooser.add_filter(filt)
+        source = Path(self.form['dataset'].get_text()).expanduser()
+        if source.exists():
+            chooser.set_current_folder(Gio.File.new_for_path(str(source if source.is_dir() else source.parent)))
         def response(dialog, result):
             if result == Gtk.ResponseType.ACCEPT and dialog.get_file():
-                self.form['dataset'].set_text(dialog.get_file().get_path()); self.inspect_dataset()
+                path = dialog.get_file().get_path()
+                if path:
+                    self.form['dataset'].set_text(path); self.inspect_dataset()
+                else:
+                    self.notify('Choose a local corpus file or folder.')
             dialog.destroy()
         chooser.connect('response', response); chooser.show()
 
     def inspect_dataset(self):
-        source = Path(self.form['dataset'].get_text()).expanduser()
+        value = self.form['dataset'].get_text().strip()
+        if not value:
+            self.dataset_info.set_text('Choose an existing corpus file or folder.')
+            return
+        source = Path(value).expanduser()
+        self.inspect_request += 1
+        request = self.inspect_request
+        self.inspect_button.set_sensitive(False)
         self.dataset_info.set_text('Inspecting corpus files…')
         def done(info, error):
+            if request != self.inspect_request:
+                return False
+            self.inspect_button.set_sensitive(True)
             self.dataset_info.set_text(str(error) if error else f'{len(info["files"])} supported files · {info["bytes"] / 1024**2:.1f} MiB · {len(info["empty_files"])} empty files. Full schema checks run before training.')
             return False
         self.background(lambda: engine.dataset_info(source), done)
@@ -347,15 +514,90 @@ class TrainerWindow(Adw.ApplicationWindow):
     def new_run(self):
         self.form['name'].set_text(''); self.stack.set_visible_child_name('train'); self.form['name'].grab_focus()
 
+    def update_batch_summary(self):
+        batch = int(self.form['batch_size'].get_value())
+        accumulation = int(self.form['grad_accum_steps'].get_value())
+        self.batch_summary.set_text(f'Effective batch: {batch * accumulation:,} sequences · {batch * accumulation * 256:,} byte tokens per optimizer step. Gradient accumulation increases this without enlarging each GPU batch.')
+
+    def filter_runs(self):
+        if not hasattr(self, 'run_list'):
+            return
+        query = self.run_search.get_text().strip().casefold()
+        kind = self.run_filter.get_selected()
+        count = 0
+        row = self.run_list.get_first_child()
+        while row:
+            run = getattr(row, 'run_record', None)
+            if run is not None:
+                matches = not query or query in ' '.join(str(run[key]) for key in ('name', 'id', 'size', 'phase')).casefold()
+                matches = matches and (kind == 0 or kind == 1 and (run['best'] or run['latest'])
+                                       or kind == 2 and run['prepared'] and not run['best'] and not run['latest']
+                                       or kind == 3 and run['phase'] in ('failed', 'interrupted', 'incomplete'))
+                row.set_visible(bool(matches)); count += bool(matches)
+            row = row.get_next_sibling()
+        self.run_count.set_text(f'{count} of {len(self.runs)} runs' + (' · No matching runs. Clear the search or change the filter.' if self.runs and not count else ''))
+
+    def update_resume_action(self):
+        if not hasattr(self, 'resume_button'):
+            return
+        run = next((item for item in self.runs if item['id'] == self.selected_id), None)
+        target = int(self.resume_steps.get_value())
+        busy = self.launching or self.sampling or bool(self.active_job_info)
+        possible = bool(run and run['prepared'] and run['meta'] and (run['latest'] or run['completed_steps'] == 0))
+        self.resume_button.set_sensitive(possible and target > run['completed_steps'] and not busy)
+        if not run:
+            message = 'Select a prepared run to resume.'
+        elif not possible:
+            message = 'Resume needs prepared data and the Latest checkpoint for previously trained runs.'
+        elif target <= run['completed_steps']:
+            message = f'Choose a total above {run["completed_steps"]:,} completed steps.'
+        else:
+            message = f'{target - run["completed_steps"]:,} additional optimizer steps.'
+        self.resume_hint.set_text(message)
+
+    def use_run_settings(self):
+        run = self.current_run()
+        if not run:
+            return
+        for key, widget in self.form.items():
+            if key not in run['meta'] or key == 'name':
+                continue
+            value = run['meta'][key]
+            if isinstance(widget, Gtk.SpinButton):
+                if finite_number(value): widget.set_value(value)
+            elif isinstance(widget, Gtk.CheckButton):
+                if isinstance(value, bool): widget.set_active(value)
+            elif isinstance(value, str):
+                widget.set_text(value)
+        if run['size'] in engine.DESKTOP_SIZES:
+            self.size_picker.set_selected(engine.DESKTOP_SIZES.index(run['size']))
+        if run['meta'].get('device') in ('cpu', 'cuda'):
+            self.device_picker.set_selected(0 if run['meta']['device'] == 'cuda' else 1)
+        self.form['name'].set_text((run['name'][:73] + ' (copy)')[:80])
+        self.stack.set_visible_child_name('train'); self.queue_save()
+        self.notify('Saved run settings copied into a new training plan.')
+
+    def open_folder(self):
+        run = self.current_run()
+        if run:
+            try:
+                Gio.AppInfo.launch_default_for_uri(Path(run['directory']).as_uri(), self.get_display().get_app_launch_context())
+            except (ValueError, GLib.Error) as error:
+                self.notify(error)
+
     def start(self, prepare_only=False):
         self.launch(self.form_values(), prepare_only=prepare_only)
 
     def resume(self):
+        self.resume_steps.update()
+        self.update_resume_action()
+        if not self.resume_button.get_sensitive():
+            self.notify(self.resume_hint.get_text()); return
         values = self.form_values(); values['steps'] = int(self.resume_steps.get_value())
         self.launch(values, resume_id=self.selected_id)
 
     def launch(self, values, **options):
-        if self.launching:
+        if self.launching or self.sampling:
             return
         self.launching = True; self.refresh(); self.status.set_text('Checking training plan…')
         def done(job, error):
@@ -363,16 +605,20 @@ class TrainerWindow(Adw.ApplicationWindow):
             if error:
                 self.refresh(); self.notify(error); self.status.set_text(str(error))
             else:
+                self.stop_requested = False
                 self.last_job = job; self.selected_id = Path(job['run']).name
                 self.stack.set_visible_child_name('activity'); self.refresh(True)
             return False
         self.background(lambda: self.trainer.start(values, **options), done)
 
     def stop(self):
+        if self.stop_requested:
+            return
         try:
             job = self.trainer.active_job() or self.last_job
             if job:
-                self.trainer.stop(job); self.status.set_text('Stopping; finishing the current step and saving when weights are available…')
+                self.trainer.stop(job); self.stop_requested = True; self.stop_button.set_sensitive(False)
+                self.status.set_text('Stopping; finishing the current step and saving when weights are available…')
         except (ValueError, OSError) as error:
             self.notify(error)
 
@@ -382,27 +628,53 @@ class TrainerWindow(Adw.ApplicationWindow):
     def run_selected(self, _, row):
         if self.rebuilding or row is None:
             return
+        if not hasattr(row, 'run_id'):
+            return
+        changed = self.selected_id != row.run_id
         self.selected_id = row.run_id
         run = self.current_run()
+        if not run:
+            self.refresh(True); return
         self.resume_steps.set_value(max(run['steps'], run['completed_steps'] + 1000))
+        if changed:
+            self.preview_request += 1
+            self.sample_output.set_text(''); self.copy_sample_button.set_sensitive(False)
         self.last_log = None; self.refresh()
 
     def refresh(self, force=False):
         runs = self.trainer.list_runs()
+        self.runs = runs
         active = self.trainer.active_job()
+        self.active_job_info = active
         busy = bool(active) or self.launching
         if active:
             self.last_job = active
+            self.observed_active = active
             if not self.selected_id:
                 self.selected_id = Path(active['run']).name
-        signature = json.dumps([{key: run[key] for key in ('id', 'name', 'phase', 'size', 'completed_steps')} for run in runs])
+        elif self.observed_active:
+            previous = self.observed_active
+            self.observed_active = None; self.stop_requested = False
+            completed = next((run for run in runs if run['directory'] == previous.get('run')), None)
+            if completed:
+                self.notify(f'{completed["name"]}: {completed["phase"]}.')
+        if self.selected_id and not any(run['id'] == self.selected_id for run in runs):
+            self.selected_id = None; self.last_log = None; self.metrics_signature = None
+            self.preview_request += 1; self.sample_output.set_text(''); self.copy_sample_button.set_sensitive(False)
+        if not self.selected_id and runs:
+            self.selected_id = runs[0]['id']
+        if self.displayed_id != self.selected_id:
+            self.displayed_id = self.selected_id
+            self.preview_request += 1; self.sample_output.set_text(''); self.copy_sample_button.set_sensitive(False)
+            self.last_log = None; self.metrics_signature = None
+        signature = json.dumps([{key: run[key] for key in ('id', 'name', 'phase', 'size', 'completed_steps', 'steps', 'prepared', 'best', 'latest')} for run in runs])
         if force or signature != self.run_signature:
             self.run_signature = signature; self.rebuilding = True
             child = self.run_list.get_first_child()
             while child:
                 following = child.get_next_sibling(); self.run_list.remove(child); child = following
             for run in runs:
-                row = Gtk.ListBoxRow(); row.run_id = run['id']
+                row = Gtk.ListBoxRow(); row.run_id = run['id']; row.run_record = run
                 content = box(spacing=3)
                 for setter in ('set_margin_top', 'set_margin_bottom', 'set_margin_start', 'set_margin_end'):
                     getattr(content, setter)(10)
@@ -412,27 +684,56 @@ class TrainerWindow(Adw.ApplicationWindow):
                 if run['id'] == self.selected_id:
                     self.run_list.select_row(row)
             if not runs:
-                self.run_list.append(label('No runs yet. Create one on the Train page.', 'dim-label'))
+                row = Gtk.ListBoxRow(selectable=False, activatable=False)
+                row.set_child(label('No runs yet. Create one on the Train page.', 'dim-label')); self.run_list.append(row)
             self.rebuilding = False
+            self.filter_runs()
         run = next((run for run in runs if run['id'] == self.selected_id), None)
         for widget in (self.start_button, self.prepare_button):
-            widget.set_sensitive(not busy)
-        self.stop_button.set_sensitive(bool(active))
-        self.resume_button.set_sensitive(bool(run and run['prepared'] and run['meta'] and (run['latest'] or run['completed_steps'] == 0) and not busy))
+            widget.set_sensitive(not busy and not self.sampling)
+        self.stop_button.set_sensitive(bool(active) and not self.stop_requested and active.get('state') != 'stopping')
+        self.update_resume_action()
         self.rename_button.set_sensitive(bool(run and run['meta'] and not (run['job'] and run['job']['running'])))
-        self.delete_button.set_sensitive(bool(run and not busy))
+        self.delete_button.set_sensitive(bool(run and not busy and not self.sampling))
         for widget in (self.report_button, self.copy_button):
             widget.set_sensitive(bool(run))
+        self.open_button.set_sensitive(bool(run))
+        self.duplicate_button.set_sensitive(bool(run and run['meta']))
+        self.metrics_button.set_sensitive(bool(run))
         self.best_button.set_sensitive(bool(run and run['best']))
         self.latest_button.set_sensitive(bool(run and run['latest']))
-        self.sample_button.set_sensitive(bool(run and run['best'] and not busy and not self.sampling))
+        checkpoint = 'best' if self.sample_kind.get_selected() == 0 else 'latest'
+        self.sample_button.set_sensitive(bool(run and run[checkpoint] and not busy and not self.sampling))
         if run:
             validation = f'{run["val_loss"]:.4f}' if isinstance(run['val_loss'], (int, float)) else 'not evaluated'
             self.run_detail.set_text(f'{run["name"]}\n{run["directory"]}\n{run["parameters"] or "?":} parameters · validation loss {validation}\nBest: {"saved" if run["best"] else "pending"} · Latest: {"saved" if run["latest"] else "pending"}\n{run["detail"]}')
-            self.losses = engine.read_metrics(run['directory']); self.chart.queue_draw()
+            metrics_path = Path(run['directory']) / 'train_log.jsonl'
+            try:
+                stat = metrics_path.stat()
+                metrics_signature = (str(metrics_path), stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                metrics_signature = (str(metrics_path), None)
+            if force or metrics_signature != self.metrics_signature:
+                self.metrics_signature = metrics_signature
+                self.losses = engine.read_metrics(run['directory']); self.chart.queue_draw()
             latest = next((metric for metric in reversed(self.losses) if 'total_loss' in metric), {})
-            loss = f'{latest["total_loss"]:.4f}' if 'total_loss' in latest else '—'
-            self.metrics_label.set_text(f'Training loss {loss} · best validation {validation} · {run["completed_steps"]:,} completed steps')
+            progress = engine.read_json(Path(run['directory']) / 'progress.json')
+            loss_value = latest.get('total_loss', progress.get('loss'))
+            loss = f'{loss_value:.4f}' if finite_number(loss_value) else '—'
+            self.metrics_label.set_text(f'{run["name"]} · Training loss {loss} · best validation {validation} · {run["completed_steps"]:,} completed steps')
+            performance = []
+            if finite_number(progress.get('tokens_per_second')) and progress['tokens_per_second'] >= 0:
+                performance.append(f'{progress["tokens_per_second"]:,.0f} tokens/s')
+            if finite_number(progress.get('tokens_processed')) and progress['tokens_processed'] >= 0:
+                performance.append(f'{progress["tokens_processed"]:,.0f} tokens processed')
+            if run['job'] and run['job'].get('running') and finite_number(progress.get('eta_seconds')) and progress['eta_seconds'] >= 0:
+                performance.append(f'Estimated remaining {format_duration(progress["eta_seconds"])}')
+            if finite_number(progress.get('gradient_norm')):
+                performance.append(f'Gradient norm {progress["gradient_norm"]:.3g}')
+            if performance:
+                self.metrics_label.set_text(self.metrics_label.get_text() + '\n' + ' · '.join(performance))
+            if run['detail']:
+                self.metrics_label.set_text(self.metrics_label.get_text() + '\n' + str(run['detail']))
             telemetry = engine.latest_telemetry(run['directory'])
             thermal = []
             if telemetry.get('temperature_c') is not None:
@@ -451,6 +752,9 @@ class TrainerWindow(Adw.ApplicationWindow):
             if not busy:
                 self.status.set_text(f'{run["phase"].capitalize()} · {run["name"]}')
         else:
+            self.run_detail.set_text('Choose a run to inspect its checkpoints.')
+            self.losses = []; self.metrics_signature = None; self.chart.queue_draw()
+            self.metrics_label.set_text('Training and validation losses appear here.')
             self.progress.set_fraction(0)
             self.progress.set_text('Preparing…' if busy else 'Ready')
             job = self.last_job
@@ -460,19 +764,28 @@ class TrainerWindow(Adw.ApplicationWindow):
             if not busy:
                 self.status.set_text(f'Job {job.get("state", "ready")}. See logs for details.' if job else 'Ready')
         if active:
-            self.status.set_text('Stopping and saving…' if active.get('state') == 'stopping' else f'Training job active · {Path(active["run"]).name}')
+            active_run = next((item for item in runs if item['directory'] == active['run']), None)
+            phase = active_run['phase'] if active_run else 'starting'
+            self.status.set_text('Stopping and saving…' if active.get('state') == 'stopping' or self.stop_requested else f'{phase.capitalize()} · {active_run["name"] if active_run else Path(active["run"]).name}')
+            if phase in ('preparing', 'starting', 'queued'):
+                self.progress.pulse()
         text = engine.tail_text(logfile) if logfile else ''
+        self.export_log_button.set_sensitive(bool(text))
         if text != self.last_log:
             self.last_log = text
             adjustment = self.log_scroll.get_vadjustment(); previous = adjustment.get_value()
             at_bottom = previous + adjustment.get_page_size() >= adjustment.get_upper() - 24
             self.log_view.get_buffer().set_text(text)
             def restore_scroll():
+                if self.closed:
+                    return False
                 adjustment.set_value(max(0, adjustment.get_upper() - adjustment.get_page_size()) if self.follow.get_active() and at_bottom else previous)
                 return False
             GLib.idle_add(restore_scroll)
 
     def tick(self):
+        if self.closed:
+            return False
         try:
             self.refresh()
         except (OSError, ValueError) as error:
@@ -521,41 +834,93 @@ class TrainerWindow(Adw.ApplicationWindow):
         layout.append(confirm)
         actions = box(False, 10)
         actions.append(button('Cancel', dialog.close))
+        pending = False
         def remove():
-            if not confirm.get_active(): return
+            nonlocal pending
+            if not confirm.get_active() or pending: return
+            pending = True
             kind = choices[picker.get_selected()][0]
             def done(destination, error):
+                nonlocal pending
+                pending = False
                 if error:
                     self.notify(error); remove_button.set_sensitive(confirm.get_active())
+                    confirm.set_sensitive(True); picker.set_sensitive(True)
                 else:
                     if kind == 'run': self.selected_id = None
                     dialog.close(); self.refresh(True); self.notify('Moved to Trash')
                 return False
             remove_button.set_sensitive(False)
+            confirm.set_sensitive(False); picker.set_sensitive(False)
             self.background(lambda: self.trainer.trash(run['id'], kind), done)
         remove_button = button('Move to Trash', remove)
         remove_button.set_sensitive(False)
-        confirm.connect('toggled', lambda *_: remove_button.set_sensitive(confirm.get_active()))
+        confirm.connect('toggled', lambda *_: remove_button.set_sensitive(confirm.get_active() and not pending))
         actions.append(remove_button); layout.append(actions); dialog.set_child(layout); dialog.present(self)
 
     def copy_log(self):
         self.get_display().get_clipboard().set(self.last_log or ''); self.notify('Log copied')
 
+    def scroll_to_end(self):
+        if hasattr(self, 'log_scroll'):
+            adjustment = self.log_scroll.get_vadjustment()
+            adjustment.set_value(max(0, adjustment.get_upper() - adjustment.get_page_size()))
+
+    def find_log(self, restart=False):
+        query = self.log_search.get_text()
+        if not hasattr(self, 'log_view'):
+            return
+        if not query:
+            self.log_search_status.set_text(''); return
+        buffer = self.log_view.get_buffer()
+        start = buffer.get_start_iter() if restart else buffer.get_iter_at_mark(buffer.get_insert())
+        flags = Gtk.TextSearchFlags.CASE_INSENSITIVE | Gtk.TextSearchFlags.TEXT_ONLY
+        match = start.forward_search(query, flags, None)
+        if not match and start.get_offset():
+            match = buffer.get_start_iter().forward_search(query, flags, None)
+        if match:
+            first, last = match
+            buffer.select_range(last, first)
+            self.follow.set_active(False)
+            self.log_view.scroll_to_iter(first, .1, False, 0, 0)
+            self.log_search_status.set_text(f'Match at line {first.get_line() + 1:,}. Enter finds the next match.')
+        else:
+            self.log_search_status.set_text('No matches in the displayed log.')
+
+    def choose_export(self, title, filename, produce):
+        chooser = Gtk.FileChooserNative(title=title, transient_for=self, action=Gtk.FileChooserAction.SAVE,
+                                        accept_label='Export', cancel_label='Cancel')
+        chooser.set_current_name(filename)
+        def response(dialog, result):
+            if result == Gtk.ResponseType.ACCEPT and dialog.get_file():
+                path = dialog.get_file().get_path()
+                if path:
+                    self.background(lambda: write_export(path, produce()),
+                                    lambda _, error: self.notify(error or f'Exported {Path(path).name}'))
+                else:
+                    self.notify('Choose a local destination for the export.')
+            dialog.destroy()
+        chooser.connect('response', response); chooser.show()
+
+    def export_log(self):
+        text = self.last_log or ''
+        self.choose_export('Export displayed log', f'{self.selected_id or "training"}-log.txt', lambda: text)
+
+    def export_metrics(self):
+        if self.selected_id:
+            metrics = list(self.losses)
+            self.choose_export('Export plotted metrics', f'{self.selected_id}-metrics.csv', lambda: metrics_csv(metrics))
+
+    def copy_preview(self):
+        self.get_display().get_clipboard().set(self.sample_output.get_text())
+        self.notify('Preview copied')
+
     def export_report(self):
         if not self.selected_id:
             return
         run_id = self.selected_id
-        chooser = Gtk.FileChooserNative(title='Export training report', transient_for=self, action=Gtk.FileChooserAction.SAVE,
-                                        accept_label='Export', cancel_label='Cancel')
-        chooser.set_current_name(f'{run_id}-report.json')
-        def response(dialog, result):
-            if result == Gtk.ResponseType.ACCEPT and dialog.get_file():
-                try:
-                    engine.atomic_json(dialog.get_file().get_path(), self.trainer.report(run_id)); self.notify('Training report exported')
-                except (ValueError, OSError) as error:
-                    self.notify(error)
-            dialog.destroy()
-        chooser.connect('response', response); chooser.show()
+        self.choose_export('Export training report', f'{run_id}-report.json',
+                           lambda: json.dumps(self.trainer.report(run_id), indent=2, ensure_ascii=False) + '\n')
 
     def chat(self, kind):
         try:
@@ -566,44 +931,69 @@ class TrainerWindow(Adw.ApplicationWindow):
     def sample(self):
         run = self.current_run()
         prompt = self.sample_prompt.get_text().strip()
-        if not run or not prompt or self.sampling:
-            self.notify('Choose a saved Best checkpoint and enter a short prompt.'); return
+        kind = 'best' if self.sample_kind.get_selected() == 0 else 'latest'
+        if not run or not prompt or self.sampling or self.launching or self.trainer.active_job() or not run[kind]:
+            self.notify('Choose an available checkpoint, enter a prompt, and wait for training or preview to finish.'); return
+        self.preview_request += 1
+        request = self.preview_request
+        run_id = run['id']
+        self.copy_sample_button.set_sensitive(False)
         self.sampling = True; self.sample_output.set_text('Generating a short CPU preview…'); self.refresh()
-        command = [self.form['python'].get_text(), '-u', str(engine.PIPELINE / 'preview.py'),
-                   '--checkpoint', str(Path(run['directory']) / 'ckpt_best.pt'), '--prompt', prompt]
+        command = [str(Path(self.form['python'].get_text()).expanduser()), '-u', str(engine.PIPELINE / 'preview.py'),
+                   '--checkpoint', str(Path(run['directory']) / f'ckpt_{kind}.pt'), '--prompt', prompt]
         def work():
             result = subprocess.run(command, capture_output=True, text=True, timeout=45)
             if result.returncode:
                 raise ValueError(result.stderr[-1200:] or 'Preview failed.')
             return result.stdout
         def done(value, error):
-            self.sampling = False; self.sample_output.set_text(str(error) if error else value.strip()); self.refresh()
+            self.sampling = False
+            if request == self.preview_request and run_id == self.selected_id:
+                self.sample_output.set_text(str(error) if error else value.strip())
+                self.copy_sample_button.set_sensitive(not error and bool(value.strip()))
+            self.refresh()
             return False
         self.background(work, done)
 
     def draw_loss(self, _, context, width, height):
         context.set_source_rgb(.94, .94, .94); context.paint()
-        points = [(metric['step'], metric['total_loss']) for metric in self.losses if isinstance(metric.get('total_loss'), (int, float)) and math.isfinite(metric['total_loss'])]
-        val = [(metric['step'], metric['val_loss']) for metric in self.losses if isinstance(metric.get('val_loss'), (int, float)) and math.isfinite(metric['val_loss'])]
+        if width < 100 or height < 65:
+            return
+        points = loss_series(self.losses, 'total_loss')
+        val = loss_series(self.losses, 'val_loss')
         if not points and not val:
             context.set_source_rgb(.25, .25, .25); context.move_to(16, 30); context.show_text('Loss graph appears after the first training step.'); return
         all_points = points + val
         xmax = max(1, max(point[0] for point in all_points))
-        ymin, ymax = min(point[1] for point in all_points), max(point[1] for point in all_points)
-        span = max(.05, ymax - ymin)
+        raw_ymin, raw_ymax = min(point[1] for point in all_points), max(point[1] for point in all_points)
+        # Work in a bounded range: subtracting opposite finite extremes can
+        # overflow, while adding a fixed pad to a large constant can round away.
+        yscale = max(1, abs(raw_ymin), abs(raw_ymax))
+        ymin, ymax = raw_ymin / yscale, raw_ymax / yscale
+        if ymax - ymin < max(.05 / yscale, 1e-15):
+            middle = (ymin + ymax) / 2
+            padding = max(.025 / yscale, abs(middle) * .025, 1e-15)
+            ymin, ymax = middle - padding, middle + padding
+        span = ymax - ymin
         context.set_source_rgb(.1, .1, .1); context.set_line_width(1)
         context.move_to(48, 15); context.line_to(48, height - 32); context.line_to(width - 15, height - 32); context.stroke()
-        context.move_to(5, 25); context.show_text(f'{ymax:.2f}'); context.move_to(5, height - 35); context.show_text(f'{ymin:.2f}')
+        def tick_text(bound, fallback):
+            value = bound * yscale
+            if not math.isfinite(value):
+                value = fallback
+            return f'{value:.3g}' if abs(value) >= 10_000 else f'{value:.2f}'
+        context.move_to(5, 25); context.show_text(tick_text(ymax, raw_ymax))
+        context.move_to(5, height - 35); context.show_text(tick_text(ymin, raw_ymin))
         context.move_to(48, height - 10); context.show_text('0'); context.move_to(width - 90, height - 10); context.show_text(f'{xmax:g} steps')
         for series, color in ((points, (.05, .05, .05)), (val, (.2, .35, .7))):
             context.set_source_rgb(*color); context.set_line_width(2)
             for index, (step, loss) in enumerate(series):
-                x = 48 + step / xmax * (width - 65); y = 15 + (ymax - loss) / span * (height - 47)
+                x = 48 + step / xmax * (width - 65); y = 15 + (ymax - loss / yscale) / span * (height - 47)
                 if index == 0: context.move_to(x, y)
                 else: context.line_to(x, y)
             context.stroke()
             if len(series) == 1:
-                step, loss = series[0]; context.arc(48 + step / xmax * (width - 65), 15 + (ymax - loss) / span * (height - 47), 3, 0, 2 * math.pi); context.fill()
+                step, loss = series[0]; context.arc(48 + step / xmax * (width - 65), 15 + (ymax - loss / yscale) / span * (height - 47), 3, 0, 2 * math.pi); context.fill()
 
     def key_pressed(self, _, key, code, state):
         if self.get_visible_dialog():
@@ -612,7 +1002,14 @@ class TrainerWindow(Adw.ApplicationWindow):
             if key in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3):
                 self.stack.set_visible_child_name(('train', 'runs', 'activity')[key - Gdk.KEY_1]); return True
             if key in (Gdk.KEY_n, Gdk.KEY_N): self.new_run(); return True
-            if key == Gdk.KEY_Return and self.start_button.get_sensitive(): self.start(); return True
+            if key in (Gdk.KEY_f, Gdk.KEY_F):
+                if self.stack.get_visible_child_name() == 'runs': self.run_search.grab_focus()
+                else: self.stack.set_visible_child_name('activity'); self.log_search.grab_focus()
+                return True
+            if key == Gdk.KEY_Return:
+                page = self.stack.get_visible_child_name()
+                if page == 'train' and self.start_button.get_sensitive(): self.start(); return True
+                if page == 'runs' and self.resume_button.get_sensitive(): self.resume(); return True
         if key == Gdk.KEY_F5: self.refresh(True); return True
         return False
 

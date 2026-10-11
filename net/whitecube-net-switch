@@ -17,7 +17,7 @@ OWNER = "Whitecube net-switch v1"
 PRIORITY = -300
 CONFIG = Path("/etc/whitecube/net-switch.conf")
 STATE = Path("/var/lib/whitecube/net-lockdown.json")
-LOCK = Path("/run/lock/whitecube-net-switch.lock")
+LOCK = Path("/run/whitecube-net-switch/lock")
 NFT = "/usr/sbin/nft"
 DEFAULTS = {"allow_loopback": True, "interface": "wlan0", "controller": "cube-net"}
 
@@ -211,12 +211,27 @@ def validate_persistence():
                                 env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"})
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise SwitchError(f"Cannot verify the persistent boot service: {exc}") from exc
-    if result.returncode or result.stdout.strip() != "enabled":
+    state = result.stdout.strip()
+    vendor_enabled = False
+    if state == "disabled":
+        # Vendor .wants links activate a unit, although is-enabled reports disabled
+        # for a unit whose [Install] section has never been enabled in /etc.
+        unit = "whitecube-net-lockdown.service"
+        installed = Path("/usr/lib/systemd/system") / unit
+        for directory in ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system"):
+            dependency = Path(directory) / "multi-user.target.wants" / unit
+            if os.path.lexists(dependency):
+                vendor_enabled = dependency.is_symlink() and installed.is_file() and dependency.resolve() == installed.resolve()
+                break
+    if not ((result.returncode == 0 and state == "enabled") or vendor_enabled):
         raise SwitchError("--persist requires enabled whitecube-net-lockdown.service; install the Whitecube package first")
 
 
 @contextmanager
 def execution_lock(path=LOCK):
+    # /run is root-owned; a private subdirectory prevents another account from
+    # precreating the shared lock and obstructing boot-time network restoration.
+    secure_directory(path.parent)
     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
     try:
         info = os.fstat(fd)

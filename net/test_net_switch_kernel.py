@@ -1,9 +1,9 @@
 #!/usr/bin/python3 -I
 """Opt-in root test. All firewall writes happen in a new network namespace."""
 import argparse
+import errno
 import importlib.machinery
 import importlib.util
-import json
 import os
 from pathlib import Path
 import socket
@@ -18,7 +18,9 @@ def run(*args):
 
 def inside(backend, parent_namespace):
     # Check isolation before importing or invoking the firewall implementation.
-    if os.geteuid() != 0 or os.readlink('/proc/self/ns/net') == parent_namespace:
+    actual_parent = os.readlink(f'/proc/{os.getppid()}/ns/net')
+    if (os.geteuid() != 0 or parent_namespace != actual_parent
+            or os.readlink('/proc/self/ns/net') == actual_parent):
         raise RuntimeError('Refusing firewall tests without a separate root network namespace')
     loader = importlib.machinery.SourceFileLoader('net_switch_kernel_test', str(backend))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -26,7 +28,11 @@ def inside(backend, parent_namespace):
     loader.exec_module(module)
     run('/usr/bin/ip', 'link', 'set', 'lo', 'up')
     nft = module.Nft()
-    nft.apply('table inet whitecube_test_foreign { chain input { type filter hook input priority 0; policy accept; } }\n')
+    nft.apply('table inet whitecube_test_foreign {\n'
+              '    chain input {\n'
+              '        type filter hook input priority 0; policy accept;\n'
+              '    }\n'
+              '}\n')
     foreign = nft.run('list', 'table', 'inet', 'whitecube_test_foreign')
     with tempfile.TemporaryDirectory(prefix='whitecube-net-kernel-') as directory:
         state = module.State(Path(directory) / 'state.json')
@@ -36,7 +42,15 @@ def inside(backend, parent_namespace):
         assert switch.change(True).startswith('OFF:')
         assert state.read() is None
         # Actual IPv4 and IPv6 loopback datagrams must pass the default block.
-        families = [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET6, '::1')]
+        families = [(socket.AF_INET, '127.0.0.1')]
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as probe:
+                probe.bind(('::1', 0))
+            families.append((socket.AF_INET6, '::1'))
+        except OSError as exc:
+            if exc.errno not in (errno.EAFNOSUPPORT, errno.EPROTONOSUPPORT, errno.EADDRNOTAVAIL):
+                raise
+            print('SKIP IPv6 packet delivery: IPv6 is disabled by this kernel; inet rule coverage is still verified.')
         for family, address in families:
             with socket.socket(family, socket.SOCK_DGRAM) as receiver, socket.socket(family, socket.SOCK_DGRAM) as sender:
                 receiver.bind((address, 0))
@@ -47,17 +61,20 @@ def inside(backend, parent_namespace):
         assert module.inspect_table(nft.snapshot()) is False
         assert module.persistent_setting(state.read()) is False
         # Both protocols now hit the output drop counter in the real kernel.
+        def output_drops():
+            document = nft.snapshot()
+            return sum(expr['counter']['packets'] for item in document['nftables']
+                       if 'rule' in item and item['rule']['chain'] == 'output'
+                       for expr in item['rule']['expr'] if 'counter' in expr)
+
         for family, address in families:
+            before = output_drops()
             with socket.socket(family, socket.SOCK_DGRAM) as sender:
                 try:
                     sender.sendto(b'blocked', (address, 54321))
                 except PermissionError:
                     pass
-        document = nft.snapshot()
-        count = sum(expr['counter']['packets'] for item in document['nftables']
-                    if 'rule' in item and item['rule']['chain'] == 'output'
-                    for expr in item['rule']['expr'] if 'counter' in expr)
-        assert count >= 2, f'Expected IPv4 and IPv6 output drops, observed {count}'
+            assert output_drops() > before, f'Expected an output drop for {address}'
         # Simulate reboot's empty kernel table with the persistence marker retained.
         nft.apply(f'delete table inet {module.TABLE}\n')
         switch.change(True, boot=True)
@@ -76,7 +93,7 @@ def inside(backend, parent_namespace):
         else:
             raise AssertionError('Foreign table was not rejected')
         assert nft.run('list', 'table', 'inet', module.TABLE) == collision
-    print('Kernel tests passed: IPv4/IPv6 loopback, drops, persistence, restore, idempotency, foreign firewall preservation.')
+    print('Kernel tests passed: inet rules, available-protocol loopback and drops, persistence, restore, idempotency, foreign firewall preservation.')
 
 
 def main():

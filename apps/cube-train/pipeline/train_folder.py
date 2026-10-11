@@ -28,10 +28,38 @@ class Tee:
         self.terminal.write(text)
         self.log.write(text)
         self.log.flush()
+        return len(text)
 
     def flush(self):
         self.terminal.flush()
         self.log.flush()
+
+
+class PreparationProgress:
+    """Surface preparation phases while bounding metadata writes on large corpora."""
+    def __init__(self, path, device, *, clock=time.monotonic):
+        self.path, self.device, self.clock = path, device, clock
+        self.last_phase = None
+        self.next_update = 0
+
+    def __call__(self, event):
+        phase = event.get('phase', 'reading')
+        now = self.clock()
+        changed = phase != self.last_phase
+        if not changed and now < self.next_update:
+            return
+        tokens, documents = event.get('tokens', 0), event.get('documents', 0)
+        details = {'checking': 'Checking source files', 'reading': 'Reading source documents',
+                   'splitting': 'Building training and validation splits', 'publishing': 'Saving prepared corpus'}
+        detail = details.get(phase, 'Preparing corpus')
+        if documents or tokens:
+            detail += f' · {documents:,} documents · {tokens:,} tokens'
+        atomic_json(self.path, {'state': 'preparing', 'device': self.device, 'detail': detail,
+                               'preparation_phase': phase, 'prepared_tokens': tokens,
+                               'prepared_documents': documents})
+        if changed:
+            print(detail, flush=True)
+        self.last_phase, self.next_update = phase, now + .25
 
 
 class Monitor:
@@ -143,7 +171,8 @@ def main():
             print(f'Idle disk priority unavailable: {error}', file=sys.stderr)
     torch.set_num_threads(args.cpu_threads)
     torch.set_num_interop_threads(1)
-    state = home / ".local" / "state" / "tensegrity"
+    # This lock is shared with desktop launch/trash and existing CLI installs.
+    state = home / '.local' / 'state' / 'tensegrity'
     state.mkdir(parents=True, exist_ok=True)
     with (state / "train.lock").open("w") as lock:
         try:
@@ -181,13 +210,14 @@ def main():
             try:
                 monitor = Monitor(run / 'gpu.jsonl', args.max_temp, args.device, args.max_cpu_temp,
                                   args.burst_seconds, args.cooldown_seconds)
-                signal.signal(signal.SIGINT, monitor.request_stop)
-                signal.signal(signal.SIGTERM, monitor.request_stop)
+                previous_handlers = {sig: signal.signal(sig, monitor.request_stop)
+                                     for sig in (signal.SIGINT, signal.SIGTERM)}
                 atomic_json(run / 'status.json', {'state': 'preparing' if not args.resume else 'starting', 'device': args.device})
                 print(f"Run directory: {run}", flush=True)
                 if not args.resume:
                     corpus = prepare_folder(args.dataset.expanduser(), data, max_tokens=args.max_tokens, column=args.column,
-                                            stop_requested=lambda: monitor.stopped)
+                                            stop_requested=lambda: monitor.stopped,
+                                            progress_callback=PreparationProgress(run / 'status.json', args.device))
                     steps = args.steps or math.ceil(corpus["train_tokens"] / (args.batch_size * args.grad_accum_steps * 256))
                     config = {"steps": steps, "batch_size": args.batch_size,
                               "grad_accum_steps": args.grad_accum_steps, "max_temp": args.max_temp,
@@ -232,6 +262,8 @@ def main():
                 raise SystemExit(1)
             finally:
                 sys.stdout, sys.stderr = previous_out, previous_err
+                for sig, handler in locals().get('previous_handlers', {}).items():
+                    signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

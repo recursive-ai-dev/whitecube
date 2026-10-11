@@ -28,6 +28,9 @@ SESSION_MODES = ('enter', 'try', 'offline')
 # Exports are NAME-YYYYmmdd-HHMMSS-TOKEN.tar.gz; the suggestion drops the stamp.
 EXPORT_STAMP = re.compile(r'-[0-9]{8}-[0-9]{6}-[A-Za-z0-9]+\Z')
 # sudo prints these (with LC_ALL=C) when it would have to ask for a password.
+# Children get their own process group but stay in the app's session: sudo only
+# honours a cached password from the same session ID, so start_new_session would
+# make every `sudo -n` miss the timestamp `sudo -S -v` just made (password loop).
 SUDO_NEEDS_PASSWORD = ('a password is required', 'a terminal is required')
 
 
@@ -238,7 +241,7 @@ class Manager:
         if on_line is None:
             try:
                 done = subprocess.run(argv, capture_output=True, text=True, env=self._env(), stdin=subprocess.DEVNULL,
-                                      start_new_session=True, timeout=timeout)
+                                      process_group=0, timeout=timeout)
             except FileNotFoundError as error:
                 return Result(127, '', f'Error: {error.filename} is not installed')
             except subprocess.TimeoutExpired:
@@ -246,7 +249,7 @@ class Manager:
             return Result(done.returncode, done.stdout, done.stderr)
         try:
             process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-                                       text=True, env=self._env(), start_new_session=True, bufsize=1)
+                                       text=True, env=self._env(), process_group=0, bufsize=1)
         except FileNotFoundError as error:
             return Result(127, '', f'Error: {error.filename} is not installed')
         stdout_parts = []
@@ -265,7 +268,7 @@ class Manager:
         """True when sudo would run a command now without asking."""
         try:
             return subprocess.run([self.sudo, '-n', '-v'], capture_output=True, env=self._env(), stdin=subprocess.DEVNULL,
-                                  start_new_session=True, timeout=15).returncode == 0
+                                  process_group=0, timeout=15).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -273,10 +276,19 @@ class Manager:
         """Validate the password with sudo once; the password is not stored."""
         try:
             done = subprocess.run([self.sudo, '-S', '-p', '', '-v'], input=password + '\n', capture_output=True, text=True,
-                                  env=self._env(), start_new_session=True, timeout=30)
+                                  env=self._env(), process_group=0, timeout=30)
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return done.returncode == 0
+        if done.returncode != 0:
+            return False
+        if not self.authenticated():
+            # The password was right but sudo will not reuse it (timestamp_timeout=0,
+            # or a policy keyed to something this process cannot keep). Asking again
+            # would loop forever, so say why instead.
+            raise ManagerError('sudo accepted your password but will not remember it for the next command. '
+                               'Check timestamp_timeout and timestamp_type in sudoers, or run '
+                               '`sudo chrootable-manager` in a terminal.')
+        return True
 
     @staticmethod
     def _needs_password(result: Result) -> bool:

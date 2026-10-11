@@ -27,6 +27,7 @@ Stdlib + torch only. An OpenAI `tools` field in a request is ignored.
 import argparse
 import codecs
 import json
+import math
 import os
 import sys
 import threading
@@ -192,6 +193,15 @@ def build_prompt(messages, budget: int, fmt: str):
 
 def sample(logits, temperature, top_k, top_p):
     """One step of the same sampling stack TensegrityLM.generate() uses."""
+    if not math.isfinite(temperature) or temperature < 0:
+        raise ValueError('temperature must be finite and nonnegative')
+    if top_k is not None and (isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1):
+        raise ValueError('top_k must be a positive integer or None')
+    if top_p is not None and (not math.isfinite(top_p) or not 0 < top_p <= 1):
+        raise ValueError('top_p must be within (0, 1] or None')
+    logits = logits.float()
+    if torch.isnan(logits).any() or torch.isposinf(logits).any() or not torch.isfinite(logits).any():
+        raise RuntimeError('Cannot sample nonfinite model logits')
     if temperature <= 0.0:
         return int(logits.argmax(dim=-1).item())
     logits = logits / temperature
@@ -220,6 +230,12 @@ def decode(model, prompt_ids, *, temperature, top_k, top_p, max_new_tokens):
     EOS is yielded too - callers decide when to stop, so the stop reason is
     reported accurately.
     """
+    if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 0:
+        raise ValueError('max_new_tokens must be a nonnegative integer')
+    prompt_ids = list(prompt_ids) or [ByteTokenizer.BOS]
+    if any(isinstance(token, bool) or not isinstance(token, int) or not 0 <= token < model.cfg.vocab_size
+           for token in prompt_ids):
+        raise ValueError('Prompt token IDs must be integers within the model vocabulary')
     device = next(model.parameters()).device
     seq = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     past = None

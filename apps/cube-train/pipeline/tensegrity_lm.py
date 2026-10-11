@@ -42,6 +42,8 @@ import sys
 import time
 import inspect
 import random
+import tempfile
+from collections import OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple, List, Dict, Any
 
@@ -1391,28 +1393,45 @@ def prepare_data(data_path: str, out_dir: str, val_fraction: float = 0.1, seed: 
 
 
 
-_MEMMAP_CACHE: Dict[str, np.memmap] = {}
+_MEMMAP_CACHE = OrderedDict()
+_MEMMAP_SIGNATURES = {}
+_MEMMAP_CACHE_LIMIT = 16
 
 
 def _get_memmap(path: str) -> np.memmap:
     """Cached np.memmap open. Data files are read-only and don't change during
     training, so reusing the same memmap across calls is safe and avoids a fresh
     open()+mmap() syscall on every single get_batch/get_batch_mixed call."""
-    arr = _MEMMAP_CACHE.get(path)
+    path = os.path.realpath(os.fspath(path))
+    stat = os.stat(path)
+    if stat.st_size == 0 or stat.st_size % np.dtype(np.uint16).itemsize:
+        raise ValueError(f'{path} must be a nonempty uint16 token file (even byte length)')
+    signature = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    arr = _MEMMAP_CACHE.get(path) if _MEMMAP_SIGNATURES.get(path) == signature else None
     if arr is None:
         arr = np.memmap(path, dtype=np.uint16, mode="r")
         _MEMMAP_CACHE[path] = arr
+        _MEMMAP_SIGNATURES[path] = signature
+    _MEMMAP_CACHE.move_to_end(path)
+    while len(_MEMMAP_CACHE) > _MEMMAP_CACHE_LIMIT:
+        stale, _ = _MEMMAP_CACHE.popitem(last=False)
+        _MEMMAP_SIGNATURES.pop(stale, None)
     return arr
 
 
 def get_batch(data_dir: str, split: str, batch_size: int, block_size: int,
                device: str, rng=None) -> Tuple[torch.Tensor, torch.Tensor]:
+    if split not in ('train', 'val'):
+        raise ValueError("split must be 'train' or 'val'")
+    if any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 1
+           for v in (batch_size, block_size)):
+        raise ValueError('batch_size and block_size must be positive integers')
     path = os.path.join(data_dir, f"{split}.bin")
     arr = _get_memmap(path)
     n = len(arr)
-    if n <= block_size + 1:
+    if n < block_size + 1:
         raise ValueError(
-            f"{split}.bin has only {n} tokens, need > block_size+1 ({block_size + 1}). "
+            f"{split}.bin has only {n} tokens, need at least block_size+1 ({block_size + 1}). "
             f"Use a larger corpus or smaller --block_size."
         )
     max_start = n - block_size - 1
@@ -1473,18 +1492,27 @@ def save_checkpoint(path: str, model: nn.Module, optimizer: torch.optim.Optimize
         "rng_state": rng_state,
         "training_state": training_state,
     }
-    tmp_path = path + ".tmp"
-    torch.save(ckpt, tmp_path)
-    # Flush to disk before the atomic rename, so a crash/power-loss immediately after
-    # os.replace can't leave a checkpoint that *looks* complete (the rename succeeded)
-    # but whose contents were still sitting in OS write-back cache.
-    with open(tmp_path, "r+b") as f:
-        os.fsync(f.fileno())
-    os.replace(tmp_path, path)
+    fd, tmp_path = tempfile.mkstemp(prefix=f'.{os.path.basename(path)}-', suffix='.tmp', dir=out_dir or '.')
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            torch.save(ckpt, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        directory_fd = os.open(out_dir or '.', os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def load_checkpoint(path: str, device: str) -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(ckpt, dict):
+        raise ValueError(f'{path} is not a checkpoint mapping')
     required = ("model_state_dict", "optimizer_state_dict", "config", "step", "best_val_loss")
     missing = [k for k in required if k not in ckpt]
     if missing:
@@ -1492,6 +1520,14 @@ def load_checkpoint(path: str, device: str) -> Dict[str, Any]:
             f"{path} is missing expected checkpoint key(s) {missing}; "
             f"this may not be a TensegrityLM checkpoint, or it predates the current format."
         )
+    for name in ('config', 'model_state_dict', 'optimizer_state_dict'):
+        if not isinstance(ckpt[name], dict):
+            raise ValueError(f'{path} checkpoint {name} must be a mapping')
+    if isinstance(ckpt['step'], bool) or not isinstance(ckpt['step'], int) or ckpt['step'] < -1:
+        raise ValueError(f'{path} checkpoint step must be an integer >= -1')
+    loss = ckpt['best_val_loss']
+    if isinstance(loss, bool) or not isinstance(loss, (int, float)) or math.isnan(loss) or loss == -math.inf:
+        raise ValueError(f'{path} checkpoint best_val_loss must be a number other than NaN or negative infinity')
     ckpt_version = ckpt.get("format_version")
     if ckpt_version != CHECKPOINT_FORMAT_VERSION:
         print(f"[warn] {path} has format_version={ckpt_version!r}, code expects "
@@ -1505,8 +1541,9 @@ def capture_rng_state() -> Dict[str, Any]:
     state = {
         "torch": torch.get_rng_state(),
         "numpy": np.random.get_state(),
+        "python": random.getstate(),
     }
-    if torch.cuda.is_available():
+    if torch.cuda.is_initialized():
         state["cuda"] = torch.cuda.get_rng_state_all()
     return state
 
@@ -1521,6 +1558,8 @@ def restore_rng_state(state: Dict[str, Any]):
         torch.set_rng_state(torch_state)
     if "numpy" in state:
         np.random.set_state(state["numpy"])
+    if "python" in state:
+        random.setstate(state["python"])
     if "cuda" in state and torch.cuda.is_available():
         try:
             cuda_state = state["cuda"]
