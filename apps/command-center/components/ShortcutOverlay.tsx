@@ -1,4 +1,5 @@
-import React, { useEffect } from 'react';
+import React from 'react';
+import { useDialog } from './useDialog';
 import { ShortcutGroup, ScriptItem } from '../types';
 
 interface ShortcutOverlayProps {
@@ -9,15 +10,7 @@ interface ShortcutOverlayProps {
 }
 
 const ShortcutOverlay: React.FC<ShortcutOverlayProps> = ({ group, scripts, onClose, onExecute }) => {
-  // Close on Escape
-  useEffect(() => {
-    const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKey);
-    return () => window.removeEventListener('keydown', handleKey);
-  }, [onClose]);
-
+  const dialogRef = useDialog(true, onClose);
   const groupScripts = scripts.filter(s => group.scriptIds.includes(s.id));
 
   return (
@@ -27,13 +20,13 @@ const ShortcutOverlay: React.FC<ShortcutOverlayProps> = ({ group, scripts, onClo
         onClick={onClose}
       ></div>
       
-      <div className="relative bg-[#10151e]/90 p-8 rounded-2xl shadow-2xl border border-white/10 max-w-4xl w-full mx-4">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={group.name} tabIndex={-1} className="relative bg-[#10151e]/90 p-8 rounded-2xl shadow-2xl border border-white/10 max-w-4xl w-full mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-8">
            <div className="flex items-center gap-3">
-              <span className="bg-whitecube-accent px-2 py-1 rounded text-white font-mono font-bold text-sm">{group.shortcut}</span>
+              <span className="bg-whitecube-accent px-2 py-1 rounded text-white font-mono font-bold text-sm">{group.shortcut || 'Unbound'}</span>
               <h2 className="text-3xl text-white font-light">{group.name}</h2>
            </div>
-           <button onClick={onClose} className="text-white/40 hover:text-white">
+           <button aria-label="Close shortcut group" onClick={onClose} className="text-white/40 hover:text-white">
              <span className="material-symbols-outlined text-3xl">close</span>
            </button>
         </div>

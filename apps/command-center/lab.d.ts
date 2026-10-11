@@ -70,6 +70,7 @@ export interface Lab {
   appInfo(): Promise<{ version: string; electron: string; dataDir: string; packaged: boolean } | Failure>;
   openData(): Promise<{ ok: boolean } | Failure>;
   saveFile(name: string, content: string): Promise<SaveResult>;
+  chooseDirectory(): Promise<{ path?: string; canceled?: boolean } | Failure>;
   importFile(): Promise<{ canceled?: boolean; content?: string } | Failure>;
   host(): Promise<HostInfo | Failure>;
   snapshot(): Promise<Snapshot | Failure>;

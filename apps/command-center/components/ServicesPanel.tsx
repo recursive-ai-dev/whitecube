@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import type { ServiceUnit } from '../lab.d';
 import { isFailure, usePoll } from '../hooks';
+import { PollNotice } from './Panel';
 import ConfirmationModal from './ConfirmationModal';
 
 interface Props { onLog: (text: string, type: 'info' | 'success' | 'error') => void }
@@ -18,7 +19,7 @@ const ServicesPanel: React.FC<Props> = ({ onLog }) => {
   const [filter, setFilter] = useState<'all' | 'running' | 'failed'>('all');
   const [busy, setBusy] = useState<string | null>(null);
   const [pending, setPending] = useState<{ unit: ServiceUnit; action: string } | null>(null);
-  const { data, reload } = usePoll(() => window.lab.services(scope), 5000, scope);
+  const { data, reload, error: pollError, updatedAt } = usePoll(() => window.lab.services(scope).then(r => { if (r.error) throw new Error(r.error); return r; }), 5000, scope);
   const result = data && !isFailure(data) ? data : null;
   const rawError = data && isFailure(data) ? data.error : result?.error;
   const error = rawError && /Failed to connect|System has not been booted|bus/i.test(rawError)
@@ -50,7 +51,7 @@ const ServicesPanel: React.FC<Props> = ({ onLog }) => {
   );
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col"><PollNotice error={pollError} updatedAt={updatedAt} />
       <ConfirmationModal isOpen={!!pending} title="Change service" message={`Apply this change to the ${scope} service? Stopping or restarting a service may interrupt its work.`} command={pending ? `systemctl ${scope === 'user' ? '--user ' : ''}${pending.action} ${pending.unit.unit}` : ''} onCancel={() => setPending(null)} onConfirm={() => { const p = pending; setPending(null); if (p) void act(p.unit, p.action); }} />
       <div className="p-4 border-b border-white/5 flex flex-wrap items-center gap-3">
         <div className="flex rounded-full bg-black/20 border border-white/10 overflow-hidden text-sm">
@@ -58,7 +59,7 @@ const ServicesPanel: React.FC<Props> = ({ onLog }) => {
             <button key={s} onClick={() => setScope(s)} className={`px-4 py-1.5 ${scope === s ? 'bg-whitecube-accent text-white' : 'text-white/60 hover:text-white'}`}>{s}</button>
           ))}
         </div>
-        <input type="text" placeholder="Filter services…" value={query} onChange={(e) => setQuery(e.target.value)}
+        <input type="text" aria-label="Filter services" placeholder="Filter services…" value={query} onChange={(e) => setQuery(e.target.value)}
           className="flex-1 min-w-48 bg-black/20 border border-white/10 rounded-full px-4 py-2 text-sm text-white outline-none" />
         <div className="flex gap-1 text-sm">
           {(['all', 'running', 'failed'] as const).map((f) => (

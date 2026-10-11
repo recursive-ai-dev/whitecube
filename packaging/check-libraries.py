@@ -8,7 +8,10 @@ import re
 import subprocess
 import sys
 
-NATIVE = ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca')
+NATIVE = ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
+          'usr/libexec/whitecube/cube-browser/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-renderd',
+          'usr/libexec/whitecube/cube-browser/cube-netd')
+# cube-player is not listed: libmpv (Depends: libmpv2) reaches X11 and is not on the build host.
 PRIVATE = ('libwlroots-0.18.so', 'libcairo.so.2')
 REQUIRED_PROVIDERS = {'libEGL.so.1': 'libegl1', 'libGLESv2.so.2': 'libgles2'}
 RESOLVED = re.compile(r'^\s*(\S+)\s+=>\s+(\S+)\s+\(', re.MULTILINE)
@@ -41,7 +44,7 @@ def check(stage):
         elif not library.resolve().is_relative_to(private):
             problems.append(f'private library symlink escapes the package: {name}')
     env = dict(os.environ, LD_LIBRARY_PATH=str(private))
-    binaries = [stage / 'usr/bin' / name for name in NATIVE]
+    binaries = [stage / name for name in NATIVE]
     libraries = [p for p in private.glob('*.so*') if p.is_file() and not p.is_symlink()]
     for path in binaries + libraries:
         if not path.is_file():

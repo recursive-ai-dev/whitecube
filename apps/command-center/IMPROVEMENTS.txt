@@ -1,7 +1,11 @@
 Whitecube Command Center — 48 proposed improvements
 Reviewed: 2026-10-10 against the existing 2.0.0 implementation.
 
-This is a future-work backlog, not a claim that these features are implemented.
+This backlog originated before 2.1.0. Completed in 2.1.0: 1, 2, 4, 13,
+32, 34, 36, and the command-editor/palette/confirmation/shortcut-overlay flows
+in 37. Monitoring cadence in 6 and process pause/refresh in 18 are implemented;
+view-specific cadence and configurable process columns remain future work.
+Other entries remain proposals. See README.md and CHANGELOG.md for release scope.
 The relocation and 2.0.1 rebrand are separate maintenance changes.
 P1 = address first; P2 = next; P3 = optional expansion.
 Each entry identifies an implementation area and a concrete completion check.

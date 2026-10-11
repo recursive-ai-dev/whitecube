@@ -238,3 +238,56 @@ button:disabled { opacity: .5; cursor: default; }
 #rename-name { display: block; width: 100%; margin: 8px 0 14px; }
 #rename-error { color: var(--danger); font-size: 12px; }
 @media (max-width: 520px) { .settings-actions { flex-wrap: wrap; } .msg { max-width: 97%; } }
+
+#find-bar { display: flex; align-items: center; gap: 6px; padding: 6px 12px; flex-wrap: wrap; }
+#find-text { flex: 1; min-width: 100px; color: var(--text); background: var(--bg-alt); border: 1px solid var(--border); padding: 6px; }
+#find-bar button { background: var(--bg-alt); color: var(--text); border: 1px solid var(--border); padding: 4px 8px; }
+#find-count, #composer-hint { font-size: 11px; color: var(--text-dim); }
+#composer-hint { margin: 0; padding: 0 14px 8px; }
+.msg.find-match { border-color: var(--accent); }
+.msg.find-current { outline: 2px solid var(--accent); }
+.msg.failed-send { border-style: dashed; }
+#input { max-height: 180px; overflow-y: auto; }
+#model-controls, #titlebar { flex-wrap: wrap; }
+#rename-panel { max-height: 90vh; overflow-y: auto; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; transition: none !important; animation: none !important; } }
+
+/* Whitecube shell look, matching the bar and Command Center: near-black glass,
+   square 2px white borders, bold DejaVu Sans and a red accent. */
+:root {
+  --bg: #0b0d12;
+  --bg-alt: #111111;
+  --border: #f2f2f2;
+  --text: #f2f2f2;
+  --text-dim: #a8a8a8;
+  --accent: #ff3b3b;
+  --danger: #ff6b6b;
+  --user-bubble: #0b0d12;
+  --assistant-bubble: #161616;
+  --tool-bubble: #111111;
+}
+html, body { font-family: "DejaVu Sans", "Cantarell", sans-serif; }
+*, *::before, *::after { border-radius: 0 !important; }
+#app { border: 2px solid var(--border); }
+#titlebar, #model-bar { border-bottom: 2px solid var(--border); }
+#composer { border-top: 2px solid var(--border); }
+#title { color: var(--text); font-weight: 800; letter-spacing: 0.24em; }
+#titlebar-actions button { border: 2px solid transparent; }
+#titlebar-actions button:hover { border-color: var(--border); background: transparent; }
+.msg.user { border: 2px solid var(--border); }
+.msg.assistant { border: 2px solid #3a3a3a; }
+.msg.error { background: #111; border: 2px solid var(--danger); }
+.msg.tool { color: #e6e6e6; border: 2px solid #3a3a3a; font-family: "DejaVu Sans Mono", monospace; }
+.msg.tool .tool-name { color: #fff; }
+.msg.rendered code, .code-block, pre { font-family: "DejaVu Sans Mono", monospace; }
+.code-block { border: 2px solid #3a3a3a; }
+#input { border: 2px solid var(--border); background: #000; }
+#input:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+#btn-send { background: #f2f2f2; color: #111; border: 2px solid #f2f2f2; font-weight: 800; }
+#btn-send:hover:not(:disabled) { background: #fff; box-shadow: 4px 4px 0 rgba(255,255,255,.25); }
+#btn-stop { background: #111; border: 2px solid var(--accent); color: var(--accent); }
+#model-picker, #model-controls button, #rename-name, #find-text, #find-bar button,
+#settings-panel input[type=text], #settings-panel input[type=password] { border: 2px solid var(--border); }
+#settings-panel, #confirm-panel, #rename-panel { border: 2px solid var(--border); box-shadow: 8px 8px 0 rgba(0,0,0,.6); }
+.copy-btn, .copy-reply, #btn-latest { border: 2px solid #3a3a3a; }
+.copy-btn:hover, .copy-reply:hover, #btn-latest:hover { border-color: var(--border); color: var(--text); }

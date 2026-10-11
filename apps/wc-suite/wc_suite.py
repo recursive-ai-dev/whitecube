@@ -398,6 +398,15 @@ def project(args):
     detach(terminal_argv(path), "project")
 
 
+def require_folder_app():
+    """xdg-open exits 0 and does nothing visible when no app handles folders; say so instead."""
+    if not shutil.which("xdg-mime"):
+        return
+    result = run(["xdg-mime", "query", "default", "inode/directory"], capture=True, check=False)
+    if result.returncode == 0 and not result.stdout.strip():
+        raise Error("no app is set to open folders; set one with: xdg-mime default thunar.desktop inode/directory", 2)
+
+
 @command("open", "Applications", "Open a file, directory, or URL with its default application",
          "wc-open ~/Downloads\nwc-open https://example.org", "xdg-open")
 def open_target(args):
@@ -406,6 +415,8 @@ def open_target(args):
         path = Path(target).expanduser().resolve()
         if not path.exists():
             raise Error(f"path not found: {path}", 2)
+        if path.is_dir():
+            require_folder_app()
         target = str(path)
     detach(["xdg-open", target], "open")
 
@@ -415,6 +426,7 @@ def files(args):
     path = args.directory.expanduser().resolve()
     if not path.is_dir():
         raise Error(f"not a directory: {path}", 2)
+    require_folder_app()
     detach(["xdg-open", path], "files")
 
 

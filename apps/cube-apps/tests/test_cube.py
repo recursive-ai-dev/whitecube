@@ -2,6 +2,9 @@ import hashlib
 import sys
 import tempfile
 import unittest
+import os
+import threading
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -39,6 +42,22 @@ class TestTheme(Base):
         self.assertEqual(ct.unique_path(a).name, "x-2.pdf")
         (self.d / "x-2.pdf").write_text("1")
         self.assertEqual(ct.unique_path(a).name, "x-3.pdf")
+
+
+class TestLastFolder(Base):
+    def test_pickers_reopen_where_the_last_pick_happened(self):
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(self.d / "state")}):
+            self.assertIsNone(ct.last_folder())
+            ct.remember_folder(str(self.d))
+            self.assertEqual(ct.last_folder(), str(self.d))
+            saved = self.d / "state" / "cube-apps" / "last-folder"
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+            ct.remember_folder(str(self.d / "missing"))       # ignored
+            self.assertEqual(ct.last_folder(), str(self.d))
+            saved.write_text("relative/path\n")              # never trusted
+            self.assertIsNone(ct.last_folder())
 
 
 class TestPdf(Base):
@@ -206,6 +225,140 @@ class TestRename(Base):
         cr.apply([(a, self.d / "b.txt", None), (b, self.d / "c.txt", None)])
         self.assertEqual(sorted(p.name for p in self.d.iterdir()), ["b.txt", "c.txt"])
         self.assertEqual((self.d / "b.txt").read_text(), "a.txt")
+
+
+class ImprovementRegressions(Base):
+    def test_output_is_atomic_and_never_overwrites(self):
+        target = self.d / 'result.txt'
+        target.write_text('original')
+        def failed(path):
+            path.write_text('partial')
+            raise OSError('disk full')
+        with self.assertRaises(OSError):
+            ct.write_output(target, failed)
+        self.assertEqual(target.read_text(), 'original')
+        self.assertEqual(list(self.d.iterdir()), [target])
+        result = ct.write_output(target, lambda p: p.write_text('complete'))
+        self.assertEqual(result.read_text(), 'complete')
+        self.assertEqual(result.stat().st_mode & 0o777, 0o600)
+
+    def test_concurrent_outputs_have_distinct_names(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda i: ct.write_output(self.d / 'x.txt', lambda p: p.write_text(str(i))), range(8)))
+        self.assertEqual(len(set(results)), 8)
+        self.assertEqual({p.read_text() for p in results}, {str(i) for i in range(8)})
+
+    def test_dangling_symlink_counts_as_an_existing_output(self):
+        path = self.d / 'output.pdf'
+        path.symlink_to(self.d / 'missing')
+        self.assertEqual(ct.unique_path(path).name, 'output-2.pdf')
+        actual = ct.write_output(path, lambda p: p.write_text('safe'))
+        self.assertTrue(path.is_symlink())
+        self.assertFalse((self.d / 'missing').exists())
+        self.assertEqual(actual.name, 'output-2.pdf')
+
+    def test_hash_empty_file_and_cancellation(self):
+        path = self.d / 'empty'; path.touch()
+        progress = []
+        self.assertEqual(ch.hash_file(path, progress=progress.append), hashlib.sha256(b'').hexdigest())
+        self.assertEqual(progress[-1], 1)
+        cancel = threading.Event(); cancel.set()
+        with self.assertRaises(InterruptedError):
+            ch.hash_file(path, cancel=cancel)
+
+    def test_hash_rejects_fifo_without_blocking(self):
+        path = self.d / 'fifo'; os.mkfifo(path)
+        with self.assertRaisesRegex(ValueError, 'regular file'):
+            ch.hash_file(path)
+
+    def test_hash_reports_source_changes(self):
+        path = self.d / 'file'; path.write_bytes(b'a' * (2 << 20))
+        def progress(_fraction):
+            with path.open('ab') as stream:
+                stream.write(b'change')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            ch.hash_file(path, progress=progress)
+
+    def test_bsd_checksum_paste(self):
+        self.assertEqual(ch.clean_expected('SHA256 (an input file.iso) = ' + 'AB' * 32), 'ab' * 32)
+
+    def test_new_rename_rules_and_natural_order(self):
+        paths = [self.d / n for n in ('image10.JPG', 'image2.JPG', 'image1.JPG')]
+        for path in paths: path.touch()
+        rows = cr.plan(paths, cr.Opts(order=3, number=True, extension_case=1))
+        self.assertEqual([p.name for p, _, _ in rows], ['image1.JPG', 'image2.JPG', 'image10.JPG'])
+        self.assertEqual(rows[0][1].name, 'image1-01.jpg')
+        options = cr.Opts(find='a', replace='z', first_only=True, trim=True, collapse_spaces=True)
+        self.assertEqual(cr.new_stem('  aa   bb  ', 0, options), 'za bb')
+
+    def test_rename_rejects_control_and_oversized_names(self):
+        path = self.d / 'a.txt'; path.touch()
+        for suffix in ('\n', '\t', '\x7f', 'é' * 130):
+            self.assertEqual(cr.plan([path], cr.Opts(suffix=suffix))[0][2], 'invalid name')
+        self.assertEqual(cr.plan([path], cr.Opts(digits=100000))[0][2], 'invalid numbering')
+
+    def test_rename_rejects_duplicate_sources_and_conflicted_preview(self):
+        path = self.d / 'a'; path.write_text('original')
+        with self.assertRaises(ValueError):
+            cr.apply([(path, self.d / 'b', None), (path, self.d / 'c', None)])
+        with self.assertRaises(ValueError):
+            cr.apply([(path, self.d / 'b', 'conflict')])
+        self.assertEqual(path.read_text(), 'original')
+
+    def test_rename_rolls_back_both_staging_and_commit_failures(self):
+        for fail_at in (2, 5, 6):
+            paths = [self.d / n for n in ('a', 'b', 'c')]
+            for p in paths: p.write_text(p.name)
+            rows = [(paths[0], paths[1], None), (paths[1], paths[2], None), (paths[2], self.d / 'd', None)]
+            real = cr.move_no_replace
+            calls = 0
+            def failing(source, destination):
+                nonlocal calls
+                calls += 1
+                if calls == fail_at: raise OSError('injected failure')
+                real(source, destination)
+            with patch.object(cr, 'move_no_replace', failing), self.assertRaises(OSError):
+                cr.apply(rows)
+            self.assertEqual({p.name:p.read_text() for p in self.d.iterdir()}, {'a':'a','b':'b','c':'c'})
+
+    def test_rename_will_not_overwrite_an_undo_conflict(self):
+        current, original = self.d / 'renamed', self.d / 'original'
+        current.write_text('renamed data'); original.write_text('new data')
+        with self.assertRaises(FileExistsError): cr.apply([(current, original, None)])
+        self.assertEqual(current.read_text(), 'renamed data')
+        self.assertEqual(original.read_text(), 'new data')
+
+    def test_pdf_extended_ranges_and_invalid_split_have_no_output(self):
+        self.assertEqual(cp.parse_ranges('-3, 5–6, 8-', 10), [(1,3),(5,6),(8,10)])
+        self.assertEqual(cp.parse_ranges('all', 10), [(1,10)])
+        for text in ('1,,3', ',1', '1,'):
+            with self.assertRaises(ValueError): cp.parse_ranges(text, 10)
+        src = make_pdf(self.d / 'a.pdf', 3)
+        folder = self.d / 'out'
+        with self.assertRaises(ValueError): cp.split(src, [(1,1), (3,4)], folder)
+        self.assertFalse(folder.exists())
+        with self.assertRaises(ValueError): cp.merge([], self.d / 'empty.pdf')
+
+    def test_pdf_rotation_only_once_per_selected_page(self):
+        src = make_pdf(self.d / 'a.pdf', 3)
+        out = cp.rotate(src, 90, '1-2, 2', self.d / 'rotated.pdf')
+        with pikepdf.open(out) as pdf:
+            self.assertEqual([int(page.obj.get('/Rotate', 0)) for page in pdf.pages], [90,90,0])
+        with pikepdf.open(src) as pdf:
+            self.assertEqual(int(pdf.pages[0].obj.get('/Rotate', 0)), 0)
+
+    def test_pdf_lock_preserves_dotted_names_and_existing_files(self):
+        src = make_pdf(self.d / 'report.v1.pdf', 1)
+        dest = cl.output_path(src, None)
+        self.assertEqual(dest.name, 'report.v1-locked.pdf')
+        dest.write_text('existing')
+        actual = cl.encrypt_pdf(src, dest, 'password', '', True, True, False)
+        self.assertEqual(dest.read_text(), 'existing')
+        cl.verify_locked(src, actual, 'password')
+        self.assertNotEqual(actual, dest)
+        for password in ('', 'é' * 64):
+            with self.assertRaises(ValueError): cl.encrypt_pdf(src, self.d / 'bad.pdf', password, '', True, True, False)
 
 
 if __name__ == "__main__":

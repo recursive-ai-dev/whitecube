@@ -1,0 +1,7 @@
+Cube Prompts — Whitecube prompt library
+
+prompt_manager/ is the core of Prompt Manager Studio 0.2.0 (MIT License),
+copied from ~/Projects/prompt-manager at commit 7882c40 and adapted for
+Whitecube: app name and data paths, a private-file credential store when no OS
+keyring runs, current Claude models, and no licence gating. app.py and
+style.css are new and follow the Whitecube app style.

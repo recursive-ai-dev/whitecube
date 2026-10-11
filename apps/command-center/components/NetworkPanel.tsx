@@ -1,29 +1,30 @@
 import React, { useState } from 'react';
 import { isFailure, usePoll } from '../hooks';
+import { PollNotice } from './Panel';
 
 const quality = (dbm: number) => (dbm >= -55 ? ['Excellent', 'text-green-300'] : dbm >= -67 ? ['Good', 'text-green-300'] : dbm >= -75 ? ['Fair', 'text-yellow-300'] : ['Weak', 'text-red-300']);
 const latencyColor = (ms: number | null, loss: number) => (loss >= 100 ? 'text-red-300' : loss > 0 || (ms ?? 0) > 150 ? 'text-yellow-300' : 'text-green-300');
 
 const NetworkPanel: React.FC = () => {
-  const { data } = usePoll(() => window.lab.network(), 4000);
+  const { data, error: pollError, updatedAt } = usePoll(() => window.lab.network(), 4000);
   const net = data && !isFailure(data) ? data : null;
   const gw = net?.gateway?.ip;
   const [anchor, setAnchor] = useState('1.1.1.1');
   const [probes, setProbes] = useState<{ host: string; loss: number; avg: number | null; max: number | null }[] | null>(null);
   const [probing, setProbing] = useState(false);
+  const [probeError, setProbeError] = useState('');
 
   const runProbe = async () => {
-    setProbing(true);
-    const r = await window.lab.probe([...(gw ? [gw] : []), anchor]);
-    setProbing(false);
-    if (!isFailure(r)) setProbes(r);
+    setProbing(true); setProbeError('');
+    try { const r = await window.lab.probe([...(gw ? [gw] : []), anchor]); if (isFailure(r)) setProbeError(r.error); else setProbes(r); }
+    catch (e) { setProbeError((e as Error).message); } finally { setProbing(false); }
   };
 
   if (data && isFailure(data)) return <div className="p-6 text-red-400 text-sm">{data.error}</div>;
   if (!net) return <div className="p-6 text-white/40 text-sm">Reading network…</div>;
 
   return (
-    <div className="p-6 overflow-y-auto h-full">
+    <div className="p-6 overflow-y-auto h-full"><PollNotice error={pollError} updatedAt={updatedAt} />
       <div className="max-w-5xl mx-auto space-y-4">
         <h2 className="text-2xl font-light text-white">Network</h2>
 
@@ -60,6 +61,7 @@ const NetworkPanel: React.FC = () => {
             <input value={anchor} onChange={(e) => setAnchor(e.target.value.trim())} aria-label="External host" className="w-40 bg-black/20 border border-white/10 rounded px-3 py-1.5 text-sm text-white outline-none font-mono" />
             <button disabled={probing || !anchor} onClick={runProbe} className="px-4 py-2 rounded text-sm font-bold text-white bg-whitecube-accent hover:bg-red-600 disabled:opacity-40">{probing ? 'Probing…' : 'Run probe'}</button>
           </div>
+          {probeError && <div role="alert" className="text-xs text-amber-200 mb-3">{probeError}</div>}
           {probes?.map((p) => (
             <div key={p.host} className="flex justify-between py-1.5 border-t border-white/5 text-sm">
               <span className="text-white/80 font-mono">{p.host}{p.host === gw ? ' (gateway)' : ''}</span>

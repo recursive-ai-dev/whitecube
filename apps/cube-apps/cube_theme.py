@@ -9,6 +9,9 @@ the headless compositor).
 import os
 import sys
 import threading
+import json
+import math
+import tempfile
 from pathlib import Path
 
 import gi
@@ -100,7 +103,22 @@ windowcontrols button image, windowcontrols button.circular, button.circular {
 def apply_theme():
     Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
     provider = Gtk.CssProvider()
-    provider.load_from_string(CSS)
+    extra = "button:focus-visible, entry:focus-within { outline: 2px solid #111; outline-offset: 2px; }"
+    try:
+        state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state')
+        path = state / 'whitecube/accessibility.json'
+        if path.stat().st_size <= 1048576:
+            settings = json.loads(path.read_text(encoding='utf-8'))
+            scale = settings.get('ui_scale', 1)
+            if type(scale) in (int, float) and math.isfinite(scale) and .8 <= scale <= 1.6:
+                extra += f" * {{ font-size: {round(11 * scale, 2)}pt; }}"
+            if settings.get('contrast') == 'strong':
+                extra += "window, row, entry, list.boxed-list { background: #fff; color: #000; } .dim-label, row .subtitle { color: #111; }"
+            if settings.get('reduced_motion') is True:
+                Gtk.Settings.get_default().set_property('gtk-enable-animations', False)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    provider.load_from_string(CSS + extra)
     Gtk.StyleContext.add_provider_for_display(
         Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_USER)
 
@@ -129,6 +147,29 @@ class CubeApp(Adw.Application):
     def do_startup(self):
         Adw.Application.do_startup(self)
         apply_theme()
+        for name, keys, callback in (
+            ('quit', ['<Control>q'], lambda: self.quit()),
+            ('close', ['<Control>w'], lambda: self.window().close()),
+            ('open', ['<Control>o'], self.pick),
+            ('run', ['<Control>Return'], self.run_current),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', lambda _a, _p, cb=callback: cb())
+            self.add_action(action)
+            self.set_accels_for_action('app.' + name, keys)
+
+    def pick(self):
+        win = self.window()
+        if getattr(win, 'busy', False):
+            return
+        pick_files(win, 'Choose files', win.add_files,
+                   'application/pdf' if 'Pdf' in self.get_application_id() else None)
+
+    def run_current(self):
+        win = self.window()
+        target = win.stack.get_visible_child() if hasattr(win, 'stack') else win
+        if target.go.get_sensitive():
+            target.go.emit('clicked')
 
     def window(self):
         if self.win is None:
@@ -148,7 +189,7 @@ class CubeApp(Adw.Application):
 
     def do_open(self, files, _n, _hint):
         win = self.window()
-        win.add_files([f.get_path() for f in files])
+        win.add_files([f.get_path() for f in files if f.get_path()])
         self.do_activate()
 
 
@@ -163,32 +204,78 @@ def file_filter(name: str, mime: str | None = None) -> Gio.ListStore:
     return store
 
 
+def _last_folder_file():
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+    return os.path.join(state, "cube-apps", "last-folder")
+
+
+def last_folder():
+    """The folder the previous pick happened in (shared by the Cube apps), if it still exists."""
+    try:
+        with open(_last_folder_file(), encoding="utf-8") as f:
+            folder = f.read(4096).strip()
+    except (OSError, UnicodeError):
+        return None
+    return folder if folder and os.path.isabs(folder) and os.path.isdir(folder) else None
+
+
+def remember_folder(folder):
+    """Record where the user picked from; private, written atomically, never fatal."""
+    if not folder or not os.path.isdir(folder):
+        return
+    path = _last_folder_file()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix='.last-folder-', dir=os.path.dirname(path))
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(folder + "\n")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    finally:
+        if 'tmp' in locals():
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+def _dialog(title, **props):
+    dialog = Gtk.FileDialog(title=title, modal=True, **props)
+    start = last_folder()
+    if start:
+        dialog.set_initial_folder(Gio.File.new_for_path(start))
+    return dialog
+
+
 def pick_files(parent, title, callback, mime=None, multiple=True):
-    dialog = Gtk.FileDialog(title=title, filters=file_filter(
+    dialog = _dialog(title, filters=file_filter(
         "PDF documents" if mime == "application/pdf" else "All files", mime))
 
     def done(d, res):
         try:
-            result = (d.open_multiple_finish(res) if multiple
-                      else Gio.ListStore.new(Gio.File))
-            if not multiple:
-                single = d.open_finish(res)
-                result = [single]
+            result = d.open_multiple_finish(res) if multiple else [d.open_finish(res)]
         except GLib.Error:
             return
-        callback([f.get_path() for f in result])
+        paths = [f.get_path() for f in result if f.get_path()]
+        if paths:
+            remember_folder(os.path.dirname(paths[0]))
+            callback(paths)
 
     (dialog.open_multiple if multiple else dialog.open)(parent, None, done)
 
 
 def pick_folder(parent, title, callback):
-    dialog = Gtk.FileDialog(title=title)
+    dialog = _dialog(title)
 
     def done(d, res):
         try:
-            callback(d.select_folder_finish(res).get_path())
+            folder = d.select_folder_finish(res).get_path()
         except GLib.Error:
-            pass
+            return
+        if folder:
+            remember_folder(folder)
+            callback(folder)
 
     dialog.select_folder(parent, None, done)
 
@@ -198,8 +285,10 @@ def drop_target(callback):
     target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
 
     def on_drop(_t, value, _x, _y):
-        callback([f.get_path() for f in value.get_files()])
-        return True
+        paths = [f.get_path() for f in value.get_files() if f.get_path()]
+        if paths:
+            callback(paths)
+        return bool(paths)
 
     target.connect("drop", on_drop)
     return target
@@ -220,10 +309,30 @@ def unique_path(path: Path) -> Path:
     """path, or path with -2, -3... before the suffix; never an existing file."""
     path = Path(path)
     candidate, n = path, 2
-    while candidate.exists():
+    while os.path.lexists(candidate):
         candidate = path.with_name(f"{path.stem}-{n}{path.suffix}")
         n += 1
     return candidate
+
+
+def write_output(path, writer):
+    """Publish a complete private file without replacing any existing directory entry."""
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.cube-output-', suffix=path.suffix, dir=path.parent)
+    os.close(fd)
+    try:
+        writer(Path(temporary))
+        with open(temporary, 'rb') as stream:
+            os.fsync(stream.fileno())
+        while True:
+            destination = unique_path(path)
+            try:
+                os.link(temporary, destination)
+                return destination
+            except FileExistsError:
+                continue
+    finally:
+        os.unlink(temporary)
 
 
 def run_task(fn, done):
@@ -253,12 +362,15 @@ class FileList(Gtk.ListBox):
         self.refresh()
 
     def add_paths(self, paths):
-        if self.single:
-            self.paths.clear()
-        for p in map(Path, paths):
+        for value in paths:
+            if not value:
+                continue
+            p = Path(os.path.abspath(Path(value).expanduser()))
             if self.exts and p.suffix.lower() not in self.exts:
                 continue
             if p.is_file() and p not in self.paths:
+                if self.single:
+                    self.paths.clear()
                 self.paths.append(p)
                 if self.single:
                     break
@@ -269,8 +381,9 @@ class FileList(Gtk.ListBox):
         self.refresh()
 
     def remove_path(self, path):
-        self.paths.remove(path)
-        self.refresh()
+        if path in self.paths:
+            self.paths.remove(path)
+            self.refresh()
 
     def move(self, path, delta):
         i = self.paths.index(path)
@@ -284,9 +397,11 @@ class FileList(Gtk.ListBox):
             self.remove(child)
         if not self.paths:
             self.append(self.placeholder)
-        for p in self.paths:
+        for index, p in enumerate(self.paths):
             row = Adw.ActionRow(title=GLib.markup_escape_text(p.name),
-                                subtitle=GLib.markup_escape_text(str(p.parent)))
+                                subtitle=GLib.markup_escape_text(str(p.parent)),
+                                title_selectable=True, subtitle_selectable=True,
+                                tooltip_text=str(p))
             buttons = [("window-close-symbolic", "Remove", lambda _b, q=p: self.remove_path(q))]
             if self.reorder:
                 buttons = [("go-up-symbolic", "Move up", lambda _b, q=p: self.move(q, -1)),
@@ -295,13 +410,17 @@ class FileList(Gtk.ListBox):
                 b = Gtk.Button(icon_name=icon, valign=Gtk.Align.CENTER, tooltip_text=tip)
                 b.add_css_class("flat")
                 b.connect("clicked", handler)
+                if tip == 'Move up':
+                    b.set_sensitive(index > 0)
+                elif tip == 'Move down':
+                    b.set_sensitive(index + 1 < len(self.paths))
                 row.add_suffix(b)
             self.append(row)
         self.on_changed()
 
 
 def status_label() -> Gtk.Label:
-    label = Gtk.Label(wrap=True, xalign=0, margin_bottom=6)
+    label = Gtk.Label(wrap=True, selectable=True, xalign=0, margin_bottom=6)
     label.add_css_class("cube-status")
     return label
 

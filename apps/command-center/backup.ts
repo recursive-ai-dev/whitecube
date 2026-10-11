@@ -1,5 +1,6 @@
 import { ScriptStatus, type ScriptItem, type NautilusAction, type ShortcutGroup } from './types';
 import { createId } from './id';
+import { normalizeShortcut, shortcutIssue } from './shortcuts';
 export interface Library { scripts: ScriptItem[]; nautilusActions: NautilusAction[]; shortcutGroups: ShortcutGroup[] }
 const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v);
 const string = (v: unknown, max = 4096): v is string => typeof v === 'string' && v.length <= max;
@@ -20,7 +21,8 @@ export function decodeBackup(content: string): Library {
   }
   const scripts = (lib.scripts as Record<string, unknown>[]).map(s => {
     if (!string(s.command, 65536) || !s.command.trim() || s.command.includes('\0') || !string(s.description) || !string(s.icon, 100) || !categories.has(String(s.category)) || (s.path !== undefined && !string(s.path))) throw new Error('Invalid command in backup');
-    return { id: s.id as string, name: s.name as string, command: s.command, description: s.description, icon: s.icon, category: s.category as ScriptItem['category'], path: s.path as string | undefined, requiresConfirmation: true, lastRun: 'Not run', status: ScriptStatus.IDLE };
+    if ((s.pinned !== undefined && typeof s.pinned !== 'boolean') || (s.tags !== undefined && (!Array.isArray(s.tags) || s.tags.length > 12 || !s.tags.every(t => string(t, 32))))) throw new Error('Invalid command organization in backup');
+    return { pinned: s.pinned === true, tags: [...new Set((s.tags || []) as string[])], id: s.id as string, name: s.name as string, command: s.command, description: s.description, icon: s.icon, category: s.category as ScriptItem['category'], path: s.path as string | undefined, requiresConfirmation: true, lastRun: 'Not run', status: ScriptStatus.IDLE };
   });
   const scriptIds = new Set(scripts.map(s => s.id));
   const nautilusActions = (lib.nautilusActions as Record<string, unknown>[]).map(a => {
@@ -44,6 +46,15 @@ export function mergeLibrary(current: Library, incoming: Library): Library {
   return {
     scripts: [...current.scripts, ...scripts],
     nautilusActions: [...current.nautilusActions, ...incoming.nautilusActions.map(a => ({ ...a, id: fresh(a.id) }))],
-    shortcutGroups: [...current.shortcutGroups, ...incoming.shortcutGroups.map(g => ({ ...g, id: fresh(g.id), scriptIds: g.scriptIds.map(id => remap.get(id)!) }))],
+    shortcutGroups: (() => {
+      const groups = [...current.shortcutGroups];
+      for (const g of incoming.shortcutGroups) {
+        // Retain colliding imported groups for editing, but leave their binding
+        // disabled rather than silently stealing an existing shortcut.
+        const shortcut = shortcutIssue(g.shortcut, groups) ? '' : normalizeShortcut(g.shortcut);
+        groups.push({ ...g, id: fresh(g.id), shortcut, scriptIds: g.scriptIds.map(id => remap.get(id)!) });
+      }
+      return groups;
+    })(),
   };
 }

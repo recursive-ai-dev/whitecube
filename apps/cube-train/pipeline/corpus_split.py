@@ -1,5 +1,7 @@
 """Deterministic, document-grouped splits for staged uint16 token streams."""
 import hashlib
+import json
+from contextlib import ExitStack
 import math
 import numbers
 import os
@@ -50,51 +52,44 @@ def split_documents(combined, output, records, *, val_fraction=0.05, block_size=
     validate_split_options(val_fraction, block_size, seed)
     check_cancelled(stop_requested)
     combined, output = Path(combined), Path(output)
-    records = list(records)
-    groups, expected_offset = {}, 0
-    for offset, count, key in records:
-        check_cancelled(stop_requested)
-        positive_integer(count, 'Document token count')
-        if isinstance(offset, bool) or not isinstance(offset, numbers.Integral) or offset != expected_offset:
-            raise ValueError('Document offsets must cover the token stream consecutively without gaps or overlaps')
-        if not isinstance(key, str) or not key:
-            raise ValueError('Document hashes must be nonempty strings')
-        expected_offset += count
-        groups[key] = groups.get(key, 0) + count
-    total = sum(groups.values())
-    if combined.stat().st_size != total * 2:
-        raise ValueError('Token stream size does not match document records (uint16 requires two bytes per token)')
-    target = total * val_fraction
-    minimum = block_size + 2
-    if len(groups) < 2:
-        raise ValueError('Document-level validation needs at least two distinct documents; '
-                         'provide more JSONL/Parquet rows or separate text files.')
-    ordered = sorted(groups, key=lambda key: hashlib.sha256(f'{seed}:{key}'.encode()).digest())
-    # Start with a group close to the target, avoiding a giant first document
-    # swallowing validation when smaller, suitable documents exist.
-    ordered.sort(key=lambda key: abs(groups[key] - target))
-    selected, n_val = set(), 0
-    for key in ordered:
-        check_cancelled(stop_requested)
-        count = groups[key]
-        if total - n_val - count < minimum:
-            continue
-        if n_val < minimum or abs(n_val + count - target) < abs(n_val - target):
-            selected.add(key)
-            n_val += count
-    if min(n_val, total - n_val) < minimum:
-        raise ValueError('Whole-document splits are too short for this context; supply more documents '
-                         'or increase the token cap. No document will be split across train and validation.')
-    for name in ('train.bin', 'val.bin'):
+    from corpus_index import DocumentIndex
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as resources:
+        if isinstance(records, DocumentIndex):
+            index = records
+        else:
+            temporary = resources.enter_context(tempfile.TemporaryDirectory(prefix='.index-', dir=output.parent))
+            index = resources.enter_context(DocumentIndex(Path(temporary) / 'documents.sqlite', seed, stop_requested))
+            for record in records:
+                check_cancelled(stop_requested)
+                index.append(record)
+        total = index.total
+        if combined.stat().st_size != total * 2:
+            raise ValueError('Token stream size does not match document records (uint16 requires two bytes per token)')
+        n_val = index.select_validation(val_fraction, block_size + 2)
+        _write_splits(combined, output, index, stop_requested)
+    return total - n_val, n_val
+
+
+def _write_splits(combined, output, index, stop_requested):
+    for name in ('train.bin', 'val.bin', 'documents.jsonl'):
         if (output / name).exists() or (output / name).is_symlink():
             raise FileExistsError(f'Split output already exists: {output / name}')
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='.split-', dir=output) as temporary:
         stage = Path(temporary)
-        with combined.open('rb') as source, (stage / 'train.bin').open('wb') as train, (stage / 'val.bin').open('wb') as val:
-            for offset, count, key in records:
+        with (combined.open('rb') as source, (stage / 'train.bin').open('wb') as train,
+              (stage / 'val.bin').open('wb') as val,
+              (stage / 'documents.jsonl').open('w', encoding='utf-8') as documents):
+            positions = {'train': 0, 'val': 0}
+            for offset, count, key, split, path, row, truncated, source_key, group_key in index.split_records():
+                check_cancelled(stop_requested)
                 source.seek(offset * 2)
-                dest = val if key in selected else train
+                dest = val if split == 'val' else train
+                documents.write(json.dumps({'split': split, 'offset': positions[split], 'tokens': count,
+                    'sha256': key, 'source_sha256': source_key, 'group_sha256': group_key, 'source': path, 'row': row,
+                    'truncated': bool(truncated)}, ensure_ascii=False) + '\n')
+                positions[split] += count
                 remaining = count * 2
                 while remaining:
                     check_cancelled(stop_requested)
@@ -104,6 +99,5 @@ def split_documents(combined, output, records, *, val_fraction=0.05, block_size=
                     dest.write(chunk)
                     remaining -= len(chunk)
         check_cancelled(stop_requested)
-        for name in ('train.bin', 'val.bin'):
+        for name in ('train.bin', 'val.bin', 'documents.jsonl'):
             os.replace(stage / name, output / name)
-    return total - n_val, n_val

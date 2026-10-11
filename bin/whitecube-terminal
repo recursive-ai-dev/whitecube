@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import math
 
 base = Path('/usr/share/whitecube/workspace')
 if not (base / 'desktop_state.py').is_file():
@@ -14,42 +15,64 @@ from desktop_state import DesktopStore
 
 def terminal_argv(args, settings, home=None):
     home = Path(home or Path.home())
-    config = home / '.config/foot/foot.ini'
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'foot/foot.ini'
     index = 0
     options_with_values = {'-c', '--config', '-a', '--app-id', '-T', '--title', '-o', '--override', '-f', '--font', '-w', '--window-size-pixels', '-W', '--window-size-chars'}
     while index < len(args):
         arg = args[index]
         if arg == '--' or not arg.startswith('-'):
             break
-        if arg in options_with_values and index + 1 < len(args):
+        if arg.startswith('--config='):
+            config = Path(arg.partition('=')[2]).expanduser()
+            index += 1
+        elif arg in options_with_values and index + 1 < len(args):
             if arg in ('-c', '--config'):
-                config = Path(args[index + 1])
+                config = Path(args[index + 1]).expanduser()
             index += 2
         else:
             index += 1
     font = 'monospace:size=11'
-    if config.is_file() and not config.is_symlink() and config.stat().st_size < 262144:
-        for line in config.read_text().splitlines():
-            if line.startswith('font='):
-                font = line.partition('=')[2]
-                break
-    match = re.search(r':size=([0-9.]+)', font)
+    try:
+        if config.is_file() and not config.is_symlink() and config.stat().st_size < 262144:
+            section = 'main'
+            for line in config.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if line.startswith('['):
+                    section = line.strip('[]').strip()
+                if section == 'main' and line.partition('=')[0].strip() == 'font':
+                    font = line.partition('=')[2].strip() or font
+                    break
+    except (OSError, UnicodeError):
+        pass
+    scale = settings.get('terminal_scale', 1)
+    if type(scale) not in (int, float) or not .8 <= scale <= 2:
+        scale = 1
+    match = re.search(r':size=([0-9]+(?:\.[0-9]+)?)(?=[:,]|$)', font)
     if match:
-        size = float(match.group(1)) * settings['terminal_scale']
+        size = float(match.group(1)) * scale
+        if not math.isfinite(size) or size <= 0 or size > 256:
+            size = 11 * scale
         font = font[:match.start(1)] + str(round(size, 2)) + font[match.end(1):]
     else:
-        font += ':size=' + str(round(11 * settings['terminal_scale'], 2))
+        font += ':size=' + str(round(11 * scale, 2))
     argv = ['foot', '-o', 'font=' + font]
-    if settings['contrast'] == 'strong':
+    if settings.get('contrast') == 'strong':
         argv.extend(['-o', 'colors.foreground=ffffff', '-o', 'colors.background=000000'])
     return argv + args
 
 
 def main():
-    state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'whitecube'
-    settings = DesktopStore(state).get_settings()
+    state = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'whitecube'
+    try:
+        settings = DesktopStore(state).get_settings()
+    except (OSError, ValueError):
+        settings = {'terminal_scale': 1, 'contrast': 'normal'}
     argv = terminal_argv(sys.argv[1:], settings)
-    os.execvp(argv[0], argv)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError as error:
+        print(f'whitecube-terminal: unable to start foot: {error.strerror}', file=sys.stderr)
+        raise SystemExit(127)
 
 
 if __name__ == '__main__':

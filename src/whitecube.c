@@ -49,6 +49,15 @@
 #define DRM_FORMAT_ARGB8888 0x34325241 // 'AR24', cairo's ARGB32 layout on little-endian
 #endif
 #include "desktop-state.h"
+#include <wlr/types/wlr_fractional_scale_v1.h>
+#include <wlr/types/wlr_idle_inhibit_v1.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
+#include <wlr/types/wlr_presentation_time.h>
+#include <wlr/types/wlr_primary_selection.h>
+#include <wlr/types/wlr_primary_selection_v1.h>
+#include <wlr/types/wlr_single_pixel_buffer_v1.h>
+#include <wlr/types/wlr_viewporter.h>
+#include <wlr/types/wlr_xdg_activation_v1.h>
 #include "bar-layout.h"
 #include "tab-panel.h"
 #include "native-preferences.h"
@@ -296,6 +305,12 @@ struct wc_server {
 	char state_directory[512];
 	bool shutting_down;
 	struct wl_event_source *settings_timer;
+	/* Implicit grab: while a button is held, the pressed surface keeps the pointer. */
+	struct wlr_surface *grab_surface; double grab_x, grab_y;
+	uint32_t swallow_button; // a press the compositor consumed; its release is dropped too
+	struct wl_listener request_set_primary_selection, request_activate;
+	struct wlr_idle_inhibit_manager_v1 *idle_inhibit;
+	struct wc_desktop_state saved_layout; bool saved_layout_valid;
 };
 struct wc_output {
 	struct wl_list link;
@@ -406,6 +421,26 @@ static void wc_focus(struct wc_toplevel *t);
 static void wc_tab_label(struct wc_toplevel *t, int w, int h, bool focused);
 static void wc_more_update(struct wc_server *s, struct wc_output *o, int W, int n, int vis);
 static void wc_panel_close(struct wc_server *s);
+/* A toplevel with a parent is a dialog (file pickers, alerts). It floats over
+ * its parent instead of taking a tab's whole screen, and focusing the parent
+ * hands focus to it, because a modal parent ignores input while it is open. */
+static bool is_dialog(struct wc_toplevel *t) { return t->xdg_toplevel->parent != NULL; }
+static struct wc_toplevel *wc_toplevel_of(struct wlr_xdg_toplevel *x) {
+	struct wlr_scene_tree *tree = x && x->base ? x->base->data : NULL;
+	return tree ? tree->node.data : NULL;
+}
+static struct wc_toplevel *wc_open_dialog(struct wc_toplevel *t) {
+	struct wc_toplevel *c;
+	wl_list_for_each(c, &t->server->toplevels, link)
+		if (c != t && c->mapped && c->xdg_toplevel->parent == t->xdg_toplevel) return c;
+	return NULL;
+}
+static bool wc_is_ancestor(struct wc_toplevel *t, struct wc_toplevel *of) {
+	for (struct wlr_xdg_toplevel *p = of ? of->xdg_toplevel->parent : NULL; p; p = p->parent)
+		if (p == t->xdg_toplevel) return true;
+	return false;
+}
+static bool wc_idle_inhibited(struct wc_server *s);
 static void wc_save_layout(struct wc_server *s) {
 	if (s->shutting_down || !s->state_directory[0]) return;
 	if (!g_remember_layout) return;
@@ -413,7 +448,7 @@ static void wc_save_layout(struct wc_server *s) {
 	s->layout.workspace = s->workspace; s->layout.desktop_visible = s->desktop_visible;
 	struct wc_toplevel *t;
 	wl_list_for_each(t, &s->toplevels, link) {
-		if (!t->mapped) continue;
+		if (!t->mapped || is_dialog(t)) continue;
 		const char *app = t->xdg_toplevel->app_id, *title = t->xdg_toplevel->title;
 		if (!app || !*app) continue;
 		if (t->saved_index < 0) {
@@ -429,7 +464,9 @@ static void wc_save_layout(struct wc_server *s) {
 		saved->fullscreen = t->fullscreen; saved->maximized = t->maximized; saved->claimed = true;
 		saved->x = t->layout_x; saved->y = t->layout_y; saved->w = t->layout_w; saved->h = t->layout_h;
 	}
-	wc_state_save(s->state_directory, &s->layout);
+	/* Retile runs on every click; two fsyncs each time stalled input delivery. */
+	if (s->saved_layout_valid && !memcmp(&s->saved_layout, &s->layout, sizeof(s->layout))) return;
+	if (wc_state_save(s->state_directory, &s->layout)) { s->saved_layout = s->layout; s->saved_layout_valid = true; }
 }
 static bool is_scripts(struct wc_toplevel *t) {
 	const char *id = t->xdg_toplevel->app_id;
@@ -500,7 +537,7 @@ static void wc_retile(struct wc_server *server) {
 			}
 		}
 		bool show = t->mapped && t->workspace == server->workspace && !t->hidden && !server->desktop_visible &&
-			(full ? t == full : (t == server->normal || is_scripts(t)));
+			(full ? t == full : (t == server->normal || is_scripts(t) || wc_is_ancestor(t, server->normal)));
 		wlr_scene_node_set_enabled(&t->scene_tree->node, show);
 		if (!show) continue;
 		int x = 0, y = full ? 0 : g_tab_h, w = W, h = H - y;
@@ -513,12 +550,25 @@ static void wc_retile(struct wc_server *server) {
 			x = W * t->layout_x / 1000; y = g_tab_h + (H - g_tab_h) * t->layout_y / 1000;
 			w = W * t->layout_w / 1000; h = (H - g_tab_h) * t->layout_h / 1000;
 		}
+		if (is_dialog(t) && t != full && !t->maximized && !(t->layout_w > 0 && t->layout_h > 0)) {
+			/* The client's own size (it was configured 0x0), within 90% of the screen. */
+			struct wlr_box geo; wlr_xdg_surface_get_geometry(t->xdg_toplevel->base, &geo);
+			int max_w = W * 9 / 10, max_h = (H - g_tab_h) * 9 / 10;
+			int min_w = t->xdg_toplevel->current.min_width, min_h = t->xdg_toplevel->current.min_height;
+			w = geo.width > 0 ? geo.width : W * 7 / 10;
+			h = geo.height > 0 ? geo.height : (H - g_tab_h) * 3 / 4;
+			if (w < min_w) w = min_w;
+			if (h < min_h) h = min_h;
+			if (w > max_w) w = max_w;
+			if (h > max_h) h = max_h;
+			x = (W - w) / 2; y = g_tab_h + (H - g_tab_h - h) / 2;
+		}
 		wlr_scene_node_set_position(&t->scene_tree->node, box.x + x, box.y + y);
 		if (t->configured_w != w || t->configured_h != h) {
 			wlr_xdg_toplevel_set_size(t->xdg_toplevel, w, h);
 			t->configured_w = w; t->configured_h = h;
 		}
-		if (is_scripts(t)) wlr_scene_node_raise_to_top(&t->scene_tree->node);
+		if (is_scripts(t) || is_dialog(t)) wlr_scene_node_raise_to_top(&t->scene_tree->node);
 	}
 	wc_more_update(server, out, W, n_tabs, vis);
 	/* Persist the final placement once on release, rather than fsync per motion. */
@@ -526,6 +576,7 @@ static void wc_retile(struct wc_server *server) {
 }
 static void wc_focus(struct wc_toplevel *t) {
 	if (!t || !t->mapped || t->workspace != t->server->workspace || t->server->locked) return;
+	for (struct wc_toplevel *d = wc_open_dialog(t); d && d->workspace == t->workspace; d = wc_open_dialog(t)) t = d;
 	struct wc_server *s = t->server;
 	if (s->drag.toplevel && s->drag.toplevel != t) wc_cancel_drag(s);
 	if (s->focused && s->focused != t)
@@ -533,7 +584,9 @@ static void wc_focus(struct wc_toplevel *t) {
 	s->focused = t; t->hidden = false; s->desktop_visible = false;
 	if (!is_scripts(t)) s->normal = t;
 	s->saved_focus[s->workspace] = t; s->saved_normal[s->workspace] = s->normal;
-	wlr_xdg_toplevel_set_activated(t->xdg_toplevel, true);
+	/* Each set_activated is a configure; clients repaint on it, which delayed
+	 * the second click of a double-click when it was sent on every press. */
+	if (!t->xdg_toplevel->scheduled.activated) wlr_xdg_toplevel_set_activated(t->xdg_toplevel, true);
 	struct wlr_keyboard *kb = wlr_seat_get_keyboard(s->seat);
 	if (kb) wlr_seat_keyboard_notify_enter(s->seat, t->xdg_toplevel->base->surface,
 		kb->keycodes, kb->num_keycodes, &kb->modifiers);
@@ -633,6 +686,18 @@ static void forget_toplevel(struct wc_toplevel *t) {
 	}
 	if (s->normal == t) s->normal = NULL;
 }
+/* A window and its open dialogs travel together, or the parent would be left
+ * frozen behind a picker on another workspace. */
+static void wc_move_family(struct wc_toplevel *t, unsigned target) {
+	struct wc_toplevel *root = t, *up;
+	while ((up = wc_toplevel_of(root->xdg_toplevel->parent))) root = up;
+	struct wc_toplevel *c;
+	wl_list_for_each(c, &t->server->toplevels, link)
+		if (c == root || wc_is_ancestor(root, c)) {
+			if (c != t) forget_toplevel(c);
+			c->workspace = target;
+		}
+}
 static void wc_workspace(struct wc_server *s, unsigned target, bool move) {
 	if (target >= WORKSPACES || target == s->workspace) return;
 	wc_cancel_drag(s);
@@ -640,7 +705,7 @@ static void wc_workspace(struct wc_server *s, unsigned target, bool move) {
 		struct wc_toplevel *t = s->focused;
 		if (!t) return;
 		forget_toplevel(t);
-		t->workspace = target;
+		wc_move_family(t, target);
 		s->saved_focus[target] = t;
 		if (!is_scripts(t)) s->saved_normal[target] = t;
 		wc_focus_available(s);
@@ -1073,6 +1138,7 @@ static int accessibility_tick(void *data) {
 	}
 	snprintf(path, sizeof(path), "%s/native-names.json", s->state_directory);
 	if (s->state_directory[0]) wc_names_load(path, &s->layout);
+	if (wc_idle_inhibited(s)) wc_activity(s);
 	struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
 	if (wc_idle_lock_due(s, now)) {
 		s->last_lock_attempt = now;
@@ -1292,6 +1358,38 @@ static void seat_cursor_req(struct wl_listener *l, void *data) {
 	    (!s->locked || wc_lock_surface_allowed(s, s->seat->pointer_state.focused_surface)))
 		wlr_cursor_set_surface(s->cursor, ev->surface, ev->hotspot_x, ev->hotspot_y);
 }
+static void seat_primary_req(struct wl_listener *l, void *data) {
+	struct wc_server *s = wl_container_of(l, s, request_set_primary_selection);
+	struct wlr_seat_request_set_primary_selection_event *ev = data;
+	if (!g_clipboard || s->locked) { if (ev->source) wlr_primary_selection_source_destroy(ev->source); return; }
+	wlr_seat_set_primary_selection(s->seat, ev->source, ev->serial);
+}
+/* An app hands focus to a window it opened (a link, a folder, a second window).
+ * Only tokens minted from real input on this seat count, so nothing can steal
+ * focus on its own; the target's workspace is shown first. */
+static void activation_req(struct wl_listener *l, void *data) {
+	struct wc_server *s = wl_container_of(l, s, request_activate);
+	struct wlr_xdg_activation_v1_request_activate_event *ev = data;
+	if (s->locked || !ev->token || ev->token->seat != s->seat || !ev->surface) return;
+	struct wlr_xdg_toplevel *x = wlr_xdg_toplevel_try_from_wlr_surface(ev->surface);
+	struct wc_toplevel *t = x ? wc_toplevel_of(x) : NULL;
+	if (!t || !t->mapped) return;
+	if (t->workspace != s->workspace) wc_workspace(s, t->workspace, false);
+	t->hidden = false;
+	wc_focus(t);
+}
+/* Video players and presentations keep the screen from locking, but only while
+ * the inhibiting surface is actually on screen. */
+static bool wc_idle_inhibited(struct wc_server *s) {
+	if (!s->idle_inhibit || s->locked) return false;
+	struct wlr_idle_inhibitor_v1 *inhibitor;
+	wl_list_for_each(inhibitor, &s->idle_inhibit->inhibitors, link) {
+		struct wlr_xdg_toplevel *x = wlr_xdg_toplevel_try_from_wlr_surface(wlr_surface_get_root_surface(inhibitor->surface));
+		struct wc_toplevel *t = x ? wc_toplevel_of(x) : NULL;
+		if (t && t->mapped && t->scene_tree->node.enabled) return true;
+	}
+	return false;
+}
 static void seat_selection_req(struct wl_listener *l, void *data) {
 	struct wc_server *s = wl_container_of(l, s, request_set_selection);
 	struct wlr_seat_request_set_selection_event *ev = data;
@@ -1313,6 +1411,12 @@ static void cursor_process(struct wc_server *s, uint32_t time) {
 	if (s->drag.toplevel) {
 		wc_update_drag(s, s->cursor->x, s->cursor->y);
 		wc_retile(s);
+		return;
+	}
+	if (!s->locked && s->grab_surface && s->seat->pointer_state.button_count &&
+	    s->seat->pointer_state.focused_surface == s->grab_surface) {
+		/* A drag that leaves the window stays with it until release (no stray releases). */
+		wlr_seat_pointer_notify_motion(s->seat, time, s->cursor->x - s->grab_x, s->cursor->y - s->grab_y);
 		return;
 	}
 	double sx, sy;
@@ -1368,6 +1472,9 @@ static void cursor_button(struct wl_listener *l, void *data) {
 	if (s->drag.button) {
 		return;
 	}
+	if (ev->state == WL_POINTER_BUTTON_STATE_RELEASED && s->swallow_button == ev->button) {
+		s->swallow_button = 0; cursor_process(s, ev->time_msec); return;
+	}
 	if (ev->state == WL_POINTER_BUTTON_STATE_PRESSED) {
 		struct wc_output *out = server_first_output(s);
 		if (out && s->top->node.enabled) {
@@ -1375,13 +1482,15 @@ static void cursor_button(struct wl_listener *l, void *data) {
 			int W, H; wlr_output_effective_resolution(out->wlr_output, &W, &H);
 			double px = s->cursor->x - box.x, py = s->cursor->y - box.y;
 			int left = cubes_left(W), unit = (int)(26 * g_accessibility.ui_scale);
-			if (wc_more_press(s, out, W, H, px, py, ev->button)) return;
+			if (wc_more_press(s, out, W, H, px, py, ev->button)) { s->swallow_button = ev->button; return; }
 			if (py >= 0 && py < g_tab_h && px >= left && px < left + unit * 4) {
+				s->swallow_button = ev->button;
 				wc_workspace(s, (unsigned)((px - left) / unit), false); return;
 			}
 			int tab_x = 0;
 			struct wc_toplevel *t = tab_at(s, px, py, &tab_x);
 			if (t) {
+				s->swallow_button = ev->button;
 				if (ev->button == BTN_MIDDLE || (ev->button == BTN_LEFT && px >= tab_x + g_tab_w - tab_close_w() - 6))
 					wlr_xdg_toplevel_send_close(t->xdg_toplevel);
 				else { wc_focus(t); cursor_process(s, ev->time_msec); }
@@ -1402,6 +1511,15 @@ static void cursor_button(struct wl_listener *l, void *data) {
 	}
 	cursor_process(s, ev->time_msec);
 	wlr_seat_pointer_notify_button(s->seat, ev->time_msec, ev->button, ev->state);
+	if (ev->state == WL_POINTER_BUTTON_STATE_PRESSED && s->seat->pointer_state.button_count == 1 &&
+	    s->seat->pointer_state.focused_surface) {
+		s->grab_surface = s->seat->pointer_state.focused_surface;
+		s->grab_x = s->cursor->x - s->seat->pointer_state.sx;
+		s->grab_y = s->cursor->y - s->seat->pointer_state.sy;
+	} else if (!s->seat->pointer_state.button_count) {
+		s->grab_surface = NULL;
+		cursor_process(s, ev->time_msec); // re-pick the surface under the cursor after the grab
+	}
 }
 static void cursor_axis(struct wl_listener *l, void *data) {
 	struct wc_server *s = wl_container_of(l, s, cursor_axis);
@@ -1662,6 +1780,7 @@ static void wc_restore_window(struct wc_toplevel *t) {
 	 * workspace, even if the user switched while the client was starting. */
 	t->workspace = t->server->workspace;
 	t->hidden = false;
+	if (is_dialog(t)) { t->saved_index = -1; return; }
 	t->saved_index = g_remember_layout ? wc_state_match(&t->server->layout,
 		t->xdg_toplevel->app_id, t->xdg_toplevel->title, t->workspace) : -1;
 	if (t->saved_index < 0) return;
@@ -1699,7 +1818,13 @@ static void t_unmap(struct wl_listener *l, void *data) {
 	t->mapped = false;
 	wlr_scene_node_set_enabled(&t->scene_tree->node, false);
 	forget_toplevel(t);
-	if (t->server->focused == t) wc_focus_available(t->server);
+	if (t->server->grab_surface == t->xdg_toplevel->base->surface) t->server->grab_surface = NULL;
+	struct wc_toplevel *parent = wc_toplevel_of(t->xdg_toplevel->parent);
+	if (t->server->focused == t) {
+		if (parent && parent->mapped && parent->workspace == t->server->workspace) {
+			t->server->focused = NULL; wc_focus(parent);
+		} else wc_focus_available(t->server);
+	}
 	wc_retile(t->server);
 }
 static void t_commit(struct wl_listener *l, void *data) {
@@ -1708,7 +1833,13 @@ static void t_commit(struct wl_listener *l, void *data) {
 		struct wc_output *out = server_first_output(t->server);
 		int W = out && out->wlr_output->width > 0 ? out->wlr_output->width : 1280;
 		int H = out && out->wlr_output->height > 0 ? out->wlr_output->height : 800;
-		wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, H - g_tab_h);
+		/* 0x0 lets a dialog pick its own size; retile centres and caps it. */
+		if (is_dialog(t)) wlr_xdg_toplevel_set_size(t->xdg_toplevel, 0, 0);
+		else wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, H - g_tab_h);
+		/* No minimize and no window menu here, so clients hide those buttons. */
+		wlr_xdg_toplevel_set_wm_capabilities(t->xdg_toplevel,
+			WLR_XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE | WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
+		wlr_xdg_toplevel_set_bounds(t->xdg_toplevel, W, H - g_tab_h);
 	}
 }
 static void t_destroy(struct wl_listener *l, void *data) {
@@ -1766,10 +1897,44 @@ static void server_new_toplevel(struct wl_listener *l, void *data) {
 	t->set_title.notify = t_set_title; wl_signal_add(&x->events.set_title, &t->set_title);
 	wl_list_insert(&s->toplevels, &t->link);
 }
-struct wc_popup { struct wlr_xdg_popup *x; struct wl_listener commit, destroy; };
+struct wc_popup { struct wlr_xdg_popup *x; struct wc_server *server; struct wl_listener commit, destroy; };
+/* The scene tree a popup belongs under: its xdg parent's, or a layer surface's. */
+static struct wlr_scene_tree *wc_popup_parent_tree(struct wlr_surface *parent) {
+	if (!parent) return NULL;
+	struct wlr_xdg_surface *xdg = wlr_xdg_surface_try_from_wlr_surface(parent);
+	if (xdg) return xdg->data;
+	struct wlr_layer_surface_v1 *layer = wlr_layer_surface_v1_try_from_wlr_surface(parent);
+	return layer ? layer->data : NULL;
+}
+static void wc_popup_unconstrain(struct wc_popup *p) {
+	struct wc_output *out = server_first_output(p->server);
+	struct wlr_scene_tree *parent = wc_popup_parent_tree(p->x->parent);
+	if (!out || !parent) return;
+	/* Find the root surface (toplevel or layer) and its on-screen origin. */
+	struct wlr_surface *root = p->x->parent;
+	struct wlr_xdg_surface *xdg;
+	while ((xdg = wlr_xdg_surface_try_from_wlr_surface(root)) && xdg->role == WLR_XDG_SURFACE_ROLE_POPUP && xdg->popup->parent)
+		root = xdg->popup->parent;
+	struct wlr_scene_tree *tree = wc_popup_parent_tree(root);
+	int lx = 0, ly = 0;
+	if (!tree || !wlr_scene_node_coords(&tree->node, &lx, &ly)) return;
+	if (xdg && xdg->role == WLR_XDG_SURFACE_ROLE_TOPLEVEL) {
+		struct wlr_box geo; wlr_xdg_surface_get_geometry(xdg, &geo); lx -= geo.x; ly -= geo.y;
+	}
+	struct wlr_box box; wlr_output_layout_get_box(p->server->output_layout, out->wlr_output, &box);
+	box.x -= lx; box.y -= ly;
+	wlr_xdg_popup_unconstrain_from_box(p->x, &box);
+}
 static void p_commit(struct wl_listener *l, void *data) {
 	struct wc_popup *p = wl_container_of(l, p, commit);
-	if (p->x->base->initial_commit) wlr_xdg_surface_schedule_configure(p->x->base);
+	if (!p->x->base->initial_commit) return;
+	if (!p->x->base->data) {
+		struct wlr_scene_tree *parent = wc_popup_parent_tree(p->x->parent);
+		if (!parent) { wlr_xdg_popup_destroy(p->x); return; } // no parent: nothing to show it in
+		p->x->base->data = wlr_scene_xdg_surface_create(parent, p->x->base);
+	}
+	wc_popup_unconstrain(p);
+	wlr_xdg_surface_schedule_configure(p->x->base);
 }
 static void p_destroy(struct wl_listener *l, void *data) {
 	struct wc_popup *p = wl_container_of(l, p, destroy);
@@ -1777,11 +1942,12 @@ static void p_destroy(struct wl_listener *l, void *data) {
 }
 static void server_new_popup(struct wl_listener *l, void *data) {
 	struct wlr_xdg_popup *x = data;
-	struct wc_popup *p = calloc(1, sizeof(*p)); p->x = x;
-	struct wlr_xdg_surface *par = wlr_xdg_surface_try_from_wlr_surface(x->parent);
-	assert(par);
-	struct wlr_scene_tree *pt = par->data;
-	x->base->data = wlr_scene_xdg_surface_create(pt, x->base);
+	struct wc_popup *p = calloc(1, sizeof(*p));
+	if (!p) return;
+	p->x = x; p->server = wl_container_of(l, p->server, new_xdg_popup);
+	/* Layer-shell popups get their parent only after creation (it used to abort here). */
+	struct wlr_scene_tree *pt = wc_popup_parent_tree(x->parent);
+	if (pt) x->base->data = wlr_scene_xdg_surface_create(pt, x->base);
 	p->commit.notify = p_commit; wl_signal_add(&x->base->surface->events.commit, &p->commit);
 	p->destroy.notify = p_destroy; wl_signal_add(&x->events.destroy, &p->destroy);
 }
@@ -1970,6 +2136,7 @@ static void server_new_layer(struct wl_listener *l, void *data) {
 	default: break;
 	}
 	obj->scene = wlr_scene_layer_surface_v1_create(parent, ls);
+	if (obj->scene) ls->data = obj->scene->tree; // popups of this surface attach here
 	struct wlr_box box; wlr_output_layout_get_box(s->output_layout, out->wlr_output, &box);
 	wlr_scene_node_set_position(&obj->scene->tree->node, box.x, box.y);
 	obj->map.notify = layer_map; wl_signal_add(&ls->surface->events.map, &obj->map);
@@ -2038,7 +2205,7 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.lock_manager->events.new_lock, &server.new_lock);
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
 	wl_list_init(&server.toplevels);
-	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 3);
+	server.xdg_shell = wlr_xdg_shell_create(server.wl_display, 5);
 	server.new_xdg_toplevel.notify = server_new_toplevel;
 	wl_signal_add(&server.xdg_shell->events.new_toplevel, &server.new_xdg_toplevel);
 	server.new_xdg_popup.notify = server_new_popup;
@@ -2063,6 +2230,17 @@ int main(int argc, char *argv[]) {
 	server.new_input.notify = server_new_input;
 	wl_signal_add(&server.backend->events.new_input, &server.new_input);
 	server.seat = wlr_seat_create(server.wl_display, "seat0");
+	wlr_primary_selection_v1_device_manager_create(server.wl_display);
+	server.request_set_primary_selection.notify = seat_primary_req;
+	wl_signal_add(&server.seat->events.request_set_primary_selection, &server.request_set_primary_selection);
+	struct wlr_xdg_activation_v1 *activation = wlr_xdg_activation_v1_create(server.wl_display);
+	server.request_activate.notify = activation_req;
+	wl_signal_add(&activation->events.request_activate, &server.request_activate);
+	server.idle_inhibit = wlr_idle_inhibit_v1_create(server.wl_display);
+	wlr_viewporter_create(server.wl_display);
+	wlr_presentation_create(server.wl_display, server.backend);
+	wlr_single_pixel_buffer_manager_v1_create(server.wl_display);
+	wlr_fractional_scale_manager_v1_create(server.wl_display, 1);
 	wlr_seat_set_capabilities(server.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD);
 	server.request_cursor.notify = seat_cursor_req;
 	wl_signal_add(&server.seat->events.request_set_cursor, &server.request_cursor);

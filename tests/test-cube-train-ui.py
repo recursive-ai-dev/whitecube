@@ -28,6 +28,7 @@ def inside(fixture, screenshots):
     engine.atomic_json(run / 'progress.json', {'completed_steps': 4, 'loss': 4.5, 'tokens_per_second': 1234,
                                              'tokens_processed': 4096, 'gradient_norm': 0.8, 'eta_seconds': 65})
     for split in ('train', 'val'): (run / 'data' / f'{split}.bin').write_bytes(b'UI fixture data')
+    engine.atomic_json(run / 'data/corpus.json', {'train_tokens': 700, 'val_tokens': 700, 'total_tokens': 1400})
     (run / 'ckpt_best.pt').write_bytes(b'Never loaded or executed')
     (run / 'ckpt_latest.pt').write_bytes(b'Latest UI fixture')
     (run / 'console.log').write_text('Fixture log\nTraining paused after four steps.\n')
@@ -77,6 +78,15 @@ def inside(fixture, screenshots):
             assert w.form['name'].get_text() == 'Native fixture (copy)'
             assert w.size_picker.get_selected() == 2 and w.form['batch_size'].get_value() == 1
             w.save_draft(); assert trainer.preferences()['draft_name'] == 'Native fixture (copy)'
+            assert w.reuse_corpus_button.get_sensitive()
+            w.reuse_prepared_corpus()
+            assert w.form['dataset'].get_text() == str(run / 'data')
+            w.form['deduplicate'].set_active(True); w.form['shuffle_files'].set_active(True)
+            w.form['min_document_bytes'].set_value(100); w.form['max_document_bytes'].set_value(8000)
+            w.form['batch_rows'].set_value(8); w.save_draft()
+            prefs = trainer.preferences()
+            assert prefs['deduplicate'] and prefs['shuffle_files'] and prefs['min_document_bytes'] == 100
+            assert prefs['max_document_bytes'] == 8000 and prefs['batch_rows'] == 8
             w.form['batch_size'].set_value(2); w.form['grad_accum_steps'].set_value(3)
             assert '1,536 byte tokens' in w.batch_summary.get_text()
             with patch.object(app.engine, 'read_metrics', wraps=app.engine.read_metrics) as read:
@@ -131,6 +141,39 @@ def inside(fixture, screenshots):
             prefs = trainer.preferences()
             assert prefs['stagger_training'] and prefs['low_priority']
             assert prefs['burst_seconds'] == 20 and prefs['cooldown_seconds'] == 15
+            # 0.8.0: plan presets, tuning, reset, pins, notes, sorting, previews, chart and log tools
+            w.plan_preset.set_selected(1); assert w.form['steps'].get_value() == 20
+            w.form['steps'].set_value(777); assert w.plan_preset.get_selected() == 0
+            assert 'training tokens' in w.plan_label.get_text()
+            w.form['learning_rate'].set_value(.0005); w.schedule_picker.set_selected(1); w.form['thermal_pause'].set_active(True)
+            w.form['early_stop_patience'].set_value(3); w.save_draft(); prefs = trainer.preferences()
+            assert prefs['learning_rate'] == .0005 and prefs['schedule'] == 'wsd' and prefs['thermal_pause'] and prefs['early_stop_patience'] == 3
+            w.reset_settings(); w.save_draft(); prefs = trainer.preferences()
+            assert prefs['learning_rate'] == 3e-4 and prefs['schedule'] == 'cosine' and prefs['steps'] == 1000
+            assert not prefs['thermal_pause'] and prefs['draft_name'] == 'Native fixture (copy)'
+            assert not prefs['deduplicate'] and not prefs['shuffle_files'] and prefs['max_document_bytes'] == 0 and prefs['batch_rows'] == 32
+            w.stack.set_visible_child_name('runs')
+            w.toggle_pin(); assert trainer.find_run('fixture-run')['pinned'] and w.pin_button.get_label() == 'Unpin'
+            w.run_filter.set_selected(4); assert '1 of 1' in w.run_count.get_text(); w.run_filter.set_selected(0)
+            w.notes_view.get_buffer().set_text('Fixture note'); assert w.notes_button.get_sensitive()
+            w.save_notes(); assert trainer.find_run('fixture-run')['notes'] == 'Fixture note'
+            w.run_sort.set_selected(2); w.save_draft(); assert trainer.preferences()['run_sort'] == 2
+            assert 'Renamed native run' in w.run_list.get_row_at_index(0).run_record['name']
+            w.copy_resume_command()
+            assert w.weights_button.get_sensitive() and w.command_button.get_sensitive()
+            w.sample_kind.set_selected(2); assert w.sample_button.get_sensitive(); w.sample_kind.set_selected(0)
+            assert 'Created' in w.run_detail.get_text()
+            w.stack.set_visible_child_name('activity')
+            w.smooth_check.set_active(True); w.lr_check.set_active(True)
+            w.chart_geometry = (48, 500, 4); w.chart_pointer(300)
+            assert 'Step' in w.chart_readout.get_text() and w.chart_readout.get_visible()
+            w.chart_pointer(None); assert not w.chart_readout.get_visible()
+            w.log_search.set_text('paused'); w.matching_only.set_active(True)
+            log = w.log_view.get_buffer(); assert log.get_text(log.get_start_iter(), log.get_end_iter(), False) == 'Training paused after four steps.'
+            w.matching_only.set_active(False); w.log_search.set_text('')
+            assert 'Fixture log' in log.get_text(log.get_start_iter(), log.get_end_iter(), False)
+            assert w.key_pressed(None, app.Gdk.KEY_F1, 0, 0) and w.get_visible_dialog()
+            w.get_visible_dialog().close()
             app.GLib.timeout_add(250, self.confirmation)
             return False
         def confirmation(self): return self.guarded(self.confirmation_guarded)
@@ -162,12 +205,130 @@ def inside(fixture, screenshots):
                 assert time.monotonic() < self.deadline; return True
             assert 'existing corpus' in w.status.get_text(), w.status.get_text()
             assert w.start_button.get_sensitive() and not w.stop_button.get_sensitive()
+            app.GLib.timeout_add(50, lambda: self.guarded(self.upgrades)); return False
+        def wait(self, condition, then, seconds=10):
+            deadline = time.monotonic() + seconds
+            def poll():
+                def check():
+                    if condition():
+                        then(); return False
+                    assert time.monotonic() < deadline, f'timed out waiting in {then.__name__}'
+                    return True
+                return self.guarded(check)
+            app.GLib.timeout_add(40, poll)
+        def widgets(self, root):
+            found = []
+            def walk(widget):
+                found.append(widget)
+                child = widget.get_first_child()
+                while child: walk(child); child = child.get_next_sibling()
+            walk(root); return found
+        def upgrades(self):
+            # 0.9.0: in-place rows, checkpoints incl. snapshots, context menu, compare, notebook export, cleanup, fields
+            w = self.window
+            second = trainer.runs_dir / 'second-run'; (second / 'data').mkdir(parents=True)
+            engine.atomic_json(second / 'run.json', {'steps': 4, 'model_size': '2m', 'parameters': 1_981_512, 'display_name': 'Second fixture'})
+            engine.atomic_json(second / 'result.json', {'completed_steps': 4, 'best_val_loss': 2.0, 'stop_reason': 'completed'})
+            for split in ('train', 'val'): (second / 'data' / f'{split}.bin').write_bytes(b'UI fixture data')
+            (second / 'ckpt_best.pt').write_bytes(b'best'); (second / 'ckpt_step00000002.pt').write_bytes(b'snapshot')
+            (second / 'train_log.jsonl').write_text('\n'.join(json.dumps(item) for item in [
+                {'step': 0, 'total_loss': 5.0}, {'step': 1, 'val_loss': 3.0}, {'step': 3, 'val_loss': 2.0}]))
+            failed = trainer.runs_dir / 'failed-run'; failed.mkdir()
+            engine.atomic_json(failed / 'status.json', {'state': 'failed', 'detail': 'No recognized text column'})
+            w.stack.set_visible_child_name('runs'); w.selected_id = 'fixture-run'; w.refresh(True)
+            row = w.run_rows['fixture-run']
+            engine.atomic_json(run / 'progress.json', {'completed_steps': 5, 'loss': 4.4})
+            w.refresh(); assert w.run_rows['fixture-run'] is row and '5/' in row.meta.get_text(), row.meta.get_text()
+            assert row.is_selected() and len(w.spark_cache['second-run'][1]) == 2
+            assert w.cleanup_button.get_visible()
+            w.run_list.select_row(w.run_rows['second-run']); assert w.selected_id == 'second-run'
+            assert [item['kind'] for item in w.checkpoint_items] == ['best', 'step00000002'], w.checkpoint_items
+            assert w.actions['export-notebook'].get_enabled() and not w.actions['chat-latest'].get_enabled()
+            assert '2.885' in w.detail_tiles.tile_signature  # bits per byte of 2.0
+            w.run_list.select_row(w.run_rows['fixture-run']); w.refresh()
+            index = w.compare_ids.index('second-run') + 1; w.compare_picker.set_selected(index)
+            assert w.compare_losses and w.compare_name == 'Second fixture'
+            w.chart_geometry = (48, 500, 4); w.chart_pointer(300); assert 'Second fixture' in w.chart_readout.get_text()
+            w.chart_pointer(None); w.compare_picker.set_selected(0); assert not w.compare_losses
+            w.run_list.select_row(w.run_rows['second-run']); w.refresh()
+            w.export_notebook('step00000002'); dialog = w.get_visible_dialog(); assert dialog
+            entries = [item for item in self.widgets(dialog) if isinstance(item, app.Gtk.Entry)]
+            entries[0].set_text(str(fixture / 'exports'))
+            assert entries[1].get_text() == 'second-fixture-step00000002-notebook'
+            self.export_button = next(item for item in self.widgets(dialog) if isinstance(item, app.Gtk.Button) and item.get_label() == 'Export')
+            (fixture / 'exports').mkdir()
+            self.dialog = dialog
+            app.GLib.timeout_add(350, lambda: self.guarded(self.dialog_shot)); return False
+        def dialog_shot(self):
+            w, dialog = self.window, self.dialog
+            app.screenshot(w, str(screenshots / 'cube-train-notebook-dialog.png'))
+            for item in self.widgets(dialog):
+                if isinstance(item, app.Gtk.CheckButton) and getattr(item, 'option_text', '').startswith('Open in Jupyter'): item.set_active(False)
+            self.export_button.emit('clicked')
+            self.wait(lambda: w.last_notebook is not None, self.exported)
+            return False
+        def exported(self):
+            w = self.window
+            notebook = Path(w.last_notebook)
+            assert notebook == fixture / 'exports/second-fixture-step00000002-notebook/second-fixture.ipynb', notebook
+            document = json.loads(notebook.read_text())
+            assert document['nbformat'] == 4 and any('ckpt_step00000002.pt' in ''.join(cell['source']) for cell in document['cells'])
+            assert (notebook.parent / 'checkpoint/ckpt_step00000002.pt').read_bytes() == b'snapshot'
+            assert (notebook.parent / 'whitecube_pipeline/tensegrity_lm.py').is_file() and notebook.with_suffix('.py').is_file()
+            assert not w.get_visible_dialog() and 'Last export' in w.notebook_status.get_text()
+            w.stack.set_visible_child_name('runs')
+            found, bounds = w.run_rows['second-run'].compute_bounds(w.run_list); assert found and bounds.get_y() >= 0
+            w.open_run_menu(20, bounds.get_y() + 5); assert w.run_menu.get_visible() and w.selected_id == 'second-run'
+            w.run_menu.popdown()
+            assert [run['id'] for run in trainer.cleanup_candidates()] == ['failed-run']
+            w.clean_up_failed(); dialog = w.get_visible_dialog(); assert dialog
+            confirm = next(item for item in self.widgets(dialog) if isinstance(item, app.Gtk.CheckButton))
+            go = next(item for item in self.widgets(dialog) if isinstance(item, app.Gtk.Button) and item.get_label() == 'Move to Trash')
+            assert not go.get_sensitive(); confirm.set_active(True); go.emit('clicked')
+            self.wait(lambda: not (trainer.runs_dir / 'failed-run').exists() and not w.get_visible_dialog(), self.cleaned)
+        def cleaned(self):
+            w = self.window
+            assert 'failed-run' not in w.run_rows and not w.cleanup_button.get_visible()
+            corpus = fixture / 'mixed-corpus'; corpus.mkdir()
+            (corpus / 'stories.jsonl').write_text(json.dumps({'story': 'A long story. ' * 30}) + '\n')
+            (corpus / 'questions.jsonl').write_text(json.dumps({'question': 'Why?', 'answer': 'Because. ' * 30}) + '\n')
+            w.form['column'].set_text(''); w.stack.set_visible_child_name('train')
+            files = app.Gdk.FileList.new_from_list([app.Gio.File.new_for_path(str(corpus))])
+            assert w.dropped(None, files) and w.form['dataset'].get_text() == str(corpus)
+            self.wait(lambda: w.field_picker.get_sensitive(), self.fields_ready)
+        def fields_ready(self):
+            w = self.window
+            assert set(w.field_names) == {'story', 'question', 'answer'}, w.field_names
+            assert 'questions.jsonl' in w.field_info.get_text() and 'would fail' in w.field_info.get_text()
+            w.start(); assert 'no usable text field' in w.status.get_text(), w.status.get_text()
+            app.GLib.timeout_add(350, lambda: self.guarded(self.fields_shot))
+        def fields_shot(self):
+            w = self.window
+            app.screenshot(w, str(screenshots / 'cube-train-fields.png'))
+            w.field_picker.set_selected(w.field_names.index('answer') + 1); assert w.form['column'].get_text() == 'answer'
+            assert 'stories.jsonl' in w.field_info.get_text()
+            w.field_picker.set_selected(0); assert w.form['column'].get_text() == ''
+            corpus = fixture / 'mixed-corpus'
+            trainer.save_preferences({'recent_datasets': [str(corpus)]}); w.update_recent_menu()
+            assert w.recent_button.get_sensitive() and w.recent_button.get_menu_model().get_n_items() == 1
+            w.use_recent_dataset(str(fixture / 'missing-dataset')); assert w.form['dataset'].get_text().endswith('missing-dataset')
+            w.stack.set_visible_child_name('runs'); w.run_list.select_row(w.run_rows['second-run'])
+            assert w.key_pressed(None, app.Gdk.KEY_E, 0, app.Gdk.ModifierType.CONTROL_MASK | app.Gdk.ModifierType.SHIFT_MASK)
+            assert w.get_visible_dialog(); w.get_visible_dialog().close()
+            app.GLib.timeout_add(250, lambda: self.guarded(self.rename_key)); return False
+        def rename_key(self):
+            w = self.window
+            assert w.key_pressed(None, app.Gdk.KEY_F2, 0, 0) and w.get_visible_dialog()
+            w.get_visible_dialog().close()
+            assert w.run_list.get_selected_row() is w.run_rows['second-run']
+            assert w.run_list_key(None, app.Gdk.KEY_Menu, 0, 0) and w.run_menu.get_visible(); w.run_menu.popdown()
+            w.run_list.select_row(w.run_rows['fixture-run']); w.refresh()
             self.pages = iter(('train', 'runs', 'activity'))
-            self.capture_next(); return False
+            app.GLib.timeout_add(250, lambda: self.guarded(self.capture_next)); return False
         def capture_next(self):
             try: self.page = next(self.pages)
             except StopIteration:
-                print('PASS: native model options, run selection/search/filters, rename, resume validation, run-settings reuse, deletion confirmation, cooling controls, effective batch summary, cached loss graph, log search/follow, draft names, contextual shortcuts, atomic report/metrics/log exports, checkpoint choices, Chat commands, invalid-start recovery')
+                print('PASS: native model options, run selection/search/filters, rename, resume validation, run-settings reuse, deletion confirmation, cooling controls, effective batch summary, cached loss graph, log search/follow, draft names, contextual shortcuts, atomic report/metrics/log exports, checkpoint choices, Chat commands, invalid-start recovery, plan presets/tuning/reset, pins, notes, sorting, preview modes, chart readout, matching log lines, shortcuts dialog, in-place run rows, snapshot checkpoints, run menu, compare overlay, notebook export dialog, failed-run cleanup, text-field probe and start guard, recent corpora, drop target, notebook/rename keys')
                 self.quit(); return False
             self.window.stack.set_visible_child_name(self.page)
             app.GLib.timeout_add(350, self.capture); return False
@@ -202,7 +363,7 @@ def run(screenshots):
                 assert socket.exists(), (fixture / 'compositor.log').read_text()
                 env['WAYLAND_DISPLAY'] = socket.name
                 result = subprocess.run([sys.executable, '-I', str(Path(__file__).resolve()), '--inside', str(fixture), str(screenshots)],
-                                        env=env, capture_output=True, text=True, timeout=20)
+                                        env=env, capture_output=True, text=True, timeout=60)
                 assert result.returncode == 0 and 'Traceback' not in result.stderr, result.stdout + result.stderr
                 print(result.stdout.rstrip())
                 for page in ('train', 'runs', 'activity'):

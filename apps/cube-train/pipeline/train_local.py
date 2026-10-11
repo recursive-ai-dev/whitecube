@@ -4,7 +4,6 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 import tempfile
-import sys
 
 import numpy as np
 import torch
@@ -13,7 +12,7 @@ from tensegrity_lm import TensegrityConfig, TensegrityLM, prepare_data, load_che
 from tensegrity_nb_lib import run_training
 from prepare_folder import prepare_folder
 from model_presets import MODEL_PRESETS
-from files import atomic_json, file_sha256
+from files import atomic_json
 
 ROOT = Path(__file__).resolve().parent
 
@@ -37,18 +36,38 @@ def local_config(model_size="1m"):
     )
 
 
+def wsd_plan(horizon, warmup_steps):
+    """Warmup, hold, then decay over the final fifth of the horizon."""
+    decay = max(1, round(horizon * .2))
+    return max(0, horizon - warmup_steps - decay), decay
+
+
 def train(data_dir, out_dir, *, steps=1000, batch_size=4,
-          grad_accum_steps=4, device="cuda", resume=False, stop_requested=None, schedule_steps=None, model_size=None):
+          grad_accum_steps=4, device="cuda", resume=False, stop_requested=None, schedule_steps=None, model_size=None,
+          learning_rate=3e-4, min_lr_ratio=.1, warmup_steps=None, weight_decay=.1, grad_clip=1.0,
+          eval_interval=50, seed=1337, schedule='cosine', early_stop_patience=0, keep_snapshots=0, outcome=None):
     for name, value in {'steps': steps, 'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
+                        'eval_interval': eval_interval,
                         **({'schedule_steps': schedule_steps} if schedule_steps is not None else {})}.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f'{name} must be a positive integer')
+    for name, value in {'seed': seed, 'early_stop_patience': early_stop_patience, 'keep_snapshots': keep_snapshots,
+                        **({'warmup_steps': warmup_steps} if warmup_steps is not None else {})}.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f'{name} must be a nonnegative integer')
+    for name, value, low, high in (('learning_rate', learning_rate, 1e-6, .1), ('min_lr_ratio', min_lr_ratio, 0, 1),
+                                   ('weight_decay', weight_decay, 0, 1), ('grad_clip', grad_clip, 0, 100)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
+            raise ValueError(f'{name} must be between {low:g} and {high:g}')
+    if schedule not in ('cosine', 'wsd'):
+        raise ValueError('schedule must be cosine or wsd')
     if device not in ('cpu', 'cuda'):
         raise ValueError('device must be cpu or cuda')
     if device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable. Select --device cpu or check the NVIDIA setup.")
-    torch.manual_seed(1337)
-    np.random.seed(1337)
+    outcome = {} if outcome is None else outcome
+    torch.manual_seed(seed)
+    np.random.seed(seed)
     cfg = local_config(model_size or "1m")
     out_dir = Path(out_dir).resolve()
     ckpt_path = out_dir / "ckpt_latest.pt"
@@ -61,44 +80,16 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
                              "Resume without a size flag or start a new run.")
     elif ckpt_path.exists():
         raise FileExistsError("This run has a checkpoint. Use --resume or a new --out-dir.")
-    manifest_path = Path(data_dir) / 'corpus.json'
-    if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        if not isinstance(manifest, dict):
-            raise ValueError(f'{manifest_path} must contain a corpus metadata object')
-        if manifest.get('token_dtype', 'uint16') != 'uint16' or manifest.get('byte_order', sys.byteorder) != sys.byteorder:
-            raise ValueError(f'{manifest_path} uses an incompatible token format or byte order')
-        artifacts = manifest.get('artifacts')
-        if artifacts is not None:
-            if not isinstance(artifacts, dict):
-                raise ValueError(f'{manifest_path} artifacts must be an object')
-            for split in ('train.bin', 'val.bin'):
-                expected = artifacts.get(split)
-                path = Path(data_dir) / split
-                if not isinstance(expected, dict) or not isinstance(expected.get('sha256'), str) or not path.is_file():
-                    raise ValueError(f'{path} is missing a valid corpus integrity record or token file')
-                if path.stat().st_size != expected.get('bytes') or file_sha256(path) != expected['sha256']:
-                    raise ValueError(f'{path} failed corpus integrity verification; restore the prepared corpus or start a new run')
-    for split in ("train", "val"):
-        path = Path(data_dir) / f"{split}.bin"
-        if not path.is_file() or path.stat().st_size // 2 < cfg.block_size + 1:
-            raise ValueError(f"{path} must contain at least {cfg.block_size + 1} tokens")
-        if path.stat().st_size % 2:
-            raise ValueError(f'{path} has an odd byte length; uint16 token data is truncated')
-        tokens = np.memmap(path, dtype=np.uint16, mode='r')
-        try:
-            for offset in range(0, len(tokens), 1_000_000):
-                if np.max(tokens[offset:offset + 1_000_000]) >= cfg.vocab_size:
-                    raise ValueError(f'{path} contains token IDs outside the vocabulary (0-{cfg.vocab_size - 1})')
-        finally:
-            tokens._mmap.close()
+    from corpus_artifacts import verify_corpus
+    verify_corpus(data_dir, minimum=cfg.block_size + 1, vocab_size=cfg.vocab_size,
+                  stop_requested=(lambda: stop_requested(0)) if stop_requested else None)
     model = TensegrityLM(cfg).to(device)
     count = sum(p.numel() for p in model.parameters())
     if not resume and count != MODEL_PRESETS[model_size or "1m"]["parameters"]:
         raise ValueError(f"Unexpected parameter count: {count:,}")
     print(f"Parameters: {count:,}; context: {cfg.block_size} byte tokens", flush=True)
     optimizer = model.configure_optimizer(
-        weight_decay=0.1, learning_rate=3e-4, betas=(0.9, 0.95),
+        weight_decay=weight_decay, learning_rate=learning_rate, betas=(0.9, 0.95),
         device_type=device, use_muon=False,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -106,21 +97,30 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
     if device == "cuda":
         torch.cuda.reset_peak_memory_stats()
         print(f"GPU: {torch.cuda.get_device_name(0)}", flush=True)
+    horizon = schedule_steps or steps
+    warmup = max(1, min(50, horizon // 10)) if warmup_steps is None else warmup_steps
+    if schedule == 'wsd':
+        warmup = max(1, warmup)
+    stable, decay = wsd_plan(horizon, warmup) if schedule == 'wsd' else (None, None)
     result = run_training(
         model=model, optimizer=optimizer, cfg=cfg,
         out_dir=str(out_dir), device=device, data_dirs=str(Path(data_dir).resolve()),
-        max_steps=steps, warmup_steps=max(1, min(50, (schedule_steps or steps) // 10)),
+        max_steps=steps, warmup_steps=warmup,
+        learning_rate=learning_rate, min_lr=learning_rate * min_lr_ratio,
+        schedule=schedule, stable_steps=stable, decay_steps=decay, grad_clip=grad_clip,
         batch_size=batch_size, grad_accum_steps=grad_accum_steps,
         log_interval=1 if steps <= 10 else 10,
-        eval_interval=50, eval_iters=20,
+        eval_interval=eval_interval, eval_iters=20,
         dtype="auto",
         init_from="resume" if resume else "scratch",
         stop_requested=stop_requested, schedule_steps=schedule_steps,
+        early_stop_patience=early_stop_patience, keep_snapshots=keep_snapshots, outcome=outcome,
     )
     if not np.isfinite(result[1]):
         raise RuntimeError("Validation loss is nonfinite")
     if device == "cuda":
-        print(f"Peak allocated VRAM: {torch.cuda.max_memory_allocated()/2**20:.1f} MiB")
+        outcome['peak_vram_mib'] = round(torch.cuda.max_memory_allocated() / 2**20, 1)
+        print(f"Peak allocated VRAM: {outcome['peak_vram_mib']:.1f} MiB")
     return result
 
 

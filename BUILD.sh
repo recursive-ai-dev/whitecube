@@ -18,6 +18,9 @@ if [[ -n ${SANITIZE:-} ]]; then
   export UBSAN_OPTIONS=${UBSAN_OPTIONS:-print_stacktrace=1}
 fi
 mkdir -p "$out"
+# Launcher tests execute temporary scripts; /tmp can be mounted noexec.
+export TMPDIR=${TMPDIR:-$native_dir/$out/tmp}
+mkdir -p "$TMPDIR"
 if [[ -n $sysroot ]]; then
   sysroot=$(realpath -- "$sysroot")
   cc=${CC:-$sysroot/usr/bin/gcc}
@@ -70,11 +73,13 @@ python3 tests/workspace-test.py > $out/workspace-test.c
 "$cc" "${flags[@]}" -DWLR_USE_UNSTABLE tests/hotplug-test.c -o $out/hotplug-test "${compositor_flags[@]}" -lm
 "$cc" "${flags[@]}" tests/status-theme-test.c -o $out/status-theme-test -lm
 "$cc" "${flags[@]}" tests/settings-test.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/settings-test "${settings_flags[@]}" -lm
+"$cc" "${flags[@]}" tests/status-apps-test.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/status-apps-test "${settings_flags[@]}" -lm
 if [[ -n $sysroot ]]; then
 	"$loader" --library-path "$libpath" $out/compositor-test
 	WLR_RENDERER=pixman "$loader" --library-path "$libpath" $out/hotplug-test
 	"$loader" --library-path "$libpath" $out/status-theme-test
 	"$loader" --library-path "$libpath" $out/settings-test
+	"$loader" --library-path "$libpath" $out/status-apps-test
 	"$loader" --library-path "$libpath" $out/cube-status --selftest
   "$loader" --library-path "$libpath" $out/workspace-test
   "$loader" --library-path "$libpath" $out/desktop-state-test
@@ -86,6 +91,7 @@ else
 	WLR_RENDERER=pixman $out/hotplug-test      # real wlroots headless backend: outputs added and removed at runtime
 	$out/status-theme-test
 	$out/settings-test
+	$out/status-apps-test
 	$out/cube-status --selftest
   $out/workspace-test
   $out/desktop-state-test
@@ -106,15 +112,36 @@ python3 -I tests/test-install.py
 python3 -I tests/test-preferences.py
 python3 -I tests/test-migrate.py
 python3 -I tests/test-packaging.py
+python3 -I -m unittest discover -s apps/cube-apps/tests -v
+python3 -I tests/test-desktop-improvements.py
 "${NODE:-node}" --test apps/desktop-chat/test/*.test.js
 python3 -I apps/desktop-chat/test/local-server-test.py
-python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_engine.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_engine*.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_app.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_worker_descendants.py' -v
+if [[ -n ${TRAINING_PYTHON:-} ]]; then
+  "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_pipeline.py' -v
+  "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_corpus_improvements.py' -v
+  "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_training_improvements.py' -v
+  "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_presets.py' -v
+  "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_notebook_execution.py' -v
+  # Hardware smoke runs require a cool host and are explicitly opt-in.
+  if [[ -n ${TRAINING_SMOKE:-} ]]; then
+    "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_training_job.py' -v
+  fi
+fi
 python3 -I tests/test-cube-train-ui.py
 python3 -I -m unittest discover -s apps/cube-editor/tests -v
 python3 -I tests/test-cube-editor-ui.py
 python3 -I tests/test-chrootables.py
+python3 -I tests/test-cube-prompts.py
+python3 -I -m unittest discover -s apps/cube-strap/tests -v
+python3 -I tests/test-cube-strap-ui.py
 python3 -I tests/test-app-launch.py
+python3 -I tests/test-cube-apps-ui.py
 # The wc suite tests run wrappers from temporary homes, which a noexec /tmp would refuse.
 TMPDIR="$native_dir/$out" python3 -I -m unittest discover -s apps/wc-suite -p test_suite.py
 bash -n net/apply.sh
+# Native meson apps (cube-browser, cube-player): compiled, tested and staged in $out/native-apps-root for the package.
+[[ -n $sysroot || -n ${SANITIZE:-} ]] || bash apps/build-native-apps.sh "$native_dir/$out"
 printf 'Built: %s/%s/{whitecube,cube-ca,cube-settings,cube-status}; previews: %s/cube-space.ppm %s/{bar,menu,menu-search}.png\n' "$native_dir" "$out" "$out" "$out"

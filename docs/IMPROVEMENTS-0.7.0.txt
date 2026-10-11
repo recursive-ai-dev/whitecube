@@ -1,0 +1,218 @@
+WHITECUBE DESKTOP 0.7.0 — IMPLEMENTED IMPROVEMENTS
+
+Scope: Changes made for the 2026-10-11 desktop/app improvement request.
+Pre-existing working-tree changes were preserved and included in the package.
+Source backup and test logs: /home/woez/whitecube-review-20261011/
+
+Every item below names behavior implemented in the indicated source files.
+Regression checks and release validation are recorded in VALIDATION-0.7.0.txt.
+
+NATIVE DESKTOP APPLICATION MENU
+Sources: src/cube-status.c; tests/status-apps-test.c
+001. Respect custom XDG_DATA_HOME when discovering applications.
+002. Respect the ordered XDG_DATA_DIRS application search path.
+003. Ignore relative XDG application search directories.
+004. Discover desktop entries in nested application directories.
+005. Use flattened desktop IDs to preserve nested entry precedence.
+006. Bound directory traversal and avoid following directory symlink loops.
+007. Reject oversized desktop entry files before parsing.
+008. Decode desktop entry string escapes through GLib's key-file parser.
+009. Display localized application names.
+010. Search localized generic names and keywords.
+011. Include application comments in search results.
+012. Match Unicode names without ASCII-only case limitations.
+013. Normalize composed and decomposed Unicode during search.
+014. Allow search words to appear in any order.
+015. Launch applications with literal argv instead of shell evaluation.
+016. Honor application working-directory metadata.
+017. Expand the application-name field code without shell quoting errors.
+018. Expand the desktop-file field code as a literal path.
+019. Expand icon field codes into the required argument pair.
+020. Reject directories masquerading as TryExec executables.
+021. Navigate long application lists with PageUp and PageDown.
+022. Clear application search with Ctrl+U.
+023. Sort application names with locale-aware collation.
+
+SHARED CUBE FILE-APP INTERFACE
+Sources: apps/cube-apps/cube_theme.py
+024. Add Ctrl+Q to quit Cube file applications.
+025. Add Ctrl+W to close the current Cube file window.
+026. Add Ctrl+O to open the appropriate file picker.
+027. Add Ctrl+Enter to run an enabled file operation.
+028. Give keyboard focus a visible outline.
+029. Apply the shared desktop interface-scale preference.
+030. Apply the shared strong-contrast preference.
+031. Disable GTK animations when reduced motion is enabled.
+032. Filter remote file URLs from open and drop requests.
+033. Preserve a single-file selection when a replacement selection is invalid.
+034. Normalize local file paths before deduplicating selected files.
+035. Disable reorder buttons at the first and last list positions.
+036. Make chosen file names and parent paths selectable.
+037. Show full-path tooltips on chosen file rows.
+038. Make operation status and error text selectable.
+039. Write picker history through unique atomic temporary files.
+040. Recover gracefully from invalid picker-history encoding.
+041. Treat dangling symlinks as occupied output names.
+
+CUBE HASH
+Sources: apps/cube-apps/cube_hash.py; apps/cube-apps/tests/test_cube.py
+042. Offer SHA3-256 alongside the existing checksum algorithms.
+043. Allow long-running checksum operations to be cancelled.
+044. Detect files modified during checksum computation.
+045. Reject nonregular inputs without blocking on FIFOs.
+046. Report completed progress for empty files.
+047. Keep checksum progress fractions within the progress-bar range.
+048. Throttle progress updates to avoid flooding the GTK event loop.
+049. Validate expected checksum length and hexadecimal characters.
+050. Accept BSD-style checksum lines pasted into verification.
+051. Save checksum manifests to a chosen folder.
+052. Escape unusual file names in GNU-compatible checksum manifests.
+053. Prevent copying error messages as checksums.
+054. Retain completion, cancellation and failure counts in the status line.
+055. Prevent concurrent hashing and lock file/algorithm controls while busy.
+056. Invalidate prior results when the selected algorithm changes.
+057. Reset progress before starting each batch.
+
+CUBE RENAME
+Sources: apps/cube-apps/cube_rename.py; apps/cube-apps/tests/test_cube.py
+058. Trim leading and trailing spaces from file stems.
+059. Collapse repeated whitespace in file stems.
+060. Replace only the first literal or regular-expression match.
+061. Change filename-extension case independently of stem case.
+062. Number files in alphabetic or reverse alphabetic order.
+063. Number files in natural numeric order.
+064. Reject control characters in generated filenames.
+065. Reject filenames exceeding the filesystem byte limit.
+066. Validate numbering options before formatting filenames.
+067. Mark vanished input files in the rename preview.
+068. Reject conflicted previews at the operation boundary.
+069. Reject duplicate source and destination pairs at apply time.
+070. Use atomic no-replace moves to protect files created after preview.
+071. Roll back failures while moving sources into temporary names.
+072. Roll back partial commits without corrupting swaps or chains.
+073. Preserve undo history when an undo conflicts with a newly created file.
+074. Handle invalid regex replacement groups as preview errors.
+075. Revalidate the preview immediately before applying it.
+076. Keep batch renames in each original parent folder.
+077. Report remaining recovery files if rollback itself cannot finish.
+
+CUBE PDF TOOLS
+Sources: apps/cube-apps/cube_pdf.py; apps/cube-apps/cube_theme.py
+078. Publish PDF output atomically after the complete file has been written.
+079. Avoid replacing existing outputs when naming collisions occur during a save.
+080. Reject empty merge inputs and page-free merged documents.
+081. Validate every split range before creating output files or folders.
+082. Accept the all-pages keyword in range fields.
+083. Accept typographic dashes and whitespace in page ranges.
+084. Support ranges starting at page one, such as -3.
+085. Reject empty comma-separated range components.
+086. Add a PDF Rotate tab with 90, 180 and 270 degree rotations.
+087. Rotate selected page ranges while preserving other pages and the original.
+088. Rotate overlapping page selections only once.
+089. Prevent additional operations and file changes while a PDF operation is busy.
+090. Continue batch unlocking after an individual damaged or unreadable PDF.
+091. Clear unlock passwords after an operation.
+092. Reject invalid merged-output filenames before saving.
+093. Close generated PDF objects explicitly after saving.
+
+CUBE PDF LOCK
+Sources: apps/cube-apps/cube_lock.py
+094. Preserve dotted stems such as report.v1 in encrypted output names.
+095. Reject empty encryption passwords at the engine boundary.
+096. Reject passwords exceeding the PDF UTF-8 byte limit.
+097. Verify AES-256 encryption when checking locked output.
+098. Verify every encrypted output before reporting success.
+099. Show per-file progress while encrypting a batch.
+100. Provide a reset control for the selected output folder.
+101. Clear password entries after a successful batch.
+102. Prevent duplicate encryption and list edits while encryption is busy.
+103. Check that Trash operations actually succeed before counting an original as removed.
+
+DESKTOP PREFERENCES AND TERMINAL
+Sources: workspace/desktop_state.py; bin/whitecube-terminal; tests/test-desktop-improvements.py
+104. Recover safe preferences from malformed or incorrectly encoded settings JSON.
+105. Keep valid individual preferences when neighboring saved values are invalid.
+106. Preserve unrelated preferences during a partial settings update.
+107. Validate layout versions and visibility flags by exact type.
+108. Reject duplicate and malformed saved pane identities.
+109. Reject invalid pane sizes, directions and window bounds.
+110. Reject malformed saved project display fields.
+111. Respect custom XDG_CONFIG_HOME for Foot configuration.
+112. Recognize the --config=FILE terminal option.
+113. Read font settings only from Foot's main configuration section.
+114. Handle whitespace around terminal font settings.
+115. Recover from unreadable or incorrectly encoded terminal configuration.
+116. Handle malformed font sizes and terminal-scale values without crashing.
+117. Report a missing Foot executable with a concise launcher error.
+118. Start a terminal with safe defaults when desktop state cannot be read.
+119. Retain compatibility with the older high_contrast settings field.
+
+DESKTOP CHAT
+Sources: apps/desktop-chat/renderer; apps/desktop-chat/main.js; apps/desktop-chat/src
+120. Find text in the conversation with Ctrl+F.
+121. Navigate matching messages forwards and backwards.
+122. Highlight matching messages and show the current match position.
+123. Copy the conversation as Markdown.
+124. Copy user messages directly from their bubbles.
+125. Restore the draft after a failed send without replacing a newer draft.
+126. Recall the last user prompt into an empty composer with Alt+Up.
+127. Grow the composer with its contents up to a bounded height.
+128. Show the draft character count.
+129. Enforce a 100,000-character message limit in both UI and IPC.
+130. Make the underlying chat inert while a modal is open.
+131. Trap focus using visible enabled dialog controls.
+132. Focus pending tool confirmation when the chat is shown again.
+133. Clear the API-key input when closing settings.
+134. Prevent saving settings during an active reply.
+135. Prevent duplicate settings saves while a save is pending.
+136. Focus the composer with Ctrl+L.
+137. Respect the system reduced-motion preference in Chat CSS.
+138. Adapt title-bar and model controls to narrow windows.
+139. Require confirmation when a saved confirmation preference has an invalid type.
+140. Validate settings payload types and bound endpoint/model input.
+141. Return failed-send status to the renderer so draft recovery can work.
+
+BROWSER WORKSPACE
+Sources: workspace/web/app.js; workspace/web/index.html; workspace/server.py
+142. Keep request timeouts active while JSON response bodies are read.
+143. Report invalid JSON responses instead of silently treating them as empty data.
+144. Restore focus to the button that opened a closed drawer.
+145. Focus script search when opening the script library.
+146. Normalize Unicode and allow multiple words in project and script searches.
+147. Search project/script IDs and tags as well as names and descriptions.
+148. Navigate search-result cards with arrows, Home and End.
+149. Clear a nonempty search with Escape before closing its drawer.
+150. Avoid processing global desktop shortcuts while a native dialog is open.
+151. Announce project and script result counts.
+152. Reduce terminal polling while the browser document is hidden.
+153. Suspend background telemetry/history refreshes while hidden and refresh telemetry on return.
+154. Persist project visibility when returning to the desktop.
+155. Offer the full supported 160 percent interface scale in the display slider.
+156. Reject incomplete, chunked and nonfinite JSON request bodies.
+
+WHITECUBE TRAINER
+Sources: apps/cube-train/engine.py; apps/cube-train/tests/test_engine_improvements.py
+157. Validate numeric training preferences before writing configuration.
+158. Validate boolean and string preference types before writing configuration.
+159. Reject unsupported model-size and device selections before saving.
+160. Validate draft names and bound saved strings without replacing valid configuration.
+
+DEBIAN BUILD AND VALIDATION
+Sources: packaging/build-deb.sh; packaging/check-tree.py; BUILD.sh
+161. Declare python3-pikepdf as a runtime dependency for the bundled PDF apps.
+162. Preserve previous Debian package versions when rebuilding.
+163. Prevent concurrent package builders from sharing a staging directory.
+164. Validate the Debian version and supported bundle architecture before packaging.
+165. Build and validate the Debian archive before atomically publishing it.
+166. Run file-app, native launcher, desktop-preference and additional Trainer regression tests in the standard build.
+167. Use an executable temporary directory automatically for launcher tests.
+168. Recognize the standard XDG data search roots in package path validation.
+
+Total implemented improvements: 168
+
+Application metadata references:
+https://specifications.freedesktop.org/desktop-entry/latest/recognized-keys.html
+https://specifications.freedesktop.org/basedir/latest/
+
+Installation: sudo apt install ./packaging/out/whitecube-desktop_0.7.0_amd64.deb
+Log out and back in to load compositor and panel changes.

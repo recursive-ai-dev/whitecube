@@ -53,3 +53,18 @@ test('checkpoint IDs and friendly names survive restart and partial API changes'
   const disk = JSON.parse(fs.readFileSync(path.join(directory, 'config.json'), 'utf8'));
   assert.equal(disk.checkpointId, saved.checkpointId);
 }));
+
+test('malformed confirmation state falls back to requiring confirmation', () => fixture((config, directory) => {
+  fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify({ confirmDestructive:'false', hotkey:42 }));
+  assert.equal(config.load().confirmDestructive, true);
+  assert.equal(config.load().hotkey, 'CommandOrControl+Shift+T');
+}));
+
+test('invalid settings types never replace a saved configuration', () => fixture((config, directory) => {
+  config.save({ model:'my-model' });
+  const before = fs.readFileSync(path.join(directory, 'config.json'), 'utf8');
+  for (const bad of [null, [], { confirmDestructive:'false' }, { hotkey:42 }, { endpoint:42 }, { model:'bad\nmodel' }]) {
+    assert.throws(() => config.save(bad));
+    assert.equal(fs.readFileSync(path.join(directory, 'config.json'), 'utf8'), before);
+  }
+}));

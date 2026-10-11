@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { ShortcutGroup, ScriptItem } from '../types';
+import { normalizeShortcut, shortcutIssue } from '../shortcuts';
 
 interface ShortcutGroupsEditorProps {
   groups: ShortcutGroup[];
@@ -18,15 +19,17 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
 }) => {
   const [editingGroup, setEditingGroup] = useState<Partial<ShortcutGroup> | null>(null);
 
+  const issue = editingGroup ? shortcutIssue(editingGroup.shortcut || '', groups, editingGroup.id) : null;
   const handleSave = () => {
-    if (!editingGroup?.name || !editingGroup.shortcut) return;
+    if (!editingGroup?.name?.trim() || issue) return;
+    const shortcut = normalizeShortcut(editingGroup.shortcut || '');
 
     if (editingGroup.id) {
-      onUpdateGroup(editingGroup as ShortcutGroup);
+      onUpdateGroup({ ...editingGroup, shortcut } as ShortcutGroup);
     } else {
       onAddGroup({
         name: editingGroup.name,
-        shortcut: editingGroup.shortcut,
+        shortcut,
         scriptIds: editingGroup.scriptIds || []
       });
     }
@@ -47,7 +50,7 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
        <div className="flex items-center justify-between mb-6">
         <div>
           <h2 className="text-2xl font-light text-white mb-1">Shortcut Groups</h2>
-          <p className="text-white/50 text-sm">Create HUD menus triggered by global shortcuts.</p>
+          <p className="text-white/50 text-sm">Create command menus triggered by shortcuts while this app is focused.</p>
         </div>
         {!editingGroup && (
           <button
@@ -66,6 +69,9 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
            {groups.map(group => (
              <div
                key={group.id}
+               role="button"
+               tabIndex={0}
+               onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setEditingGroup(group); } }}
                onClick={() => setEditingGroup(group)}
                className={`p-4 rounded-lg border cursor-pointer transition-all ${
                  editingGroup?.id === group.id
@@ -75,7 +81,7 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
              >
                <div className="flex items-center justify-between mb-2">
                  <h3 className="font-bold">{group.name}</h3>
-                 <span className="text-xs bg-white/10 px-2 py-1 rounded font-mono">{group.shortcut}</span>
+                 <span className="text-xs bg-white/10 px-2 py-1 rounded font-mono">{group.shortcut || 'Unbound'}</span>
                </div>
                <p className="text-xs opacity-60">{group.scriptIds.length} actions linked</p>
              </div>
@@ -91,6 +97,7 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
                      <label className="text-xs font-bold text-white/40 uppercase block mb-1">Group Name</label>
                      <input
                        className="w-full bg-black/20 border border-white/10 rounded px-3 py-2 text-white"
+                       aria-label="Shortcut group name"
                        value={editingGroup.name}
                        onChange={e => setEditingGroup({...editingGroup, name: e.target.value})}
                        placeholder="e.g. Media Controls"
@@ -100,13 +107,17 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
                      <label className="text-xs font-bold text-white/40 uppercase block mb-1">Trigger Shortcut</label>
                      <input
                        className="w-full bg-black/20 border border-white/10 rounded px-3 py-2 text-white font-mono"
+                       aria-label="Trigger shortcut"
+                       aria-invalid={!!issue}
+                       aria-describedby="shortcut-feedback"
                        value={editingGroup.shortcut}
                        onChange={e => setEditingGroup({...editingGroup, shortcut: e.target.value})}
-                       placeholder="e.g. Alt+M"
+                       placeholder="e.g. Ctrl+Shift+G"
                      />
                    </div>
                 </div>
 
+                {issue && <p id="shortcut-feedback" role="alert" className="text-xs text-amber-200 mb-4">{issue}</p>}
                 <div className="flex-1 overflow-hidden flex flex-col">
                   <label className="text-xs font-bold text-white/40 uppercase block mb-2">Included Actions</label>
                   <div className="flex-1 overflow-y-auto border border-white/5 rounded bg-black/20 p-2 space-y-1">
@@ -115,6 +126,10 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
                        return (
                          <div
                            key={script.id}
+                           role="checkbox"
+                           aria-checked={!!isSelected}
+                           tabIndex={0}
+                           onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggleScriptInGroup(script.id); } }}
                            onClick={() => toggleScriptInGroup(script.id)}
                            className={`flex items-center gap-3 p-2 rounded cursor-pointer select-none ${isSelected ? 'bg-whitecube-accent/20 text-white' : 'hover:bg-white/5 text-white/50'}`}
                          >
@@ -140,7 +155,7 @@ const ShortcutGroupsEditor: React.FC<ShortcutGroupsEditorProps> = ({
                    )}
                    <div className="flex gap-3 ml-auto">
                       <button onClick={() => setEditingGroup(null)} className="px-4 py-2 text-white/60 hover:text-white text-sm">Cancel</button>
-                      <button onClick={handleSave} className="px-6 py-2 bg-whitecube-accent hover:bg-red-600 rounded text-white text-sm font-bold shadow-md">Save Group</button>
+                      <button disabled={!!issue || !editingGroup.name?.trim()} onClick={handleSave} className="px-6 py-2 bg-whitecube-accent hover:bg-red-600 rounded text-white text-sm font-bold shadow-md disabled:opacity-40">Save Group</button>
                    </div>
                 </div>
              </>

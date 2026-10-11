@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import './index.css';
 import App from './App';
 import ErrorBoundary from './components/ErrorBoundary';
+import { MonitoringProvider } from './monitoring';
 
 const rootElement = document.getElementById('root');
 if (!rootElement) {
@@ -11,6 +12,6 @@ if (!rootElement) {
 
 ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <ErrorBoundary><App /></ErrorBoundary>
+    <ErrorBoundary><MonitoringProvider><App /></MonitoringProvider></ErrorBoundary>
   </React.StrictMode>
 );

@@ -1,0 +1,82 @@
+#!/bin/bash
+# cube-strap-build : the one privileged step of Cube Strap (run through sudo).
+#
+#   cube-strap-build --debstrap FILE --config FILE --workdir DIR --kind chroot|vm --owner UID:GID
+#
+# Runs deb-strap unattended with the configuration Cube Strap wrote into DIR (the user's
+# build directory), bootstrapping under /var/lib/cube-strap/<build id> because debootstrap
+# needs a filesystem with device nodes. The finished artifact (DIR/NAME.tar.xz or DIR/NAME.img)
+# is handed to UID:GID. The configuration holds a password and is always deleted; the root
+# work directory is always removed, but never while anything is still mounted inside it.
+set -euo pipefail
+
+ROOT_WORK=/var/lib/cube-strap
+fail() { printf 'Error: %s\n' "$*" >&2; exit 2; }
+
+debstrap= config= workdir= kind= owner=
+while (($#)); do
+  case $1 in
+    --debstrap) debstrap=${2-}; shift 2 ;;
+    --config) config=${2-}; shift 2 ;;
+    --workdir) workdir=${2-}; shift 2 ;;
+    --kind) kind=${2-}; shift 2 ;;
+    --owner) owner=${2-}; shift 2 ;;
+    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    *) fail "unknown argument: $1" ;;
+  esac
+done
+
+[[ $EUID -eq 0 ]] || fail 'cube-strap-build must run as root (through sudo).'
+[[ $kind == chroot || $kind == vm ]] || fail '--kind must be chroot or vm.'
+[[ $owner =~ ^([0-9]{1,9}):([0-9]{1,9})$ ]] || fail '--owner must be UID:GID.'
+uid=${BASH_REMATCH[1]} gid=${BASH_REMATCH[2]}
+[[ $workdir == /* && -d $workdir && ! -L $workdir ]] || fail "--workdir must be an existing directory: $workdir"
+[[ $(stat -c %u -- "$workdir") == "$uid" ]] || fail 'the build directory is not owned by the requesting user.'
+id=$(basename -- "$workdir")
+[[ $id =~ ^build-[A-Za-z0-9_]{1,32}$ ]] || fail "not a Cube Strap build directory: $workdir"
+[[ $config == "$workdir/cube.conf" && -f $config && ! -L $config ]] || fail '--config must be cube.conf in the build directory.'
+[[ $debstrap == /* && -f $debstrap && ! -L $debstrap ]] || fail "deb-strap not found: $debstrap"
+
+work=$ROOT_WORK/$id
+install -d -m 0700 "$ROOT_WORK"
+[[ ! -e $work ]] || fail "a build with this id is already running: $work"
+install -d -m 0700 "$work" "$work/mnt"
+
+mounted_below() { findmnt -rn -o TARGET | awk -v p="$work/" 'index($0, p) == 1' ; }
+finish() {
+  local status=$?
+  rm -f -- "$config"
+  local m
+  while read -r m; do [[ -z $m ]] || umount -R "$m" 2>/dev/null || umount -l "$m" 2>/dev/null || true; done \
+    < <(mounted_below | sort -r)
+  if [[ -n $(mounted_below) ]]; then
+    printf 'Error: %s still has mounts; leaving it in place.\n' "$work" >&2
+  else
+    rm -rf --one-file-system -- "$work"
+  fi
+  # Whatever deb-strap left in the user's directory belongs to the user.
+  find "$workdir" -xdev -user 0 -exec chown -h "$uid:$gid" {} + 2>/dev/null || true
+  exit "$status"
+}
+trap finish EXIT
+trap 'exit 130' INT TERM HUP
+
+printf 'Cube Strap: building a %s cube in %s\n' "$kind" "$work"
+status=0
+# TMPDIR keeps deb-strap's resume state per build; STRAP_MNT is where image partitions mount.
+# deb-strap gets its own process group: sudo relays a cancel only to this script, which passes
+# it on to deb-strap and everything it started (debootstrap, apt, chroot), then cleans up.
+setsid env TMPDIR="$work" STRAP_MNT="$work/mnt" DEBIAN_FRONTEND=noninteractive \
+  bash "$debstrap" --config "$config" --unattended --log "$work/deb-strap.log" </dev/null 2>&1 &
+child=$!
+trap 'kill -TERM -- "-$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 130' INT TERM HUP
+wait "$child" || status=$?
+trap 'exit 130' INT TERM HUP
+cp -f -- "$work/deb-strap.log" "$workdir/deb-strap.log" 2>/dev/null || true
+(( status == 0 )) || { printf 'Error: deb-strap failed with status %s\n' "$status" >&2; exit "$status"; }
+
+pattern='*.img'; [[ $kind == vm ]] || pattern='*.tar.xz'
+artifact=$(find "$workdir" -maxdepth 1 -type f -name "$pattern" -print -quit)
+[[ -n $artifact ]] || fail 'deb-strap finished but produced no archive or image.'
+chown "$uid:$gid" -- "$artifact"
+printf 'Cube Strap: artifact %s\n' "$artifact"

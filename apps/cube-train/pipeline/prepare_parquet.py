@@ -1,5 +1,6 @@
 """Stream a local Parquet text column into a capped Tensegrity byte-token corpus."""
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -10,6 +11,7 @@ import re
 from corpus_split import (check_cancelled, document_key, positive_integer, split_documents,
                           utf8_prefix, validate_split_options)
 from files import atomic_json, file_sha256, publish_directory
+from corpus_index import DocumentIndex
 
 import numpy as np
 try:
@@ -102,15 +104,19 @@ def parquet_values(parquet, selected, batch_rows=32):
 
 
 def corpus_integrity(directory, records, stop_requested=None):
-    groups = {key for _, _, key in records}
+    group_count = records.group_count if isinstance(records, DocumentIndex) else len({key for _, _, key in records})
+    names = ['train.bin', 'val.bin']
+    if (directory / 'documents.jsonl').is_file():
+        names.append('documents.jsonl')
     return {
-        'schema_version': 2, 'token_dtype': 'uint16', 'token_bytes': 2,
+        'schema_version': 3, 'token_dtype': 'uint16', 'token_bytes': 2,
         'byte_order': sys.byteorder, 'eos_token_id': 257,
-        'unique_document_groups': len(groups), 'document_records': len(records),
-        'repeated_document_records': len(records) - len(groups),
+        'document_index': 'documents.jsonl', 'document_index_version': 1,
+        'unique_document_groups': group_count, 'document_records': len(records),
+        'repeated_document_records': len(records) - group_count,
         'artifacts': {name: {'bytes': (directory / name).stat().st_size,
                              'sha256': file_sha256(directory / name, stop_requested)}
-                      for name in ('train.bin', 'val.bin')},
+                      for name in names},
     }
 
 
@@ -132,7 +138,9 @@ def prepare(source, output, *, column=None, max_tokens=2_000_000,
         raise ImportError("Parquet input requires pyarrow")
     initial_stat = source.stat()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with pq.ParquetFile(source) as parquet, tempfile.TemporaryDirectory(prefix=".parquet-prep-", dir=output.parent) as temp:
+    with (tempfile.TemporaryDirectory(prefix=".parquet-prep-", dir=output.parent) as temp,
+          DocumentIndex(Path(temp) / 'documents.sqlite', seed, stop_requested) as records,
+          pq.ParquetFile(source) as parquet):
         column = pick_column(parquet.schema_arrow, column)
         if not parquet.metadata.num_rows:
             raise ValueError(f'Empty dataset: {source}')
@@ -140,7 +148,6 @@ def prepare(source, output, *, column=None, max_tokens=2_000_000,
         stage = work / 'corpus'
         stage.mkdir()
         combined = work / "tokens.bin"
-        records = []
         total = rows_scanned = documents = truncated = skipped = 0
         eos = np.array([257], dtype=np.uint16).tobytes()
         with combined.open("wb") as stream:
@@ -163,7 +170,9 @@ def prepare(source, output, *, column=None, max_tokens=2_000_000,
                     check_cancelled(stop_requested)
                     stream.write(np.frombuffer(raw[offset:offset + 65536], dtype=np.uint8).astype(np.uint16).tobytes())
                 stream.write(eos)
-                records.append((total, len(raw) + 1, document_key(text, stop_requested)))
+                records.append((total, len(raw) + 1, hashlib.sha256(raw).hexdigest()),
+                               source=str(source), row=rows_scanned, truncated=was_truncated,
+                               source_key=document_key(text, stop_requested))
                 total += len(raw) + 1
                 documents += 1
                 if progress_callback:
@@ -185,7 +194,7 @@ def prepare(source, output, *, column=None, max_tokens=2_000_000,
                       val_tokens=n_val, rows_scanned=rows_scanned, documents=documents,
                       truncated_documents=truncated, block_size=block_size,
                       val_fraction=val_fraction, batch_rows=batch_rows, strip_html=strip_html,
-                      split_method="document_hash_groups_v1", split_seed=seed,
+                      split_method="source_and_stored_document_hash_groups_v2", split_seed=seed,
                       skipped_documents=skipped, actual_val_fraction=n_val / total,
                       source_bytes=initial_stat.st_size, source_mtime_ns=initial_stat.st_mtime_ns,
                       **corpus_integrity(stage, records, stop_requested))

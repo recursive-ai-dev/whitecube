@@ -1,0 +1,52 @@
+[
+  {
+    "name": "article",
+    "path": "article.html",
+    "text": "Article corpus marker"
+  },
+  {
+    "name": "documentation",
+    "path": "documentation.html",
+    "text": "Documentation corpus marker"
+  },
+  {
+    "name": "flex",
+    "path": "flex.html",
+    "text": "Flex corpus marker"
+  },
+  {
+    "name": "grid",
+    "path": "grid.html",
+    "text": "Grid corpus marker"
+  },
+  {
+    "name": "forms",
+    "path": "forms.html",
+    "text": "Forms corpus marker"
+  },
+  {
+    "name": "login",
+    "path": "login.html",
+    "text": "Login corpus marker"
+  },
+  {
+    "name": "responsive",
+    "path": "responsive.html",
+    "text": "Responsive corpus marker"
+  },
+  {
+    "name": "malformed",
+    "path": "malformed.html",
+    "text": "Recovery corpus marker"
+  },
+  {
+    "name": "scripted",
+    "path": "scripted.html",
+    "text": "Script corpus marker"
+  },
+  {
+    "name": "tables",
+    "path": "tables.html",
+    "text": "Tables corpus marker"
+  }
+]

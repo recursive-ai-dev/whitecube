@@ -21,7 +21,8 @@ FORBIDDEN = re.compile(rb'/usr/local/|/home/[a-z][a-z0-9_-]*/')
 # Shell/format fragments that look like paths but are templates, not files.
 RUNTIME_FILES = ('/etc/whitecube/network/networks.json', '/etc/whitecube/network/wpa.conf', '/etc/whitecube/network/device.json',
                  '/etc/whitecube/network/profiles.json')
-SEARCH_DIRS = (b'/usr/local/share/applications', b'/usr/local/share/icons')
+SEARCH_DIRS = (b'/usr/local/share/applications', b'/usr/local/share/icons',
+               b'/usr/local/share:/usr/share')  # XDG_DATA_DIRS default search roots
 # These exact strings describe paths inside the editable guest, not host installation
 # locations. Other /usr/local or /home references in the same files remain forbidden.
 GUEST_PATH_FRAGMENTS = {
@@ -31,6 +32,11 @@ GUEST_PATH_FRAGMENTS = {
         b'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',),
     'usr/bin/chrootable-manager': (
         b'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',),
+}
+# Owned-looking paths that name files inside a target system being built, not host files:
+# deb-strap's user shells and its foreign-architecture qemu copies live in the new rootfs.
+GUEST_OWNED_PATHS = {
+    'usr/share/whitecube/cube-strap/deb-strap.sh': ('/usr/bin/zsh', '/usr/bin/fish', '/usr/bin/qemu-'),
 }
 ALLOW_FORBIDDEN_IN = ('usr/bin/whitecube-migrate', 'usr/share/doc/', 'usr/share/whitecube/workspace/docs', 'usr/share/whitecube/boot-theme/',
                       'usr/share/whitecube/desktop-chat/assets', 'usr/lib/whitecube/')
@@ -86,6 +92,8 @@ def main():
             ref = match.decode()
             if ref.startswith(RUNTIME_FILES):
                 continue                                   # created at run time, not shipped
+            if ref.startswith(GUEST_OWNED_PATHS.get(rel, ())):
+                continue                                   # a path in the system being built
             if not (stage / ref.lstrip('/')).exists() and not (host / ref.lstrip('/')).exists():
                 problems.append(f'{rel}: refers to {ref}, which the package does not provide')
         if not rel.startswith(allow_forbidden) and not rel.endswith('.txt'):
@@ -117,8 +125,19 @@ def main():
                 'usr/share/whitecube/cube-editor/worker.py', 'usr/share/applications/cube-editor.desktop',
                 'usr/share/icons/hicolor/scalable/apps/cube-editor.svg',
                 'usr/bin/chrootables', 'usr/bin/chrootable-manager', 'usr/share/whitecube/chrootables/app.py',
-                'usr/share/whitecube/chrootables/backend.py', 'usr/share/applications/chrootables.desktop',
+                'usr/share/whitecube/chrootables/backend.py', 'usr/share/whitecube/chrootables/broker.py', 'usr/share/applications/chrootables.desktop',
                 'usr/share/icons/hicolor/scalable/apps/chrootables.svg',
+                'usr/bin/cube-strap', 'usr/share/whitecube/cube-strap/app.py', 'usr/share/whitecube/cube-strap/strap.py',
+                'usr/share/whitecube/cube-strap/deb-strap.sh', 'usr/libexec/whitecube/cube-strap-build',
+                'usr/share/applications/cube-strap.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-strap.svg',
+                'usr/bin/cube-prompts', 'usr/share/whitecube/cube-prompts/app.py',
+                'usr/share/whitecube/cube-prompts/prompt_manager/storage/repository.py',
+                'usr/share/applications/cube-prompts.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-prompts.svg',
+                'usr/bin/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-browser',
+                'usr/libexec/whitecube/cube-browser/cube-renderd', 'usr/libexec/whitecube/cube-browser/cube-netd',
+                'usr/share/applications/cube-browser.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-browser.svg',
+                'usr/bin/cube-player', 'usr/share/applications/cube-player.desktop',
+                'usr/share/icons/hicolor/scalable/apps/cube-player.svg',
                 'usr/bin/wc-help', 'usr/bin/wc-doctor', 'usr/lib/wc-suite/wc_suite.py',
                 'usr/bin/cube-train', 'usr/bin/whitecube-train', 'usr/share/whitecube/cube-train/app.py',
                 'usr/share/whitecube/cube-train/engine.py', 'usr/share/whitecube/cube-train/worker.py',

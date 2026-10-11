@@ -104,7 +104,7 @@ class CubeArt(Gtk.DrawingArea):
         cr.translate(width / 2, height / 2)
         scale = min(width / 220, height / 190)
         cr.scale(scale, scale)
-        cr.set_source_rgba(.14, .23, .08, .12)
+        cr.set_source_rgba(.07, .07, .07, .14)
         cr.set_line_width(1)
         for r in [48, 69, 91]:
             cr.arc(0, 0, r, 0, 2 * math.pi)
@@ -113,18 +113,18 @@ class CubeArt(Gtk.DrawingArea):
             cr.rectangle(x, y, 5, 5)
             cr.fill()
         points = [(0, -58), (58, -28), (58, 35), (0, 65), (-58, 35), (-58, -28)]
-        cr.set_source_rgb(.10, .14, .07)
+        cr.set_source_rgb(.07, .07, .07)
         cr.move_to(*points[0])
         for p in points[1:]:
             cr.line_to(*p)
         cr.close_path()
         cr.fill()
         cr.set_line_width(2)
-        cr.set_source_rgb(.82, 1, .54)
+        cr.set_source_rgb(1, 1, 1)
         cr.move_to(-58, -28); cr.line_to(0, 3); cr.line_to(58, -28)
         cr.move_to(0, 3); cr.line_to(0, 65)
         cr.stroke()
-        cr.set_source_rgba(.82, 1, .54, .55)
+        cr.set_source_rgba(1, 1, 1, .55)
         cr.move_to(0, -43); cr.line_to(42, -22); cr.line_to(0, -1); cr.line_to(-42, -22)
         cr.close_path(); cr.stroke()
 
@@ -133,13 +133,20 @@ class EditorWindow(Adw.ApplicationWindow):
     def __init__(self, app, initial=None):
         super().__init__(application=app, title='cube-editor', default_width=1180, default_height=820)
         self.project = None
+        self.pick_dirs = {}  # last folder per picker kind, for this session
         self.worker = None
         self.busy = False
         self.running_action = None
         self.hydrating = False
         self.save_timer = None
         self.entries = {}
+        self.field_errors = {}
+        self.selected_release = None
+        self.test_disk = None
+        self.editing_payload = None
         self.payloads = []
+        self.original_commands = []
+        self.original_script_text = ''
         self.log_lines = []
         self.stage_buttons = {}
         self.action_buttons = []
@@ -242,6 +249,10 @@ class EditorWindow(Adw.ApplicationWindow):
         holder.append(row)
         if hint:
             holder.append(label(hint, 'help', True))
+        error = label('', 'error', True)
+        error.set_visible(False)
+        holder.append(error)
+        self.field_errors[key] = error
         parent.append(holder)
         return widget
 
@@ -293,7 +304,22 @@ class EditorWindow(Adw.ApplicationWindow):
         self.action_buttons.append(self.extract_button)
         act.append(self.extract_button)
         act.append(button('Inspect again', self.inspect_project, css='flat'))
+        act.append(button('Storage estimate', lambda: self.check_storage('extract')))
+        act.append(button('Full extraction plan', lambda: self.show_plan('extract')))
         ready.append(act); page.append(ready)
+        integrity = card('Source integrity', 'Record a source SHA256 before extraction. Supply the publisher’s digest to check it.')
+        self.entry(integrity, 'Expected SHA256 (optional)', 'source_checksum')
+        integrity.append(button('Verify source ISO', self.verify_source))
+        self.source_hash = label('', 'help', True); self.source_hash.set_selectable(True)
+        integrity.append(self.source_hash); page.append(integrity)
+        recovery = card('Recovery and restore points', 'Restore points include the editable root and ISO tree. Replaced files are retained in recovery/.')
+        self.recovery_label = label('Open a project to see its recovery status.', 'help', True)
+        recovery.append(self.recovery_label)
+        self.auto_snapshot = Gtk.CheckButton(label='Save a restore point before applying recipes or opening the image terminal', active=True)
+        self.auto_snapshot.connect('toggled', self.mark_changed); recovery.append(self.auto_snapshot)
+        for title, action in [('Save restore point', 'snapshot'), ('Restore saved point', 'restore'), ('Recover project', 'recover')]:
+            recovery.append(button(title, lambda a=action: self.start_job(a)))
+        page.append(recovery)
         self.recent_box = card('Recent projects')
         page.append(self.recent_box)
 
@@ -312,8 +338,9 @@ class EditorWindow(Adw.ApplicationWindow):
         packages = card('Package plan', 'Use package names separated by spaces or newlines. Package operations use the repositories configured inside the source image.')
         self.entry(packages, 'Install', 'install_packages', '', 'Example: git curl python3-venv')
         self.entry(packages, 'Remove', 'remove_packages', '', 'Example: thunderbird  —  check the plan before applying.')
+        packages.append(button('Preview package changes', lambda: self.start_job('packages')))
         page.append(packages)
-        custom = card('Your commands', 'One command per line. Commands run as root inside the image, in order. Stop on the first error.')
+        custom = card('Your Bash script', 'A complete Bash script runs as root inside the image. Loops, functions and heredocs are supported. Stop on the first error.')
         self.commands = Gtk.TextView(monospace=True)
         self.commands.set_top_margin(12); self.commands.set_bottom_margin(12)
         self.commands.set_left_margin(12); self.commands.set_right_margin(12)
@@ -327,6 +354,13 @@ class EditorWindow(Adw.ApplicationWindow):
         self.action_buttons.extend([self.apply_button, self.terminal_button])
         actions.append(self.apply_button); actions.append(self.terminal_button)
         custom.append(actions); page.append(custom)
+        self.recipe_error = label('', 'error', True)
+        self.recipe_error.set_visible(False); custom.append(self.recipe_error)
+        transfer = card('Portable recipes', 'Export a recipe independently of the project. Imported local files must be available on this computer.')
+        transfer.append(button('Import recipe', lambda: self.pick('Import recipe JSON', self.import_recipe, 'project')))
+        transfer.append(button('Export recipe', lambda: self.save_file('Export recipe', self.export_recipe, 'recipe.json')))
+        transfer.append(button('Preview complete customization plan', lambda: self.show_plan('customize')))
+        page.append(transfer)
         tip = card('A terminal with a boundary', 'The editor stays in your user session. Extraction and image changes open a dedicated terminal for sudo authentication, and the chroot gets its own mount namespace.')
         page.append(tip)
 
@@ -344,7 +378,9 @@ class EditorWindow(Adw.ApplicationWindow):
         files = card('File overlays', 'Copy a file or a directory into the extracted root. Paths are relative to the image, for example /etc/skel/.config or /usr/local/bin. Overlays are applied with the recipe.')
         self.entry(files, 'From your computer', 'payload_source', '', picker='any')
         self.entry(files, 'Destination in image', 'payload_destination', '/etc/skel/')
-        files.append(button('Add overlay', self.add_payload, icon='list-add-symbolic'))
+        self.payload_policy = Gtk.DropDown.new_from_strings(['Replace existing files', 'Skip existing files', 'Fail if files exist'])
+        files.append(self.payload_policy)
+        files.append(button('Add / update overlay', self.add_payload, icon='list-add-symbolic'))
         self.payload_list = box(spacing=8)
         files.append(self.payload_list); page.append(files)
         actions = card('Explore the project')
@@ -366,6 +402,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self.compression = Gtk.DropDown.new_from_strings(['zstd', 'xz', 'gzip', 'lz4'])
         self.compression.connect('notify::selected', self.mark_changed)
         row.append(title); row.append(self.compression); settings.append(row)
+        self.processors = Gtk.SpinButton.new_with_range(1, 256, 1); self.processors.set_value(2)
+        self.build_memory = Gtk.SpinButton.new_with_range(128, 262144, 128); self.build_memory.set_value(1024)
+        self.compression_level = Gtk.SpinButton.new_with_range(0, 22, 1)
+        for title, widget in [('Build processors', self.processors), ('Compression memory (MiB)', self.build_memory), ('Compression level (0 = default; gzip 1–9, zstd 1–22)', self.compression_level)]:
+            widget.connect('value-changed', self.mark_changed)
+            settings.append(label(title, 'help', True)); settings.append(widget)
+        self.resource_error = label('', 'error', True)
+        self.resource_error.set_visible(False); settings.append(self.resource_error)
         page.append(settings)
         plan = card('Build flight plan', 'Preview the main compression and export commands. Full worker steps, including installer preparation, appear in Activity.')
         self.plan_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
@@ -377,7 +421,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.action_buttons.append(self.build_button)
         actions.append(self.build_button)
         actions.append(button('Refresh plan', self.refresh_plan))
-        actions.append(button('Copy commands', lambda: self.clipboard(self.text(self.plan_view))))
+        actions.append(button('Copy plan', lambda: self.clipboard(self.text(self.plan_view))))
+        actions.append(button('Storage estimate', lambda: self.check_storage('build')))
+        plan.append(button('Full build plan', lambda: self.show_plan('build')))
         plan.append(actions); page.append(plan)
         self.build_summary = label('Extract your source image to unlock the build.', 'help', True)
         page.append(self.build_summary)
@@ -417,6 +463,26 @@ class EditorWindow(Adw.ApplicationWindow):
                      '04  Keep the source ISO, saved recipe and release checksum together.']:
             tips.append(label(text, 'help', True))
         page.append(tips)
+        history = card('Release history', 'Choose a previous release to verify or boot. Test outcomes are attached to the actual ISO hash.')
+        self.release_selector = Gtk.DropDown.new_from_strings(['Current output'])
+        self.release_selector.connect('notify::selected', self.select_release); history.append(self.release_selector)
+        self.history_summary = label('', 'help', True); history.append(self.history_summary)
+        page.append(history)
+        installer = card('Installer test', 'Create a disposable 32 GiB virtual disk, install into it, then reboot from disk. Disk changes persist until you discard the test disk.')
+        installer.append(button('Create test disk', self.create_test_disk))
+        installer.append(button('Open existing test disk', lambda: self.pick('Choose a project test disk', self.open_test_disk)))
+        self.disk_label = label('No test disk selected.', 'help', True); installer.append(self.disk_label)
+        installer.append(button('Boot installer with disk', lambda: self.launch_vm(installer=True)))
+        installer.append(button('Reboot installed system', lambda: self.launch_vm(installer=True, installed=True)))
+        installer.append(button('Discard test disk', self.discard_test_disk))
+        page.append(installer)
+        checks = card('Record a release check')
+        self.check_kind = Gtk.DropDown.new_from_strings(['BIOS live', 'UEFI live', 'BIOS installer', 'UEFI installer'])
+        self.check_outcome = Gtk.DropDown.new_from_strings(['not tested', 'passed', 'failed'])
+        checks.append(self.check_kind); checks.append(self.check_outcome)
+        self.entry(checks, 'Test notes', 'check_note')
+        checks.append(button('Record result for this ISO', self.record_check))
+        page.append(checks)
 
     def make_activity(self, page):
         page.append(label('Follow every operation. Failed commands stay visible, and your saved project can be reopened at any time.', 'lede', True))
@@ -425,8 +491,15 @@ class EditorWindow(Adw.ApplicationWindow):
         self.cancel_button.set_sensitive(False)
         actions.append(self.cancel_button)
         actions.append(button('Copy log', lambda: self.clipboard('\n'.join(self.log_lines))))
+        actions.append(button('Export log', lambda: self.save_file('Export activity log', self.export_log, 'cube-editor.log')))
+        actions.append(button('Next error', self.next_log_error))
         actions.append(button('Show project folder', lambda: self.reveal(self.project.directory if self.project else None)))
         page.append(actions)
+        self.log_search = Gtk.SearchEntry(placeholder_text='Filter activity…')
+        self.log_search.connect('search-changed', lambda *_: self.render_log()); page.append(self.log_search)
+        self.log_errors_only = Gtk.CheckButton(label='Errors only')
+        self.log_errors_only.connect('toggled', lambda *_: self.render_log()); page.append(self.log_errors_only)
+        self.log_follow = Gtk.CheckButton(label='Follow new activity', active=True); page.append(self.log_follow)
         self.log_view = Gtk.TextView(editable=False, cursor_visible=False, monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
         self.log_view.set_vexpand(True)
         console = box(css='console'); console.set_vexpand(True)
@@ -454,6 +527,256 @@ class EditorWindow(Adw.ApplicationWindow):
         elif self.current_stage == 'test': self.launch_vm()
         elif self.current_stage == 'activity': self.cancel_job()
 
+    def save_file(self, title, callback, name):
+        chooser = Gtk.FileChooserNative.new(title, self, Gtk.FileChooserAction.SAVE, 'Save', 'Cancel')
+        chooser.set_current_name(name)
+        def response(dialog, result):
+            if result == Gtk.ResponseType.ACCEPT and dialog.get_file():
+                path = dialog.get_file().get_path()
+                if path:
+                    try:
+                        callback(path)
+                    except Exception as exc:
+                        self.toast(str(exc))
+            dialog.destroy()
+        chooser.connect('response', response); chooser.show()
+
+    def background(self, message, task, completed=None):
+        if self.busy or not self.project:
+            return
+        self.set_busy(True, message)
+        def work():
+            try:
+                result = task()
+                error = None
+            except Exception as exc:
+                result, error = None, str(exc)
+            def finish():
+                self.set_busy(False)
+                if error:
+                    self.toast(error); self.log(error); self.status.set_text(error)
+                elif completed:
+                    completed(result)
+                return False
+            GLib.idle_add(finish)
+        threading.Thread(target=work, daemon=True).start()
+
+    def verify_source(self):
+        if not self.project: return
+        if self.source_changed():
+            self.toast('Create a project for the selected source before verifying it.'); return
+        expected = self.entries['source_checksum'].get_text()
+        worker = self.worker
+        def done(result):
+            self.source_hash.set_text(result['sha256'])
+            self.status.set_text('Source matches the supplied checksum.' if result['matched_supplied_checksum'] else 'Source hash recorded.')
+        self.background('Hashing source ISO…', lambda: worker.verify_source(expected), done)
+
+    def check_storage(self, action):
+        if not self.project or not self.save_project(): return
+        project = self.project
+        def done(result):
+            lines = ['Conservative estimate; actual space depends on the source image and installer.']
+            for check in result['checks']:
+                lines.append(f"\n{check['path']}\n{check['required_bytes'] / 1024**3:.1f} GiB estimated · {check['free_bytes'] / 1024**3:.1f} GiB free\n" + '; '.join(check['reasons']))
+            lines.append('\nSpace check passed.' if result['sufficient'] else '\nFree more space before starting.')
+            self.text_dialog('Storage estimate', '\n'.join(lines))
+        self.background('Estimating storage…', lambda: engine.storage_preflight(project, action), done)
+
+    def show_plan(self, action):
+        if not self.project or not self.save_project(): return
+        worker = self.worker
+        self.background('Preparing operation preview…', lambda: worker.detailed_plan(action),
+                        lambda result: self.text_dialog('Complete operation plan', json.dumps(result, indent=2)))
+
+    def export_recipe(self, path):
+        if not self.project or self.busy or not self.save_project(): return
+        engine.export_recipe(self.project, path)
+        self.toast('Recipe exported.')
+
+    def import_recipe(self, path):
+        if not self.project or self.busy: return
+        try:
+            recipe, missing = engine.import_recipe(path)
+            self.project.save(recipe=recipe)
+            self.hydrate()
+            if missing:
+                self.text_dialog('Recipe files to locate', 'Update these local paths before applying:\n' + '\n'.join(missing))
+            else:
+                self.toast('Recipe imported.')
+        except Exception as exc: self.toast(str(exc))
+
+    def edit_payload(self, index):
+        if self.busy: return
+        item = self.payloads[index]
+        self.entries['payload_source'].set_text(item['source'])
+        self.entries['payload_destination'].set_text(item['destination'])
+        self.payload_policy.set_selected(['replace', 'skip', 'error'].index(item.get('overwrite', 'replace')))
+        self.editing_payload = index
+        self.toast('Edit the mapping, then choose Add / update overlay.')
+
+    def preview_payload(self, index):
+        source = Path(self.payloads[index]['source'])
+        def task():
+            if not source.exists(): raise engine.CubeError('Payload source is missing')
+            lines = [str(source)]
+            if source.is_dir():
+                for parent, directories, files in os.walk(source, followlinks=False):
+                    for name in directories + files:
+                        lines.append(str((Path(parent) / name).relative_to(source)))
+                        if len(lines) >= 201:
+                            return '\n'.join(lines) + '\n… preview limited to 200 entries'
+            else: lines.append(f'{source.stat().st_size:,} bytes')
+            return '\n'.join(lines)
+        self.background('Reading payload…', task, lambda result: self.text_dialog('Payload preview', result))
+
+    def selected_output(self):
+        return self.selected_release or self.output_path()
+
+    def select_release(self, *_):
+        if not hasattr(self, 'release_choices') or self.hydrating: return
+        index = self.release_selector.get_selected()
+        self.selected_release = self.release_choices[index] if index < len(self.release_choices) else None
+        self.update_release_display()
+
+    def update_release_display(self):
+        path = self.selected_output()
+        if path and path.is_file():
+            self.release_name.set_text(path.name)
+            self.release_path.set_text(f'{path}\n{path.stat().st_size / 1024**3:.2f} GB · ready to test')
+        elif self.project:
+            self.release_name.set_text(self.project.data.get('output_name', 'Waiting for a build.'))
+            self.release_path.set_text('Build a release or select an available previous release.')
+        if self.project:
+            checks = [c for c in self.project.data.get('release_checks', []) if c.get('path') == str(path)]
+            self.history_summary.set_text('\n'.join(f"{c['kind']}: {c['outcome']} · SHA256 {c['sha256'][:12]} · {c.get('note', '')}" for c in checks[-8:]) or 'No recorded checks for this output.')
+        self.refresh_buttons()
+
+    def create_test_disk(self):
+        if not self.project or self.busy or self.vm_running(): return
+        worker = self.worker
+        def done(path):
+            self.test_disk = path
+            self.disk_label.set_text(str(path))
+            self.toast('Disposable installer disk created.')
+        self.background('Creating installer test disk…', worker.create_test_disk, done)
+
+    def open_test_disk(self, value):
+        if self.busy or self.vm_running() or not self.project: return
+        path = Path(value).resolve()
+        if path.parent != self.project.directory / 'vm-tests' or path.suffix != '.qcow2' or not path.is_file():
+            self.toast('Choose a qcow2 disk from this project’s vm-tests folder.'); return
+        self.test_disk = path
+        self.disk_label.set_text(str(path))
+
+    def vm_running(self):
+        process = getattr(self, 'vm_process', None)
+        return process is not None and process.poll() is None
+
+    def discard_test_disk(self):
+        if self.busy or self.vm_running() or not self.test_disk: return
+        disk = self.test_disk
+        def discard():
+            if self.project and disk.parent == self.project.directory / 'vm-tests':
+                disk.unlink(missing_ok=True)
+                Path(str(disk) + '.vars.fd').unlink(missing_ok=True)
+                self.test_disk = None; self.disk_label.set_text('No test disk selected.')
+        self.confirm('Discard installer test disk?', 'This removes the virtual disk and its installed system.', discard)
+
+    def confirm(self, title, body, callback):
+        dialog = Adw.MessageDialog(transient_for=self, heading=title, body=body)
+        dialog.add_response('cancel', 'Cancel'); dialog.add_response('continue', 'Continue')
+        dialog.set_response_appearance('continue', Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_default_response('cancel'); dialog.set_close_response('cancel')
+        dialog.connect('response', lambda _d, response: callback() if response == 'continue' else None)
+        dialog.present()
+
+    def record_check(self):
+        if not self.project: return
+        kind = ['BIOS live', 'UEFI live', 'BIOS installer', 'UEFI installer'][self.check_kind.get_selected()]
+        outcome = ['not tested', 'passed', 'failed'][self.check_outcome.get_selected()]
+        note = self.entries['check_note'].get_text()
+        worker, path = self.worker, self.selected_output()
+        self.background('Recording check for exact ISO hash…', lambda: worker.record_check(kind, outcome, note, path),
+                        lambda _: self.update_release_display())
+
+    @staticmethod
+    def is_log_error(line):
+        return any(word in line.lower() for word in ('error', 'failed', 'failure', 'traceback', 'mismatch', 'exited with'))
+
+    def render_log(self):
+        if not hasattr(self, 'log_view'): return
+        query = self.log_search.get_text().lower()
+        errors = self.log_errors_only.get_active()
+        lines = [line for line in self.log_lines if query in line.lower() and (not errors or self.is_log_error(line))]
+        self.log_view.get_buffer().set_text('\n'.join(lines))
+        self.log_error_offset = 0
+        self.scroll_log()
+
+    def scroll_log(self):
+        if not self.log_follow.get_active(): return
+        buffer = self.log_view.get_buffer()
+        mark = buffer.create_mark(None, buffer.get_end_iter(), False)
+        self.log_view.scroll_to_mark(mark, 0, False, 0, 1); buffer.delete_mark(mark)
+
+    def next_log_error(self):
+        buffer = self.log_view.get_buffer()
+        text = self.text(self.log_view)
+        offsets = []
+        offset = 0
+        for line in text.splitlines(True):
+            if self.is_log_error(line): offsets.append(offset)
+            offset += len(line)
+        if not offsets:
+            self.toast('No errors in the visible log.'); return
+        current = getattr(self, 'log_error_offset', 0)
+        chosen = next((o for o in offsets if o >= current), offsets[0])
+        start = buffer.get_iter_at_offset(chosen)
+        end = start.copy(); end.forward_to_line_end()
+        buffer.select_range(start, end)
+        self.log_view.scroll_to_iter(start, .1, False, 0, 0)
+        self.log_error_offset = chosen + 1
+
+    def export_log(self, path):
+        if self.project and (self.project.directory / 'events.jsonl').is_file():
+            shutil.copyfile(self.project.directory / 'events.jsonl', path)
+        else:
+            Path(path).write_text('\n'.join(self.log_lines) + '\n')
+        self.toast('Activity exported.')
+
+    def validate_fields(self):
+        if not hasattr(self, 'build_button') or not hasattr(self, 'inject_switch'): return {}
+        errors = {}
+        volume = self.entries['volume_id'].get_text().strip()
+        if not re.fullmatch('[A-Z0-9_]{1,32}', volume):
+            errors['volume_id'] = 'Use 1–32 uppercase letters, digits or underscores.'
+        name = self.entries['output_name'].get_text().strip()
+        if Path(name).name != name or not name.lower().endswith('.iso'):
+            errors['output_name'] = 'Use an ISO filename without folders.'
+        for key in ('install_packages', 'remove_packages'):
+            try: engine.package_list(self.entries[key].get_text())
+            except Exception as exc: errors[key] = str(exc)
+        if not self.entries['output_dir'].get_text().strip() or not Path(self.entries['output_dir'].get_text()).expanduser().is_absolute():
+            errors['output_dir'] = 'Choose an absolute release folder.'
+        try: engine.validate_recipe(self.recipe())
+        except Exception as exc: errors['_recipe'] = str(exc)
+        try: engine.build_resources(self.resource_settings())
+        except Exception as exc: errors['_resources'] = str(exc)
+        if hasattr(self, 'recipe_error'):
+            self.recipe_error.set_text(errors.get('_recipe', '')); self.recipe_error.set_visible('_recipe' in errors)
+        if hasattr(self, 'resource_error'):
+            self.resource_error.set_text(errors.get('_resources', '')); self.resource_error.set_visible('_resources' in errors)
+        for key, widget in self.field_errors.items():
+            widget.set_text(errors.get(key, '')); widget.set_visible(key in errors)
+            if key in errors: self.entries[key].add_css_class('error')
+            else: self.entries[key].remove_css_class('error')
+        return errors
+
+    def resource_settings(self):
+        return dict(compression=['zstd', 'xz', 'gzip', 'lz4'][self.compression.get_selected()],
+                    processors=self.processors.get_value_as_int(), memory_mb=self.build_memory.get_value_as_int(),
+                    compression_level=self.compression_level.get_value_as_int())
+
     def mark_changed(self, *_):
         self.refresh_buttons()
         if self.hydrating or not self.project or self.busy:
@@ -476,7 +799,7 @@ class EditorWindow(Adw.ApplicationWindow):
     def recipe(self):
         return dict(install_packages=self.entries['install_packages'].get_text().split(),
                     remove_packages=self.entries['remove_packages'].get_text().split(),
-                    commands=[line.strip() for line in self.text(self.commands).splitlines() if line.strip()],
+                    commands=list(self.original_commands) if self.text(self.commands) == self.original_script_text else [self.text(self.commands)] if self.text(self.commands).strip() else [],
                     payloads=list(self.payloads),
                     desktop_deb=self.entries['desktop_deb'].get_text() if self.inject_switch.get_active() else '')
 
@@ -484,6 +807,8 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self.project or self.hydrating or self.busy:
             return False
         try:
+            errors = self.validate_fields()
+            if errors: raise ValueError(next(iter(errors.values())))
             volume = self.entries['volume_id'].get_text().strip()
             if not re.fullmatch('[A-Z0-9_]{1,32}', volume):
                 raise ValueError('Use 1–32 uppercase letters, digits or underscores for the volume label.')
@@ -492,28 +817,39 @@ class EditorWindow(Adw.ApplicationWindow):
                 raise ValueError('Use a filename ending in .iso, without folders.')
             engine.package_list(self.entries['install_packages'].get_text())
             engine.package_list(self.entries['remove_packages'].get_text())
+            engine.validate_recipe(self.recipe())
+            engine.build_resources(self.resource_settings())
             self.project.save(name=self.entries['name'].get_text(), output_dir=self.entries['output_dir'].get_text(),
                               recipe=self.recipe(), volume_id=volume,
                               output_name=filename,
-                              compression=['zstd', 'xz', 'gzip', 'lz4'][self.compression.get_selected()])
+                              auto_snapshot=self.auto_snapshot.get_active(), **self.resource_settings())
             self.saved_label.set_text('SAVED LOCALLY')
+            self.saved_label.set_tooltip_text(None)
             self.project_label.set_text(self.project.data.get('name', 'Project'))
             return True
         except Exception as exc:
             self.saved_label.set_text('SAVE FAILED')
-            self.toast(str(exc))
+            self.validate_fields()
+            self.saved_label.set_tooltip_text(str(exc))
             return False
 
     def pick(self, title, callback, kind='any'):
         action = Gtk.FileChooserAction.SELECT_FOLDER if kind == 'folder' else Gtk.FileChooserAction.OPEN
         chooser = Gtk.FileChooserNative.new(title, self, action, 'Choose', 'Cancel')
+        chooser.set_modal(True)
+        # Start where the last choice of this kind was made, else in the project.
+        start = self.pick_dirs.get(kind) or (self.project.directory if self.project else None)
+        if start and Path(start).is_dir():
+            chooser.set_current_folder(Gio.File.new_for_path(str(start)))
         if kind in ('iso', 'deb', 'project'):
             filt = Gtk.FileFilter(); filt.set_name({'iso': 'Linux images (*.iso)', 'deb': 'Debian packages (*.deb)', 'project': 'cube-editor project (*.json)'}[kind])
             filt.add_pattern({'iso': '*.iso', 'deb': '*.deb', 'project': '*.json'}[kind]); chooser.add_filter(filt)
         def response(dialog, result):
             if result == Gtk.ResponseType.ACCEPT and dialog.get_file():
                 path = dialog.get_file().get_path()
-                if path: callback(path)
+                if path:
+                    self.pick_dirs[kind] = path if kind == 'folder' else str(Path(path).parent)
+                    callback(path)
             dialog.destroy()
         chooser.connect('response', response); chooser.show()
 
@@ -523,8 +859,13 @@ class EditorWindow(Adw.ApplicationWindow):
         self.pick('Open cube-editor.json', self.load_project, 'project')
 
     def create_project(self):
-        if self.busy: return
+        if self.busy or self.vm_running(): return
+        if self.project and not self.save_project():
+            self.toast('Correct the highlighted fields before creating another project.'); return
         try:
+            self.selected_release = None
+            self.test_disk = None
+            self.disk_label.set_text('No test disk selected.')
             self.project = engine.Project.create(self.entries['source_iso'].get_text(), self.entries['name'].get_text(),
                         base_dir=self.entries['base_dir'].get_text(), output_dir=self.entries['output_dir'].get_text())
             self.worker = engine.Engine(self.project, on_event=self.on_event)
@@ -536,14 +877,20 @@ class EditorWindow(Adw.ApplicationWindow):
             self.toast(str(exc)); self.log(f'Create failed: {exc}')
 
     def load_project(self, path):
-        if self.busy:
-            self.toast('Finish the current operation before switching projects.'); return
-        self.save_project()
+        if self.busy or self.vm_running():
+            self.toast('Finish the current operation and close the test VM before switching projects.'); return
+        if self.project and not self.save_project():
+            self.toast('Correct the highlighted fields before switching projects.'); return
         try:
             self.project = engine.Project.load(path)
+            self.selected_release = None
             self.worker = engine.Engine(self.project, on_event=self.on_event)
             self.hydrate(); self.refresh_recent()
             self.restore_log()
+            self.render_log()
+            self.selected_release = None
+            self.test_disk = None
+            self.disk_label.set_text('No test disk selected.')
             self.log(f'Opened project: {self.project.directory}')
             self.toast('Project restored. Your recipe is ready.')
         except Exception as exc:
@@ -558,13 +905,31 @@ class EditorWindow(Adw.ApplicationWindow):
         recipe = data.get('recipe', {})
         for key in ['install_packages', 'remove_packages']:
             self.entries[key].set_text(' '.join(recipe.get(key, [])))
-        self.commands.get_buffer().set_text('\n'.join(recipe.get('commands', [])))
+        self.original_commands = engine.recipe_scripts(recipe)
+        self.original_script_text = '\n'.join(self.original_commands)
+        self.commands.get_buffer().set_text(self.original_script_text)
+        self.editing_payload = None
         self.payloads = list(recipe.get('payloads', []))
         if recipe.get('desktop_deb'): self.entries['desktop_deb'].set_text(recipe['desktop_deb'])
         self.inject_switch.set_active(bool(recipe.get('desktop_deb')))
         compression = data.get('compression', 'zstd')
         if compression in ['zstd', 'xz', 'gzip', 'lz4']:
             self.compression.set_selected(['zstd', 'xz', 'gzip', 'lz4'].index(compression))
+        self.processors.set_value(data.get('processors', 2))
+        self.build_memory.set_value(data.get('memory_mb', 1024))
+        self.compression_level.set_value(data.get('compression_level', 0))
+        self.auto_snapshot.set_active(data.get('auto_snapshot', True))
+        self.source_hash.set_text(data.get('source_sha256', ''))
+        self.entries['source_checksum'].set_text(data.get('source_expected_sha256', ''))
+        report = engine.recovery_report(self.project)
+        recovery_text = f"Project state: {report['state']}"
+        if report['active_operation']: recovery_text += '\nAnother operation currently holds this project.'
+        elif report['interrupted']: recovery_text += '\n' + report['recommendation']
+        recovery_text += '\nRestore point available.' if report['restore_available'] else '\nNo saved restore point.'
+        if report['environment_backups']: recovery_text += '\nGuest DNS or service-policy backups need recovery.'
+        if report['pending_whiteouts']: recovery_text += '\nInterrupted boot-layer deletion markers need recovery.'
+        if report['staging']: recovery_text += f"\n{len(report['staging'])} unfinished build artifact(s) can be retained by recovery."
+        self.recovery_label.set_text(recovery_text)
         self.project_label.set_text(data.get('name', 'Project'))
         self.project_state.set_text(str(data.get('state', 'created')).replace('_', ' ').capitalize())
         self.saved_label.set_text('SAVED LOCALLY')
@@ -662,8 +1027,10 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.busy: return
         existing = self.entries['install_packages'].get_text().split()
         self.entries['install_packages'].set_text(' '.join(dict.fromkeys(existing + packages)))
-        lines = [line for line in self.text(self.commands).splitlines() if line.strip()]
-        self.commands.get_buffer().set_text('\n'.join(dict.fromkeys(lines + commands)))
+        script = self.text(self.commands)
+        additions = [c for c in commands if c not in script.splitlines()]
+        if additions:
+            self.commands.get_buffer().set_text(script + ('\n' if script else '') + '\n'.join(additions))
         self.toast(f'{name} added to your recipe.')
 
     def add_payload(self):
@@ -673,7 +1040,17 @@ class EditorWindow(Adw.ApplicationWindow):
             self.toast('Choose an existing file or folder.'); return
         if not target.startswith('/') or '..' in Path(target).parts or target == '/':
             self.toast('Use an image path such as /etc/skel/.config.'); return
-        self.payloads.append({'source': str(Path(source).expanduser().resolve()), 'destination': target})
+        if self.busy: return
+        item = {'source': str(Path(source).expanduser().resolve()), 'destination': target,
+                'overwrite': ['replace', 'skip', 'error'][self.payload_policy.get_selected()]}
+        candidate = list(self.payloads)
+        if self.editing_payload is None: candidate.append(item)
+        else: candidate[self.editing_payload] = item
+        try: engine.validate_recipe({'payloads': candidate})
+        except Exception as exc:
+            self.toast(str(exc)); return
+        self.payloads = candidate
+        self.editing_payload = None
         self.refresh_payloads(); self.mark_changed()
 
     def refresh_payloads(self):
@@ -681,11 +1058,15 @@ class EditorWindow(Adw.ApplicationWindow):
         for i, payload in enumerate(self.payloads):
             row = box(False, 10)
             text = label(f'{payload.get("source", "")}  →  {payload.get("destination", "")}', 'help', True); text.set_hexpand(True)
-            row.append(text); row.append(button('Remove', lambda n=i: self.remove_payload(n), css='flat'))
+            row.append(text)
+            row.append(button('Edit', lambda n=i: self.edit_payload(n), css='flat'))
+            row.append(button('Preview', lambda n=i: self.preview_payload(n), css='flat'))
+            row.append(button('Remove', lambda n=i: self.remove_payload(n), css='flat'))
             self.payload_list.append(row)
 
     def remove_payload(self, index):
         if self.busy: return
+        self.editing_payload = None
         self.payloads.pop(index); self.refresh_payloads(); self.mark_changed()
 
     def show_recipe(self):
@@ -699,7 +1080,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.plan_view.get_buffer().set_text('Create or reopen a project to see its build commands.'); return
         self.save_project()
         try:
-            plan = self.worker.plan('build')
+            plan = {'steps': ['Installer adaptation and clean installer image when applicable', 'Manifest refresh, deletion markers, integrity checks', 'Staged export, SHA256 and release history'], 'commands': self.worker.plan('build')}
             if isinstance(plan, dict):
                 value = json.dumps(plan, indent=2, default=str)
             elif isinstance(plan, list):
@@ -712,16 +1093,20 @@ class EditorWindow(Adw.ApplicationWindow):
     def refresh_buttons(self):
         if not hasattr(self, 'build_button'): return
         for item in self.action_buttons: item.set_sensitive(not self.busy)
+        invalid = bool(self.validate_fields())
         loaded = self.project is not None
         extracted = loaded and (self.project.directory / '.extracted').is_file()
         supported = loaded and self.project.data.get('inspection', {}).get('can_rebuild', False)
         new_source = self.source_changed()
         self.extract_button.set_sensitive(supported and not self.busy and not extracted and not new_source)
-        for item in [self.apply_button, self.terminal_button, self.build_button]: item.set_sensitive(extracted and not self.busy)
-        output = self.output_path()
+        for item in [self.apply_button, self.terminal_button, self.build_button]: item.set_sensitive(extracted and not self.busy and not invalid)
+        output = self.selected_output()
         built = output is not None and output.is_file()
         self.vm_button.set_sensitive(built and not self.busy and bool(shutil.which('qemu-system-x86_64')))
         self.verify_button.set_sensitive(built and not self.busy)
+        for item in [self.apply_button, self.terminal_button, self.build_button]:
+            item.set_tooltip_text('Finish the current operation.' if self.busy else 'Correct the highlighted fields.' if invalid else 'Extract the source image first.' if not extracted else None)
+        self.vm_button.set_tooltip_text('Build or select a release first.' if not built else 'Install qemu-system-x86 to boot this release.' if not shutil.which('qemu-system-x86_64') else None)
         self.cancel_button.set_sensitive(self.busy and self.running_action is not None)
         self.build_summary.set_text('Ready to rebuild. Apply your recipe first if you changed packages, commands or overlays.' if extracted else 'Extract your source image to unlock the build.')
         if hasattr(self, 'context_action'):
@@ -729,9 +1114,9 @@ class EditorWindow(Adw.ApplicationWindow):
             title, enabled = {
                 'source': ('Create project' if not loaded or new_source else 'Image terminal' if extracted else 'Extract image',
                            not self.busy and (not loaded or new_source or extracted or supported)),
-                'customize': ('Apply recipe', extracted and not self.busy),
-                'files': ('Apply overlays', extracted and not self.busy),
-                'build': ('Build release', extracted and not self.busy),
+                'customize': ('Apply recipe', self.apply_button.get_sensitive()),
+                'files': ('Apply overlays', self.apply_button.get_sensitive()),
+                'build': ('Build release', self.build_button.get_sensitive()),
                 'test': ('Boot test', self.vm_button.get_sensitive()),
                 'activity': ('Cancel operation', self.cancel_button.get_sensitive()),
             }[name]
@@ -750,15 +1135,18 @@ class EditorWindow(Adw.ApplicationWindow):
         self.progress.set_visible(state)
         if state: self.progress.pulse()
         if message: self.status.set_text(message)
-        for widget in list(self.entries.values()) + [self.commands, self.compression, self.inject_switch]:
+        for widget in list(self.entries.values()) + [self.commands, self.compression, self.inject_switch, self.auto_snapshot, self.processors, self.build_memory, self.compression_level, self.payload_policy]:
             widget.set_sensitive(not state)
         self.refresh_buttons()
 
-    def start_job(self, action):
+    def start_job(self, action, confirmed=False):
         if self.busy or not self.project: return
         if not self.save_project(): return
         try:
-            command = getattr(self.worker, f'{action}_command')()
+            if action == 'restore' and not confirmed:
+                self.confirm('Restore saved point?', 'This replaces the current root and ISO tree. Current trees will be retained under recovery/.', lambda: self.start_job(action, True))
+                return
+            command = self.worker.worker_command(action)
         except Exception as exc:
             self.toast(str(exc)); return
         self.navigate('activity')
@@ -808,6 +1196,11 @@ class EditorWindow(Adw.ApplicationWindow):
                 fraction = event.get('fraction', event.get('progress'))
                 if isinstance(fraction, (float, int)): self.progress.set_fraction(min(1, max(0, fraction)))
                 else: self.progress.pulse()
+                if event.get('elapsed_seconds') is not None:
+                    eta = event.get('eta_seconds')
+                    text = f"{message} · {event['elapsed_seconds']:.0f}s elapsed"
+                    if eta is not None: text += f' · about {eta:.0f}s remaining in phase'
+                    self.status.set_text(text)
             if event.get('type') == 'state' and message: self.status.set_text(message)
         else: self.log(str(event))
         return False
@@ -817,11 +1210,18 @@ class EditorWindow(Adw.ApplicationWindow):
         self.log_lines.append(f'[{stamp}] {message}')
         self.log_lines = self.log_lines[-2500:]
         if hasattr(self, 'log_view'):
-            buffer = self.log_view.get_buffer()
-            buffer.set_text('\n'.join(self.log_lines))
-            mark = buffer.create_mark(None, buffer.get_end_iter(), False)
-            self.log_view.scroll_to_mark(mark, 0, False, 0, 1)
-            buffer.delete_mark(mark)
+            query = self.log_search.get_text().lower()
+            line = self.log_lines[-1]
+            if query in line.lower() and (not self.log_errors_only.get_active() or self.is_log_error(line)):
+                buffer = self.log_view.get_buffer()
+                prefix = '\n' if buffer.get_char_count() else ''
+                buffer.insert(buffer.get_end_iter(), prefix + line)
+                if buffer.get_line_count() > 3000:
+                    begin = buffer.get_start_iter(); end = buffer.get_iter_at_line(500)
+                    # GTK 4 returns (success, iterator) on some GI versions.
+                    if isinstance(end, tuple): end = end[-1]
+                    buffer.delete(begin, end)
+                self.scroll_log()
 
     def restore_log(self):
         """Show persisted worker history without loading an unbounded log."""
@@ -845,41 +1245,47 @@ class EditorWindow(Adw.ApplicationWindow):
         except (ValueError, engine.CubeError): return None
 
     def refresh_release(self):
-        path = self.output_path()
-        if path and path.is_file():
-            self.release_name.set_text(path.name)
-            self.release_path.set_text(f'{path}\n{path.stat().st_size / (1024 ** 3):.2f} GB  ·  ready to test')
-        elif self.project:
-            self.release_name.set_text(self.project.data.get('output_name', 'Waiting for a build.'))
-            self.release_path.set_text('Build your release image to unlock verification and VM testing.')
-        self.refresh_buttons()
+        previous = self.selected_release
+        history = self.worker.releases() if self.worker else []
+        self.release_choices = [None] + [Path(r['path']) for r in reversed(history) if r.get('path')]
+        names = ['Current output'] + [p.name for p in self.release_choices[1:]]
+        hydrating = self.hydrating
+        self.hydrating = True
+        self.release_selector.set_model(Gtk.StringList.new(names))
+        self.selected_release = previous if previous in self.release_choices else None
+        self.release_selector.set_selected(self.release_choices.index(self.selected_release))
+        self.hydrating = hydrating
+        self.update_release_display()
 
-    def launch_vm(self):
-        if not self.project or self.busy: return
+    def launch_vm(self, installer=False, installed=False):
+        if not self.project or self.busy or self.vm_running(): return
         try:
-            argv = self.worker.qemu_command(memory=[2048, 4096, 8192, 16384][self.memory.get_selected()], uefi=self.firmware.get_selected() == 1)
+            if installer and not self.test_disk:
+                raise engine.CubeError('Create a test disk first.')
+            argv = self.worker.qemu_command(memory=[2048, 4096, 8192, 16384][self.memory.get_selected()], uefi=self.firmware.get_selected() == 1, disk=self.test_disk if installer else None, installed=installed, iso=self.selected_output())
             log_dir = self.project.directory / 'logs'; log_dir.mkdir(exist_ok=True)
             with (log_dir / 'qemu.log').open('a') as stream:
                 process = subprocess.Popen(argv, stdout=stream, stderr=stream, start_new_session=True)
+            self.vm_process = process
             self.log(f'VM launch: {shlex.join(argv)}')
             def check():
                 code = process.poll()
                 if code is not None and code != 0:
                     self.toast('QEMU could not start. See the project logs/qemu.log.')
                     self.log((log_dir / 'qemu.log').read_text()[-8000:])
-                else: self.toast('VM launched. Guest changes use temporary storage.')
+                else: self.toast('VM launched. Test disk changes persist.' if installer else 'VM launched. Guest changes use temporary storage.')
                 return False
             GLib.timeout_add(1800, check)
         except Exception as exc: self.toast(str(exc)); self.log(str(exc))
 
     def verify_release(self):
-        path = self.output_path()
-        if not path: return
+        path = self.selected_output()
+        if not path or self.busy: return
         self.set_busy(True, 'Verifying release checksum…')
         self.navigate('activity')
         def work():
             try:
-                result = self.worker.verify_release()
+                result = self.worker.verify_release(path, record=True)
                 if not result.get('success'):
                     raise engine.CubeError('Checksum mismatch. The ISO differs from its release checksum.')
                 GLib.idle_add(self.verify_done, result, None)
@@ -897,11 +1303,21 @@ class EditorWindow(Adw.ApplicationWindow):
     def reveal(self, path):
         if not path:
             self.toast('Create or open a project first.'); return
+        folder = Path(path).expanduser()
+        if not folder.is_dir():
+            self.toast(f'{folder} does not exist yet.'); return
+        # The launch context carries an activation token, so the file manager comes to the front.
+        try:
+            if Gio.AppInfo.launch_default_for_uri(folder.as_uri(), self.get_display().get_app_launch_context()):
+                return
+        except GLib.Error:
+            pass
         try:
             if shutil.which('xdg-open'):
-                subprocess.Popen(['xdg-open', str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.Popen(['xdg-open', str(folder)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
             else:
-                self.clipboard(str(path)); self.toast('Folder path copied. Open it in your file manager.')
+                self.clipboard(str(folder)); self.toast('Folder path copied. Open it in your file manager.')
         except OSError as exc: self.toast(str(exc))
 
     def clipboard(self, text):
@@ -963,7 +1379,11 @@ class EditorWindow(Adw.ApplicationWindow):
     def on_close(self, *_):
         if self.busy:
             self.toast('Finish or cancel the running operation before closing the editor.'); return True
-        self.save_project(); return False
+        if self.project and not self.save_project():
+            self.toast('Correct the highlighted fields before closing.'); return True
+        if self.save_timer:
+            GLib.source_remove(self.save_timer); self.save_timer = None
+        return False
 
 
 class EditorApp(Adw.Application):

@@ -2,6 +2,7 @@
 // Drives the running app over the Chrome DevTools protocol. Usage: node e2e-driver.cjs PORT OUTDIR
 const fs = require('node:fs');
 const path = require('node:path');
+const { buildSync } = require('esbuild');
 const [port, outDir] = process.argv.slice(2);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const results = [];
@@ -60,6 +61,7 @@ const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? 
   }
 
   // Terminal: real command, real cwd tracking
+  await ev('document.querySelector("button[aria-label=\\\"Expand terminal\\\"]")?.click()');
   await ev('document.getElementById("cc-term-input").focus()');
   const type = async (s) => { await send('Input.insertText', { text: s }); await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, text: '\r' }); await send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }); };
   await type('echo hello-from-bash && cd /usr');
@@ -80,6 +82,10 @@ const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? 
   await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'c', code: 'KeyC', modifiers: 2, windowsVirtualKeyCode: 67 });
   t = await waitFor((x) => /stopped \(SIGTERM\)/.test(x));
   check('ctrl+c stops running command', /stopped \(SIGTERM\)/.test(t));
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }))'); await sleep(100);
+  await send('Input.insertText', { text: 'Run Disk Usage' }); await sleep(100);
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }); await sleep(400);
+  check('palette execution uses the current working directory', await ev('window.lab.activity().then(r => r.records[0].cwd === "/usr")'));
   await shot('terminal');
   await ev('[...document.querySelectorAll("button")].find(b => b.getAttribute("aria-label") === "Collapse terminal").click()');
 
@@ -126,6 +132,52 @@ const check = (name, ok, extra = '') => { results.push(ok); console.log(`${ok ? 
   await sleep(300);
   check('ctrl+k opens palette', /Go to Network/.test(await text()));
   await shot('palette');
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
+  await nav('Overview'); await sleep(300);
+  check('overview has trends, attention and pinned commands', /Resource trends/.test(await text()) && /Attention center/.test(await text()) && /Pinned commands/.test(await text()));
+  const sampleCount = await ev('Number(document.querySelector("svg[aria-label*=history]").getAttribute("aria-label").match(/(\\d+) samples/)[1])');
+  await nav('Storage'); await sleep(300); await nav('Overview'); await sleep(300);
+  check('resource history survives view navigation', await ev('Number(document.querySelector("svg[aria-label*=history]").getAttribute("aria-label").match(/(\\d+) samples/)[1])') >= sampleCount);
+  await ev('[...document.querySelectorAll("[aria-label=\\\"Trend metric\\\"] button")].find(b => b.textContent === "Memory").click()');
+  check('memory trend can be selected', await ev('document.querySelector("svg[aria-label*=history]").getAttribute("aria-label").startsWith("Memory")'));
+  await ev('[...document.querySelectorAll("[aria-label=\\\"Trend time window\\\"] button")].find(b => b.textContent === "10m").click()');
+  check('ten-minute history can be selected', await ev('document.querySelector("svg[aria-label*=history]").getAttribute("aria-label").includes("10 minutes")'));
+  await nav('All Commands'); await sleep(200);
+  check('command cards show the actual shell command', await ev('!!document.querySelector("article code")'));
+  await ev('document.querySelector("button[aria-label=\\\"Unpin Disk Usage\\\"]").click()'); await sleep(100);
+  check('command can be unpinned', await ev('!!document.querySelector("button[aria-label=\\\"Pin Disk Usage\\\"]")'));
+  await ev('document.querySelector("button[aria-label=\\\"Pin Disk Usage\\\"]").click()');
+  await ev('document.querySelector("button[aria-label=\\\"Edit Disk Usage\\\"]").focus(); document.activeElement.click()'); await sleep(100);
+  check('command editor focuses its named input', await ev('document.activeElement.getAttribute("aria-label") === "Command name"'));
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Tab', code: 'Tab', modifiers: 8, windowsVirtualKeyCode: 9 });
+  check('shift-tab is trapped inside the command editor', await ev('document.querySelector("[role=dialog]").contains(document.activeElement)'));
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))'); await sleep(100);
+  check('closing the editor restores its trigger focus', await ev('document.activeElement.getAttribute("aria-label") === "Edit Disk Usage"'));
+  await nav('Shortcut Groups'); await sleep(100);
+  await ev('[...document.querySelectorAll("main button")].find(b => b.innerText.includes("New Group")).click()');
+  await ev('document.querySelector("input[aria-label=\\\"Trigger shortcut\\\"]").focus()'); await send('Input.insertText', { text: 'Ctrl+Shift+G' }); await sleep(100);
+  check('duplicate group shortcuts are explained and cannot be saved', await ev('document.body.innerText.includes("already used") && [...document.querySelectorAll("button")].find(b => b.textContent === "Save Group").disabled'));
+  await nav('Settings & Backups'); await sleep(100);
+  await ev('(() => { const el = document.querySelector("select[aria-label=\\\"Monitoring refresh interval\\\"]"); el.value = "5000"; el.dispatchEvent(new Event("change", { bubbles: true })); })()');
+  check('monitoring frequency is stored', await ev('localStorage.getItem("cc:refresh-ms") === "5000"'));
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "G", ctrlKey: true, shiftKey: true, bubbles: true }))'); await sleep(100);
+  check('Core Actions uses a shortcut the desktop does not intercept', await ev('document.querySelector("[role=dialog]")?.getAttribute("aria-label") === "Core Actions"'));
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "k", ctrlKey: true, bubbles: true }))'); await sleep(100);
+  await send('Input.insertText', { text: 'Open Core Actions' }); await sleep(100);
+  check('shortcut groups are discoverable in the palette', /Open Core Actions/.test(await text()));
+  await send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 }); await sleep(100);
+  check('palette opens shortcut groups', await ev('document.querySelector("[role=dialog]")?.getAttribute("aria-label") === "Core Actions"'));
+  await ev('document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }))');
+
+  await nav('Overview');
+  await send('Emulation.setDeviceMetricsOverride', { width: 1360, height: 960, deviceScaleFactor: 1, mobile: false }); await sleep(200); await shot('overview-improved');
+  await send('Emulation.setDeviceMetricsOverride', { width: 960, height: 720, deviceScaleFactor: 1, mobile: false }); await sleep(200); await shot('overview-compact');
+  check('compact layout fits the window width', await ev('document.documentElement.scrollWidth <= 960'));
+  await send('Emulation.clearDeviceMetricsOverride');
+  const fixture = buildSync({ entryPoints: [path.join(__dirname, '../tests/polling-fixture.tsx')], bundle: true, platform: 'browser', format: 'iife', write: false }).outputFiles[0].text;
+  await ev(fixture);
+  for (const [name, ok] of await ev('window.__runPollingChecks()')) check(name, ok);
   check('no uncaught renderer exceptions', exceptions.length === 0, exceptions.join('; '));
 
   const bad = results.filter((r) => !r).length;

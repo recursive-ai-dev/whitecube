@@ -13,17 +13,15 @@ APP_ID = "dev.woez.CubeLock"
 
 def output_path(source: Path, folder: Path | None) -> Path:
     """<name>-locked.pdf beside the source (or in folder); never overwrites."""
-    base = (folder or source.parent) / f"{source.stem}-locked"
-    candidate = base.with_suffix(".pdf")
-    n = 2
-    while candidate.exists():
-        candidate = base.with_name(f"{base.name}-{n}").with_suffix(".pdf")
-        n += 1
-    return candidate
+    return ct.unique_path((folder or source.parent) / f'{source.stem}-locked.pdf')
 
 
 def encrypt_pdf(source: Path, dest: Path, user_pw: str, owner_pw: str,
-                allow_print: bool, allow_copy: bool, allow_edit: bool) -> None:
+                allow_print: bool, allow_copy: bool, allow_edit: bool) -> Path:
+    if not user_pw:
+        raise ValueError('Enter a nonempty password')
+    if any(len(value.encode('utf-8')) > 127 for value in (user_pw, owner_pw)):
+        raise ValueError('PDF passwords must be at most 127 UTF-8 bytes')
     permissions = pikepdf.Permissions(
         print_lowres=allow_print,
         print_highres=allow_print,
@@ -35,12 +33,12 @@ def encrypt_pdf(source: Path, dest: Path, user_pw: str, owner_pw: str,
         modify_other=allow_edit,
     )
     with pikepdf.open(source) as pdf:
-        pdf.save(
-            dest,
+        return ct.write_output(dest, lambda output: pdf.save(
+            output,
             encryption=pikepdf.Encryption(
                 user=user_pw, owner=owner_pw or user_pw, R=6, allow=permissions
             ),
-        )
+        ))
 
 
 def verify_locked(src: Path, dest: Path, password: str) -> None:
@@ -51,23 +49,26 @@ def verify_locked(src: Path, dest: Path, password: str) -> None:
     except pikepdf.PasswordError:
         pass
     with pikepdf.open(src) as original, pikepdf.open(dest, password=password) as locked:
+        if not locked.is_encrypted or locked.encryption.bits != 256:
+            raise ValueError('locked copy does not use AES-256')
         if len(locked.pages) != len(original.pages):
             raise ValueError("locked copy has a different page count")
 
 
 def trash_file(path: Path) -> None:
-    Gio.File.new_for_path(str(path)).trash(None)
+    if not Gio.File.new_for_path(str(path)).trash(None):
+        raise OSError('Unable to move original to Trash')
 
 
 def lock_one(src, dest, pw, owner, p, c, e, remove_original=False, trash=trash_file):
     """Encrypt src to dest. With remove_original, the original goes to the Trash
     only after the locked copy is verified; any doubt keeps it. Returns a note
     (or '') describing why an original was kept."""
-    encrypt_pdf(src, dest, pw, owner, p, c, e)
+    dest = encrypt_pdf(src, dest, pw, owner, p, c, e)
+    verify_locked(src, dest, pw)
     if not remove_original:
         return ""
     try:
-        verify_locked(src, dest, pw)
         trash(src)
     except Exception as exc:  # the locked copy stays; the original stays too
         return f"original kept ({getattr(exc, 'message', None) or exc})"
@@ -80,6 +81,7 @@ class PdfLockWindow(Adw.ApplicationWindow):
                          default_width=560, default_height=820)
         self.files: list[Path] = []
         self.out_folder: Path | None = None
+        self.busy = False
 
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
@@ -140,6 +142,12 @@ class PdfLockWindow(Adw.ApplicationWindow):
         pick = Gtk.Button(label="Choose folder…", valign=Gtk.Align.CENTER)
         pick.connect("clicked", self.on_pick_folder)
         self.out_row.add_suffix(pick)
+        reset = Gtk.Button(label='Reset', valign=Gtk.Align.CENTER, tooltip_text='Save next to each original again')
+        def reset_folder(_b):
+            self.out_folder = None
+            self.out_row.set_subtitle('Next to each original')
+        reset.connect('clicked', reset_folder)
+        self.out_row.add_suffix(reset)
         out_group.add(self.out_row)
         self.remove_orig = Adw.SwitchRow(
             title="Move originals to Trash after locking",
@@ -155,8 +163,10 @@ class PdfLockWindow(Adw.ApplicationWindow):
         self.go.add_css_class("pill")
         self.go.set_halign(Gtk.Align.CENTER)
         self.go.connect("clicked", self.on_encrypt)
+        self.progress = Gtk.ProgressBar(visible=False, show_text=True)
         holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         holder.append(self.status)
+        holder.append(self.progress)
         holder.append(self.go)
         action_group.add(holder)
         page.add(action_group)
@@ -166,7 +176,11 @@ class PdfLockWindow(Adw.ApplicationWindow):
 
     # --- file list ---
     def add_files(self, paths):
+        if self.busy:
+            return
         for p in paths:
+            if not p:
+                continue
             p = Path(p)
             if p.suffix.lower() == ".pdf" and p.is_file() and p not in self.files:
                 self.files.append(p)
@@ -189,10 +203,14 @@ class PdfLockWindow(Adw.ApplicationWindow):
         self.on_change()
 
     def remove(self, path):
+        if self.busy or path not in self.files:
+            return
         self.files.remove(path)
         self.refresh_files()
 
     def on_clear(self, _b):
+        if self.busy:
+            return
         self.files.clear()
         self.refresh_files()
 
@@ -207,6 +225,9 @@ class PdfLockWindow(Adw.ApplicationWindow):
 
     # --- validation / action ---
     def on_change(self, *_):
+        if self.busy:
+            self.go.set_sensitive(False)
+            return
         pw, pw2 = self.pw.get_text(), self.pw2.get_text()
         if not self.files:
             msg, ok = "Add at least one PDF.", False
@@ -214,6 +235,8 @@ class PdfLockWindow(Adw.ApplicationWindow):
             msg, ok = "Enter a password.", False
         elif pw != pw2:
             msg, ok = "Passwords do not match.", False
+        elif any(len(value.encode('utf-8')) > 127 for value in (pw, self.owner.get_text())):
+            msg, ok = 'Passwords must be at most 127 UTF-8 bytes.', False
         else:
             n = len(self.files)
             msg, ok = f"Ready to encrypt {n} file{'s' if n != 1 else ''}.", True
@@ -221,6 +244,13 @@ class PdfLockWindow(Adw.ApplicationWindow):
         self.go.set_sensitive(ok)
 
     def on_encrypt(self, _b):
+        self.on_change()
+        if self.busy or not self.go.get_sensitive():
+            return
+        self.busy = True
+        self.file_list.set_sensitive(False)
+        self.progress.set_fraction(0)
+        self.progress.set_visible(True)
         self.go.set_sensitive(False)
         self.status.set_text("Encrypting…")
         args = (list(self.files), self.out_folder, self.pw.get_text(),
@@ -231,7 +261,7 @@ class PdfLockWindow(Adw.ApplicationWindow):
 
     def work(self, files, folder, pw, owner, p, c, e, remove):
         done, errors, notes = [], {}, {}
-        for src in files:
+        for index, src in enumerate(files):
             try:
                 note = lock_one(src, output_path(src, folder), pw, owner, p, c, e, remove)
                 done.append(src)
@@ -241,9 +271,16 @@ class PdfLockWindow(Adw.ApplicationWindow):
                 errors[src] = "already encrypted"
             except Exception as exc:  # report per file, keep going
                 errors[src] = str(exc)
+            GLib.idle_add(self.progress.set_fraction, (index + 1) / len(files))
         GLib.idle_add(self.finished, done, errors, notes, remove)
 
     def finished(self, done, errors, notes, remove):
+        self.busy = False
+        self.file_list.set_sensitive(True)
+        self.progress.set_visible(False)
+        if not errors:
+            for entry in (self.pw, self.pw2, self.owner):
+                entry.set_text('')
         self.files = [f for f in self.files if f not in done]
         self.refresh_files()
         text = f"Locked {len(done)} file{'s' if len(done) != 1 else ''}."

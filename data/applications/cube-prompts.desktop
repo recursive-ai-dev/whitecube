@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Cube Prompts
+GenericName=Prompt Library
+Comment=Store, template, test and export AI prompts
+Exec=/usr/bin/cube-prompts
+TryExec=/usr/bin/cube-prompts
+Icon=cube-prompts
+Terminal=false
+Categories=Development;Utility;
+Keywords=prompt;AI;LLM;template;Claude;OpenAI;Ollama;library;
+StartupNotify=true
+StartupWMClass=org.whitecube.CubePrompts
+X-Wayland-Native=true

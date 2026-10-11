@@ -1,6 +1,7 @@
 import { ScriptItem, TerminalLog, NautilusAction, ShortcutGroup, ScriptStatus, Category } from './types';
 import { LOG_HISTORY_LIMIT } from './constants';
 import { createId, createStableId } from './id';
+import { CORE_SHORTCUT, normalizeShortcut, shortcutIssue } from './shortcuts';
 
 export interface AppState {
   scripts: ScriptItem[];
@@ -38,6 +39,8 @@ const buildDefaultScripts = (): ScriptItem[] => TEMPLATES.map((t) => ({
   lastRun: 'Not run',
   status: ScriptStatus.IDLE,
   requiresConfirmation: /\bsudo\b/.test(t.command),
+  pinned: ['disk-usage', 'failed-units', 'addresses', 'memory-hogs'].includes(t.key),
+  tags: [],
 }));
 
 const buildDefaultLogs = (): TerminalLog[] => [{
@@ -55,7 +58,7 @@ const buildDefaultNautilusActions = (): NautilusAction[] => [
 const buildDefaultShortcutGroups = (scripts: ScriptItem[]): ShortcutGroup[] => scripts.length === 0 ? [] : [{
   id: createStableId('shortcuts-core'),
   name: 'Core Actions',
-  shortcut: 'Alt+C',
+  shortcut: CORE_SHORTCUT,
   scriptIds: scripts.slice(0, 4).map((s) => s.id),
 }];
 
@@ -76,10 +79,11 @@ export const loadState = (): AppState => {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return buildDefaultState();
     const parsed = JSON.parse(raw) as Partial<AppState>;
-    const scripts = Array.isArray(parsed.scripts) ? parsed.scripts.filter(isValidScript).map((s) => ({ ...s, description: typeof s.description === 'string' ? s.description : '', path: typeof s.path === 'string' ? s.path : undefined, lastRun: typeof s.lastRun === 'string' ? s.lastRun : 'Not run', status: s.status === ScriptStatus.RUNNING || !Object.values(ScriptStatus).includes(s.status) ? ScriptStatus.IDLE : s.status })) : [];
+    const scripts = Array.isArray(parsed.scripts) ? parsed.scripts.filter(isValidScript).map((s) => ({ ...s, pinned: s.pinned === true, tags: Array.isArray(s.tags) ? [...new Set(s.tags.filter(t => typeof t === 'string' && t.length <= 32))].slice(0, 12) : [], description: typeof s.description === 'string' ? s.description : '', path: typeof s.path === 'string' ? s.path : undefined, lastRun: typeof s.lastRun === 'string' ? s.lastRun : 'Not run', status: s.status === ScriptStatus.RUNNING || !Object.values(ScriptStatus).includes(s.status) ? ScriptStatus.IDLE : s.status })) : [];
     const logs = Array.isArray(parsed.logs) ? parsed.logs.filter(isValidLog) : [];
     const nautilusActions = Array.isArray(parsed.nautilusActions) ? parsed.nautilusActions.filter(isValidNautilusAction) : [];
-    const shortcutGroups = Array.isArray(parsed.shortcutGroups) ? parsed.shortcutGroups.filter(isValidShortcutGroup) : [];
+    const savedGroups = Array.isArray(parsed.shortcutGroups) ? parsed.shortcutGroups.filter(isValidShortcutGroup) : [];
+    const shortcutGroups = savedGroups.map(g => g.id === createStableId('shortcuts-core') && normalizeShortcut(g.shortcut) === 'ALT+C' ? { ...g, shortcut: shortcutIssue(CORE_SHORTCUT, savedGroups, g.id) ? '' : CORE_SHORTCUT } : g);
     return { scripts, logs, nautilusActions, shortcutGroups };
   } catch (error) {
     console.warn('Failed to load stored state', error);

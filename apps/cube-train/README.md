@@ -1,4 +1,4 @@
-# Whitecube Trainer 0.7.0
+# Whitecube Trainer 0.9.0
 
 Native GTK4 controls and a local small-language-model training pipeline. The
 desktop process uses the system Python and never imports PyTorch. Preparation,
@@ -19,9 +19,51 @@ total optimizer steps. **Prepare corpus only** validates and prepares data befor
 training. The run stays available when the window closes.
 
 TXT and Markdown files are whole source documents for split assignment; JSONL
-and Parquet rows are documents. Supply at least two distinct documents, with
+and Parquet rows are documents. TXT/Markdown streaming preserves whitespace and
+writes one EOS per file. Supply at least two distinct retained documents, with
 enough tokens in each split for the model context. Matching document hashes stay
 in the same split. The cap counts UTF-8 bytes and EOS tokens, not words.
+
+Expand **Corpus selection and filtering** to remove exact duplicates, shuffle
+source files using the seed, skip short documents, cap each document's length,
+or change the Parquet batch size. These controls are optional and saved with the
+run. Deduplication compares normalized source text and retained text across
+formats, before counting accepted tokens against the cap. Length limits count
+UTF-8 bytes, exclude EOS, and preserve complete characters. Long documents keep
+a prefix; a document limit lets preparation continue to later rows. Minimum
+length applies to the retained text. Shuffling changes file selection under the
+cap; rows within each file still follow source order.
+
+```sh
+whitecube-train ~/train-in --5m --prepare-only --device cpu \
+  --deduplicate --shuffle-files --min-document-bytes 200 \
+  --max-document-bytes 32768 --batch-rows 16
+```
+
+Preparation stores document metadata, duplicate lookups and split sorting in a
+temporary SQLite index with a bounded cache. A checksummed `documents.jsonl`
+records each retained document's source path and row (physical JSONL line,
+Parquet row, or 1 for a text file), split, token offset/count, retained/source
+SHA256 hashes, split group identifier and truncation flag. Matching source hashes
+and identical retained prefixes stay together, including when the corpus cap
+shortens only the final copy of a repeated document. The manifest includes duplicate,
+short-document and document/corpus-limit truncation counts. Many tiny documents
+need extra disk space for their index and provenance.
+
+To train a fresh model on identical data, select **Reuse prepared corpus** on
+Runs, or choose an earlier run's `data` directory as the corpus. The CLI accepts
+the same directory as its dataset argument:
+
+```sh
+whitecube-train ~/train-out/previous-run/data --10m --device cpu --steps 4000
+```
+
+Reuse copies and verifies the prepared artifacts into the new run without
+reading the original sources. It preserves the saved selection, token cap and
+split seed/share; corpus filtering settings in the new draft do not change it.
+Copies are independent files, so deleting or modifying the old run cannot change
+the new corpus. Existing corpora/checkpoints remain usable; new corpus manifests
+use schema version 3 and include the document index checksum.
 
 ## Desktop workflow
 
@@ -37,9 +79,99 @@ in the same split. The cap counts UTF-8 bytes and EOS tokens, not words.
   exports cover the displayed/recent data; the complete history remains in the
   run directory.
 
+## Notebook export
+
+**Export notebook…** (Runs page, the run's right-click menu, any row of the
+checkpoint list, or `Ctrl+Shift+E`) writes a runnable Jupyter notebook for Best,
+Latest or a step snapshot. The default is a self-contained folder:
+
+```
+<name>.ipynb   <name>.py (# %% cells)   README.md
+whitecube_pipeline/   model code the notebook imports
+checkpoint/           a copy of the chosen checkpoint
+run/                  run.json, result.json, metrics, previews, model config
+data/                 prepared corpus (optional)
+```
+
+The cells load the checkpoint, report loss in nats and bits per byte, plot the
+curves, generate text with the preview settings, show next-byte probabilities,
+re-measure validation loss, continue training in `continued/` (switch on
+`CONTINUE_TRAINING`; the original run is never modified) and export
+safetensors with a round-trip check. Without the corpus, evaluation and
+continued training read the original run's `data` folder. Unticking
+*Self-contained* writes only the notebook, pointing at the run in place.
+
+*Open in Jupyter afterwards* uses JupyterLab, Jupyter Notebook or VS Code, and
+registers the training Python once as the `whitecube-train` kernel
+(`python -m ipykernel install --user`). The same export is available as:
+
+```sh
+whitecube-train --export-notebook ~/train-out/<run> --output ~/Documents/my-notebook \
+  [--checkpoint best|latest|step00001234] [--with-corpus] [--reference] [--no-script]
+```
+
+## Training plan and run controls
+
+New runs can set the peak learning rate, final-rate fraction, warmup, weight
+decay, gradient clipping, evaluation interval, seed, validation share and a
+cosine or warmup-stable-decay (WSD) schedule. These are saved in `run.json`.
+Resume restores the optimizer and schedule from the checkpoint and rejects
+conflicting plan flags. Plan presets fill the step count; the estimate shows the
+token budget, approximate corpus passes and, after earlier runs with the same
+size and device, an expected duration.
+
+Run controls may change on resume: early stopping after N evaluations without a
+new best validation loss, a wall-clock time limit, step-numbered checkpoint
+snapshots (`ckpt_step00001234.pt`, oldest pruned) and a thermal pause that waits
+5 °C below a stop limit until temperatures fall 10 °C below it. A pause longer
+than 15 minutes saves and stops. `result.json` records the stop reason, final
+losses, elapsed and cumulative training time and peak VRAM.
+
+```sh
+whitecube-train --5m --steps 4000 --learning-rate 5e-4 --schedule wsd \
+  --early-stop-patience 6 --max-minutes 90 --keep-snapshots 3 --thermal-pause
+whitecube-train --list-runs     # * pinned, B/L saved checkpoints
+whitecube-train --status        # the running desktop job
+```
+
+## Runs page
+
+Runs sit in a list beside the selected run, so one click shows its details:
+stat tiles (parameters, steps, best validation, bits per byte, training time,
+disk use), the main actions and Overview / Preview / Export tabs. Rows update
+in place while a job trains and carry a phase chip, Best/Latest/snapshot chips
+and a loss sparkline. Double-click or Enter opens the run's progress;
+right-click, Menu or Shift+F10 opens every run action; F2 renames; Delete moves
+to Trash. The checkpoint list previews, exports or trashes any step snapshot.
+**Clean up failed runs…** moves failed runs that saved no data or weights to
+Trash (pinned and running runs are never included).
+
+The Train page lists Recent corpora, accepts a dropped file or folder, and after
+**Inspect** reads the JSONL/Parquet text fields with the training Python. The
+Text field picker shows what automatic selection will read per file and blocks a
+start when some files have no usable field. **Check runtime** now performs one
+CPU optimizer step, so a damaged environment is caught before a run, with a pip
+repair command for a missing module. The Progress page shows live stat tiles and
+can overlay another run's validation curve.
+
+## Runs, previews and export
+
+Sort runs by date, name, validation loss or size; pin runs and filter to pins;
+keep notes with a run. Details include the plan, timing, stop reason, snapshots
+and disk use. **Copy resume command** produces the equivalent CLI command.
+Previews accept length, temperature, top-k, top-p and seed, can compare Best and
+Latest, and can be saved with the run; reports include notes and saved
+previews. **Export weights…** writes `model.safetensors`, `model.config.json` and
+a `README.md` model card to a new folder.
+
+The loss graph can smooth training loss, overlay the learning rate, mark the best
+validation point and read values under the pointer. Log errors, warnings and
+improvements are highlighted, and the log can show only matching lines.
+
 `Ctrl+1`, `Ctrl+2`, `Ctrl+3` change pages; `Ctrl+N` starts a new draft;
-`Ctrl+F` focuses run/log search; `F5` refreshes. `Ctrl+Enter` starts on Train or
-resumes on Runs. It does not launch from Activity or an open dialog.
+`Ctrl+F` focuses run/log search; `Ctrl+Shift+E` exports a notebook; `F2` renames; `F5` refreshes. `Ctrl+Enter` starts on Train or
+resumes on Runs. It does not launch from Activity or an open dialog. `Ctrl+P`
+previews, `Ctrl+E` exports the report and `F1` lists all shortcuts.
 
 ## Data, checkpoints and jobs
 

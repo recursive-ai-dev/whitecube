@@ -8,3 +8,4 @@ build-cairo/
 packaging/out/
 packaging/out.build.log
 apps/cube-editor/upstream/cubic-*/
+apps/*/.deps/

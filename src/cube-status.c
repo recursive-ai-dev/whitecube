@@ -24,6 +24,8 @@
 #include <fcntl.h>
 #include <time.h>
 #include <dirent.h>
+#include <locale.h>
+#include <math.h>
 #include <signal.h>
 #include <errno.h>
 #include <sys/mman.h>
@@ -73,7 +75,7 @@ static const char *cat_names[CAT_COUNT] = { "All apps", "Internet", "Office", "D
 	"Graphics", "Sound & Video", "Games", "Accessories", "System", "Other" };
 
 struct app {
-	char id[128], name[96], exec[512], icon[160], search[640];
+	char id[512], name[192], exec[1024], icon[256], search[2048], path[2048], cwd[1024];
 	enum cat cat;
 	bool terminal, icon_tried;
 	cairo_surface_t *img;
@@ -235,28 +237,60 @@ static void quick_launch(int button) {
 		button == QB_POWER ? "power" : NULL);
 }
 
+static char **app_argv(const struct app *a) {
+    char **parsed = NULL;
+    if (!g_shell_parse_argv(a->exec, NULL, &parsed, NULL)) return NULL;
+    GPtrArray *args = g_ptr_array_new_with_free_func(g_free);
+    if (a->terminal) {
+        g_ptr_array_add(args, g_strdup(TERMINAL));
+        g_ptr_array_add(args, g_strdup("--"));
+    }
+    for (int i = 0; parsed[i]; i++) {
+        if (!strcmp(parsed[i], "%i")) {
+            if (a->icon[0]) {
+                g_ptr_array_add(args, g_strdup("--icon"));
+                g_ptr_array_add(args, g_strdup(a->icon));
+            }
+            continue;
+        }
+        if (!strcmp(parsed[i], "%f") || !strcmp(parsed[i], "%F") ||
+            !strcmp(parsed[i], "%u") || !strcmp(parsed[i], "%U")) continue;
+        GString *value = g_string_new(NULL);
+        for (const char *c = parsed[i]; *c; c++) {
+            if (*c == '%' && c[1]) {
+                c++;
+                if (*c == '%') g_string_append_c(value, '%');
+                else if (*c == 'c') g_string_append(value, a->name);
+                else if (*c == 'k') g_string_append(value, a->path);
+                else { g_string_free(value, TRUE); value = NULL; break; }
+            } else g_string_append_c(value, *c);
+        }
+        if (!value) { g_strfreev(parsed); g_ptr_array_free(args, TRUE); return NULL; }
+        g_ptr_array_add(args, g_string_free(value, FALSE));
+    }
+    g_strfreev(parsed);
+    int first = a->terminal ? 2 : 0;
+    if (args->len <= (unsigned)first || !((char *)args->pdata[first])[0]) {
+        g_ptr_array_free(args, TRUE); return NULL;
+    }
+    g_ptr_array_add(args, NULL);
+    return (char **)g_ptr_array_free(args, FALSE);
+}
+
 static void launch_app(const struct app *a) {
-	// Drop desktop-entry field codes; %% is a literal percent.
-	char cmd[600]; size_t o = 0;
-	for (const char *p = a->exec; *p && o + 1 < sizeof(cmd); p++) {
-		if (*p == '%' && p[1]) { if (p[1] == '%') cmd[o++] = '%'; p++; continue; }
-		cmd[o++] = *p;
-	}
-	cmd[o] = 0;
-	char line[1400];
-	if (a->terminal) {
-		char quoted[1300]; size_t q = 0;
-		quoted[q++] = '\'';
-		for (const char *p = cmd; *p && q + 5 < sizeof(quoted); p++) {
-			if (*p == '\'') { memcpy(quoted + q, "'\\''", 4); q += 4; }
-			else quoted[q++] = *p;
-		}
-		quoted[q++] = '\''; quoted[q] = 0;
-		snprintf(line, sizeof(line), "exec " TERMINAL " sh -c %s", quoted);
-	} else {
-		snprintf(line, sizeof(line), "exec %s", cmd);
-	}
-	spawn_shell(line);
+    char **args = app_argv(a);
+    if (!args) { fprintf(stderr, "cube-status: invalid Exec in %s\n", a->id); return; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGCHLD, SIG_DFL);
+        if (a->cwd[0] && chdir(a->cwd)) { perror("cube-status: application directory"); _exit(126); }
+        execvp(args[0], args);
+        perror("cube-status: application launch"); _exit(127);
+    }
+    if (pid < 0) perror("cube-status: fork");
+    g_strfreev(args);
 }
 
 // ------------------------------------------------------------------- jobs
@@ -305,12 +339,12 @@ static bool list_has(const char *list, const char *word) {
 }
 
 static bool in_path(const char *prog) {
-	if (prog[0] == '/') return access(prog, X_OK) == 0;
+	if (prog[0] == '/') return g_file_test(prog, G_FILE_TEST_IS_REGULAR) && access(prog, X_OK) == 0;
 	const char *path = getenv("PATH");
 	char buf[2048]; snprintf(buf, sizeof(buf), "%s", path && *path ? path : "/usr/bin:/usr/bin:/bin");
 	for (char *save = NULL, *d = strtok_r(buf, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
 		char full[1024]; snprintf(full, sizeof(full), "%s/%s", d, prog);
-		if (access(full, X_OK) == 0) return true;
+		if (g_file_test(full, G_FILE_TEST_IS_REGULAR) && access(full, X_OK) == 0) return true;
 	}
 	return false;
 }
@@ -332,80 +366,105 @@ static bool seen_id(const char *id) {
 	return false;
 }
 
+static void entry_value(GKeyFile *key, const char *name, bool localized, char *out, size_t cap) {
+    char *value = localized ? g_key_file_get_locale_string(key, "Desktop Entry", name, NULL, NULL)
+                            : g_key_file_get_string(key, "Desktop Entry", name, NULL);
+    if (value && g_utf8_validate(value, -1, NULL)) {
+        g_strlcpy(out, value, cap);
+        const char *invalid;
+        if (!g_utf8_validate(out, -1, &invalid)) out[invalid - out] = 0;
+    }
+    g_free(value);
+}
+
 // Hidden/NoDisplay entries still claim their id so they mask lower-priority dirs.
 static void load_entry(const char *dir, const char *file) {
-	if (napps >= MAX_APPS || seen_id(file)) return;
-	char path[1024]; snprintf(path, sizeof(path), "%s/%s", dir, file);
-	FILE *f = fopen(path, "r");
-	if (!f) return;
-	struct app a; memset(&a, 0, sizeof(a));
-	snprintf(a.id, sizeof(a.id), "%s", file);
-	char line[1024], type[32] = "", cats[512] = "", only[256] = "", notin[256] = "", tryexec[256] = "",
-		generic[96] = "", keywords[256] = "";
-	bool section = false, hidden = false;
-	while (fgets(line, sizeof(line), f)) {
-		line[strcspn(line, "\r\n")] = 0;
-		if (line[0] == '[') { section = !strcmp(line, "[Desktop Entry]"); continue; }
-		if (!section) continue;
-		char *eq = strchr(line, '=');
-		if (!eq) continue;
-		*eq = 0;
-		const char *k = line, *v = eq + 1;
-		while (*v == ' ') v++;
-		if (!strcmp(k, "Name")) snprintf(a.name, sizeof(a.name), "%s", v);
-		else if (!strcmp(k, "GenericName")) snprintf(generic, sizeof(generic), "%s", v);
-		else if (!strcmp(k, "Keywords")) snprintf(keywords, sizeof(keywords), "%s", v);
-		else if (!strcmp(k, "Exec")) snprintf(a.exec, sizeof(a.exec), "%s", v);
-		else if (!strcmp(k, "Icon")) snprintf(a.icon, sizeof(a.icon), "%s", v);
-		else if (!strcmp(k, "Type")) snprintf(type, sizeof(type), "%s", v);
-		else if (!strcmp(k, "Categories")) snprintf(cats, sizeof(cats), "%s", v);
-		else if (!strcmp(k, "OnlyShowIn")) snprintf(only, sizeof(only), "%s", v);
-		else if (!strcmp(k, "NotShowIn")) snprintf(notin, sizeof(notin), "%s", v);
-		else if (!strcmp(k, "TryExec")) snprintf(tryexec, sizeof(tryexec), "%s", v);
-		else if (!strcmp(k, "Terminal")) a.terminal = !strcmp(v, "true");
-		else if (!strcmp(k, "NoDisplay") || !strcmp(k, "Hidden")) hidden |= !strcmp(v, "true");
-	}
-	fclose(f);
-	if (hidden || strcmp(type, "Application") || !a.name[0] || !a.exec[0] ||
-	    (only[0] && !list_has(only, "whitecube")) || list_has(notin, "whitecube") ||
-	    (tryexec[0] && !in_path(tryexec))) {
-		a.name[0] = 0; // keep only the id as a mask
-	}
-	a.cat = categorize(cats);
-	snprintf(a.search, sizeof(a.search), "%s %s %s", a.name, generic, keywords);
-	apps[napps++] = a;
+    if (napps >= MAX_APPS) return;
+    struct app a = {0};
+    if (strlen(file) >= sizeof(a.id)) return;
+    g_strlcpy(a.id, file, sizeof(a.id));
+    for (char *c = a.id; *c; c++) if (*c == '/') *c = '-';
+    if (seen_id(a.id)) return;
+    if (snprintf(a.path, sizeof(a.path), "%s/%s", dir, file) >= (int)sizeof(a.path)) return;
+    struct stat st;
+    if (stat(a.path, &st) || !S_ISREG(st.st_mode) || st.st_size > 1048576) return;
+    GKeyFile *key = g_key_file_new();
+    if (!g_key_file_load_from_file(key, a.path, G_KEY_FILE_NONE, NULL)) { g_key_file_free(key); return; }
+    char type[32] = "", cats[512] = "", only[256] = "", notin[256] = "", tryexec[512] = "";
+    char generic[192] = "", keywords[512] = "", comment[512] = "";
+    entry_value(key, "Name", true, a.name, sizeof(a.name));
+    entry_value(key, "GenericName", true, generic, sizeof(generic));
+    entry_value(key, "Keywords", true, keywords, sizeof(keywords));
+    entry_value(key, "Comment", true, comment, sizeof(comment));
+    entry_value(key, "Exec", false, a.exec, sizeof(a.exec));
+    entry_value(key, "Icon", false, a.icon, sizeof(a.icon));
+    entry_value(key, "Path", false, a.cwd, sizeof(a.cwd));
+    entry_value(key, "Type", false, type, sizeof(type));
+    entry_value(key, "Categories", false, cats, sizeof(cats));
+    entry_value(key, "OnlyShowIn", false, only, sizeof(only));
+    entry_value(key, "NotShowIn", false, notin, sizeof(notin));
+    entry_value(key, "TryExec", false, tryexec, sizeof(tryexec));
+    a.terminal = g_key_file_get_boolean(key, "Desktop Entry", "Terminal", NULL);
+    bool hidden = g_key_file_get_boolean(key, "Desktop Entry", "Hidden", NULL) ||
+                  g_key_file_get_boolean(key, "Desktop Entry", "NoDisplay", NULL);
+    g_key_file_free(key);
+    if (hidden || strcmp(type, "Application") || !a.name[0] || !a.exec[0] ||
+        (only[0] && !list_has(only, "whitecube")) || list_has(notin, "whitecube") ||
+        (tryexec[0] && !in_path(tryexec))) a.name[0] = 0;
+    a.cat = categorize(cats);
+    snprintf(a.search, sizeof(a.search), "%s %s %s %s %s", a.name, generic, keywords, comment, a.id);
+    apps[napps++] = a;
 }
 
 static int app_cmp(const void *x, const void *y) {
-	return strcasecmp(((const struct app *)x)->name, ((const struct app *)y)->name);
+    int order = g_utf8_collate(((const struct app *)x)->name, ((const struct app *)y)->name);
+    return order ? order : strcmp(((const struct app *)x)->id, ((const struct app *)y)->id);
+}
+
+static void scan_apps(const char *root, const char *relative, int depth) {
+    if (depth > 4 || napps >= MAX_APPS) return;
+    char path[2048];
+    if (snprintf(path, sizeof(path), "%s/%s", root, relative) >= (int)sizeof(path)) return;
+    DIR *directory = opendir(path);
+    if (!directory) return;
+    struct dirent *entry;
+    while ((entry = readdir(directory))) {
+        if (entry->d_name[0] == '.') continue;
+        char child[1024], full[2048];
+        if (snprintf(child, sizeof(child), "%s%s%s", relative, *relative ? "/" : "", entry->d_name) >= (int)sizeof(child)) continue;
+        if (snprintf(full, sizeof(full), "%s/%s", root, child) >= (int)sizeof(full)) continue;
+        struct stat st;
+        if (lstat(full, &st)) continue;
+        if (S_ISDIR(st.st_mode)) scan_apps(root, child, depth + 1);
+        else if (g_str_has_suffix(entry->d_name, ".desktop")) load_entry(root, child);
+    }
+    closedir(directory);
 }
 
 static void load_apps(void) {
-	for (int i = 0; i < napps; i++) if (apps[i].img) cairo_surface_destroy(apps[i].img);
-	napps = 0;
-	const char *home = getenv("HOME");
-	char user[600] = "", userflat[600] = "";
-	if (home) {
-		snprintf(user, sizeof(user), "%s/.local/share/applications", home);
-		snprintf(userflat, sizeof(userflat), "%s/.local/share/flatpak/exports/share/applications", home);
-	}
-	const char *dirs[] = { user, userflat, "/usr/local/share/applications", "/var/lib/flatpak/exports/share/applications",
-		"/var/lib/snapd/desktop/applications", "/usr/share/applications" };
-	for (size_t d = 0; d < sizeof(dirs) / sizeof(*dirs); d++) {
-		if (!dirs[d][0]) continue;
-		DIR *dh = opendir(dirs[d]);
-		if (!dh) continue;
-		struct dirent *e;
-		while ((e = readdir(dh))) {
-			size_t n = strlen(e->d_name);
-			if (n > 8 && !strcmp(e->d_name + n - 8, ".desktop")) load_entry(dirs[d], e->d_name);
-		}
-		closedir(dh);
-	}
-	int keep = 0;
-	for (int i = 0; i < napps; i++) if (apps[i].name[0]) apps[keep++] = apps[i];
-	napps = keep;
-	qsort(apps, napps, sizeof(*apps), app_cmp);
+    for (int i = 0; i < napps; i++) if (apps[i].img) cairo_surface_destroy(apps[i].img);
+    napps = 0;
+    const char *home = getenv("HOME"), *data = getenv("XDG_DATA_HOME");
+    char path[2048];
+    if (data && data[0] == '/') snprintf(path, sizeof(path), "%s/applications", data);
+    else snprintf(path, sizeof(path), "%s/.local/share/applications", home ? home : "");
+    if ((data && data[0] == '/') || home) scan_apps(path, "", 0);
+    if (home) {
+        snprintf(path, sizeof(path), "%s/.local/share/flatpak/exports/share/applications", home);
+        scan_apps(path, "", 0);
+    }
+    const char *data_dirs = getenv("XDG_DATA_DIRS");
+    char **dirs = g_strsplit(data_dirs && *data_dirs ? data_dirs : "/usr/local/share:/usr/share", ":", -1);
+    for (int i = 0; dirs[i]; i++) if (dirs[i][0] == '/') {
+        snprintf(path, sizeof(path), "%s/applications", dirs[i]); scan_apps(path, "", 0);
+    }
+    g_strfreev(dirs);
+    scan_apps("/var/lib/flatpak/exports/share/applications", "", 0);
+    scan_apps("/var/lib/snapd/desktop/applications", "", 0);
+    int keep = 0;
+    for (int i = 0; i < napps; i++) if (apps[i].name[0]) apps[keep++] = apps[i];
+    napps = keep;
+    qsort(apps, napps, sizeof(*apps), app_cmp);
 }
 
 static cairo_surface_t *load_png(const char *path) {
@@ -444,15 +503,30 @@ static cairo_surface_t *app_icon(struct app *a) {
 	return a->img = load_png(path);
 }
 
+static bool search_matches(const char *haystack, const char *query) {
+    char *normalized = g_utf8_normalize(haystack, -1, G_NORMALIZE_ALL_COMPOSE);
+    char *folded = normalized ? g_utf8_casefold(normalized, -1) : NULL;
+    g_free(normalized);
+    normalized = g_utf8_normalize(query, -1, G_NORMALIZE_ALL_COMPOSE);
+    char *needle = normalized ? g_utf8_casefold(normalized, -1) : NULL;
+    g_free(normalized);
+    if (!folded || !needle) { g_free(folded); g_free(needle); return false; }
+    char **words = g_strsplit_set(needle, " \t", -1);
+    bool matched = true;
+    for (int i = 0; words[i]; i++) if (*words[i] && !strstr(folded, words[i])) { matched = false; break; }
+    g_strfreev(words); g_free(folded); g_free(needle);
+    return matched;
+}
+
 static void filter_apps(struct st *s) {
-	s->nfiltered = 0;
-	for (int i = 0; i < napps; i++) {
-		if (s->query[0]) { if (!strcasestr(apps[i].search, s->query)) continue; }
-		else if (s->cat != CAT_ALL && apps[i].cat != s->cat) continue;
-		s->filtered[s->nfiltered++] = i;
-	}
-	if (s->sel >= s->nfiltered) s->sel = s->nfiltered ? s->nfiltered - 1 : 0;
-	if (s->sel < 0) s->sel = 0;
+    s->nfiltered = 0;
+    for (int i = 0; i < napps; i++) {
+        if (s->query[0]) { if (!search_matches(apps[i].search, s->query)) continue; }
+        else if (s->cat != CAT_ALL && apps[i].cat != s->cat) continue;
+        s->filtered[s->nfiltered++] = i;
+    }
+    if (s->sel >= s->nfiltered) s->sel = s->nfiltered ? s->nfiltered - 1 : 0;
+    if (s->sel < 0) s->sel = 0;
 }
 
 // ------------------------------------------------------------- drawing
@@ -1694,7 +1768,9 @@ static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t t
 		launch_settings("privacy"); menu_close(s); return;
 	}
 	size_t len = strlen(s->query);
-	switch (sym) {
+    if (xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 &&
+        (sym == XKB_KEY_u || sym == XKB_KEY_U)) { s->query[0] = 0; s->sel = 0; }
+    else switch (sym) {
 	case XKB_KEY_Escape:
 		if (s->query[0]) { s->query[0] = 0; s->sel = 0; break; }
 		menu_close(s); return;
@@ -1708,7 +1784,9 @@ static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t t
 	case XKB_KEY_Right: if (s->sel + 1 < s->nfiltered) s->sel++; break;
 	case XKB_KEY_Up: if (s->sel - s->cols >= 0) s->sel -= s->cols; break;
 	case XKB_KEY_Down: if (s->sel + s->cols < s->nfiltered) s->sel += s->cols; break;
-	case XKB_KEY_Home: s->sel = 0; break;
+	case XKB_KEY_Page_Up: s->sel -= s->cols * (int)fmax(1, s->r_grid.h / (108 * s->scale)); break;
+    case XKB_KEY_Page_Down: s->sel += s->cols * (int)fmax(1, s->r_grid.h / (108 * s->scale)); break;
+    case XKB_KEY_Home: s->sel = 0; break;
 	case XKB_KEY_End: if (s->nfiltered) s->sel = s->nfiltered - 1; break;
 	case XKB_KEY_Tab: case XKB_KEY_ISO_Left_Tab: {
 		int step = sym == XKB_KEY_Tab ? 1 : CAT_COUNT - 1;
@@ -1918,6 +1996,9 @@ static int render_mode(struct st *s, const char *dir) {
 }
 
 int main(int argc, char **argv) {
+	setlocale(LC_CTYPE, "");
+	setlocale(LC_COLLATE, "");
+	setlocale(LC_MESSAGES, "");
 	struct st s;
 	memset(&s, 0, sizeof(s));
 	g_st = &s;

@@ -1,0 +1,17 @@
+Project: NanoSVG, https://github.com/memononen/nanosvg
+Commit: 239e102ec2c691f2902e20ace2ed36ee4a35cfe6
+License: zlib (LICENSE.txt and header notices)
+Retrieved: 2026-10-09
+
+Unmodified upstream files and SHA-256:
+e34fd5d084be106cea972d19ce5d27fd96d17ba89f8d06bdceee058420c8b2b0  nanosvg.h
+e82bc3dd03400aecabe12201219ba14750dbc4b36faab58663a7a6068548d372  LICENSE.txt
+
+Source URLs:
+https://raw.githubusercontent.com/memononen/nanosvg/239e102ec2c691f2902e20ace2ed36ee4a35cfe6/src/nanosvg.h
+https://raw.githubusercontent.com/memononen/nanosvg/239e102ec2c691f2902e20ace2ed36ee4a35cfe6/LICENSE.txt
+
+cube-browser uses the memory parser only, after strict Expat validation and
+reconstruction of a bounded SVG subset. Cairo renders the resulting paths.
+NanoSVG's file loader, CSS stylesheet parser and original untrusted XML parser
+are not exposed to web content. No NanoSVG rasterizer is used.

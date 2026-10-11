@@ -1,7 +1,7 @@
 'use strict';
 const fs = require('node:fs');
-const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { writeAtomic } = require('./persistence.cjs');
 
 // Persist only command metadata, never captured stdout/stderr. Interrupted sessions
 // are marked explicitly on the next launch rather than remaining "running" forever.
@@ -15,10 +15,7 @@ function createActivity(file) {
   records = records.map(r => r.status === 'running' ? { ...r, status: 'interrupted', endedAt: Date.now() } : r);
   const save = () => {
     try {
-      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-      const temp = `${file}.tmp`;
-      fs.writeFileSync(temp, JSON.stringify(records), { mode: 0o600 });
-      fs.renameSync(temp, file);
+      writeAtomic(file, JSON.stringify(records));
       warning = null;
     } catch (e) { warning = `Activity could not be saved: ${e.message}`; }
   };

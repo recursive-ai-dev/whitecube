@@ -31,6 +31,7 @@ function load() {
   if (fs.existsSync(p)) {
     try {
       raw = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
     } catch (e) {
       raw = {};
     }
@@ -52,8 +53,8 @@ function load() {
     endpoint: cfg.endpoint,
     model: cfg.model,
     apiKey,
-    confirmDestructive: cfg.confirmDestructive,
-    hotkey: cfg.hotkey,
+    confirmDestructive: typeof cfg.confirmDestructive === 'boolean' ? cfg.confirmDestructive : true,
+    hotkey: typeof cfg.hotkey === 'string' ? cfg.hotkey : DEFAULTS.hotkey,
     keyStorage: canEncrypt() ? 'encrypted' : 'plaintext',
     chatSource: cfg.chatSource === 'local' ? 'local' : 'api',
     checkpointId: typeof cfg.checkpointId === 'string' ? cfg.checkpointId : '',
@@ -62,6 +63,7 @@ function load() {
 }
 
 function save(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Settings must be an object.');
   let existingRaw = {};
   try {
     existingRaw = JSON.parse(fs.readFileSync(configPath(), 'utf8') || '{}');
@@ -74,6 +76,8 @@ function save(settings) {
     if (settings[key] !== undefined) out[key] = settings[key];
   }
   const validated = validateSettings(out);
+  if (typeof out.confirmDestructive !== 'boolean') throw new Error('Confirmation preference must be true or false.');
+  if (typeof out.hotkey !== 'string' || out.hotkey.length > 128) throw new Error('Invalid hotkey.');
   out.endpoint = validated.endpoint; out.model = validated.model;
   if (!['api', 'local'].includes(out.chatSource)) throw new Error('Choose an API model or local checkpoint.');
   if (typeof out.checkpointId !== 'string') throw new Error('Invalid checkpoint selection.');

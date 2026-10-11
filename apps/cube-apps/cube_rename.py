@@ -2,6 +2,9 @@
 """Cube Rename: batch rename with a live preview and undo (Whitecube style)."""
 import re
 import uuid
+import ctypes
+import os
+import errno
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,14 +26,23 @@ class Opts:
     start: int = 1
     digits: int = 2
     case: int = 0
+    trim: bool = False
+    collapse_spaces: bool = False
+    first_only: bool = False
+    extension_case: int = 0
+    order: int = 0
 
 
 def new_stem(stem: str, index: int, o: Opts) -> str:
     if o.find:
         if o.regex:
-            stem = re.sub(o.find, o.replace, stem)
+            stem = re.sub(o.find, o.replace, stem, count=1 if o.first_only else 0)
         else:
-            stem = stem.replace(o.find, o.replace)
+            stem = stem.replace(o.find, o.replace, 1 if o.first_only else -1)
+    if o.trim:
+        stem = stem.strip()
+    if o.collapse_spaces:
+        stem = re.sub(r'\s+', ' ', stem)
     stem = (o.prefix + stem + o.suffix)
     if o.number:
         stem += f"-{o.start + index:0{o.digits}d}"
@@ -45,20 +57,29 @@ def new_stem(stem: str, index: int, o: Opts) -> str:
 
 def plan(paths, o: Opts):
     """[(old, new, problem|None)]. Problems stop the whole batch from applying."""
+    paths = [Path(p) for p in paths]
+    if o.order in (1, 2):
+        paths.sort(key=lambda p: p.name.casefold(), reverse=o.order == 2)
+    elif o.order == 3:
+        paths.sort(key=lambda p: [(1, int(t)) if t.isdigit() else (0, t.casefold()) for t in re.split(r'(\d+)', p.name)])
     rows = []
+    if type(o.start) is not int or o.start < 0 or type(o.digits) is not int or not 1 <= o.digits <= 8:
+        return [(p, p, 'invalid numbering') for p in paths]
     try:
-        names = [new_stem(p.stem, i, o) + p.suffix for i, p in enumerate(paths)]
-    except re.error as exc:
+        names = [new_stem(p.stem, i, o) + (p.suffix.lower() if o.extension_case == 1 else p.suffix.upper() if o.extension_case == 2 else p.suffix) for i, p in enumerate(paths)]
+    except (re.error, IndexError) as exc:
         return [(p, p, f"bad pattern: {exc}") for p in paths]
     batch = set(paths)
     seen: dict[Path, int] = {}
     for p, name in zip(paths, names):
         problem = None
-        if not name.strip(" .") or "/" in name or "\0" in name:
+        if not name.strip(" .") or "/" in name or any(ord(c) < 32 or ord(c) == 127 for c in name) or len(os.fsencode(name)) > 255:
             problem, new = "invalid name", p
         else:
             new = p.with_name(name)
-            if new != p and new.exists() and new not in batch:
+            if not os.path.lexists(p):
+                problem = 'source missing'
+            elif new != p and os.path.lexists(new) and new not in batch:
                 problem = "already exists"
         seen[new] = seen.get(new, 0) + 1
         rows.append([p, new, problem])
@@ -68,25 +89,63 @@ def plan(paths, o: Opts):
     return [tuple(r) for r in rows]
 
 
+def move_no_replace(source, destination):
+    """Linux atomic rename with RENAME_NOREPLACE, including symlinks."""
+    library = ctypes.CDLL(None, use_errno=True)
+    rename = library.renameat2
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
 def apply(rows):
     """Rename via temporary names so swaps and chains are safe. Returns undo pairs."""
+    rows = [(Path(old), Path(new), problem) for old, new, problem in rows]
+    if any(problem for _, _, problem in rows):
+        raise ValueError('Fix all preview conflicts before renaming')
+    sources = {old for old, _, _ in rows}
+    targets = {new for _, new, _ in rows}
+    if len(sources) != len(rows) or len(targets) != len(rows):
+        raise ValueError('Duplicate source or destination')
+    for old, new, _ in rows:
+        if old.parent != new.parent:
+            raise ValueError('Batch rename must stay in the original folder')
+        if not os.path.lexists(old):
+            raise FileNotFoundError(errno.ENOENT, 'Source no longer exists', str(old))
+        if old != new and os.path.lexists(new) and new not in sources:
+            raise FileExistsError(errno.EEXIST, 'Destination already exists', str(new))
     todo = [(old, new) for old, new, _ in rows if old != new]
-    token = uuid.uuid4().hex[:8]
+    token = uuid.uuid4().hex
     temps = []
-    for i, (old, new) in enumerate(todo):
-        tmp = old.with_name(f".cube-rename-{token}-{i}")
-        old.rename(tmp)
-        temps.append((tmp, old, new))
     done = []
     try:
+        for i, (old, new) in enumerate(todo):
+            tmp = old.with_name(f".cube-rename-{token}-{i}")
+            move_no_replace(old, tmp)
+            temps.append((tmp, old, new))
         for tmp, old, new in temps:
-            tmp.rename(new)
+            move_no_replace(tmp, new)
             done.append((new, old))
-    except OSError:
-        for tmp, old, new in temps:  # put everything back
-            target = new if (new, old) in done else tmp
-            if target.exists():
-                target.rename(old)
+    except OSError as error:
+        # Vacate every committed destination before restoring originals: chains
+        # and swaps would otherwise overwrite each other's contents on rollback.
+        failures = []
+        for tmp, old, new in temps:
+            if (new, old) in done:
+                try:
+                    move_no_replace(new, tmp)
+                except OSError as exc:
+                    failures.append(str(exc))
+        for tmp, old, new in reversed(temps):
+            if os.path.lexists(tmp):
+                try:
+                    move_no_replace(tmp, old)
+                except OSError as exc:
+                    failures.append(str(exc))
+        if failures:
+            raise OSError(f'{error}; recovery needed for .cube-rename-{token}-* files: ' + '; '.join(failures)) from error
         raise
     return done
 
@@ -134,16 +193,23 @@ class RenameWindow(Adw.ApplicationWindow):
         self.digits.set_title("Digits")
         self.digits.set_value(2)
         self.case = Adw.ComboRow(title="Letter case", model=Gtk.StringList.new(CASES))
+        self.trim = Adw.SwitchRow(title='Trim spaces around the name')
+        self.collapse = Adw.SwitchRow(title='Collapse repeated whitespace')
+        self.first = Adw.SwitchRow(title='Replace only the first match')
+        self.extension = Adw.ComboRow(title='Extension case', model=Gtk.StringList.new(['Unchanged', 'lowercase', 'UPPERCASE']))
+        self.order = Adw.ComboRow(title='Numbering order', model=Gtk.StringList.new(['Chosen order', 'Name A to Z', 'Name Z to A', 'Natural numeric order']))
         for r in (self.find, self.replace, self.regex, self.prefix, self.suffix,
-                  self.number, self.start, self.digits, self.case):
+                  self.number, self.start, self.digits, self.case, self.trim, self.collapse, self.first, self.extension, self.order):
             o.add(r)
         for r in (self.find, self.replace, self.prefix, self.suffix):
             r.connect("changed", lambda *_: self.refresh())
-        for r in (self.regex, self.number):
+        for r in (self.regex, self.number, self.trim, self.collapse, self.first):
             r.connect("notify::active", lambda *_: self.refresh())
         for r in (self.start, self.digits):
             r.connect("notify::value", lambda *_: self.refresh())
         self.case.connect("notify::selected", lambda *_: self.refresh())
+        self.extension.connect('notify::selected', lambda *_: self.refresh())
+        self.order.connect('notify::selected', lambda *_: self.refresh())
         page.add(o)
 
         self.preview_group = Adw.PreferencesGroup(title="Preview")
@@ -174,7 +240,8 @@ class RenameWindow(Adw.ApplicationWindow):
         return Opts(self.find.get_text(), self.replace.get_text(), self.regex.get_active(),
                     self.prefix.get_text(), self.suffix.get_text(), self.number.get_active(),
                     int(self.start.get_value()), int(self.digits.get_value()),
-                    self.case.get_selected())
+                    self.case.get_selected(), self.trim.get_active(), self.collapse.get_active(),
+                    self.first.get_active(), self.extension.get_selected(), self.order.get_selected())
 
     def add_files(self, paths):
         self.files.add_paths(paths)
@@ -216,10 +283,13 @@ class RenameWindow(Adw.ApplicationWindow):
         self.go.set_sensitive(ok)
 
     def do_rename(self):
+        self.refresh()
+        if not self.go.get_sensitive():
+            return
         try:
             self.undo = apply(self.rows)
-        except OSError as exc:
-            self.toast(f"Rename failed, nothing changed: {exc.strerror or exc}")
+        except (OSError, ValueError) as exc:
+            self.toast(f"Rename failed: {exc}")
             return
         new_paths = {old: new for old, new, _ in self.rows}
         self.files.paths = [new_paths.get(p, p) for p in self.files.paths]
@@ -228,13 +298,14 @@ class RenameWindow(Adw.ApplicationWindow):
         self.toast(f"Renamed {len(self.undo)} file(s)")
 
     def do_undo(self):
-        pairs, self.undo = self.undo, []
+        pairs = self.undo
         try:
             apply([(cur, orig, None) for cur, orig in pairs])
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self.toast(f"Undo failed: {exc.strerror or exc}")
             return
         back = {cur: orig for cur, orig in pairs}
+        self.undo = []
         self.files.paths = [back.get(p, p) for p in self.files.paths]
         self.undo_btn.set_sensitive(False)
         self.files.refresh()

@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const { waylandProblem, enforce } = require('./wayland.cjs');
 const { trustedUrl, validateDevUrl } = require('./security.cjs');
 const { createActivity } = require('./activity.cjs');
+const { writeAtomic } = require('./persistence.cjs');
 const inspector = require('./inspector.cjs');
 
 const problem = waylandProblem();
@@ -40,7 +41,7 @@ function createWindow() {
   win.webContents.on('will-navigate', (e, url) => { if (!trustedUrl(url, DIST_INDEX, DEV_URL)) e.preventDefault(); });
   win.webContents.on('will-attach-webview', e => e.preventDefault());
   win.on('close', () => {
-    try { fs.mkdirSync(path.dirname(settingsFile), { recursive: true }); fs.writeFileSync(settingsFile, JSON.stringify({ ...win.getNormalBounds(), maximized: win.isMaximized() })); } catch { /* optional window state */ }
+    try { writeAtomic(settingsFile, JSON.stringify({ ...win.getNormalBounds(), maximized: win.isMaximized() })); } catch { /* optional window state */ }
   });
   if (DEV_URL) win.loadURL(DEV_URL); else win.loadFile(DIST_INDEX);
   win.on('closed', () => { win = null; });
@@ -96,6 +97,10 @@ function registerIpc() {
     if (r.canceled || !r.filePath) return { canceled: true };
     await fs.promises.writeFile(r.filePath, content, { mode: 0o600 });
     return { path: r.filePath };
+  });
+  handle('file:directory', async () => {
+    const result = await dialog.showOpenDialog(win, { title: 'Choose working directory', properties: ['openDirectory'] });
+    return result.canceled || !result.filePaths[0] ? { canceled: true } : { path: result.filePaths[0] };
   });
   handle('file:import', async () => {
     const r = await dialog.showOpenDialog(win, { title: 'Import Whitecube Command Center backup', properties: ['openFile'], filters: [{ name: 'Whitecube Command Center backup', extensions: ['json'] }] });

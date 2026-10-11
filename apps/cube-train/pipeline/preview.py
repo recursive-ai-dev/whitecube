@@ -12,6 +12,7 @@ def main():
     parser.add_argument('--max-new-tokens', type=int, default=120)
     parser.add_argument('--temperature', type=float, default=.85)
     parser.add_argument('--top-k', type=int, default=40)
+    parser.add_argument('--top-p', type=float, default=1.0, help='Nucleus sampling share, (0, 1]; 1 disables')
     parser.add_argument('--seed', type=int, default=1337)
     args = parser.parse_args()
     if not 1 <= args.max_new_tokens <= 4096:
@@ -20,6 +21,8 @@ def main():
         parser.error('--temperature must be finite and nonnegative')
     if args.top_k < 1:
         parser.error('--top-k must be positive')
+    if not math.isfinite(args.top_p) or not 0 < args.top_p <= 1:
+        parser.error('--top-p must be greater than 0 and at most 1')
     # Model constructors report their shape; keep that in diagnostics.
     with contextlib.redirect_stdout(sys.stderr):
         import torch
@@ -32,7 +35,7 @@ def main():
         model = TensegrityLM(cfg).eval()
         model.load_state_dict(saved['model_state_dict'])
     prompt = list(args.prompt.encode('utf-8')[-cfg.block_size:]) or [256]
-    tokens = list(decode(model, prompt, temperature=args.temperature, top_k=args.top_k, top_p=None,
+    tokens = list(decode(model, prompt, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p if args.top_p < 1 else None,
                          max_new_tokens=args.max_new_tokens))
     print(bytes(token for token in tokens if token < 256).decode('utf-8', errors='replace'))
 

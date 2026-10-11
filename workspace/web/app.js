@@ -18,7 +18,7 @@
     const saved = JSON.parse(sessionStorage.getItem('whitecube.console.sessions') || '[]');
     if (Array.isArray(saved)) savedSessions = saved.filter(s => typeof s.id === 'string' && /^[a-f0-9]{32}$/.test(s.id) && typeof s.name === 'string').slice(0, 8);
   } catch (_) { /* Storage is optional in a file preview. */ }
-  let toastTimer, layoutTimer, restoringLayout = true, selectedProject = null, lastProjectSession = null;
+  let toastTimer, layoutTimer, restoringLayout = true, selectedProject = null, lastProjectSession = null, drawerOpener = null;
   let settings = {ui_scale:1,terminal_scale:1,contrast:'normal',reduced_motion:matchMedia('(prefers-reduced-motion: reduce)').matches};
   let retainedSessionsReady = Promise.resolve();
   function toast(message) {
@@ -33,16 +33,20 @@
       response = await fetch(path, {...options, signal: controller.signal, headers: {
         'Content-Type': 'application/json', 'X-Whitecube-Token': token, ...(options.headers || {})
       }});
+      let result = {};
+      if (response.status !== 204) {
+        try { result = await response.json(); }
+        catch (error) { if (error.name === 'AbortError') throw error; throw new Error('The desktop service returned invalid JSON. Try again.'); }
+      }
+      if (!response.ok) {
+        const error = new Error(result.error || (response.status === 403 ? 'This desktop link is missing its access token. Open the link from the Whitecube launcher.' : `Desktop service returned ${response.status}.`));
+        error.status = response.status; throw error;
+      }
+      return result;
     } catch (error) {
+      if (error.status || (response && error.name !== 'AbortError')) throw error;
       throw new Error(error.name === 'AbortError' ? 'The local desktop service timed out.' : 'The local desktop service is unavailable. Start Whitecube and try again.');
     } finally { clearTimeout(timeout); }
-    let result = {};
-    try { result = await response.json(); } catch (_) { /* Empty responses are valid. */ }
-    if (!response.ok) {
-      const error = new Error(result.error || (response.status === 403 ? 'This desktop link is missing its access token. Open the link from the Whitecube launcher.' : `Desktop service returned ${response.status}.`));
-      error.status = response.status; throw error;
-    }
-    return result;
   }
   function connection(connected, label) {
     state.connected = connected;
@@ -50,14 +54,18 @@
     $('connection-dot').className = `status-dot ${connected ? 'connected' : 'offline'}`;
   }
   function closeDrawers() {
+    const restore = drawerOpener && document.activeElement?.closest('.side-panel');
     for (const id of ['library-panel', 'scripts-panel', 'network-panel', 'labs-panel', 'health-panel', 'recovery-panel', 'settings-panel']) $(id).hidden = true;
     for (const id of ['library-button', 'games-button', 'network-button', 'labs-button', 'health-button', 'recovery-button', 'settings-button']) { $(id).classList.remove('active'); $(id).setAttribute('aria-expanded','false'); }
+    if (restore) drawerOpener.focus();
   }
   function drawer(id, button) {
     const opening = $(id).hidden; closeDrawers();
     $(id).hidden = !opening; $(button).classList.toggle('active', opening);
     $(button).setAttribute('aria-expanded',String(opening));
+    if (opening) drawerOpener = $(button);
     if (opening && id === 'library-panel') $('project-search').focus();
+    else if (opening && id === 'scripts-panel') $('script-search').focus();
     else if (opening) ($(id).querySelector?.('button,input,select,summary') || $(id)).focus();
   }
   $('library-button').onclick = () => drawer('library-panel', 'library-button');
@@ -69,7 +77,7 @@
   $('recovery-button').onclick = () => { drawer('recovery-panel','recovery-button'); if (!$('recovery-panel').hidden) refreshBackups(); };
   $('settings-button').onclick = () => { drawer('settings-panel','settings-button'); $('workspace-name').value=workspaces[state.workspace].name; };
   for (const element of document.querySelectorAll('.close-panel')) element.onclick = closeDrawers;
-  $('home-button').onclick = event => { event.preventDefault(); closeDrawers(); $('app-panel').hidden = true; hideTerminal(); };
+  $('home-button').onclick = event => { event.preventDefault(); closeDrawers(); $('app-panel').hidden = true; workspaces[state.workspace].appVisible = false; hideTerminal(); scheduleLayout(); };
   $('help-button').onclick = () => $('help-dialog').showModal();
   $('help-close').onclick = () => $('help-dialog').close();
   function card(item, index, action, script = false) {
@@ -85,7 +93,8 @@
   function renderProjects() {
     const needle = $('project-search').value.toLowerCase().trim();
     $('project-list').replaceChildren();
-    const projects = state.catalog.projects.filter(p => `${p.name} ${p.description || ''}`.toLowerCase().includes(needle));
+    const projects = state.catalog.projects.filter(p => matchesSearch(`${p.name} ${p.id} ${p.description || ''} ${(Array.isArray(p.tags) ? p.tags : []).join(' ')}`, needle));
+    $('project-count').textContent = `${projects.length} projects`;
     projects.forEach((project, i) => {
       const entry=card(project,i,item=>{configureProject(item); if(item.url || item.kind==='command') openProject(item);});
       if (Object.keys(project.commands || {}).length || project.build || project.test || project.preview) {
@@ -97,6 +106,23 @@
   }
   function empty(id, message) { const p = document.createElement('p'); p.className = 'empty-state'; p.textContent = message; $(id).replaceChildren(p); }
   $('project-search').oninput = renderProjects;
+  function matchesSearch(text, query) {
+    const folded = String(text).normalize('NFKC').toLocaleLowerCase();
+    return query.normalize('NFKC').toLocaleLowerCase().split(/\s+/).filter(Boolean).every(word => folded.includes(word));
+  }
+  for (const [search, list] of [['project-search', 'project-list'], ['script-search', 'script-list']]) {
+    $(search).addEventListener('keydown', event => {
+      if (event.key === 'ArrowDown') { event.preventDefault(); $(list).querySelector('.project-card')?.focus(); }
+      if (event.key === 'Escape' && $(search).value) { event.preventDefault(); event.stopPropagation(); $(search).value = ''; $(search).dispatchEvent(new Event('input')); }
+    });
+    $(list).addEventListener('keydown', event => {
+      const cards = [...$(list).querySelectorAll('.project-card')], index = cards.indexOf(document.activeElement);
+      if (index < 0) return;
+      const next = {ArrowDown:index + 1, ArrowUp:index - 1, Home:0, End:cards.length - 1}[event.key];
+      if (next === undefined) return;
+      event.preventDefault(); if (next < 0) $(search).focus(); else cards[Math.min(next, cards.length - 1)]?.focus();
+    });
+  }
   async function openProject(project, restoreView = false) {
     if (!restoreView && (project.kind === 'command' || project.launch?.kind === 'command' || project.launch?.type === 'command')) {
       try {
@@ -233,7 +259,7 @@
   }
   async function poll(session) {
     if (session.stopped || session.exited) return;
-    let delay = state.active === session && !$('terminal-panel').hidden ? 110 : 700;
+    let delay = document.hidden ? 3000 : state.active === session && !$('terminal-panel').hidden ? 110 : 700;
     try {
       const result = await api(`/api/terminal/${encodeURIComponent(session.id)}?offset=${session.offset}`);
       if (result.truncated) { session.term.reset(); toast(`${session.name}: earlier output was trimmed; showing retained terminal output.`); }
@@ -324,11 +350,12 @@
   };
   new ResizeObserver(() => requestAnimationFrame(fitTerminal)).observe($('terminal'));
   document.addEventListener('keydown', event => {
+    if (document.querySelector('dialog[open]')) return;
     if (event.ctrlKey && event.code === 'Backquote') { event.preventDefault(); $('terminal-panel').hidden ? showTerminal() : hideTerminal(); }
     else if (event.ctrlKey && event.shiftKey && event.code === 'Enter') { event.preventDefault(); if ($('terminal-panel').hidden) showTerminal(); maximizeTerminal(); }
     else if (event.ctrlKey && event.shiftKey && event.code === 'KeyP') { event.preventDefault(); drawer('library-panel', 'library-button'); }
     else if (event.ctrlKey && event.altKey && /^Digit[1-4]$/.test(event.code)) { event.preventDefault(); switchWorkspace(Number(event.code.slice(-1)) - 1); }
-    else if (event.key === 'Escape' && !event.target.closest('#terminal')) { closeDrawers(); $('terminal-button').focus(); }
+    else if (event.key === 'Escape' && !event.target.closest('#terminal')) { event.preventDefault(); closeDrawers(); }
   });
   function switchWorkspace(index, restore = false) {
     index = validWorkspace(index); if (index === state.workspace && !restore) return;
@@ -367,7 +394,8 @@
   }
   function renderScripts() {
     const needle = $('script-search').value.trim().toLowerCase(); $('script-list').replaceChildren();
-    const scripts = state.catalog.scripts.filter(s => `${s.name} ${s.description || ''} ${(Array.isArray(s.tags) ? s.tags : []).join(' ')}`.toLowerCase().includes(needle));
+    const scripts = state.catalog.scripts.filter(s => matchesSearch(`${s.name} ${s.id} ${s.description || ''} ${(Array.isArray(s.tags) ? s.tags : []).join(' ')}`, needle));
+    $('script-count').textContent = `${scripts.length} scripts`;
     for (const [i, script] of scripts.entries()) {
       const entry = document.createElement('div'); entry.className = 'script-entry';
       entry.append(card(script, i, runScript, true), smallButton('Arguments…', () => configureScript(script))); $('script-list').append(entry);
@@ -717,7 +745,9 @@
   function updateClock() { const now = new Date(); $('clock').textContent = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: false}); $('clock').title = now.toLocaleDateString([], {weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'}); }
   updateClock(); setInterval(updateClock, 15000); loadCatalog(); setInterval(loadCatalog, 30000);
   refreshHealth(); refreshLabs(); refreshHistory(); refreshSystem();
-  setInterval(refreshSystem, 10000); setInterval(refreshHistory, 15000);
+  setInterval(() => { if (!document.hidden) refreshSystem(); }, 10000);
+  setInterval(() => { if (!document.hidden) refreshHistory(); }, 15000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) { updateClock(); refreshSystem(); } });
   window.WhitecubeDesktop = {toast,api,getSettings:()=>({...settings}),saveLayout,reconnectSessions};
   retainedSessionsReady=restoreDesktop();
   setInterval(()=>{if(!$('labs-panel').hidden)refreshLabs();if(!$('jobs-view').hidden)refreshJobs();},5000);

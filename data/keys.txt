@@ -149,3 +149,15 @@ PRIVACY AND SETTINGS
   Firefox controls apply after Firefox restarts. GTK recent-file preferences
   apply when GTK apps restart. Hardware controls show unavailable if unsupported.
   After installing a compositor update, log out and back in to activate it.
+
+FILE APPS AND CHAT (0.7.0)
+Cube Hash, Rename, PDF Tools and PDF Lock:
+  Ctrl+O choose files; Ctrl+Enter run the enabled operation; Ctrl+W close; Ctrl+Q quit.
+Cube Hash: Cancel stops hashing; Save checksums writes a manifest to a chosen folder.
+Cube Rename: trim/collapse whitespace, first-match replacement, extension case and
+alphabetic/natural numbering order are available with the existing preview and undo.
+Cube PDF Tools: Rotate saves a rotated copy, optionally for selected page ranges.
+Desktop Chat: Ctrl+F finds messages; Enter/Shift+Enter moves between matches;
+Ctrl+L focuses the composer; Ctrl+Shift+C copies the conversation as Markdown;
+Alt+Up recalls the last prompt into an empty composer. Failed sends retain the draft.
+App menu: PageUp/PageDown advances through results; Ctrl+U clears the query.

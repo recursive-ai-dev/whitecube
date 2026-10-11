@@ -16,6 +16,7 @@ import hmac
 import http.server
 import json
 import mimetypes
+import math
 import os
 from pathlib import Path
 import pty
@@ -680,10 +681,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if self.headers.get_content_type() != 'application/json':
                         raise Problem(415, 'Use application/json')
                     length = int(self.headers.get('Content-Length','0'))
+                    if self.headers.get('Transfer-Encoding'):
+                        raise Problem(400, 'Chunked request bodies are unsupported')
                     limit = 1048704 if path == '/api/seeds' else MAX_BODY
                     if length < 0 or length > limit:
                         raise Problem(413, 'Request too large')
-                    data = json.loads(self.rfile.read(length) or b'{}')
+                    body = self.rfile.read(length)
+                    if len(body) != length:
+                        raise Problem(400, 'Incomplete request body')
+                    def invalid_number(_value):
+                        raise ValueError('Nonfinite JSON number')
+                    def finite_float(value):
+                        number = float(value)
+                        if not math.isfinite(number):
+                            return invalid_number(value)
+                        return number
+                    data = json.loads(body or b'{}', parse_constant=invalid_number, parse_float=finite_float)
                     if not isinstance(data, dict):
                         raise Problem(400, 'Expected a JSON object')
                 return self.reply(200,work.api(self.command,path,query,data))

@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.1.0
+
+- Redesigned the overview and navigation with resource meters, health and update checks, pinned actions, recent activity, and compact layouts.
+- Added CPU, memory and network trends with 2/5/10-minute windows, history retained across navigation, and explicit missing-sample gaps.
+- Added persistent monitoring cadence and pause/refresh controls, including process-table pause and refresh.
+- Retained cached data on inspection failure, exposed timestamps and errors, and repaired initially hidden one-shot loading.
+- Added command pins, tags, preview text, filtering, sorting and backup compatibility.
+- Fixed palette execution callbacks retaining obsolete commands or working directories; added accessible search and scrolling keyboard selection.
+- Unified modal focus trapping, background isolation, Escape dismissal and focus restoration; added native working-directory selection.
+- Added terminal focus shortcut, elapsed time, stopping feedback, automatic expansion on execution and command-draft recall.
+- Added palette access to shortcut groups and migrated the default Core Actions binding to Ctrl+Shift+G to avoid Whitecube’s native Alt+C action.
+- Rejected duplicate, desktop-reserved and unsupported shortcut bindings; imported conflicts remain unbound for editing.
+- Made activity and window-state persistence atomic with file and directory flushes.
+- Expanded regression tests and isolated Wayland UI checks; made the test harness work on noexec temporary filesystems.
+
 ## 2.0.1
 
 - Renamed the product, desktop identity, launchers, icons, and Debian package to Whitecube Command Center.

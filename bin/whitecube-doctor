@@ -217,11 +217,57 @@ def check_shadowing(env):
                     'sudo whitecube-migrate (dry run), then sudo whitecube-migrate --apply')]
 
 
+def folder_handler(env):
+    """The default app for inode/directory per the mimeapps.list search order, and its .desktop file."""
+    lists = [env.home / '.config/mimeapps.list', env.at('/etc/xdg/mimeapps.list'),
+             env.home / '.local/share/applications/mimeapps.list', env.at('/usr/share/applications/mimeapps.list')]
+    for path in lists:
+        try:
+            lines = path.read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        section = ''
+        for line in lines:
+            line = line.strip()
+            if line.startswith('['):
+                section = line
+            elif section == '[Default Applications]' and line.startswith('inode/directory='):
+                for name in filter(None, line.split('=', 1)[1].split(';')):
+                    for folder in (env.home / '.local/share/applications', env.at('/usr/share/applications')):
+                        if (folder / name).is_file():
+                            return name, folder / name
+                    return name, None
+    return None, None
+
+
+def check_folder_handler(env):
+    """Apps open folders through xdg-open/GIO; a missing default sends 'Open folder' nowhere."""
+    name, desktop = folder_handler(env)
+    if not name:
+        return [finding('WARN', 'folders', 'no default app for folders (inode/directory)',
+                        'xdg-mime default thunar.desktop inode/directory')]
+    if desktop is None:
+        return [finding('WARN', 'folders', f'the default folder app {name} is not installed',
+                        'xdg-mime default thunar.desktop inode/directory')]
+    command = ''
+    for line in desktop.read_text(errors='replace').splitlines():
+        if line.startswith('Exec='):
+            command = line[5:].split()[0] if line[5:].split() else ''
+            break
+    found = command and (env.at(command).is_file() if command.startswith('/') else
+                         any((d / command).is_file() for d in (env.at('/usr/bin'), env.at('/usr') / 'local/bin', env.at('/bin'))))
+    if not found:
+        return [finding('WARN', 'folders', f'{name} runs {command or "nothing"}, which is not installed',
+                        f'reinstall it, or pick another: xdg-mime default APP.desktop inode/directory')]
+    return [finding('ok', 'folders', f'folders open with {name}')]
+
+
 def run_checks(env):
     net = load_cube_net(env)
     results = []
     for check in (lambda: check_firewall(env), lambda: check_network(env, net), lambda: check_competitors(env, net),
-                  lambda: check_wpa_leftovers(env), lambda: check_drift(env), lambda: check_sudoers(env), lambda: check_xfree(env), lambda: check_session(env), lambda: check_shadowing(env)):
+                  lambda: check_wpa_leftovers(env), lambda: check_drift(env), lambda: check_sudoers(env), lambda: check_xfree(env), lambda: check_session(env), lambda: check_shadowing(env),
+                  lambda: check_folder_handler(env)):
         try:
             results.extend(check())
         except Exception as error:  # one broken check must not hide the others

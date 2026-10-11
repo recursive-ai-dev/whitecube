@@ -1,13 +1,15 @@
 import React, { useMemo, useState } from 'react';
 import { formatBytes, formatUptime } from '../format';
 import { isFailure, usePoll } from '../hooks';
+import { PollNotice } from './Panel';
 
 interface Props { onLog: (text: string, type: 'info' | 'success' | 'error') => void }
 
 type SortKey = 'cpu' | 'mem' | 'pid';
 
 const ProcessesPanel: React.FC<Props> = ({ onLog }) => {
-  const { data, reload } = usePoll(() => window.lab.processes(), 3000);
+  const [updatesPaused, setUpdatesPaused] = useState(false);
+  const { data, reload, loading, error: pollError, updatedAt } = usePoll(() => window.lab.processes(), updatesPaused ? null : 3000);
   const [query, setQuery] = useState('');
   const [sort, setSort] = useState<SortKey>('cpu');
   const [paused, setPaused] = useState<number | null>(null);
@@ -36,16 +38,17 @@ const ProcessesPanel: React.FC<Props> = ({ onLog }) => {
   );
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col"><PollNotice error={pollError} updatedAt={updatedAt} />
       <div className="p-4 border-b border-white/5 flex items-center gap-3">
-        <input type="text" placeholder="Filter by command, user or PID…" value={query} onChange={(e) => setQuery(e.target.value)}
+        <input type="text" aria-label="Filter processes" placeholder="Filter by command, user or PID…" value={query} onChange={(e) => setQuery(e.target.value)}
           className="flex-1 bg-black/20 border border-white/10 rounded-full px-4 py-2 text-sm text-white outline-none" />
+        <button aria-pressed={updatesPaused} onClick={() => setUpdatesPaused(!updatesPaused)} className="text-xs text-white/60 px-2 py-2 bg-white/5 rounded">{updatesPaused ? 'Resume updates' : 'Pause updates'}</button><button disabled={loading} onClick={reload} className="text-xs text-white/60 px-2 py-2 bg-white/5 rounded">Refresh</button>
         <span className="text-xs text-white/40">{result ? `${result.processes.length} processes` : ''}</span>
       </div>
       {data && isFailure(data) && <div className="p-4 text-sm text-red-400">{data.error}</div>}
       <div className="grid grid-cols-[4rem_6rem_1fr_4rem_4rem_5rem_5rem_9rem] gap-2 px-4 py-2 text-xs border-b border-white/10">
         {head('pid', 'PID', 'text-left')}<span className="text-white/40">User</span><span className="text-white/40">Command</span>
-        {head('cpu', 'CPU', 'text-right')}{head('mem', 'Mem', 'text-right')}<span className="text-white/40 text-right">RSS</span><span className="text-white/40 text-right">Age</span><span />
+        {head('cpu', 'CPU avg', 'text-right')}{head('mem', 'Mem', 'text-right')}<span className="text-white/40 text-right">RSS</span><span className="text-white/40 text-right">Age</span><span />
       </div>
       <div className="flex-1 overflow-y-auto">
         {rows.map((p) => (

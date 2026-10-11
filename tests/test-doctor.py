@@ -98,6 +98,31 @@ class NetworkTests(Fixture):
         self.assertEqual(doctor.check_network(self.env, None)[0]["level"], "WARN")
 
 
+class FolderHandlerTests(Fixture):
+    def handler(self, mimeapps=None, desktop=None, binary=False):
+        if mimeapps is not None:
+            (self.home / '.config').mkdir(parents=True, exist_ok=True)
+            (self.home / '.config/mimeapps.list').write_text(mimeapps)
+        if desktop:
+            folder = self.root / 'usr/share/applications'; folder.mkdir(parents=True, exist_ok=True)
+            (folder / desktop).write_text('[Desktop Entry]\nExec=thunar %U\n')
+        if binary:
+            (self.root / 'usr/bin').mkdir(parents=True, exist_ok=True); (self.root / 'usr/bin/thunar').write_text('')
+        return doctor.check_folder_handler(self.env)[0]
+
+    def test_no_default_is_a_warning_with_the_command_to_set_one(self):
+        result = self.handler()
+        self.assertEqual(result['level'], 'WARN'); self.assertIn('xdg-mime default', result['fix'])
+
+    def test_a_default_whose_program_is_missing_is_named(self):
+        result = self.handler('[Default Applications]\ninode/directory=thunar.desktop\n', 'thunar.desktop')
+        self.assertEqual(result['level'], 'WARN'); self.assertIn('thunar', result['detail'])
+
+    def test_an_installed_default_is_fine(self):
+        result = self.handler('[Default Applications]\ninode/directory=thunar.desktop\n', 'thunar.desktop', binary=True)
+        self.assertEqual((result['level'], result['detail']), ('ok', 'folders open with thunar.desktop'))
+
+
 class OtherChecks(Fixture):
     def test_rival_managers_are_named_and_dhcpcd_is_not_a_rival(self):
         net = mock.Mock(competing_processes=mock.Mock(return_value=["dhcpcd", "NetworkManager"]))

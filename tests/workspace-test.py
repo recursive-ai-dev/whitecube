@@ -40,22 +40,29 @@ static bool wl_list_empty(struct wl_list *n) { return n->next==n; }
 #define wl_list_for_each(pos,head,member) for (pos=wl_container_of((head)->next,pos,member); &pos->member!=(head); pos=wl_container_of(pos->member.next,pos,member))
 struct wc_toplevel;
 struct fake_base { void *surface; };
-struct fake_xdg { char *app_id; bool activated; struct fake_base *base; };
+struct fake_xdg { char *app_id; bool activated; struct fake_base *base; struct fake_xdg *parent; struct { bool activated; } scheduled; };
 struct wlr_keyboard { int *keycodes; int num_keycodes; int modifiers; };
 struct wc_server { struct wl_list toplevels; unsigned workspace; struct wc_toplevel *focused,*normal,*saved_focus[4],*saved_normal[4]; bool desktop_visible,locked; void *seat; struct { struct wc_toplevel *toplevel; } drag; };
 struct wc_toplevel { struct wl_list link; struct wc_server *server; struct fake_xdg *xdg_toplevel; unsigned workspace; bool mapped,hidden,fullscreen,maximized; int layout_x,layout_y,layout_w,layout_h; };
 static const char *g_scripts_app_id="cube-scripts";
 static unsigned keyboard_clears=0, pointer_clears=0;
 static void wc_retile(struct wc_server *s) {}
+static void forget_toplevel(struct wc_toplevel *t);
+static void wc_move_family(struct wc_toplevel *t, unsigned target) {
+    struct wc_toplevel *c; // the fake has no scene trees: one level of parent/dialog
+    struct fake_xdg *root = t->xdg_toplevel->parent ? t->xdg_toplevel->parent : t->xdg_toplevel;
+    wl_list_for_each(c, &t->server->toplevels, link) if (c->xdg_toplevel == root || c->xdg_toplevel->parent == root) c->workspace = target;
+}
 static void wc_lock_focus(struct wc_server *s) {}
 static void wc_cancel_drag(struct wc_server *s) { s->drag.toplevel = NULL; }
-static void wlr_xdg_toplevel_set_activated(struct fake_xdg *x,bool active) { x->activated=active; }
+static unsigned activations=0;
+static void wlr_xdg_toplevel_set_activated(struct fake_xdg *x,bool active) { x->activated=x->scheduled.activated=active; activations++; }
 static struct wlr_keyboard *wlr_seat_get_keyboard(void *seat) { return NULL; }
 static void wlr_seat_keyboard_notify_enter(void *seat,void *surface,int *keycodes,int count,int *mods) {}
 static void wlr_seat_keyboard_clear_focus(void *seat) { keyboard_clears++; }
 static void wlr_seat_pointer_clear_focus(void *seat) { pointer_clears++; }
 ''')
-for name in ['is_scripts', 'wc_find_app', 'wc_focus', 'wc_focus_next', 'wc_focus_previous', 'wc_adjust_window', 'wc_focus_nth', 'wc_focus_available', 'forget_toplevel', 'wc_workspace']:
+for name in ['is_scripts', 'wc_open_dialog', 'wc_find_app', 'wc_focus', 'wc_focus_next', 'wc_focus_previous', 'wc_adjust_window', 'wc_focus_nth', 'wc_focus_available', 'forget_toplevel', 'wc_workspace']:
     print(function(name))
 print(r'''
 static void add(struct wc_server *s,struct wc_toplevel *t,struct fake_xdg *x,unsigned workspace) {
@@ -93,7 +100,16 @@ int main(void) {
     for(unsigned i=0;i<4;i++) assert(s.saved_focus[i]!=&hidden && s.saved_normal[i]!=&hidden);
     wc_workspace(&s,9,false); assert(s.workspace==1);
     assert(pointer_clears>=6);
-    puts("workspaces: focus isolation, reverse keyboard navigation, bounded panel placement/resize, hidden panels, fullscreen moves and lifecycle references passed");
+    // A file picker (child toplevel) takes focus from its parent and keeps it while open.
+    struct wc_toplevel dialog; struct fake_xdg xd={.app_id="game",.parent=&xp};
+    play.fullscreen=false; wc_focus(&play); add(&s,&dialog,&xd,1);
+    wc_focus(&play); assert(s.focused==&dialog && s.normal==&dialog && xd.activated && !xp.activated);
+    unsigned before=activations; wc_focus(&dialog); wc_focus(&play);
+    assert(activations==before); // clicks inside a focused window send no new configure
+    wc_workspace(&s,3,true); assert(play.workspace==3 && dialog.workspace==3); // the family moves together
+    wc_workspace(&s,3,false); assert(s.focused==&dialog);
+    dialog.mapped=false; forget_toplevel(&dialog); wc_focus(&play); assert(s.focused==&play && xp.activated);
+    puts("workspaces: focus isolation, reverse keyboard navigation, bounded panel placement/resize, hidden panels, fullscreen moves, dialogs and lifecycle references passed");
     return 0;
 }
 ''')

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from collections import deque
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -21,13 +23,22 @@ import sys
 import threading
 import time
 
-from engine import Project, CubeError, Cancelled, atomic_json, atomic_text, guest_destination, inspect_iso, package_list, utcnow
+from engine import (Project, CubeError, Cancelled, atomic_json, atomic_text, guest_destination,
+                    inspect_iso, package_list, utcnow, validate_recipe, recipe_scripts,
+                    build_resources, storage_preflight, sha256_file, recovery_report)
 
 
-def copy_payload(source, destination, root):
+def copy_payload(source, destination, root, overwrite='replace'):
     """Copy files recursively, checking each destination before any write."""
     source, destination, root = Path(source), Path(destination), Path(root)
     guest_destination(root, "/" + str(destination.relative_to(root)))
+    if destination.exists() and not (source.is_dir() and destination.is_dir()):
+        if overwrite == 'skip':
+            return
+        if overwrite == 'error':
+            raise CubeError(f'Payload destination already exists: {destination}')
+        if destination.is_dir() != source.is_dir():
+            raise CubeError(f'Payload source and destination have different file types: {destination}')
     if source.is_symlink():
         if destination.exists():
             raise CubeError(f"Cannot replace existing payload destination with a symlink: {destination}")
@@ -35,7 +46,7 @@ def copy_payload(source, destination, root):
     elif source.is_dir():
         destination.mkdir(parents=True, exist_ok=True)
         for child in source.iterdir():
-            copy_payload(child, destination / child.name, root)
+            copy_payload(child, destination / child.name, root, overwrite)
         shutil.copystat(source, destination, follow_symlinks=False)
     else:
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -118,7 +129,9 @@ def rebuild_iso(project, run, check_cancel=lambda: None):
         release = {"path": str(output), "sha256": sha, "size_bytes": output.stat().st_size,
                    "completed_at": utcnow(), "source_iso": project.data["source_iso"],
                    "volume_id": project.data.get("volume_id"), "compression": project.data.get("compression"),
-                   "recipe": project.data.get("recipe", {})}
+                   "recipe": project.data.get("recipe", {}), 'source_sha256': project.data.get('source_sha256', ''),
+                   'processors': project.data.get('processors', 2), 'memory_mb': project.data.get('memory_mb', 1024),
+                   'compression_level': project.data.get('compression_level', 0)}
         atomic_json(Path(str(output) + ".release.json"), release)
         created.append(Path(str(output) + ".release.json"))
         return release
@@ -155,7 +168,7 @@ class Worker:
             raise CubeError("Project paths must not contain commas, colons, or newlines")
         if p.directory.stat().st_uid != self.uid:
             raise CubeError("Project directory must belong to the authenticated desktop user")
-        for name in ("cube-editor.json", "events.jsonl", ".operation.lock", "iso", "rootfs", "layers", "overlay", "baseline-paths.json", ".extracted"):
+        for name in ("cube-editor.json", "events.jsonl", ".operation.lock", "iso", "rootfs", "layers", "overlay", "baseline-paths.json", ".extracted", 'restore-point', '.restore-point.building', '.restore.building', 'recovery', '.guest-environment.json', '.whiteouts.json'):
             if (p.directory / name).is_symlink():
                 raise CubeError(f"Project control path cannot be a symlink: {name}")
         source = Path(p.data["source_iso"]).resolve()
@@ -164,6 +177,7 @@ class Worker:
         if source.stat().st_size != p.data.get("source_size") or source.stat().st_mtime_ns != p.data.get("source_mtime_ns"):
             raise CubeError("Source ISO changed since this project was created. Create a new project for the changed source.")
         p.output_path
+        if self.action == 'build': build_resources(p.data)
 
     def user_ownership(self, path):
         os.chown(path, self.uid, self.gid, follow_symlinks=False)
@@ -227,11 +241,20 @@ class Worker:
             kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.child_interactive = interactive
         self.child = subprocess.Popen(command, **kwargs)
-        lines = []
+        lines = [] if capture else deque(maxlen=100)
+        started = time.monotonic()
         if not interactive:
             for line in self.child.stdout:
                 lines.append(line)
                 self.emit("log", line.rstrip())
+                if Path(command[0]).name in ('unsquashfs', 'mksquashfs', 'xorriso'):
+                    match = re.search(r'(\d+(?:\.\d+)?)\s*%', line) or re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*', line)
+                    if match:
+                        fraction = min(1, float(match.group(1)) / 100)
+                        elapsed = time.monotonic() - started
+                        self.emit('progress', f'{Path(command[0]).name}: {fraction:.0%}',
+                                  progress=fraction, phase=Path(command[0]).name, elapsed_seconds=elapsed,
+                                  eta_seconds=elapsed * (1 - fraction) / fraction if fraction > .01 else None)
                 print(line, end="", flush=True)
                 self.check_cancel()
         code = self.child.wait()
@@ -258,8 +281,184 @@ class Worker:
         if self.project.rootfs.stat().st_uid != 0:
             raise CubeError("The image root must retain root ownership. Extract it again in a new project.")
 
+    def check_storage(self, action):
+        report = storage_preflight(self.project, action)
+        for check in report['checks']:
+            self.emit('log', f"Storage estimate at {check['path']}: {check['required_bytes'] / 1024**3:.1f} GiB needed, {check['free_bytes'] / 1024**3:.1f} GiB free")
+        if not report['sufficient']:
+            raise CubeError('Insufficient free space for the estimated operation. See Activity.')
+
+    def quarantine(self, path):
+        recovery = self.project.directory / 'recovery'
+        recovery.mkdir(mode=0o700, exist_ok=True)
+        self.user_ownership(recovery)
+        if path.lstat().st_dev != recovery.stat().st_dev:
+            recovery = path.parent / '.cube-editor-recovery'
+            if recovery.is_symlink():
+                raise CubeError('Output recovery directory cannot be a symlink')
+            recovery.mkdir(mode=0o700, exist_ok=True)
+            self.user_ownership(recovery)
+        target = recovery / (path.name + '-' + __import__('uuid').uuid4().hex[:12])
+        path.rename(target)
+        self.emit('log', f'Retained recovery artifact: {target}')
+        return target
+
+    def snapshot(self):
+        self.ensure_extracted()
+        if recovery_report(self.project)['environment_backups'] or (self.project.directory / '.whiteouts.json').exists():
+            raise CubeError('Guest environment backups need recovery before saving a restore point')
+        self.check_storage('snapshot')
+        p = self.project
+        staging = p.directory / '.restore-point.building'
+        if staging.exists():
+            raise CubeError('An interrupted restore point exists. Run Recover project first.')
+        staging.mkdir(mode=0o755)
+        self.save(state='snapshotting')
+        try:
+            for name in ('rootfs', 'iso'):
+                self.run(['cp', '-a', '--reflink=auto', '--', str(p.directory / name), str(staging / name)])
+            atomic_json(staging / 'manifest.json', {'created_at': utcnow(), 'recipe': p.data.get('recipe', {}),
+                                                   'source_sha256': p.data.get('source_sha256', '')})
+            old = p.directory / 'restore-point'
+            retired = self.quarantine(old) if old.exists() else None
+            try:
+                staging.rename(old)
+            except BaseException:
+                if retired:
+                    retired.rename(old)
+                raise
+            self.save(state='ready', restore_point_at=utcnow())
+            self.emit('log', 'Restore point saved. Previous points are retained under recovery/.')
+        except BaseException:
+            if staging.exists():
+                self.quarantine(staging)
+            raise
+
+    def restore(self):
+        p = self.project
+        point = p.directory / 'restore-point'
+        for name in ('rootfs', 'iso', 'manifest.json'):
+            if (point / name).is_symlink() or not (point / name).exists():
+                raise CubeError('Restore point is incomplete or contains an unsafe control path')
+        manifest = json.loads((point / 'manifest.json').read_text())
+        validate_recipe(manifest.get('recipe', {}))
+        self.check_storage('restore')
+        staging = p.directory / '.restore.building'
+        if staging.exists():
+            raise CubeError('Interrupted restore staging exists. Run Recover project first.')
+        staging.mkdir(mode=0o700)
+        self.save(state='restoring')
+        moved = {}
+        installed = []
+        try:
+            for name in ('rootfs', 'iso'):
+                self.run(['cp', '-a', '--reflink=auto', '--', str(point / name), str(staging / name)])
+            self.check_cancel()
+            for name in ('rootfs', 'iso'):
+                current = p.directory / name
+                if current.exists():
+                    moved[name] = self.quarantine(current)
+                (staging / name).rename(current)
+                installed.append(name)
+            marker = p.directory / '.extracted'
+            marker.write_text(utcnow() + '\n')
+            self.user_ownership(marker)
+            self.save(state='ready', recipe=manifest.get('recipe', {}), last_error='')
+            if (p.directory / '.whiteouts.json').exists(): self.quarantine(p.directory / '.whiteouts.json')
+            for value in recovery_report(p)['environment_backups']:
+                self.quarantine(Path(value))
+            self.emit('log', 'Restore complete. Replaced trees are retained under recovery/.')
+        except BaseException:
+            for name in reversed(installed):
+                self.quarantine(p.directory / name)
+            for name, previous in moved.items():
+                previous.rename(p.directory / name)
+            raise
+        finally:
+            if staging.exists():
+                self.quarantine(staging)
+
+    def recover(self):
+        p = self.project
+        report = recovery_report(p)
+        journal = p.directory / '.guest-environment.json'
+        environment = json.loads(journal.read_text()) if journal.is_file() else {}
+        if report['extracted']:
+            for relative in ('etc/resolv.conf', 'usr/sbin/policy-rc.d'):
+                destination = guest_destination(p.rootfs, '/' + str(Path(relative).parent)) / Path(relative).name
+                backup = p.directory / ('.backup-' + relative.replace('/', '-'))
+                if backup.exists() or backup.is_symlink():
+                    if destination.exists() or destination.is_symlink(): self.quarantine(destination)
+                    backup.rename(destination)
+                    self.emit('log', f'Restored guest environment file: /{relative}')
+                elif environment.get(relative) is False and (destination.exists() or destination.is_symlink()):
+                    self.quarantine(destination)
+            if journal.exists(): self.quarantine(journal)
+        if not report['extracted']:
+            for name in ('rootfs', 'iso', 'layers', 'overlay', 'baseline-paths.json', '.extracted'):
+                path = p.directory / name
+                if path.exists():
+                    self.quarantine(path)
+            for value in report['environment_backups']:
+                self.quarantine(Path(value))
+        for name in ('.restore-point.building', '.restore.building'):
+            path = p.directory / name
+            if path.exists():
+                self.quarantine(path)
+        for value in report['staging']:
+            path = Path(value)
+            if path.exists() and not path.is_symlink():
+                self.quarantine(path)
+        whiteouts = p.directory / '.whiteouts.json'
+        if whiteouts.exists():
+            for relative in json.loads(whiteouts.read_text()):
+                path = guest_destination(p.rootfs, '/' + relative)
+                if path.exists():
+                    info = path.lstat()
+                    if stat.S_ISCHR(info.st_mode) and info.st_rdev == os.makedev(0, 0):
+                        path.unlink()
+                        self.emit('log', f'Removed interrupted boot-layer deletion marker: /{relative}')
+            self.quarantine(whiteouts)
+        self.save(state='ready' if report['extracted'] else 'new', last_error='')
+        self.emit('log', 'Recovery finished. Review retained artifacts in recovery/ before retrying.')
+
+    def packages(self):
+        self.ensure_extracted()
+        recipe = self.project.data.get('recipe', {})
+        validate_recipe(recipe, self.project.rootfs, check_files=True)
+        output = []
+        desktop = recipe.get('desktop_deb', '')
+        staged = None
+        if desktop:
+            staged = guest_destination(self.project.rootfs, '/tmp/cube-editor-desktop.deb')
+            if staged.exists(): raise CubeError('Guest desktop staging path already exists')
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(Path(desktop).expanduser(), staged)
+            staged.chmod(0o644)
+        try:
+            with self.chroot_environment():
+                for operation, key in (('install', 'install_packages'), ('purge', 'remove_packages')):
+                    packages = package_list(recipe.get(key, []))
+                    if operation == 'install' and desktop: packages.append('/tmp/cube-editor-desktop.deb')
+                    if packages:
+                        output.append(self.guest(['/usr/bin/apt-get', '--simulate', operation, '--', *packages], capture=True))
+                        if operation == 'install':
+                            output.append(self.guest(['/usr/bin/apt-get', '--print-uris', '--download-only', '--yes', 'install', '--', *packages], capture=True))
+        finally:
+            if staged: staged.unlink(missing_ok=True)
+        text = 'Package simulation uses the guest’s current apt indexes; update them in the image terminal for a fresh preview.\n' + '\n'.join(output)
+        atomic_text(self.project.directory / 'package-preview.txt', text)
+        self.user_ownership(self.project.directory / 'package-preview.txt')
+        self.emit('log', text)
+
     def extract(self):
         p = self.project
+        self.check_storage('extract')
+        self.emit('log', 'Hashing source ISO before extraction')
+        digest = sha256_file(p.data['source_iso'], lambda done, total: self.check_cancel())
+        if p.data.get('source_sha256') and digest != p.data['source_sha256']:
+            raise CubeError('Source ISO no longer matches its recorded SHA256')
+        self.save(source_sha256=digest)
         if (p.directory / ".extracted").exists():
             raise CubeError("This project is already extracted. Create another project to start again.")
         if p.iso_tree.exists() or p.rootfs.exists() or (p.directory / "layers").exists():
@@ -281,7 +480,7 @@ class Worker:
                     os.chmod(item, stat.S_IMODE(item.stat().st_mode) | stat.S_IWUSR | (stat.S_IXUSR if item.is_dir() else 0))
         chain = inspection["layer_chain"]
         if len(chain) == 1:
-            self.run(["unsquashfs", "-processors", "2", "-d", str(p.rootfs), str(p.iso_tree / chain[0].lstrip("/"))])
+            self.run(["unsquashfs", "-percentage", "-processors", str(self.project.data.get("processors", 2)), "-d", str(p.rootfs), str(p.iso_tree / chain[0].lstrip("/"))])
         else:
             layers = p.directory / "layers"
             layers.mkdir(mode=0o700)
@@ -289,7 +488,7 @@ class Worker:
             for index, path in enumerate(chain):
                 self.emit("progress", f"Extracting layer {index + 1}/{len(chain)}: {Path(path).name}", progress=0.15 + index * 0.18)
                 target = layers / str(index)
-                self.run(["unsquashfs", "-processors", "2", "-d", str(target), str(p.iso_tree / path.lstrip("/"))])
+                self.run(["unsquashfs", "-percentage", "-processors", str(self.project.data.get("processors", 2)), "-d", str(target), str(p.iso_tree / path.lstrip("/"))])
                 extracted.append(target)
             overlay = p.directory / "overlay"
             overlay.mkdir(mode=0o700)
@@ -318,6 +517,8 @@ class Worker:
     @contextlib.contextmanager
     def chroot_environment(self):
         root = self.project.rootfs
+        if (self.project.directory / '.guest-environment.json').exists():
+            raise CubeError('Interrupted guest environment needs Recover project before opening another session')
         restored = []
         try:
             for directory in ("/proc", "/sys", "/dev", "/run"):
@@ -349,6 +550,11 @@ class Worker:
                 if backup.exists() or backup.is_symlink():
                     raise CubeError(f"Unrestored environment backup exists: {backup.name}")
                 existed = destination.exists() or destination.is_symlink()
+                journal = self.project.directory / '.guest-environment.json'
+                entries = json.loads(journal.read_text()) if journal.exists() else {}
+                entries[relative] = existed
+                atomic_json(journal, entries)
+                self.user_ownership(journal)
                 if existed:
                     destination.rename(backup)
                 restored.append((destination, backup, existed))
@@ -357,22 +563,29 @@ class Worker:
                 destination.chmod(mode)
             yield
         finally:
+            cleanup_ok = True
             try:
                 for destination, backup, existed in reversed(restored):
                     try:
                         if not destination.parent.resolve().is_relative_to(root.resolve()):
+                            cleanup_ok = False
                             self.emit("log", f"Retained original backup because guest path changed: {backup}")
                             continue
                         if destination.is_dir() and not destination.is_symlink():
+                            cleanup_ok = False
                             self.emit("log", f"Retained original backup because guest file became a directory: {backup}")
                             continue
                         destination.unlink(missing_ok=True)
                         if existed:
                             backup.rename(destination)
                     except OSError as error:
+                        cleanup_ok = False
                         self.emit("log", f"Environment restoration needs attention: {error}; backup at {backup}")
             finally:
                 self.cleanup_mounts()
+                if cleanup_ok and not any((self.project.directory / name).exists() or (self.project.directory / name).is_symlink()
+                           for name in ('.backup-etc-resolv.conf', '.backup-usr-sbin-policy-rc.d')):
+                    (self.project.directory / '.guest-environment.json').unlink(missing_ok=True)
 
     def guest(self, command, **kwargs):
         environment = ["/usr/bin/env", "-i", "HOME=/root", "USER=root", "LOGNAME=root", "LC_ALL=C.UTF-8",
@@ -394,7 +607,7 @@ class Worker:
             self.emit("log", f"Copying {source} to {payload['destination']}")
             if destination.is_relative_to(source):
                 raise CubeError("Cannot copy a directory into itself")
-            copy_payload(source, destination, self.project.rootfs)
+            copy_payload(source, destination, self.project.rootfs, payload.get('overwrite', 'replace'))
             self.check_cancel()
 
     def customize(self):
@@ -402,11 +615,14 @@ class Worker:
         recipe = self.project.data.get("recipe", {})
         install = package_list(recipe.get("install_packages", []))
         remove = package_list(recipe.get("remove_packages", []))
-        commands = recipe.get("commands", [])
+        validate_recipe(recipe, self.project.rootfs, check_files=True)
+        commands = recipe_scripts(recipe)
         if isinstance(commands, str):
             commands = [commands] if commands.strip() else []
         if any(not isinstance(command, str) for command in commands):
             raise CubeError("Custom commands must be text")
+        if self.project.data.get('auto_snapshot', True):
+            self.snapshot()
         self.save(state="customizing", last_error="")
         self.payloads(recipe)
         desktop = recipe.get("desktop_deb", "")
@@ -416,6 +632,7 @@ class Worker:
             if not source.is_file() or source.suffix != ".deb":
                 raise CubeError("Select an existing desktop .deb package")
             staged_deb = guest_destination(self.project.rootfs, "/tmp/cube-editor-desktop.deb")
+            if staged_deb.exists(): raise CubeError('Guest desktop staging path already exists')
             staged_deb.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, staged_deb)
             staged_deb.chmod(0o644)
@@ -440,6 +657,8 @@ class Worker:
 
     def terminal(self):
         self.ensure_extracted()
+        if self.project.data.get('auto_snapshot', True):
+            self.snapshot()
         self.save(state="terminal", last_error="")
         self.emit("log", "This shell runs inside your live image. Exit the shell to return to Cube Editor.")
         with self.chroot_environment():
@@ -573,8 +792,8 @@ class Worker:
         if temporary.exists() or temporary.is_symlink():
             raise CubeError(f"An unfinished filesystem compression exists: {temporary.name}")
         try:
-            self.run(["mksquashfs", str(self.project.rootfs), str(temporary), "-noappend", "-comp", self.project.data.get("compression", "xz"),
-                      "-processors", "2", "-wildcards", "-e", "proc/*", "sys/*", "dev/*", "run/*", "tmp/*"])
+            self.run(["mksquashfs", str(self.project.rootfs), str(temporary), "-percentage", "-noappend", "-comp", self.project.data.get("compression", "xz"),
+                      *build_resources(self.project.data), "-wildcards", "-e", "proc/*", "sys/*", "dev/*", "run/*", "tmp/*"])
             os.replace(temporary, destination)
             self.user_ownership(destination)
         finally:
@@ -643,14 +862,29 @@ class Worker:
             if any(str(parent) in missing for parent in Path(relative).parents if str(parent) != "."):
                 continue
             if destination.parent.is_dir() and not destination.parent.is_symlink():
-                os.mknod(destination, stat.S_IFCHR | 0o000, os.makedev(0, 0))
                 removed.append(destination)
                 missing.add(relative)
+        journal = p.directory / '.whiteouts.json'
+        atomic_json(journal, [str(path.relative_to(p.rootfs)) for path in removed])
+        self.user_ownership(journal)
+        created = []
+        try:
+            for path in removed:
+                self.check_cancel()
+                os.mknod(path, stat.S_IFCHR | 0o000, os.makedev(0, 0))
+                created.append(path)
+        except BaseException:
+            for path in created: path.unlink(missing_ok=True)
+            journal.unlink(missing_ok=True)
+            raise
         return removed
 
     def build(self):
         self.ensure_extracted()
+        self.check_storage('build')
         p = self.project
+        if (p.directory / '.whiteouts.json').exists():
+            raise CubeError('Interrupted deletion markers need Recover project before building')
         compression = p.data.get("compression", "xz")
         if compression not in ("xz", "zstd", "gzip", "lz4", "lzo"):
             raise CubeError("Choose a supported squashfs compression")
@@ -671,6 +905,7 @@ class Worker:
         finally:
             for whiteout in whiteouts:
                 whiteout.unlink(missing_ok=True)
+            (p.directory / '.whiteouts.json').unlink(missing_ok=True)
         self.emit("progress", "Refreshing integrity checks", progress=0.65)
         inspection = p.data.get("inspection", {})
         checksum_tree(p.iso_tree, excluded=inspection.get("boot_image_paths", []) + [inspection.get("boot_catalog", "")], check_cancel=self.check_cancel)
@@ -678,7 +913,7 @@ class Worker:
         release = rebuild_iso(p, lambda command: self.run(command, user=True), self.check_cancel)
         self.user_ownership(Path(str(p.output_path) + ".sha256"))
         self.user_ownership(Path(str(p.output_path) + ".release.json"))
-        self.save(state="built", last_build=release)
+        self.save(state="built", last_build=release, releases=[*p.data.get('releases', []), release])
         self.emit("progress", f"Release ready: {p.output_path}", progress=1.0)
 
     def execute(self):
@@ -717,7 +952,7 @@ class Worker:
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Cube Editor authenticated image worker")
     parser.add_argument("--project", required=True)
-    parser.add_argument("--action", required=True, choices=("extract", "customize", "terminal", "build"))
+    parser.add_argument("--action", required=True, choices=("extract", "customize", "terminal", "build", "snapshot", "restore", "recover", "packages"))
     parser.add_argument("--namespace", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--job", default="")
     args = parser.parse_args(argv)

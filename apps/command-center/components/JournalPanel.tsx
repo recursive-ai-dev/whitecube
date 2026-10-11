@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { isFailure, usePoll } from '../hooks';
+import { PollNotice } from './Panel';
 import { Button, Notice, Search } from './Panel';
 
 const LEVELS: { label: string; value: number }[] = [
@@ -14,7 +15,7 @@ const JournalPanel: React.FC = () => {
   const [follow, setFollow] = useState(true);
   const [query, setQuery] = useState('');
   const [message, setMessage] = useState('');
-  const { data, reload } = usePoll(() => window.lab.journal({ lines: 300, priority, unit: /\.\w+$/.test(unit) ? unit : unit ? `${unit}.service` : '', scope }), follow ? 3000 : null, `${scope}:${priority}:${unit}`);
+  const { data, reload, error: pollError, updatedAt } = usePoll(() => window.lab.journal({ lines: 300, priority, unit: /\.\w+$/.test(unit) ? unit : unit ? `${unit}.service` : '', scope }).then(r => { if (r.error) throw new Error(r.error); return r; }), follow ? 3000 : null, `${scope}:${priority}:${unit}`);
   const result = data && !isFailure(data) ? data : null;
   const error = data && isFailure(data) ? data.error : result?.error;
   const entries = result?.entries.filter(e => `${e.unit} ${e.message}`.toLowerCase().includes(query.toLowerCase())) || [];
@@ -24,14 +25,14 @@ const JournalPanel: React.FC = () => {
   };
 
   return (
-    <div className="h-full flex flex-col">
+    <div className="h-full flex flex-col"><PollNotice error={pollError} updatedAt={updatedAt} />
       <div className="p-4 border-b border-white/5 flex flex-wrap items-center gap-3">
-        <select value={priority} onChange={(e) => setPriority(Number(e.target.value))} className="bg-black/30 border border-white/10 rounded px-3 py-1.5 text-sm text-white">
+        <select aria-label="Journal priority" value={priority} onChange={(e) => setPriority(Number(e.target.value))} className="bg-black/30 border border-white/10 rounded px-3 py-1.5 text-sm text-white">
           {LEVELS.map((l) => <option key={l.value} value={l.value}>{l.label} and above</option>)}
         </select>
-        <input type="text" placeholder="Unit (e.g. NetworkManager)" value={unit} onChange={(e) => setUnit(e.target.value.trim())}
+        <input type="text" aria-label="Journal unit" placeholder="Unit (e.g. NetworkManager)" value={unit} onChange={(e) => setUnit(e.target.value.trim())}
           className="flex-1 min-w-48 bg-black/20 border border-white/10 rounded-full px-4 py-2 text-sm text-white outline-none" />
-        <select value={scope} onChange={(e) => setScope(e.target.value as 'system' | 'user')} className="bg-black/30 border border-white/10 rounded px-3 py-1.5 text-sm text-white">
+        <select aria-label="Journal scope" value={scope} onChange={(e) => setScope(e.target.value as 'system' | 'user')} className="bg-black/30 border border-white/10 rounded px-3 py-1.5 text-sm text-white">
           <option value="system">system</option><option value="user">user</option>
         </select>
         <label className="flex items-center gap-2 text-sm text-white/60"><input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} /> live</label>

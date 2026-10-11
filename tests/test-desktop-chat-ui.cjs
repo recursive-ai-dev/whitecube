@@ -66,10 +66,12 @@ async function main() {
     await evaluate('window.api.saveSettings({endpoint:"https://example.invalid/v1", model:"ui-test-model", apiKey:""})');
     await evaluate('clearTranscript(); document.getElementById("input").value="missing-key test"; void send()');
     await until('document.querySelector(".msg.error") && !sending');
+    await until('inputEl.value === "missing-key test"');
     assert.equal(await evaluate('document.getElementById("btn-new").disabled'), false);
 
     await evaluate('openSettings()');
     await until('document.activeElement.id === "s-endpoint"');
+    assert.equal(await evaluate('document.getElementById("app").inert'), true, 'settings isolate background controls');
     await evaluate(`sEndpoint.value=${JSON.stringify(endpoint + '/chat/completions')}; sModel.value="ui-test-model"; sApiKey.value=""; document.getElementById("s-test").click()`);
     await until('document.getElementById("s-test-result").textContent === "Connected OK."');
     assert.equal(modelRequests, 1, 'Test used edited endpoint');
@@ -79,10 +81,20 @@ async function main() {
     assert.equal(await evaluate('document.activeElement.id'), 's-endpoint', 'settings trap keyboard focus');
     await evaluate('document.getElementById("s-save").click()');
     await until('settingsOverlay.classList.contains("hidden")');
+    assert.equal(await evaluate('document.getElementById("app").inert'), false);
     await evaluate('document.getElementById("input").value="hello"; void send()');
     await until('!sending && Boolean(document.querySelector(".copy-reply"))');
     assert.match(await evaluate('document.querySelector(".msg.assistant.rendered").textContent'), /working chat/);
     assert.ok(await evaluate('document.querySelector(".msg.assistant.rendered strong") !== null'));
+    await evaluate('document.getElementById("btn-find").click(); document.getElementById("find-text").value="WHITECUBE"; document.getElementById("find-text").dispatchEvent(new Event("input"))');
+    assert.equal(await evaluate('foundMessages.length'), 1, 'search matches original reply text without case sensitivity');
+    await evaluate('document.getElementById("find-next").click()');
+    assert.equal(await evaluate('document.querySelectorAll(".find-current").length'), 1);
+    await evaluate('document.getElementById("find-close").click(); document.getElementById("btn-copy-chat").click()');
+    assert.equal(await evaluate('document.getElementById("activity").textContent'), 'Conversation copied as Markdown');
+    await evaluate('inputEl.value=""; inputEl.dispatchEvent(new KeyboardEvent("keydown",{key:"ArrowUp",altKey:true,bubbles:true}))');
+    assert.equal(await evaluate('inputEl.value'), 'hello', 'Alt+Up recalls the last prompt');
+    assert.equal(await evaluate('document.getElementById("draft-count").textContent'), '5');
     if (process.argv[3]) {
       const screenshot = await command('Page.captureScreenshot', { format: 'png' });
       fs.writeFileSync(process.argv[3], Buffer.from(screenshot.data, 'base64'));
@@ -158,6 +170,7 @@ async function main() {
     await evaluate('latestBtn.click()');
     assert.ok(await evaluate('messagesEl.scrollTop > 0 && stickToBottom'));
     console.log('PASS: actual Wayland Electron UI — settings focus/test/save, missing-key recovery, streaming/Markdown/copy, confirmation Stop, draft restoration and history scrolling');
+    console.log('PASS: failed-send draft recovery, inert settings, conversation search and navigation, copy-chat and prompt recall');
   } finally {
     ws.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
     fs.rmSync(temporary, { recursive: true, force: true });

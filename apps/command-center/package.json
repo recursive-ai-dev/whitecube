@@ -2,7 +2,7 @@
   "name": "whitecube-command-center",
   "productName": "Whitecube Command Center",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.1.0",
   "license": "Apache-2.0",
   "type": "module",
   "main": "electron/main.cjs",

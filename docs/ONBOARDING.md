@@ -117,11 +117,10 @@ in this tree. This is `REVIEW.md` §8.
 
 ### Sibling projects (outside `~/whitecube`)
 
-* `~/cube-browser` — the Alt+W browser shell (meson, has its own `README.md`, `RELEASE.md`,
-  `COMPATIBILITY.md` and `COPYING`).
-* `~/cube-player` — media player (meson, has `COPYING`, `tests/`).
-* `~/Projects/desktop-chat` — the Electron chat app behind the Chat menu; `~/.local/bin/desktop-chat`
-  symlinks to its `desktop-chat.sh`.
+* `apps/cube-browser` and `apps/cube-player` (meson) were copied in from `~/cube-browser` and
+  `~/cube-player` and ship in the package; `apps/build-native-apps.sh` builds them. The old
+  directories still back the per-user launchers in `~/.local/bin` until those are removed.
+* `apps/desktop-chat` is the packaged chat app; `~/Projects/desktop-chat` is an older copy.
 * `~/whitecube-sec` — a private local RAG index (Ollama + chunk store + `index.json`) used for
   offline docs/questions. Not part of the desktop.
 

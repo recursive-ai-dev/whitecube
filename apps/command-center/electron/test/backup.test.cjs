@@ -28,3 +28,15 @@ test('merge retains existing items and remaps imported shortcut references', () 
   assert.notEqual(merged.scripts[1].id, 'cmd'); assert.equal(merged.shortcutGroups[1].scriptIds[0], merged.scripts[1].id);
   assert.equal(current.scripts.length, 1);
 });
+test('pins and tags survive backup without trusting malformed metadata', () => {
+  const lib = fixture(); lib.scripts[0].pinned = true; lib.scripts[0].tags = ['daily', 'inspect'];
+  const restored = B.decodeBackup(B.encodeBackup(lib));
+  assert.equal(restored.scripts[0].pinned, true); assert.deepEqual(restored.scripts[0].tags, ['daily', 'inspect']);
+  lib.scripts[0].tags = [false]; assert.throws(() => B.decodeBackup(B.encodeBackup(lib)), /organization/);
+});
+test('an imported shortcut collision preserves the group with an unbound trigger', () => {
+  const merged = B.mergeLibrary(fixture(), B.decodeBackup(B.encodeBackup(fixture())));
+  assert.equal(merged.shortcutGroups[0].shortcut, 'Alt+C');
+  assert.equal(merged.shortcutGroups[1].shortcut, '');
+  assert.equal(merged.shortcutGroups[1].scriptIds[0], merged.scripts[1].id);
+});

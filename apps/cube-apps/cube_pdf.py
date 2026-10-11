@@ -12,13 +12,17 @@ APP_ID = "dev.woez.CubePdf"
 
 def parse_ranges(text: str, total: int) -> list[tuple[int, int]]:
     """'1-3, 5, 8-' -> [(1,3),(5,5),(8,total)]. 1-based, inclusive, validated."""
+    if type(total) is not int or total <= 0:
+        raise ValueError('PDF has no pages')
+    if text.strip().lower() == 'all':
+        return [(1, total)]
     out = []
-    for part in text.replace(" ", "").split(","):
+    for part in ''.join(text.split()).replace('–', '-').replace('—', '-').split(","):
         if not part:
-            continue
+            raise ValueError('Empty page range')
         lo, dash, hi = part.partition("-")
         try:
-            a = int(lo)
+            a = int(lo) if lo else 1
             b = (total if hi == "" else int(hi)) if dash else a
         except ValueError:
             raise ValueError(f"'{part}' is not a page or range")
@@ -31,37 +35,41 @@ def parse_ranges(text: str, total: int) -> list[tuple[int, int]]:
 
 
 def merge(paths, dest: Path) -> Path:
-    out = pikepdf.new()
-    for p in paths:
-        try:
-            with pikepdf.open(p) as src:
-                out.pages.extend(src.pages)
-        except pikepdf.PasswordError:
-            raise ValueError(f"{Path(p).name} is password-protected; unlock it first")
-    dest = ct.unique_path(dest)
-    out.save(dest)
-    return dest
+    paths = list(paths)
+    if not paths:
+        raise ValueError('Choose at least one PDF')
+    with pikepdf.new() as out:
+        for p in paths:
+            try:
+                with pikepdf.open(p) as src:
+                    out.pages.extend(src.pages)
+            except pikepdf.PasswordError:
+                raise ValueError(f"{Path(p).name} is password-protected; unlock it first")
+        if not len(out.pages):
+            raise ValueError('PDFs contain no pages')
+        return ct.write_output(dest, out.save)
 
 
 def split(path: Path, ranges, folder: Path) -> list[Path]:
-    folder.mkdir(parents=True, exist_ok=True)
+    ranges = list(ranges)
     made = []
     with pikepdf.open(path) as src:
+        total = len(src.pages)
+        if not ranges or any(type(a) is not int or type(b) is not int or not 1 <= a <= b <= total for a, b in ranges):
+            raise ValueError('Choose valid page ranges before splitting')
+        folder.mkdir(parents=True, exist_ok=True)
         for a, b in ranges:
-            piece = pikepdf.new()
-            piece.pages.extend(src.pages[a - 1:b])
             label = f"p{a}" if a == b else f"p{a}-{b}"
-            dest = ct.unique_path(folder / f"{Path(path).stem}-{label}.pdf")
-            piece.save(dest)
-            made.append(dest)
+            with pikepdf.new() as piece:
+                piece.pages.extend(src.pages[a - 1:b])
+                made.append(ct.write_output(folder / f"{Path(path).stem}-{label}.pdf", piece.save))
     return made
 
 
 def unlock(path: Path, password: str, dest: Path) -> Path:
     try:
         with pikepdf.open(path, password=password) as pdf:
-            dest = ct.unique_path(dest)
-            pdf.save(dest, encryption=False)
+            dest = ct.write_output(dest, lambda p: pdf.save(p, encryption=False))
     except pikepdf.PasswordError:
         raise ValueError("wrong password")
     return dest
@@ -72,6 +80,17 @@ def page_count(path: Path) -> int:
         return len(pdf.pages)
 
 
+def rotate(path, degrees, ranges, dest):
+    if degrees not in (90, 180, 270):
+        raise ValueError('Choose 90, 180 or 270 degrees')
+    with pikepdf.open(path) as pdf:
+        selected = parse_ranges(ranges or 'all', len(pdf.pages))
+        indices = {i for a, b in selected for i in range(a - 1, b)}
+        for i in sorted(indices):
+            pdf.pages[i].rotate(degrees, relative=True)
+        return ct.write_output(dest, pdf.save)
+
+
 class Tab(Adw.PreferencesPage):
     """One tool: a file list, its options, a status line and a go button."""
     verb = "Go"
@@ -79,13 +98,14 @@ class Tab(Adw.PreferencesPage):
     def __init__(self, win, single=False, reorder=False):
         super().__init__()
         self.win = win
+        self.busy = False
         group = Adw.PreferencesGroup(title="PDFs")
         add = Gtk.Button(label="Add PDFs…", valign=Gtk.Align.CENTER)
         add.add_css_class("suggested-action")
         add.connect("clicked", lambda _b: ct.pick_files(
-            win, "Choose PDFs", self.files.add_paths, "application/pdf", multiple=not single))
+            win, "Choose PDFs", self.add_files, "application/pdf", multiple=not single))
         clear = Gtk.Button(label="Clear", valign=Gtk.Align.CENTER)
-        clear.connect("clicked", lambda _b: self.files.clear())
+        clear.connect("clicked", lambda _b: self.files.clear() if not self.busy else None)
         box = Gtk.Box(spacing=6)
         box.append(clear)
         box.append(add)
@@ -111,6 +131,10 @@ class Tab(Adw.PreferencesPage):
     def options(self, page):
         pass
 
+    def add_files(self, paths):
+        if not self.busy:
+            self.files.add_paths(paths)
+
     def message(self):
         """(text, ok) describing readiness."""
         return ("Add a PDF.", False) if not self.files.paths else ("Ready.", True)
@@ -120,7 +144,7 @@ class Tab(Adw.PreferencesPage):
             return
         text, ok = self.message()
         self.status.set_text(text)
-        self.go.set_sensitive(ok)
+        self.go.set_sensitive(ok and not self.busy)
 
     def finish(self, text):
         self.status.set_text(text)
@@ -128,10 +152,16 @@ class Tab(Adw.PreferencesPage):
         self.go.set_sensitive(self.message()[1])
 
     def run(self, fn, ok_text):
+        if self.busy:
+            return
+        self.busy = True
+        self.files.set_sensitive(False)
         self.go.set_sensitive(False)
         self.status.set_text("Working…")
 
         def done(result, error):
+            self.busy = False
+            self.files.set_sensitive(True)
             self.finish(f"Failed: {error}" if error else ok_text(result))
         ct.run_task(fn, done)
 
@@ -156,6 +186,9 @@ class MergeTab(Tab):
         paths = list(self.files.paths)
         name = (self.name.get_text().strip() or "merged.pdf")
         name = Path(name).name
+        if name in ('.', '..', '') or any(ord(c) < 32 for c in name):
+            self.finish('Enter a valid PDF file name')
+            return
         if not name.lower().endswith(".pdf"):
             name += ".pdf"
         dest = paths[0].parent / name
@@ -222,10 +255,36 @@ class UnlockTab(Tab):
             for p in paths:
                 try:
                     done.append(unlock(p, pw, p.with_name(f"{p.stem}-unlocked.pdf")))
-                except ValueError as exc:
+                except (ValueError, OSError, pikepdf.PdfError) as exc:
                     bad.append(f"{p.name} ({exc})")
             return done, bad
         self.run(job, lambda r: f"Unlocked {len(r[0])}." + (f" Failed: {'; '.join(r[1])}" if r[1] else ""))
+
+    def finish(self, text):
+        self.pw.set_text('')
+        super().finish(text)
+
+
+class RotateTab(Tab):
+    verb = 'Rotate'
+
+    def __init__(self, win):
+        super().__init__(win, single=True)
+
+    def options(self, page):
+        group = Adw.PreferencesGroup(title='Rotate a copy')
+        self.angle = Adw.ComboRow(title='Clockwise rotation', model=Gtk.StringList.new(['90 degrees', '180 degrees', '270 degrees']))
+        self.pages = Adw.EntryRow(title='Pages (blank for all)', text='')
+        group.add(self.angle)
+        group.add(self.pages)
+        page.add(group)
+
+    def start(self):
+        path = self.files.paths[0]
+        angle = (self.angle.get_selected() + 1) * 90
+        pages = self.pages.get_text()
+        self.run(lambda: rotate(path, angle, pages, path.with_name(path.stem + '-rotated.pdf')),
+                 lambda p: f'Saved {p.name}')
 
 
 class PdfToolsWindow(Adw.ApplicationWindow):
@@ -239,7 +298,7 @@ class PdfToolsWindow(Adw.ApplicationWindow):
         switcher = Gtk.StackSwitcher(stack=self.stack)
         header.set_title_widget(switcher)
         view.add_top_bar(header)
-        self.tabs = {"merge": MergeTab(self), "split": SplitTab(self), "unlock": UnlockTab(self)}
+        self.tabs = {"merge": MergeTab(self), "split": SplitTab(self), "unlock": UnlockTab(self), 'rotate': RotateTab(self)}
         for key, tab in self.tabs.items():
             self.stack.add_titled(tab, key, key.capitalize())
         view.set_content(self.stack)
@@ -248,7 +307,9 @@ class PdfToolsWindow(Adw.ApplicationWindow):
         self.add_controller(ct.drop_target(self.add_files))
 
     def add_files(self, paths):
-        self.stack.get_visible_child().files.add_paths(paths)
+        tab = self.stack.get_visible_child()
+        if not tab.busy:
+            tab.files.add_paths(paths)
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text))

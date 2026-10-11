@@ -1,4 +1,5 @@
-import React, { useEffect, useRef } from 'react';
+import React from 'react';
+import { useDialog } from './useDialog';
 
 interface ConfirmationModalProps {
   isOpen: boolean;
@@ -17,30 +18,12 @@ const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
   onConfirm, 
   onCancel 
 }) => {
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const cancelRef = useRef(onCancel);
-  cancelRef.current = onCancel;
-  useEffect(() => {
-    if (!isOpen) return;
-    const previous = document.activeElement as HTMLElement | null;
-    dialogRef.current?.querySelector<HTMLButtonElement>('button')?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { e.preventDefault(); cancelRef.current(); }
-      if (e.key === 'Tab') {
-        const buttons = dialogRef.current?.querySelectorAll<HTMLButtonElement>('button');
-        if (!buttons?.length) return;
-        if (e.shiftKey && document.activeElement === buttons[0]) { e.preventDefault(); buttons[buttons.length - 1].focus(); }
-        else if (!e.shiftKey && document.activeElement === buttons[buttons.length - 1]) { e.preventDefault(); buttons[0].focus(); }
-      }
-    };
-    document.addEventListener('keydown', onKey);
-    return () => { document.removeEventListener('keydown', onKey); previous?.focus(); };
-  }, [isOpen]);
+  const dialogRef = useDialog(isOpen, onCancel);
   if (!isOpen) return null;
 
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
-      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="confirmation-title" className="bg-[#10151e] w-full max-w-md rounded-xl shadow-2xl border border-white/10 overflow-hidden transform transition-all scale-100">
+      <div ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-message" tabIndex={-1} className="bg-[#10151e] w-full max-w-md rounded-xl shadow-2xl border border-white/10 overflow-hidden transform transition-all scale-100">
         <div className="bg-whitecube-accent p-4 flex items-center gap-3">
            <div className="bg-white/20 p-2 rounded-full">
              <span className="material-symbols-outlined text-white text-xl">warning</span>
@@ -49,7 +32,7 @@ const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
         </div>
         
         <div className="p-6">
-          <p className="text-white/80 mb-4 text-sm leading-relaxed">{message}</p>
+          <p id="confirmation-message" className="text-white/80 mb-4 text-sm leading-relaxed">{message}</p>
           
           <div className="bg-black/30 rounded p-3 mb-6 border border-white/5">
             <label className="text-[10px] text-white/40 uppercase font-bold tracking-wider mb-1 block">Command Preview</label>
@@ -67,7 +50,7 @@ const ConfirmationModal: React.FC<ConfirmationModalProps> = ({
               onClick={onConfirm}
               className="px-6 py-2 rounded text-sm font-bold bg-white/10 border border-white/10 hover:bg-whitecube-accent hover:border-whitecube-accent text-white transition-all shadow-md"
             >
-              Confirm Execution
+              {title === 'Remove command' ? 'Remove command' : 'Confirm Execution'}
             </button>
           </div>
         </div>

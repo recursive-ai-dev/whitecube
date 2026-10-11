@@ -268,6 +268,8 @@ ipcMain.handle('models:rename', (evt, { id, name } = {}) => {
 });
 
 ipcMain.handle('settings:save', (evt, payload) => {
+  if (currentAbort) throw new Error('Stop the reply before saving settings.');
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Settings must be an object.');
   if (payload && typeof payload.hotkey === 'string') {
     const hk = payload.hotkey.trim();
     if (hk && !/^(CommandOrControl|Control|Ctrl|Alt|Shift|Super|Meta)(\+(CommandOrControl|Control|Ctrl|Alt|Shift|Super|Meta|[A-Za-z0-9]))+$|^[A-Za-z0-9]$/.test(hk)) {
@@ -330,6 +332,7 @@ ipcMain.handle('chat:send', async (evt, userText) => {
   if (currentAbort) throw new Error('A reply is already in progress.');
   currentAbort = new AbortController();
   const controller = currentAbort;
+  let failure = null;
   controller.signal.addEventListener('abort', () => {
     for (const resolve of pendingConfirms.values()) resolve(false);
     pendingConfirms.clear();
@@ -350,6 +353,7 @@ ipcMain.handle('chat:send', async (evt, userText) => {
   try {
     let settings = validateSettings(config.load());
     if (typeof userText !== 'string' || !userText.trim()) throw new Error('Enter a message.');
+    if (userText.length > 100000) throw new Error('Message exceeds 100,000 characters. Split it into smaller messages.');
     if (settings.chatSource === 'local') {
       const checkpoint = localModels.find(settings.checkpointId, settings.modelAliases);
       onEvent({ type: 'notice', text: `Using ${checkpoint.name}. Loading the local checkpoint…` });
@@ -369,6 +373,7 @@ ipcMain.handle('chat:send', async (evt, userText) => {
       signal: controller.signal
     });
   } catch (err) {
+    failure = err.name === 'AbortError' ? 'Cancelled.' : err.message;
     if (err.name === 'AbortError') {
       onEvent({ type: 'error', message: 'Cancelled.' });
     } else {
@@ -381,7 +386,7 @@ ipcMain.handle('chat:send', async (evt, userText) => {
     evt.sender.send('chat:done');
   }
 
-  return { ok: true };
+  return failure ? { ok: false, error: failure } : { ok: true };
 });
 
 ipcMain.on('clipboard:write', (evt, text) => {

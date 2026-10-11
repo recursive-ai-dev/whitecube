@@ -75,6 +75,83 @@ need OVMF firmware. KVM acceleration is used when the current account can access
 `/dev/kvm`. The ISO’s original boot records are replayed during export; no claim
 is made that every third-party installer or distribution supports customization.
 
+## Editing, recovery and release tools
+
+The workbench now includes these sixteen workflow improvements:
+
+1. **Storage preflight.** Source and Build pages offer conservative estimates.
+   Workers check free space before extraction, compression and restore copies.
+   Requirements on the same filesystem are added together. Estimates include
+   staging space and a reserve; actual expansion and package downloads vary.
+2. **Interrupted-project recovery.** Source reports active operations, interrupted
+   states, staging files and guest environment backups. Recover project retains
+   partial extraction and build files, restores guest DNS/service policy, and
+   removes journaled temporary boot-layer deletion markers.
+3. **Restore points.** Save a point explicitly or enable the default automatic
+   point before recipes and manual terminals. It copies both `rootfs/` and `iso/`
+   with reflinks when supported. Restore stages both copies before replacing
+   current trees and rolls back promotion errors. Previous points and replaced
+   trees remain under `recovery/`, so review them before removing them to reclaim
+   space. Recovery artifacts on a separate output filesystem remain in its
+   `.cube-editor-recovery/` folder. Some retained files need sudo to inspect.
+4. **Complete operation previews.** Extraction, customization and build previews
+   describe mounts, payloads, installer adaptation, metadata, temporary deletion
+   markers, export promotion and cleanup in addition to the major argument arrays.
+   `payload-copy` in a preview describes an internal copy operation, not a shell
+   executable. Installer steps are conditional on recognized configurations.
+5. **Portable recipes.** Import/export uses versioned recipe JSON, independent of
+   the project directory. Local file paths are retained; import lists missing
+   paths to update in Files & desktop before applying. Import replaces the recipe.
+6. **Multiline Bash scripts.** The command editor preserves indentation, loops,
+   functions and heredocs in a complete script. Existing command arrays retain
+   their separate execution semantics until the script is edited.
+7. **Package previews.** Simulate installation/purge and print required download
+   URLs/sizes without applying the recipe. Results appear in Activity and
+   `package-preview.txt`. Previews use existing guest apt indexes; use the image
+   terminal to update those indexes when needed. Actual package availability can
+   change before Apply recipe refreshes the indexes.
+8. **Source integrity.** Supply a publisher SHA256 or checksum-file line, or record
+   a digest without an expected value. Extraction hashes the source and checks
+   any recorded digest. Recording a digest alone does not authenticate the source.
+9. **Release history.** Every successful build appends its path, hash, size, recipe
+   and build settings to project history. Test & release can select old releases
+   for checksum verification and VM booting while their files remain available.
+10. **Tool progress.** Extraction/compression percentages come from tool output.
+    Activity shows elapsed time and an estimate for the current tool phase when
+    percentage output is available; other steps retain stage progress.
+11. **Activity controls.** Search, errors-only filtering, next-error selection,
+    export and optional following are available. New visible entries append to
+    the bounded display buffer. Export retains the complete worker JSONL log.
+12. **Inline validation.** Invalid fields and recipe/resource settings show their
+    errors near the relevant controls. Action tooltips explain unavailable
+    operations. Invalid autosaves do not repeatedly open toasts or allow closing
+    with unsaved changes.
+13. **Payload editing.** Edit existing mappings, preview up to 200 directory
+    entries, reject duplicate destinations, and choose replace, skip or fail
+    when an existing file is encountered. Directories merge recursively; symlink
+    destinations remain rejected for every policy.
+14. **Build resources.** Choose processors, compression cache memory and gzip/zstd
+    compression level. Zero selects the compressor default; xz/lz4 use their
+    defaults. Memory is the squashfs cache setting, not a hard limit for the
+    entire build process.
+15. **Installer VM tests.** Create a sparse disposable 32 GiB qcow2 disk, boot the
+    installer against it, close QEMU, then reboot the installed system. UEFI
+    variables persist beside the disk. Open an existing disk from the project's
+    `vm-tests/` folder to continue a test after reopening the editor. Discard
+    removes the selected disk and its variables after confirmation. Live-only
+    boots continue to use temporary disk changes.
+16. **Recorded release checks.** Checksum outcomes are saved automatically. Record
+    BIOS/UEFI live or installer outcomes and notes manually after testing. Every
+    check includes the actual ISO SHA256, so replacing an ISO does not transfer
+    an earlier passing result to its new contents. Launching QEMU does not mark
+    a boot or installation test as passed.
+
+Restore points, recovery and package previews use the same authenticated private
+worker as other filesystem operations. A retained recovery copy is not an
+off-device backup. The installer VM workflow still needs a person to exercise
+the guest and assess the result; automated tests use small synthetic images and
+do not certify a particular distribution or installer.
+
 ## Developer commands
 
 The process/project API can run without starting the desktop interface:
@@ -88,6 +165,16 @@ python3 apps/cube-editor/engine.py run /path/to/project extract
 python3 apps/cube-editor/engine.py run /path/to/project customize
 python3 apps/cube-editor/engine.py run /path/to/project build
 python3 apps/cube-editor/engine.py verify /path/to/project
+python3 apps/cube-editor/engine.py verify-source /path/to/project --expected '<SHA256>'
+python3 apps/cube-editor/engine.py preflight /path/to/project build
+python3 apps/cube-editor/engine.py recovery /path/to/project
+python3 apps/cube-editor/engine.py run /path/to/project snapshot
+python3 apps/cube-editor/engine.py run /path/to/project restore
+python3 apps/cube-editor/engine.py run /path/to/project recover
+python3 apps/cube-editor/engine.py run /path/to/project packages
+python3 apps/cube-editor/engine.py export-recipe /path/to/project /path/to/recipe.json
+python3 apps/cube-editor/engine.py import-recipe /path/to/project /path/to/recipe.json
+python3 apps/cube-editor/engine.py releases /path/to/project
 ```
 
 `inspect` reads the ISO. `plan` prints argument arrays and the worker launch

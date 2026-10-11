@@ -4,14 +4,27 @@ A Whitecube Wayland desktop command center for Ubuntu and Debian. Version 2 adds
 inspection, installed-package search, system diagnostics, command activity, and
 portable library backups to the existing monitoring and shell tools.
 
-Source lives at `~/whitecube/command-center`; it retains its own Git repository.
+Source lives at `~/whitecube/apps/command-center` in the Whitecube repository.
 See [IMPROVEMENTS.txt](IMPROVEMENTS.txt) for 48 proposed improvements with priorities
-and completion criteria. These are a backlog, not implemented features.
+and completion criteria. The remaining proposals are a backlog; the completed subset is recorded below and in the changelog.
 
 The 2.0.1 rebrand preserves application data, storage keys, and JSON backup format.
 The Debian package replaces the former `ubuntu-command-center` package, keeping
 its command aliases. The user installer hides the old desktop-menu entry while
 leaving the old system package installed until root authentication is available.
+
+## New in 2.1.0
+
+- Redesigned overview with clickable resource meters, an attention center, pinned commands, recent activity, and machine details.
+- CPU, memory, and combined network trends for 2, 5, or 10 minutes. Samples remain in memory across view changes; gaps indicate interrupted collection. History starts fresh on app restart.
+- Resource monitoring refreshes every 2, 5, or 10 seconds (Settings), with pause and manual refresh. Other panels keep their own refresh schedules; Processes also has pause and refresh controls.
+- Failed inspection retains the last successful result with its timestamp and error. One-shot panels opened while hidden load when the window becomes visible.
+- Pins, tags, command previews, pinned-only filtering, and name/recent-run sorting in the command library. Existing libraries retain their commands and organization; backups include pins and tags.
+- Searchable keyboard palette with scrolling results; execution always uses current commands and working directory. Ctrl+backtick focuses the terminal.
+- Consistent modal focus trapping, inactive background controls, Escape dismissal, and trigger focus restoration. Command working-directory selection uses a native folder dialog.
+- Elapsed command time and stopping feedback. The terminal starts collapsed on a fresh profile and opens automatically during execution; previous collapse preferences are preserved.
+- Duplicate or unsupported shortcut bindings cannot be saved. Conflicting imported groups remain in the library with an unbound trigger for reassignment. The default Core Actions binding migrates from Alt+C (intercepted by Whitecube) to Ctrl+Shift+G. If that binding is already used, Core Actions is left unbound. Groups are also searchable in the palette.
+- Atomic, flushed writes for command activity and window state.
 
 ## Install the Debian package
 
@@ -21,7 +34,7 @@ entry, and provides `whitecube-command-center`, plus the `command-center` and
 `ubuntu-lab` compatibility commands.
 
 ```sh
-sudo apt install ./release/whitecube-command-center_2.0.1_amd64.deb
+sudo apt install ./release/whitecube-command-center_2.1.0_amd64.deb
 whitecube-command-center
 whitecube-command-center --version
 ```
@@ -147,7 +160,7 @@ Set `CC_TEST_SANDBOX=1` to test with the namespace sandbox enabled, or
 `CC_TEST_SANDBOX=system` to test with the installed root-owned helper.
 Use `CC_APP_LAUNCHER=~/.local/bin/whitecube-command-center` for the user-installed app.
 
-Keyboard shortcuts: Ctrl+K opens the command palette; Alt+C opens Core Actions;
+Keyboard shortcuts: Ctrl+K opens the command palette; Ctrl+backtick focuses the terminal; Ctrl+Shift+G opens Core Actions;
 Ctrl+C stops a terminal command; Ctrl+L clears output; Escape dismisses startup
 checks or a confirmation.
 

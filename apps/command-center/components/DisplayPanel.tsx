@@ -1,5 +1,6 @@
 import React from 'react';
 import { isFailure, usePoll } from '../hooks';
+import { PollNotice } from './Panel';
 
 const Row: React.FC<{ k: string; v: React.ReactNode; ok?: boolean }> = ({ k, v, ok }) => (
   <div className="flex justify-between gap-4 py-2 border-b border-white/5 text-sm">
@@ -9,13 +10,13 @@ const Row: React.FC<{ k: string; v: React.ReactNode; ok?: boolean }> = ({ k, v, 
 );
 
 const DisplayPanel: React.FC = () => {
-  const { data } = usePoll(() => window.lab.display(), 10000);
+  const { data, error: pollError, updatedAt } = usePoll(() => window.lab.display(), 10000);
   if (!data) return <div className="p-6 text-white/40 text-sm">Reading session…</div>;
   if (isFailure(data)) return <div className="p-6 text-red-400 text-sm">{data.error}</div>;
   const wayland = data.sessionType === 'wayland' && !!data.waylandDisplay;
 
   return (
-    <div className="p-6 overflow-y-auto h-full">
+    <div className="p-6 overflow-y-auto h-full"><PollNotice error={pollError} updatedAt={updatedAt} />
       <div className="max-w-3xl mx-auto space-y-4">
         <div>
           <h2 className="text-2xl font-light text-white mb-1">Display Session</h2>

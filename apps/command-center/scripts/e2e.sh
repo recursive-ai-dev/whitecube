@@ -17,9 +17,10 @@ printf '#!/bin/bash\nexec %q --remote-debugging-port=%q --user-data-dir=%q' "$la
 if [ -n "$sandbox_flag" ]; then printf ' %q' "$sandbox_flag" >> "$S/start"; fi
 printf '\n' >> "$S/start"
 chmod +x "$S/start"
+startup_command=$(printf '/bin/bash %q' "$S/start")
 env -i PATH="$PATH" HOME="$S/home" XDG_STATE_HOME="$S/home/state" XDG_RUNTIME_DIR="$S/xdg" XDG_SESSION_TYPE=wayland \
   WLR_BACKENDS=headless WLR_HEADLESS_OUTPUTS=1 WLR_RENDERER=pixman \
-  timeout 150 "$compositor" -s "$S/start" >"$S/app.log" 2>&1 &
+  timeout 150 "$compositor" -s "$startup_command" >"$S/app.log" 2>&1 &
 wc=$!
 cleanup() { kill "$wc" 2>/dev/null || true; wait "$wc" 2>/dev/null || true; cp "$S/app.log" "$out/app.log"; rm -rf -- "$S"; }
 trap cleanup EXIT

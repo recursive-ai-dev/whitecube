@@ -1,0 +1,33 @@
+WHITECUBE COMMAND CENTER 2.1.0 — VALIDATION
+Date: 2026-10-11
+
+PASS: TypeScript check and production Vite build.
+PASS: 44 Node unit tests and 4 Python boot-image tests.
+PASS: 72 isolated Wayland end-to-end checks.
+  Real bash output, working-directory tracking, nonzero exits and cancellation.
+  All inspection views, IPC guards and CSP.
+  Trends retained across navigation, metric/time-window selection, pins and previews.
+  Modal initial focus, focus containment, Escape and trigger restoration.
+  Duplicate shortcut rejection, Ctrl+Shift+G and palette access to Core Actions.
+  Monitoring cadence persistence, compact viewport and no renderer exceptions.
+  Real React polling checks: cached data on backend/IPC errors, zero readings,
+  recovery, late-result isolation, initially hidden one-shot panels and hidden polling.
+PASS: 12 installed-package smoke checks with the system sandbox helper enabled.
+  Packaged runtime: 2.1.0; Electron 44.7.0.
+  No --no-sandbox flag in the installed smoke test.
+PASS: Package metadata/checksum verification, JS/shell syntax and git diff --check.
+
+Artifact: /home/woez/whitecube/apps/command-center/release/whitecube-command-center_2.1.0_amd64.deb
+Checksum: a203a35e2a35aba408c86cdad185069c9e923dcbcbc5dc5c95a780df767a14f3  whitecube-command-center_2.1.0_amd64.deb
+Installed for this account: /home/woez/.local/bin/whitecube-command-center
+Current payload: /home/woez/.local/opt/whitecube-command-center/current
+Sandbox helper: /opt/whitecube-command-center/chrome-sandbox
+Older user payloads remain available for rollback. System dpkg state is unchanged.
+Commands, preferences, storage keys and backup format remain compatible.
+The default Core Actions binding migrates from Alt+C to Ctrl+Shift+G; an existing
+owner of the new binding is preserved and Core Actions remains available in the palette.
+
+Screenshots: test-artifacts/2.1.0/ and test-artifacts/2.1.0-installed/
+Full overview: test-artifacts/2.1.0/overview-improved.png
+Compact overview: test-artifacts/2.1.0/overview-compact.png
+Scope: apps/command-center only; existing unrelated Whitecube changes retained.

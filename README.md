@@ -14,7 +14,7 @@ each account keeps only its own settings in `~/.config/whitecube` and the usual 
 | `net/` | native Wi-Fi/DHCP controller `cube-net`, reversible `net-off`/`net-on`, units, tests |
 | `data/` | config example, key list, schemas, wallpapers, `.desktop` entries, sudoers examples, skel dotfiles |
 | `workspace/` | Python workspace suite (served by `whitecube-web`) |
-| `apps/` | `desktop-chat`, `cube-apps`, `cube-editor`, `cube-train`, `chrootables` (packaged); `command-center` (own product, not packaged) |
+| `apps/` | `desktop-chat`, `cube-apps`, `cube-editor`, `cube-train`, `chrootables`, `cube-prompts`, `cube-strap`, `wc-suite`, `cube-browser`, `cube-player` (packaged; the two meson apps build through `apps/build-native-apps.sh`); `command-center` (own product, not packaged) |
 | `boot/` | GRUB / Plymouth / tty1 black cube theme |
 | `packaging/` | `.deb` build: `install-tree.sh`, `build-deb.sh`, `check-tree.py`, `debian/` |
 | `tools/` | `whitecube-migrate`, dev installers, hooks; `tools/os-build/` legacy ISO tooling (not packaged) |
@@ -24,12 +24,15 @@ each account keeps only its own settings in `~/.config/whitecube` and the usual 
 
     ./BUILD.sh        # compiles everything and runs every test; must stay green
 
+Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.sh`.
+`TRAINING_SMOKE=1` also runs the hardware training-worker smoke test; it requires a cool host.
+
 `/tmp` may be mounted noexec: `export TMPDIR=$HOME/.cache/wc-tmp` first.
 
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_*.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.7.1_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +58,22 @@ See [net/NET-SWITCH.txt](net/NET-SWITCH.txt) for recovery, scope and persistence
 
 It backs up everything it moves, keeps unrelated files, and rollback restores the exact tree. Then log out and
 back in. `whitecube-doctor` warns while older copies still shadow the package.
+
+## Desktop and app improvements in 0.7.0
+
+The [168-item change list](docs/IMPROVEMENTS-0.7.0.txt) covers the native launcher,
+shared file-app accessibility, cancellable hashing and checksum export, safer rename
+transactions and undo, PDF rotation and atomic output, Chat search and draft recovery,
+workspace navigation, preference validation, and Debian packaging.
+
+Cube file apps support Ctrl+O (open), Ctrl+Enter (run), Ctrl+W (close), and Ctrl+Q (quit).
+Chat supports Ctrl+F (find), Ctrl+L (composer), Ctrl+Shift+C (copy conversation), and
+Alt+Up (recall the last prompt into an empty draft). Its Find controls search the current
+conversation. Saved checksum manifests use absolute paths and can be checked with
+the corresponding checksum command, for example `sha256sum --check sha256sums.txt`.
+
+The build retains earlier `.deb` files. Install the specific version printed by the
+build command. Log out and back in to load the compositor and panel changes.
 
 New session entry: choose **Whitecube** in a login manager, or `exec whitecube-session` from tty1.
 
@@ -95,6 +114,12 @@ sessions, snapshots, clones, exports and imports. The window runs as you and rea
 password typed into it goes to `sudo -S -v` once and is never stored); shells open in `whitecube-terminal`.
 The same engine is the `chrootable-manager` command, with its own menu and JSON output. See
 [the app notes](apps/chrootables/README.md).
+
+`cube-prompts` is the prompt library: folders, tags, favorites and full-text search over a local SQLite
+library, `{{variable}}` templates with a live filled-in preview, revisions, reusable templates, six export
+formats, and a side-by-side run against up to three models (Pollinations free, Claude, OpenAI, Gemini,
+OpenRouter, local Ollama). It is the GTK front end for the Prompt Manager Studio core. See
+[the app notes](apps/cube-prompts/README.md).
 
 The `wc-*` command suite (`apps/wc-suite`; start with `wc-help`) is installed as `wc-*` commands in `/usr/bin`,
 with its module in `/usr/lib/wc-suite` and completions for bash, zsh and fish. `python3 apps/wc-suite/install.py`

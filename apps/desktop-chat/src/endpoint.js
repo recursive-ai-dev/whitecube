@@ -17,7 +17,9 @@ function needsApiKey(endpoint) {
 }
 
 function validateSettings(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Settings must be an object.');
   const result = { ...settings };
+  if (typeof result.endpoint !== 'string' || result.endpoint.length > 2048 || /[\x00-\x20\x7f]/.test(result.endpoint.trim())) throw new Error('Enter a valid http:// or https:// endpoint.');
   let url;
   try { url = new URL(String(result.endpoint || '').trim()); }
   catch { throw new Error('Enter a valid http:// or https:// endpoint.'); }
@@ -25,7 +27,8 @@ function validateSettings(settings) {
     throw new Error('Use an HTTP(S) base URL without credentials, query, or fragment.');
   }
   result.endpoint = url.href.replace(/\/+$/, '').replace(/\/chat\/completions$/, '');
-  result.model = String(result.model || '').trim();
+  if (typeof result.model !== 'string' || result.model.length > 256 || /[\x00-\x1f\x7f]/.test(result.model)) throw new Error('Enter a valid model name of up to 256 characters.');
+  result.model = result.model.trim();
   if (!result.model) throw new Error('Enter a model name.');
   return result;
 }

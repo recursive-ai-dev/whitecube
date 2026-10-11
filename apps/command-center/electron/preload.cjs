@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('lab', {
   openData: () => invoke('app:open-data'),
   saveFile: (name, content) => invoke('file:save', { name, content }),
   importFile: () => invoke('file:import'),
+  chooseDirectory: () => invoke('file:directory'),
   run: (command, cwd) => invoke('run:start', { command, cwd }),
   kill: (id) => invoke('run:kill', id),
   onRun: (cb) => {

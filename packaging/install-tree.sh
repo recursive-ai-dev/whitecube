@@ -24,6 +24,8 @@ cd "$root"
 for b in whitecube cube-status cube-settings cube-ca; do
   [[ -x build/$b ]] || { echo "install-tree.sh: build/$b is missing; run ./BUILD.sh first" >&2; exit 1; }
 done
+[[ -x build/native-apps-root/usr/bin/cube-player && -x build/native-apps-root/usr/libexec/whitecube/cube-browser/cube-browser ]] || {
+  echo "install-tree.sh: build/native-apps-root is missing; run ./BUILD.sh first" >&2; exit 1; }
 [[ -f build/schemas/gschemas.compiled ]] || { echo "install-tree.sh: build/schemas/gschemas.compiled is missing; run ./BUILD.sh first" >&2; exit 1; }
 
 bin=$dest/usr/bin lib=$dest/usr/libexec/whitecube share=$dest/usr/share/whitecube doc=$dest/usr/share/doc/whitecube-desktop
@@ -33,6 +35,11 @@ install -d -m 0755 "$bin" "$lib" "$share" "$doc" "$dest/etc/whitecube/network" "
 for b in cube-status cube-settings cube-ca; do install -m 0755 "build/$b" "$bin/$b"; done
 # not /usr/bin/whitecube: the "whitecube" package (image tool) already owns that name
 install -m 0755 build/whitecube "$bin/whitecube-compositor"
+
+# Cube Browser and Cube Player (meson, built by apps/build-native-apps.sh). The browser starts its
+# renderer and network workers from its own directory, so the three stay together in libexec.
+cp -a build/native-apps-root/usr/. "$dest/usr/"
+ln -s ../libexec/whitecube/cube-browser/cube-browser "$bin/cube-browser"
 
 # --- commands (scripts)
 for f in bin/*; do
@@ -87,8 +94,20 @@ rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/cub
 # Chrootables: the window runs from /usr/share; its manager is a command of its own (CLI and menu),
 # which the window finds as /usr/bin/chrootable-manager.
 install -d -m 0755 "$share/chrootables"
-for f in app.py backend.py style.css README.md MANAGER.md; do install -m 0644 "apps/chrootables/$f" "$share/chrootables/$f"; done
+for f in app.py backend.py broker.py style.css README.md MANAGER.md; do install -m 0644 "apps/chrootables/$f" "$share/chrootables/$f"; done
 install -m 0755 apps/chrootables/chrootable-manager "$bin/chrootable-manager"
+# Cube Strap: the window runs from /usr/share and imports cube-apps and chrootables beside it;
+# its one privileged step, cube-strap-build, lives with the other root helpers.
+install -d -m 0755 "$share/cube-strap"
+for f in app.py strap.py README.md; do install -m 0644 "apps/cube-strap/$f" "$share/cube-strap/$f"; done
+install -m 0755 apps/cube-strap/deb-strap.sh "$share/cube-strap/deb-strap.sh"
+install -m 0755 apps/cube-strap/cube-strap-build "$lib/cube-strap-build"
+# Cube Prompts: the window and its bundled prompt_manager core run from /usr/share.
+install -d -m 0755 "$share/cube-prompts"
+for f in app.py style.css README.md NOTICE; do install -m 0644 "apps/cube-prompts/$f" "$share/cube-prompts/$f"; done
+(cd apps/cube-prompts && find prompt_manager -name '*.py' -print0) | while IFS= read -r -d '' f; do
+  install -D -m 0644 "apps/cube-prompts/$f" "$share/cube-prompts/$f"
+done
 # Electron is a runtime dependency of Chat, shipped privately so the desktop
 # session never depends on npm, nvm, or another user's development environment.
 chat_runtime=${ELECTRON_DIST:-$root/build/desktop-chat-runtime}
@@ -115,6 +134,10 @@ install -d -m 0755 "$dest/usr/share/icons/hicolor/scalable/apps"
 install -m 0644 data/icons/cube-editor.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-editor.svg"
 install -m 0644 data/icons/chrootables.svg "$dest/usr/share/icons/hicolor/scalable/apps/chrootables.svg"
 install -m 0644 data/icons/cube-train.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-train.svg"
+install -m 0644 data/icons/cube-strap.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-strap.svg"
+install -m 0644 data/icons/cube-prompts.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-prompts.svg"
+install -m 0644 data/icons/cube-browser.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-browser.svg"
+install -m 0644 data/icons/cube-player.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-player.svg"
 python3 -I apps/cube-apps/install.py --destdir "$dest" > /dev/null   # cube-lock/pdf/hash/rename: launchers, entries, icons
 python3 -I packaging/install-wc-suite.py "$dest" > /dev/null          # wc-* commands, /usr/lib/wc-suite, completions
 
@@ -131,6 +154,12 @@ install -m 0644 packaging/debian/copyright "$doc/copyright"
 install -m 0644 data/sudoers/whitecube-settings "$doc/sudoers-whitecube-settings.example"
 install -m 0644 data/sudoers/whitecube-settings.hardened "$doc/sudoers-whitecube-settings.hardened.example"
 install -m 0644 net/NET-SWITCH.txt "$doc/NET-SWITCH.txt"
+install -d -m 0755 "$doc/cube-browser/licenses" "$doc/cube-player"
+install -m 0644 apps/cube-browser/README.md apps/cube-browser/COMPATIBILITY.md "$doc/cube-browser/"
+install -m 0644 apps/cube-browser/.deps/licenses/* "$doc/cube-browser/licenses/"
+install -m 0644 apps/cube-browser/.deps/prefix/share/licenses/libjpeg-turbo/copyright "$doc/cube-browser/licenses/libjpeg-turbo-copyright"
+install -m 0644 apps/cube-browser/third_party/nanosvg/LICENSE.txt "$doc/cube-browser/licenses/nanosvg-LICENSE"
+install -m 0644 apps/cube-player/README.md apps/cube-player/COPYING "$doc/cube-player/"
 [[ -f README.md ]] && install -m 0644 README.md "$doc/README.md"
 
 # Source workspaces can use umask 077. Installed shared apps, launchers, icons

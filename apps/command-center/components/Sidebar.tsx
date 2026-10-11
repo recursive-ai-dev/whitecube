@@ -50,9 +50,10 @@ const Sidebar: React.FC<SidebarProps> = ({
     <button
       key={id}
       aria-current={activeView === id ? 'page' : undefined}
+      title={label}
       onClick={() => onSelectView(id as ViewMode)}
-      className={`w-full flex items-center px-3 py-2 rounded-md text-sm transition-all duration-200 group ${
-        activeView === id ? 'bg-whitecube-accent text-white shadow-md' : 'text-white/70 hover:bg-white/5 hover:text-white'
+      className={`w-full flex items-center px-3 py-2 rounded-lg text-[13px] transition-all duration-200 group ${
+        activeView === id ? 'bg-whitecube-accent/12 text-red-200 ring-1 ring-inset ring-whitecube-accent/20' : 'text-white/70 hover:bg-white/5 hover:text-white'
       }`}
     >
       <div className="flex items-center gap-3">
@@ -63,29 +64,31 @@ const Sidebar: React.FC<SidebarProps> = ({
   );
 
   return (
-    <aside className="w-64 bg-[#090c12]/80 border-r border-white/5 flex flex-col shrink-0">
+    <aside className="wc-sidebar w-64 bg-[#090c12]/90 border-r border-white/5 flex flex-col shrink-0">
       <div className="p-4 flex-1 overflow-y-auto">
 
-        <div className="text-xs font-bold text-white/40 uppercase tracking-wider mb-4 px-2">Monitor</div>
-        <nav className="space-y-1 mb-8">{monitor.map((m) => navButton(m.id, m.icon, m.label))}</nav>
+        <div className="text-[10px] font-semibold text-white/40 uppercase tracking-[.16em] mb-3 px-3">Monitor</div>
+        <nav aria-label="Monitoring" className="space-y-0.5 mb-6">{monitor.map((m) => navButton(m.id, m.icon, m.label))}</nav>
 
         {/* Library Section */}
-        <div className="text-xs font-bold text-white/40 uppercase tracking-wider mb-4 px-2">Library</div>
-        <nav className="space-y-1 mb-8">
+        <div className="text-[10px] font-semibold text-white/40 uppercase tracking-[.16em] mb-3 px-3">Library</div>
+        <nav aria-label="Command library" className="space-y-0.5 mb-6">
           {categories.map((cat) => (
             <button
               key={cat.id}
+              title={cat.label}
+              aria-current={activeView === 'Dashboard' && activeCategory === cat.id ? 'page' : undefined}
               onClick={() => {
                 onSelectView('Dashboard');
                 onSelectCategory(cat.id);
               }}
-              className={`w-full flex items-center justify-between px-3 py-2 rounded-md text-sm transition-all duration-200 group ${
+              className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-[13px] transition-all duration-200 group ${
                 activeView === 'Dashboard' && activeCategory === cat.id
-                  ? 'bg-whitecube-accent text-white shadow-md'
+                  ? 'bg-whitecube-accent/12 text-red-200 ring-1 ring-inset ring-whitecube-accent/20'
                   : 'text-white/70 hover:bg-white/5 hover:text-white'
               }`}
             >
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 min-w-0">
                 <span className={`material-symbols-outlined text-[20px] ${activeView === 'Dashboard' && activeCategory === cat.id ? 'text-white' : 'text-white/50 group-hover:text-white'}`}>
                   {cat.icon}
                 </span>
@@ -103,15 +106,15 @@ const Sidebar: React.FC<SidebarProps> = ({
         </nav>
 
         {/* Tools Section */}
-        <div className="text-xs font-bold text-white/40 uppercase tracking-wider mb-4 px-2">Configuration</div>
-        <nav className="space-y-1">{tools.map((t) => navButton(t.id, t.icon, t.label))}</nav>
+        <div className="text-[10px] font-semibold text-white/40 uppercase tracking-[.16em] mb-3 px-3">Configuration</div>
+        <nav aria-label="Configuration" className="space-y-1">{tools.map((t) => navButton(t.id, t.icon, t.label))}</nav>
       </div>
 
       <div className="mt-auto p-4 border-t border-white/5">
-        <div className="bg-gradient-to-br from-[#0b1018] to-black p-4 rounded-lg border border-white/10">
-          <h4 className="text-white text-sm font-bold mb-1">Shortcut Tip</h4>
+        <div className="bg-white/3 p-3 rounded-lg border border-white/10">
+          <h4 className="text-white text-sm font-bold mb-1">Make it quick</h4>
           <p className="text-white/60 text-xs leading-relaxed">
-            Press <span className="text-whitecube-accent font-bold">Alt+C</span> to open the Core Actions group.
+            Press <span className="text-whitecube-accent font-bold">Ctrl+Shift+G</span> to open the Core Actions group.
           </p>
         </div>
       </div>

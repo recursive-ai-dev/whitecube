@@ -1,0 +1,24 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>cube-browser layout fixture</title>
+<style>
+body { font-family: sans-serif; color: #202c3a; margin: 28px; max-width: 900px; }
+h1 { color: #245b88; }
+.boxes { display: flex; gap: 16px; }
+.boxes section { background: #ecf2f8; padding: 18px; border: 1px solid #cdd8e3; }
+pre { padding: 16px; background: #e9edf2; font-size: 14px; }
+.hidden { display: none; }
+</style></head><body>
+<h1>HTML + CSS, one layer at a time</h1>
+<p>This is a paragraph with <strong>bold text</strong>, <em>italic text</em>, <code>inline code</code>, and <a href="https://example.com/long/path?x=1&amp;y=2">a link that should remain clickable even when it wraps across several lines</a>.</p>
+<p>Entity decoding: &amp; &lt; &gt; &quot; &#169; &#x1f642; &mdash; &hellip;. Unicode shaping: café, Ελληνικά, العربية.</p>
+<div class="boxes"><section><h2>First column</h2><p>Equal width cards demonstrate the initial flex row subset.</p></section><section><h2>Second column</h2><p>Resize the viewport to see both text and boxes recompute.</p></section></div>
+<h2>Lists and line breaks</h2><ul><li>A first list item.</li><li>A longer second item with enough text to wrap on a small viewport.</li><li><a href="welcome.html">Return to the welcome page</a></li></ul>
+<pre>int main(void) {
+    return 0;
+}</pre>
+<p>Before a break.<br>After a break.</p>
+<img src="missing.png" alt="A clearly labeled image placeholder">
+<div hidden>This hidden attribute content must not paint.</div><p class="hidden">This CSS hidden content must not paint.</p>
+<script>document.body.innerHTML = 'Scripts are intentionally inert in this milestone';</script>
+<hr><p>End of the fixture.</p>
+</body></html>

@@ -1,0 +1,1 @@
+option('private_libdir', type: 'string', value: '', description: 'Runtime library path baked into installed binaries (Whitecube package: /usr/lib/whitecube); empty keeps the local .deps path')

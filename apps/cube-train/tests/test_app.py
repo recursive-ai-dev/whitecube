@@ -33,6 +33,26 @@ class Control:
 
 @unittest.skipUnless(app, 'System GTK bindings are required')
 class PresentationTests(unittest.TestCase):
+    def test_prepared_inspection_disables_selection_and_corpus_changes_restore_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            for name in ('train.bin', 'val.bin'):
+                (directory / name).write_bytes(b'\0\0' * 700)
+            app.engine.atomic_json(directory / 'corpus.json', {'train_tokens': 700, 'val_tokens': 700, 'total_tokens': 1400})
+            window = SimpleNamespace(form={'dataset': MagicMock(), 'max_tokens': MagicMock()},
+                inspect_request=0, inspect_button=MagicMock(), dataset_info=MagicMock(),
+                corpus_selection=MagicMock(), update_batch_summary=MagicMock())
+            window.form['dataset'].get_text.return_value = str(directory)
+            window.background = lambda work, done: done(work(), None)
+            app.TrainerWindow.inspect_dataset(window)
+            self.assertIn('700 training + 700 validation tokens', window.dataset_info.set_text.call_args.args[0])
+            self.assertEqual(window.corpus_bytes, 1400)
+            window.corpus_selection.set_sensitive.assert_called_with(False)
+            window.form['max_tokens'].set_sensitive.assert_called_with(False)
+            app.TrainerWindow.dataset_changed(window)
+            window.corpus_selection.set_sensitive.assert_called_with(True)
+            window.form['max_tokens'].set_sensitive.assert_called_with(True)
+
     def test_duration_formats_short_long_and_invalid_estimates(self):
         self.assertEqual(app.format_duration(59), '59s')
         self.assertEqual(app.format_duration(125), '2m 5s')

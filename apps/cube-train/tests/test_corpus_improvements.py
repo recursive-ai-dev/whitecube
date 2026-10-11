@@ -183,7 +183,7 @@ class CorpusImprovementsTests(unittest.TestCase):
         with self.source.open('a', encoding='utf-8') as source:
             source.write('\n' + json.dumps({'text': self.docs[0]}))
         report = prepare_folder(self.source, self.root / 'out')
-        self.assertEqual(report['schema_version'], 2)
+        self.assertEqual(report['schema_version'], 3)
         self.assertEqual(report['unique_document_groups'], len(self.docs))
         self.assertEqual(report['repeated_document_records'], 1)
         self.assertAlmostEqual(report['actual_val_fraction'], report['val_tokens'] / report['total_tokens'])

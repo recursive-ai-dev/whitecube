@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import unittest
@@ -20,7 +21,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 APP = ROOT / 'apps/chrootables'
 MANAGER = APP / 'chrootable-manager'
-PAGES = ('workspaces', 'create', 'import', 'activity', 'health')
+PAGES = ('workspaces', 'create', 'import', 'run', 'activity', 'health')
 # /tmp may be mounted noexec and the fake sudo must run: keep scratch files in build/.
 SCRATCH = ROOT / 'build' if (ROOT / 'build').is_dir() else None
 sys.path.insert(0, str(APP))
@@ -55,26 +56,60 @@ for event in 'create build-lab ok' 'snapshot build-lab ok' 'session build-lab ex
 done
 '''
 
-# A stand-in for sudo: -S -v accepts "secret" and remembers it; -n refuses until then.
-# Like real sudo (timestamp.c: "time stamp record sid mismatch") the memory only
-# counts for callers in the same session; FAKE_SUDO_NO_CACHE models timestamp_timeout=0.
-FAKE_SUDO = r'''#!/bin/sh
-marker="$FAKE_SUDO_DIR/authenticated"
-sid=$(cut -d' ' -f6 /proc/$$/stat)
-case "$1" in
-    -S) read -r password
-        if [ "$password" = secret ]; then [ -n "$FAKE_SUDO_NO_CACHE" ] || echo "$sid" >"$marker"; exit 0; fi
-        echo "Sorry, try again." >&2; exit 1 ;;
-    -n) shift
-        if [ "$(cat "$marker" 2>/dev/null)" != "$sid" ]; then echo "sudo: a password is required" >&2; exit 1; fi
-        [ "$1" = -v ] && exit 0
-        [ "$1" = -- ] && shift
-        printf '%s\n' "$*" >"$FAKE_SUDO_DIR/last-command"
-        # Root can read the private store; the readable copy stands in for it.
-        if [ "$1" = /usr/bin/env ]; then shift 2; fi
-        CHROOTABLE_HOME=$FAKE_SUDO_STORE exec "$@" ;;
+# A stand-in for sudo modelled on this desktop's sudoers: timestamp_timeout=0, so it
+# never remembers a password (`sudo -n` always refuses) unless FAKE_SUDO_CACHE is set.
+# -S reads up to three password lines like real sudo ("Sorry, try again." between)
+# and then runs the command as the test user. Root's view of the private store is
+# stood in for by the readable copy: --store and CHROOTABLE_HOME are pointed at it.
+FAKE_SUDO = r'''#!/usr/bin/python3 -I
+import os, sys
+directory = os.environ['FAKE_SUDO_DIR']
+args = sys.argv[1:]
+cached = os.path.exists(os.path.join(directory, 'cached'))
+if args == ['-k']:
+    raise SystemExit(0)
+password = '-S' in args
+while args and args[0] != '--':
+    if args[0] == '-p':
+        args = args[1:]
+    elif args[0] == '-v' and not password:
+        raise SystemExit(0 if cached else (print('sudo: a password is required', file=sys.stderr) or 1))
+    args = args[1:]
+args = args[1:]
+if password:
+    for attempt in range(3):
+        line = sys.stdin.readline()
+        if not line:
+            print('sudo: no password was provided', file=sys.stderr)
+            raise SystemExit(1)
+        if line.rstrip('\n') == 'secret':
+            break
+        print('Sorry, try again.', file=sys.stderr, flush=True)
+    else:
+        print('sudo: 3 incorrect password attempts', file=sys.stderr)
+        raise SystemExit(1)
+elif not cached:
+    print('sudo: a password is required', file=sys.stderr)
+    raise SystemExit(1)
+with open(os.path.join(directory, 'last-command'), 'w') as log:
+    log.write(' '.join(args) + '\n')
+if '--store' in args:
+    args[args.index('--store') + 1] = os.environ['FAKE_SUDO_STORE']
+if args and args[0] == '/usr/bin/env':
+    args = args[2:]
+os.environ['CHROOTABLE_HOME'] = os.environ['FAKE_SUDO_STORE']
+with open(os.path.join(directory, 'helpers'), 'a') as log:
+    log.write(f'{os.getpid()}\n')
+os.execv(args[0], args)
+'''
+
+# A manager stand-in for cancel tests: --slow sleeps until SIGTERM, then cleans up.
+SLOW_MANAGER = '''#!/bin/bash
+case $1 in
+    --slow) trap 'echo "cleaned up" >&2; exit 143' TERM; echo "working" >&2; sleep 30 & wait; exit 0 ;;
+    --echo) shift; printf '%s\\n' "$@"; echo "to stderr" >&2 ;;
+    *) echo "Error: unknown" >&2; exit 2 ;;
 esac
-exit 64
 '''
 
 
@@ -136,6 +171,64 @@ class BackendRules(unittest.TestCase):
         manager = backend.Manager(Path('/usr/bin/chrootable-manager'), sudo='sudo')
         self.assertEqual(manager.argv(['--list', '--json'], True), ['sudo', '-n', '--', '/usr/bin/chrootable-manager', '--list', '--json'])
         self.assertEqual(manager.argv(['--list', '--json'], False), ['/usr/bin/chrootable-manager', '--list', '--json'])
+
+    def test_run_command_arguments(self):
+        self.assertEqual(backend.exec_args('lab', ' uname -a '), ['--exec', 'lab', '--', '/bin/sh', '-c', 'uname -a'])
+        self.assertEqual(backend.exec_args('lab', 'ls', isolated=True)[:3], ['--exec', 'lab', '--isolated'])
+        for name, command in (('lab', ''), ('lab', '   '), ('bad name', 'ls'), ('lab', 'x' * 4001)):
+            with self.assertRaises(ValueError):
+                backend.exec_args(name, command)
+
+    def test_doctor_report_is_parsed_into_levels(self):
+        rows = backend.parse_doctor('CHROOTABLE / Host health\n\n[OK] Host commands\n[INFO] overlay\n[MISSING] debootstrap\n')
+        self.assertEqual(rows, [('', 'CHROOTABLE / Host health'), ('OK', 'Host commands'), ('INFO', 'overlay'),
+                                ('MISSING', 'debootstrap')])
+
+    def test_prune_keeps_the_newest_snapshots(self):
+        snapshots = [{'label': 'b', 'snapshot_at': '2026-10-02'}, {'label': 'a', 'snapshot_at': '2026-10-01'},
+                     {'label': 'c', 'snapshot_at': '2026-10-03'}]
+        self.assertEqual(backend.prune_plan(snapshots, 1), ['a', 'b'])
+        self.assertEqual(backend.prune_plan(snapshots, 3), [])
+        self.assertEqual(backend.prune_plan(snapshots, 0), ['a', 'b', 'c'])
+
+    def test_list_filters_and_sorts(self):
+        spaces = [{'name': 'b', 'lifecycle': 'persistent', 'size_mib': 10, 'last_used_at': 'never', 'status': 'ready'},
+                  {'name': 'a', 'lifecycle': 'ephemeral', 'size_mib': 30, 'last_used_at': '2026-10-02', 'status': 'busy',
+                   'description': 'Firmware'},
+                  {'name': 'C', 'lifecycle': 'persistent', 'size_mib': 20, 'last_used_at': '2026-10-01', 'status': 'ready'}]
+        names = lambda items: [w['name'] for w in items]
+        self.assertEqual(names(backend.arrange(spaces)), ['a', 'b', 'C'])
+        self.assertEqual(names(backend.arrange(spaces, 'size')), ['a', 'C', 'b'])
+        self.assertEqual(names(backend.arrange(spaces, 'used')), ['a', 'C', 'b'])
+        self.assertEqual(names(backend.arrange(spaces, kind='persistent')), ['b', 'C'])
+        self.assertEqual(names(backend.arrange(spaces, kind='busy')), ['a'])
+        self.assertEqual(names(backend.arrange(spaces, query='firm')), ['a'])
+
+    def test_space_check_keeps_a_spare_gibibyte(self):
+        gib = 1073741824
+        self.assertIsNone(backend.space_problem(1024, None))
+        self.assertIsNone(backend.space_problem(1024, 3 * gib))
+        self.assertIn('Needs 2.0 GiB', backend.space_problem(2048, 2 * gib))
+
+    def test_settings_round_trip_and_reject_bad_values(self):
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as temp:
+            saved = os.environ.get('XDG_CONFIG_HOME')
+            os.environ['XDG_CONFIG_HOME'] = temp
+            try:
+                self.assertEqual(backend.load_settings()['idle_minutes'], 15)
+                settings = backend.load_settings()
+                settings.update(idle_minutes=30, sort='size', history=['ls'])
+                backend.save_settings(settings)
+                self.assertEqual(backend.load_settings()['sort'], 'size')
+                self.assertEqual(backend.load_settings()['history'], ['ls'])
+                (Path(temp) / 'chrootables/settings.json').write_text('{"sort": "evil", "idle_minutes": "x", "history": [1, "ok"]}')
+                loaded = backend.load_settings()
+                self.assertEqual((loaded['sort'], loaded['idle_minutes'], loaded['history']), ('name', 15, ['ok']))
+            finally:
+                if saved is None:
+                    os.environ.pop('XDG_CONFIG_HOME', None)
+                else:
+                    os.environ['XDG_CONFIG_HOME'] = saved
 
     def test_result_messages_prefer_the_manager_error(self):
         result = backend.Result(1, '', 'Creating x\nError: Not enough free space in /var\n')
@@ -203,43 +296,139 @@ class ManagerContract(unittest.TestCase):
 
 
 class SudoFlow(unittest.TestCase):
-    def test_private_store_needs_a_password_once(self):
-        with tempfile.TemporaryDirectory(prefix='chrootables-sudo-', dir=SCRATCH) as temp:
-            temp = Path(temp)
-            readable = make_store(temp / 'readable')
-            private = make_store(temp / 'private')
-            private.chmod(0)
-            sudo = temp / 'sudo'
-            sudo.write_text(FAKE_SUDO)
-            sudo.chmod(0o755)
-            env = dict(CHROOTABLE_HOME=str(private), FAKE_SUDO_DIR=str(temp), FAKE_SUDO_STORE=str(readable))
-            saved = {key: os.environ.get(key) for key in env}
-            os.environ.update(env)
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='chrootables-sudo-', dir=SCRATCH)
+        temp = self.dir = Path(self.temp.name)
+        self.readable = make_store(temp / 'readable')
+        self.private = make_store(temp / 'private')
+        self.private.chmod(0)
+        self.sudo = temp / 'sudo'
+        self.sudo.write_text(FAKE_SUDO)
+        self.sudo.chmod(0o755)
+        env = dict(CHROOTABLE_HOME=str(self.private), FAKE_SUDO_DIR=str(temp), FAKE_SUDO_STORE=str(self.readable))
+        self.saved = {key: os.environ.get(key) for key in env}
+        os.environ.update(env)
+        self.managers = []
+
+    def tearDown(self):
+        for manager in self.managers:
+            if manager.broker:
+                manager.broker.close(wait=5)
+        self.private.chmod(0o700)
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.temp.cleanup()
+
+    def manager(self, path=MANAGER, **options):
+        manager = backend.Manager(path, sudo=str(self.sudo), **options)
+        self.managers.append(manager)
+        return manager
+
+    def test_one_password_unlocks_every_command_even_when_sudo_remembers_nothing(self):
+        manager = self.manager()
+        with self.assertRaises(backend.AuthRequired):
+            manager.workspaces()
+        self.assertTrue(manager.private_store)
+        self.assertFalse(manager.authenticated())
+        self.assertFalse(manager.authenticate('wrong'))
+        self.assertFalse(manager.unlocked())
+        self.assertTrue(manager.authenticate('secret'))
+        # The regression: with timestamp_timeout=0 every later command used to ask again.
+        for _ in range(3):
+            self.assertEqual(len(manager.workspaces()), 3)
+        self.assertEqual(len(manager.snapshots('build-lab')), 2)
+        # Concurrent requests share the one helper and get their own answers.
+        results = {}
+        threads = [threading.Thread(target=lambda n=n: results.__setitem__(n, manager.snapshots(n)))
+                   for n in ('build-lab', 'network-kit', 'python-playground')]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual({n: len(v) for n, v in results.items()}, {'build-lab': 2, 'network-kit': 0, 'python-playground': 0})
+        self.assertEqual(len((self.dir / 'helpers').read_text().split()), 1, 'more than one sudo for one unlock')
+        # sudo resets the environment: a custom store is passed explicitly.
+        self.assertIn(f'--store {self.private}', (self.dir / 'last-command').read_text())
+        self.assertIn('broker.py', (self.dir / 'last-command').read_text())
+
+    def test_lock_stops_the_helper_and_the_store_asks_again(self):
+        manager = self.manager()
+        closed = []
+        manager.on_lock = closed.append
+        self.assertTrue(manager.authenticate('secret'))
+        self.assertTrue(manager.unlocked())
+        self.assertTrue(manager.lock())
+        self.assertFalse(manager.unlocked())
+        with self.assertRaises(backend.AuthRequired):
+            manager.workspaces()
+
+    def test_passive_reads_never_start_the_helper(self):
+        manager = self.manager()
+        with self.assertRaises(backend.AuthRequired):
+            manager.workspaces()
+        with self.assertRaises(backend.AuthRequired):
+            manager.workspaces(passive=True)
+        self.assertFalse((self.dir / 'helpers').exists())
+
+    def test_cached_sudo_starts_the_helper_without_a_password(self):
+        (self.dir / 'cached').touch()
+        manager = self.manager()
+        self.assertEqual(len(manager.workspaces()), 3)
+        self.assertTrue(manager.unlocked())
+
+    def test_idle_helper_exits_and_reports_it(self):
+        manager = self.manager(idle=1)
+        closed = threading.Event()
+        reasons = []
+        manager.on_lock = lambda reason: (reasons.append(reason), closed.set())
+        self.assertTrue(manager.authenticate('secret'))
+        self.assertTrue(closed.wait(15), 'the idle helper never exited')
+        self.assertEqual(reasons, ['idle'])
+        self.assertFalse(manager.unlocked())
+
+    def test_cancel_stops_a_running_command_and_lets_it_clean_up(self):
+        slow = self.dir / 'slow-manager'
+        slow.write_text(SLOW_MANAGER)
+        slow.chmod(0o755)
+        manager = self.manager(slow)
+        self.assertTrue(manager.authenticate('secret'))
+        lines, outcome = [], {}
+
+        def work():
             try:
-                manager = backend.Manager(MANAGER, sudo=str(sudo))
-                with self.assertRaises(backend.AuthRequired):
-                    manager.workspaces()
-                self.assertTrue(manager.private_store)
-                self.assertFalse(manager.authenticated())
-                self.assertFalse(manager.authenticate('wrong'))
-                self.assertTrue(manager.authenticate('secret'))
-                self.assertTrue(manager.authenticated())
-                self.assertEqual(len(manager.workspaces()), 3)
-                # sudo resets the environment: a custom store is passed explicitly.
-                self.assertIn(f'/usr/bin/env CHROOTABLE_HOME={private} ', (temp / 'last-command').read_text())
-                # A sudo that never keeps the password must not send the window round the dialog again.
-                (temp / 'authenticated').unlink()
-                os.environ['FAKE_SUDO_NO_CACHE'] = '1'
-                with self.assertRaisesRegex(backend.ManagerError, 'will not remember'):
-                    manager.authenticate('secret')
-            finally:
-                os.environ.pop('FAKE_SUDO_NO_CACHE', None)
-                private.chmod(0o700)
-                for key, value in saved.items():
-                    if value is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = value
+                manager.change(['--slow'], on_line=lines.append)
+            except backend.ManagerError as error:
+                outcome['error'] = error
+        thread = threading.Thread(target=work)
+        thread.start()
+        deadline = time.monotonic() + 10
+        while 'working' not in lines and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertTrue(manager.cancel())
+        thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(outcome['error'].status, 143)
+        self.assertIn('cleaned up', lines)
+        # merge streams stdout lines too
+        streamed = []
+        result = manager.change(['--echo', 'a b', 'c'], on_line=streamed.append, merge=True)
+        self.assertEqual(streamed, ['a b', 'c', 'to stderr'])
+        self.assertIn('a b', result.stdout)
+
+    def test_helper_refuses_malformed_requests_and_stray_input(self):
+        manager = self.manager()
+        self.assertTrue(manager.authenticate('secret'))
+        broker = manager.broker
+        with broker._write_lock:
+            broker.process.stdin.write('not json, maybe a password\n')
+            broker.process.stdin.flush()
+        self.assertEqual(broker.request({'run': ['no-dashes']}).status, 64)
+        self.assertEqual(broker.request({'run': 'string'}).status, 64)
+        self.assertEqual(broker.request({'run': ['--list', 'x\0y']}).status, 64)
+        self.assertEqual(broker.request({'ping': True}).stdout, 'pong')
 
 
 def inside_gui(fixture, screenshot):
@@ -281,6 +470,23 @@ def inside_gui(fixture, screenshot):
             assert w.workspace_list.get_row_at_index(1) is None
             w.filter.set_text('')
             w.fill_list()
+            w.kind_buttons['ephemeral'].set_active(True)
+            assert w.list_count.get_text() == '2 of 3', w.list_count.get_text()
+            w.kind_buttons['all'].set_active(True)
+            w.sort_choice.set_selected(list(app.backend.SORTS).index('size'))
+            assert [w.workspace_list.get_row_at_index(i).workspace for i in range(3)][0] in ('build-lab', 'python-playground')
+            w.sort_choice.set_selected(0)
+            w.navigate('run')
+            model = w.run_target.get_model()
+            assert [model.get_string(i) for i in range(model.get_n_items())] == ['build-lab', 'network-kit', 'python-playground']
+            w.select_run_target('network-kit')
+            assert w.run_target_name() == 'network-kit' and 'vanish' in w.run_mode.get_text()
+            assert not w.run_button.get_sensitive()
+            w.run_command.set_text('uname -a')
+            assert w.run_button.get_sensitive()
+            w.console_toggle.set_active(True)
+            assert w.console_revealer.get_reveal_child()
+            w.console_toggle.set_active(False)
             w.navigate('create')
             assert w.create_name.get_text() == 'minimal-lab'
             w.profile_buttons['build'].set_active(True)
@@ -325,12 +531,17 @@ def inside_gui(fixture, screenshot):
             assert any('trixie' in text for text in texts)
             w.set_busy(True, 'Fixture operation')
             assert not any(widget.get_sensitive() for widget in w.action_widgets)
-            assert not w.create_button.get_sensitive()
+            assert not w.create_button.get_sensitive() and w.cancel_button.get_visible()
+            w.start_job('Queued fixture', ['--list'])
+            assert len(w.queue) == 1 and w.queue_label.get_visible()
+            w.drop_queue('Fixture')
+            assert not w.queue and not w.queue_label.get_visible()
             w.set_busy(False, 'Ready.')
+            assert not w.cancel_button.get_visible()
             assert all(widget.get_sensitive() for widget in w.action_widgets)
             self.options.screenshot = Path(screenshot)
             app.GLib.timeout_add(400, self.screenshot)
-            print('PASS: workspace list, selection, filter, details and snapshots, create validation and profile sizing, '
+            print('PASS: workspace list, selection, filter, kind and sort, run page, console, queue, details and snapshots, create validation and profile sizing, '
                   'import suggestions, page shortcuts and busy controls')
             return False
 
@@ -377,8 +588,10 @@ def inside_locked(fixture, screenshot):
                 if self.stage == 'unlocking':
                     if w.lock_card.get_visible() or len(w.workspaces) < 3:
                         return True
-                    assert w.access_label.get_text() == 'Private store · unlocked'
-                    print('PASS: private store locks, rejects a wrong password and unlocks with the right one')
+                    assert w.access_label.get_text().startswith('Private store · unlocked'), w.access_label.get_text()
+                    assert w.lock_button.get_visible() and not w.unlock_button.get_visible()
+                    print('PASS: private store locks, rejects a wrong password and unlocks with the right one, '
+                          'with a sudo that remembers nothing (timestamp_timeout=0)')
                     self.options.screenshot = Path(screenshot)
                     app.GLib.timeout_add(300, self.screenshot)
                     return False

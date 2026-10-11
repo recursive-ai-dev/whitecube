@@ -131,7 +131,9 @@ test('trainer checkpoint launches select the model on first and existing instanc
 test('missing key emits an error and always completes the send', async () => {
   const { handlers } = await start(['--hide']);
   const events = [];
-  await handlers.get('chat:send')({ sender: { send: (...args) => events.push(args) } }, 'hello');
+  const result = await handlers.get('chat:send')({ sender: { send: (...args) => events.push(args) } }, 'hello');
+  assert.equal(result.ok, false);
+  assert.match(result.error, /No API key/);
   assert.equal(events[0][0], 'chat:event');
   assert.match(events[0][1].message, /No API key/);
   assert.equal(events.at(-1)[0], 'chat:done');

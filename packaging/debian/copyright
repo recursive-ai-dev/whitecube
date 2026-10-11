@@ -33,6 +33,20 @@ License: MIT
 Comment: LICENSE in that directory is Electron's; LICENSES.chromium.html lists
  the license of every Chromium component.
 
+Files: usr/libexec/whitecube/cube-browser/*
+Copyright: 2026 recursive-ai-dev
+License: Apache-2.0
+Comment: Statically links mbedTLS (Apache-2.0), QuickJS (MIT), SQLite (public domain),
+ libjpeg-turbo (IJG/BSD-3-Clause/zlib) and includes nanosvg (zlib). Their notices are in
+ /usr/share/doc/whitecube-desktop/cube-browser/licenses/.
+
+Files: usr/bin/cube-player
+Copyright: 2026 recursive-ai-dev
+License: GPL-3+
+Comment: Links libmpv from the Debian libmpv2 package, distributed under GPL-3-or-later.
+ The GPL version 3 text is in /usr/share/common-licenses/GPL-3 and
+ /usr/share/doc/whitecube-desktop/cube-player/COPYING.
+
 License: Apache-2.0
  On Debian systems the complete text of the Apache License, Version 2.0 is in
  /usr/share/common-licenses/Apache-2.0, and in LICENSE beside this file.

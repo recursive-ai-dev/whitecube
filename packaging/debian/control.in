@@ -21,6 +21,12 @@ Description: Whitecube - Wayland desktop with native image and model training st
  GTK4 window or the chrootable-manager command line.
  The wc-* command suite (start with wc-help) opens apps and reports or changes audio,
  network, power and system state from a terminal, with shell completions.
+ Cube Strap builds Debian whitecubes with a bundled deb-strap: chroot workspaces
+ imported into Chrootables, or bootable UEFI virtual machines added to the whitecube
+ image store and run in QEMU.
+ Cube Browser is a native Wayland web preview with its own HTML/CSS engine,
+ sandboxed renderer and network workers. Cube Player plays films and music
+ through libmpv in a native Wayland window.
  Whitecube Trainer adds a native GTK4 workspace for local 1M, 2M, 5M and 10M
  language models, with resumable training, checkpoint previews and Desktop Chat
  integration. Training uses a configured PyTorch environment; the complete model

@@ -1,0 +1,42 @@
+WHITECUBE DESKTOP 0.7.0 — RELEASE VALIDATION
+
+Implemented changes: 168 numbered improvements in IMPROVEMENTS-0.7.0.txt.
+Existing working-tree changes were preserved; source backup and original patch are
+in /home/woez/whitecube-review-20261011/.
+
+PASS: ./BUILD.sh (final-build-0.7.0.log).
+  610 Python unittest cases across 22 test invocations.
+  35 Desktop Chat Node tests.
+  Native compositor configuration, shortcuts, workspace isolation, lock isolation,
+  headless output hotplug, status theme, settings, application catalog and field
+  codes, desktop state, privacy, wallpaper rule tests, and rendered native panels.
+  Network controller and firewall-switch regression tests.
+  Packaging tree, runtime-library and Chat-runtime tests.
+  Headless GUI checks for Trainer, Cube Editor, Chrootables and app visibility.
+  Real GTK Hash, Rename, PDF and Lock operations and all four rendered windows.
+
+PASS: PyTorch pipeline/corpus/training/preset checks in the configured environment.
+  test_pipeline.py: 6 cases.
+  test_corpus_improvements.py: 31 cases.
+  test_training_improvements.py: 27 cases.
+  test_presets.py: 2 cases, including CPU save/resume of 2M, 5M and 10M models.
+  The first combined optional run stopped at the hardware smoke test's existing
+  85 C pre-run temperature guard. It did not start that training job.
+  After cooling, the standalone hardware smoke test passed:
+  persistent 2M worker, nice 10/idle I/O, cooling Stop, checkpoints, resume, preview.
+  Evidence: trainer-hardware-smoke.log; earlier pipeline evidence: build-0.7.0.log.
+
+PASS: actual Wayland Electron Chat UI (chat-ui-tests.log).
+  Settings test/save/focus trap; missing-key errors and draft restoration;
+  streaming, safe Markdown and copy; confirmation Stop; history scroll;
+  conversation search/navigation; inert modal background; prompt recall.
+
+PASS: shell and JavaScript syntax checks; git diff --check.
+Screenshots: /home/woez/whitecube-review-20261011/*-0.7.0.png.
+
+The Debian builder additionally validates the staged paths, native runtime library
+resolution and private Electron sandbox/runtime before publishing the archive.
+Old package versions remain in packaging/out/ for rollback.
+
+Install: sudo apt install ./packaging/out/whitecube-desktop_0.7.0_amd64.deb
+Log out and back in to activate the new compositor and panel binaries.

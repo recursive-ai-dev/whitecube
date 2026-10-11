@@ -16,6 +16,23 @@ import wc_suite as wc
 import install
 
 
+
+class FolderAppTests(unittest.TestCase):
+    def test_files_explains_a_missing_folder_app_instead_of_silently_doing_nothing(self):
+        empty = subprocess.CompletedProcess([], 0, stdout="\n", stderr="")
+        with patch.object(wc.shutil, "which", return_value="/usr/bin/xdg-mime"), \
+             patch.object(wc, "run", return_value=empty), patch.object(wc, "detach") as detach:
+            with self.assertRaisesRegex(wc.Error, "xdg-mime default"):
+                wc.files(argparse.Namespace(directory=Path(tempfile.gettempdir())))
+            detach.assert_not_called()
+
+    def test_files_opens_when_a_folder_app_is_set(self):
+        thunar = subprocess.CompletedProcess([], 0, stdout="thunar.desktop\n", stderr="")
+        with patch.object(wc.shutil, "which", return_value="/usr/bin/xdg-mime"), \
+             patch.object(wc, "run", return_value=thunar), patch.object(wc, "detach") as detach:
+            wc.files(argparse.Namespace(directory=Path(tempfile.gettempdir())))
+            detach.assert_called_once()
+
 class SuiteTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

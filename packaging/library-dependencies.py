@@ -7,7 +7,10 @@ import re
 import subprocess
 import sys
 
-NATIVE = ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca')
+NATIVE = ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
+          'usr/libexec/whitecube/cube-browser/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-renderd',
+          'usr/libexec/whitecube/cube-browser/cube-netd')
+# cube-player is not listed: libmpv (Depends: libmpv2) reaches X11 and is not on the build host.
 RESOLVED = re.compile(r'^\s*(\S+)\s+=>\s+(\S+)\s+\(', re.MULTILINE)
 DIVERTED_FROM = re.compile(r'^diversion by .+ from: (.+)$', re.MULTILINE)
 
@@ -53,7 +56,7 @@ def owner_for_library(path, query=package_query):
 
 def discover(stage, include_chat=False):
     private = (stage / 'usr/lib/whitecube').resolve()
-    binaries = [stage / 'usr/bin' / name for name in NATIVE]
+    binaries = [stage / name for name in NATIVE]
     libraries = [p for p in private.glob('*.so*') if p.is_file() and not p.is_symlink()]
     paths = set()
     runtime = private / 'desktop-chat-runtime'

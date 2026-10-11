@@ -19,6 +19,8 @@ export interface ScriptItem {
   lastRun: string;
   status: ScriptStatus;
   requiresConfirmation?: boolean;
+  pinned?: boolean;
+  tags?: string[];
 }
 
 export interface TerminalLog {

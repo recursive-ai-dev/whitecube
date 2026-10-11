@@ -43,7 +43,7 @@ class Tree(unittest.TestCase):
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
-                     'chrootables', 'chrootable-manager', 'net-off', 'net-on'):
+                     'chrootables', 'chrootable-manager', 'cube-strap', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
@@ -54,7 +54,7 @@ class Tree(unittest.TestCase):
                      'pipeline/train_local.py', 'pipeline/train_supervisor.py', 'pipeline/prepare_folder.py',
                      'pipeline/prepare_parquet.py', 'pipeline/corpus_split.py', 'pipeline/tensegrity_lm.py',
                      'pipeline/tensegrity_nb_lib.py', 'pipeline/tensegrity_serve.py', 'pipeline/preview.py',
-                     'pipeline/pacing.py', 'pipeline/files.py'):
+                     'pipeline/pacing.py', 'pipeline/files.py', 'pipeline/export_model.py'):
             self.assertTrue((trainer / name).is_file(), name)
         for name in ('cube-train', 'whitecube-train'):
             self.assertTrue(os.access(self.stage / 'usr/bin' / name, os.X_OK))

@@ -8,6 +8,8 @@ load_checkpoint, capture_rng_state, restore_rng_state, get_lr, pick_dtype).
 """
 
 import os
+import re
+import shutil
 import json
 import dataclasses
 import time
@@ -615,6 +617,26 @@ def ewc_penalty(model, fisher, old_params):
 # Training loop (notebook-friendly: single device, no DDP/compile)
 # =============================================================================
 
+SNAPSHOT_PATTERN = re.compile(r'^ckpt_step(\d{8,})\.pt$')
+
+
+def save_snapshot(out_dir, completed_steps, keep):
+    """Copy ckpt_latest.pt to a step-numbered snapshot and prune the oldest."""
+    source = os.path.join(out_dir, 'ckpt_latest.pt')
+    target = os.path.join(out_dir, f'ckpt_step{completed_steps:08d}.pt')
+    staging = f'{target}.{os.getpid()}.tmp'
+    try:
+        shutil.copyfile(source, staging)
+        os.replace(staging, target)
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
+    snapshots = sorted(name for name in os.listdir(out_dir) if SNAPSHOT_PATTERN.match(name))
+    for name in snapshots[:-keep]:
+        os.unlink(os.path.join(out_dir, name))
+    return target
+
+
 def run_training(model, optimizer, cfg, out_dir, device,
                   data_dirs, data_weights=None,
                   max_steps=1000, warmup_steps=50,
@@ -624,7 +646,8 @@ def run_training(model, optimizer, cfg, out_dir, device,
                   log_interval=10, eval_interval=100, eval_iters=20,
                   dtype="auto", start_step=0, best_val_loss=float("inf"),
                   ewc_fisher=None, ewc_old_params=None, ewc_lambda=0.0,
-                  init_from="scratch", stop_requested=None, schedule_steps=None):
+                  init_from="scratch", stop_requested=None, schedule_steps=None,
+                  early_stop_patience=0, keep_snapshots=0, outcome=None):
     """
     Train `model` for steps [start_step, max_steps). Checkpoints
     (ckpt_latest.pt / ckpt_best.pt) and a train_log.jsonl are written to
@@ -682,12 +705,25 @@ def run_training(model, optimizer, cfg, out_dir, device,
         horizon of completed steps and print a notice. Validation uses fixed
         batches; best loss resets when the evaluation configuration changes.
 
+    early_stop_patience: stop after this many consecutive evaluations without
+        a new best validation loss (0 disables). The count restarts on resume.
+    keep_snapshots: also keep this many step-numbered copies of the latest
+        checkpoint (ckpt_step00001234.pt), removing the oldest (0 disables).
+    outcome: optional dict that receives stop_reason, final_loss,
+        evaluations and evaluations_without_improvement.
+
     Returns (final_step, best_val_loss).
     """
     if init_from not in ('scratch', 'resume'):
         raise ValueError("init_from must be 'scratch' or 'resume'")
     if schedule not in ('cosine', 'wsd'):
         raise ValueError("schedule must be 'cosine' or 'wsd'")
+    for name, value in {'early_stop_patience': early_stop_patience, 'keep_snapshots': keep_snapshots}.items():
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
+            raise ValueError(f'{name} must be a nonnegative integer')
+    if outcome is not None and not isinstance(outcome, dict):
+        raise ValueError('outcome must be a dict or None')
+    outcome = {} if outcome is None else outcome
     integer_settings = {'max_steps': max_steps, 'warmup_steps': warmup_steps,
                         'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
                         'log_interval': log_interval, 'eval_interval': eval_interval, 'eval_iters': eval_iters}
@@ -828,6 +864,8 @@ def run_training(model, optimizer, cfg, out_dir, device,
         last_evaluated_step = None
         overflow_retries = 0
         tokens_per_step = batch_size * grad_accum_steps * cfg.block_size
+        evaluations = stale_evaluations = 0
+        outcome.update(stop_reason='completed', evaluations=0, evaluations_without_improvement=0)
 
         while step < max_steps:
             if schedule == "wsd":
@@ -949,12 +987,27 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 if improved:
                     save_checkpoint(os.path.join(out_dir, "ckpt_best.pt"), model, optimizer, cfg, step, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
                     print(f"step {step:6d} | new best val_loss {best_val_loss:.4f} -> ckpt_best.pt")
+                if keep_snapshots:
+                    save_snapshot(out_dir, step + 1, keep_snapshots)
+                evaluations += 1
+                stale_evaluations = 0 if improved else stale_evaluations + 1
+                outcome.update(evaluations=evaluations, evaluations_without_improvement=stale_evaluations)
+                if early_stop_patience and stale_evaluations >= early_stop_patience and step + 1 < max_steps:
+                    step += 1
+                    outcome['stop_reason'] = 'early_stop'
+                    print(f"[train] early stop: validation loss did not improve in {stale_evaluations} "
+                          f"evaluations; best {best_val_loss:.4f}")
+                    break
 
             step += 1
             if stop_requested is not None and stop_requested(step):
+                outcome['stop_reason'] = 'stop_requested'
                 print(f"[train] stopping after {step} completed steps; saving checkpoint")
                 break
 
+        if outcome['stop_reason'] == 'stop_requested' and step >= max_steps:
+            outcome['stop_reason'] = 'completed'
+        outcome['final_loss'] = accum_total if step > start_step else last_progress.get('loss')
         if last_evaluated_step != step:
             val_loss = evaluate(model, data_dirs[0], cfg, device, device_type, amp_dtype, use_amp, eval_iters)
         if not math.isfinite(val_loss):
@@ -966,6 +1019,9 @@ def run_training(model, optimizer, cfg, out_dir, device,
         save_checkpoint(os.path.join(out_dir, "ckpt_latest.pt"), model, optimizer, cfg, step - 1, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
         if improved:
             save_checkpoint(os.path.join(out_dir, "ckpt_best.pt"), model, optimizer, cfg, step - 1, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
+        if keep_snapshots and last_evaluated_step != step:
+            save_snapshot(out_dir, step, keep_snapshots)
+        outcome['final_val_loss'] = val_loss
         print(f"[train] done. step={step} final_val_loss[{os.path.basename(data_dirs[0])}]={val_loss:.4f} "
               f"best_val_loss={best_val_loss:.4f}")
         elapsed = time.monotonic() - t0

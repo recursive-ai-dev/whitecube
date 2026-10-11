@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:" />
 <title>Desktop Chat</title>
 <link rel="stylesheet" href="style.css" />
@@ -11,6 +12,8 @@
     <div id="titlebar">
       <span id="title">Desktop Chat</span>
       <div id="titlebar-actions">
+        <button id="btn-find" title="Find in chat (Ctrl+F)" aria-label="Find in chat">Find</button>
+        <button id="btn-copy-chat" title="Copy conversation (Ctrl+Shift+C)" aria-label="Copy conversation as Markdown">Copy chat</button>
         <button id="btn-new" title="New chat (Ctrl+N)" aria-label="New chat">＋</button>
         <button id="btn-settings" title="Settings (Ctrl+,)" aria-label="Settings">⚙</button>
         <button id="btn-hide" title="Hide (Esc)" aria-label="Hide chat">✕</button>
@@ -26,14 +29,22 @@
       </div>
       <p id="model-detail" role="status" aria-live="polite">Finding checkpoints…</p>
     </div>
-    <div id="messages" role="log" aria-label="Chat messages" aria-busy="false"></div>
+    <div id="find-bar" class="hidden" role="search" aria-label="Find in conversation">
+      <input id="find-text" type="search" aria-label="Find text" placeholder="Find in chat…" />
+      <span id="find-count" role="status" aria-live="polite"></span>
+      <button id="find-prev" aria-label="Previous matching message">↑</button>
+      <button id="find-next" aria-label="Next matching message">↓</button>
+      <button id="find-close" aria-label="Close search">×</button>
+    </div>
+    <div id="messages" role="log" aria-label="Chat messages" aria-busy="false" tabindex="0"></div>
     <div id="chat-status"><span id="activity" role="status" aria-live="polite">Ready</span><button id="btn-latest" class="hidden">Jump to latest</button></div>
 
     <div id="composer">
-      <textarea id="input" aria-label="Message" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <textarea id="input" aria-label="Message" aria-describedby="composer-hint" maxlength="100000" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
       <button id="btn-send">Send</button>
       <button id="btn-stop" class="hidden">Stop</button>
     </div>
+    <p id="composer-hint">Enter to send · Shift+Enter for a new line · <span id="draft-count">0</span> characters</p>
   </div>
 
   <div id="settings-overlay" class="hidden">

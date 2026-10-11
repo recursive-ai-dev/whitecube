@@ -61,6 +61,14 @@ class EngineReliabilityTests(unittest.TestCase):
         self.assertFalse(engine.job_running({'pid': os.getpid(), 'identity': {}}))
         self.assertTrue(engine.job_running({'pid': os.getpid(), 'identity': engine.process_identity(os.getpid())}))
 
+    def test_invalid_preferences_never_replace_the_last_valid_configuration(self):
+        self.trainer.save_preferences({'steps':2000, 'device':'cpu'})
+        before = self.trainer.config.read_bytes()
+        for value in ({'steps':True}, {'steps':1.5}, {'steps':float('nan')}, {'device':'tpu'}, {'model_size':'100m'}, {'low_priority':'false'}, {'draft_name':'bad\nname'}, {'column':'x' * 4097}):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.trainer.save_preferences(value)
+            self.assertEqual(self.trainer.config.read_bytes(), before)
+
     def test_invalid_job_paths_do_not_break_run_listing(self):
         self.run_dir()
         for index, value in enumerate(('\0', '', 'relative/path')):

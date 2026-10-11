@@ -1,0 +1,19 @@
+<!doctype html>
+<html><head><title>Cube E2E interactions</title></head>
+<body style="margin:0">
+  <div style="background:#d6e3f0;min-height:280px;padding:16px">
+    <h1>Keyboard interaction</h1>
+    <a href="#bottom" style="display:block">Jump to marker</a>
+    <a href="/visited" style="display:block">Visit another page</a>
+    <form action="/submit" method="get">
+      <input type="hidden" name="token" value="a&amp;b">
+      <input type="text" name="q" value="replace this" aria-label="Search query">
+      <button type="submit" name="go" value="run">Search</button>
+    </form>
+  </div>
+  <div style="min-height:1100px">Scroll space before the anchored section.</div>
+  <section id="bottom" style="background:#6a9f58;min-height:500px;padding:20px">
+    <h2>anchor-marker</h2>
+    <p>Same-document navigation reached this section.</p>
+  </section>
+</body></html>

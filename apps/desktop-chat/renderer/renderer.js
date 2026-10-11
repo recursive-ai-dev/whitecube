@@ -17,6 +17,10 @@ let modelData = null;
 let changingModel = false;
 let renamingId = null;
 
+function syncModals() {
+  document.getElementById('app').inert = [settingsOverlay, confirmOverlay, renameOverlay].some(el => !el.classList.contains('hidden'));
+}
+
 function updateModelControls() {
   modelPicker.disabled = sending || changingModel;
   refreshModelsBtn.disabled = sending || changingModel;
@@ -72,7 +76,7 @@ modelPicker.addEventListener('change', async () => {
     appendBubble('error', err.message || String(err));
   } finally { changingModel = false; updateModelControls(); inputEl.focus(); }
 });
-function closeRename() { renameOverlay.classList.add('hidden'); renamingId = null; renameModelBtn.focus(); }
+function closeRename() { renameOverlay.classList.add('hidden'); syncModals(); renamingId = null; renameModelBtn.focus(); }
 renameModelBtn.addEventListener('click', () => {
   const item = modelData?.items.find(item => item.id === modelPicker.value);
   if (!item) return;
@@ -81,6 +85,7 @@ renameModelBtn.addEventListener('click', () => {
   document.getElementById('rename-name').value = item.customName || item.name;
   document.getElementById('rename-error').textContent = '';
   renameOverlay.classList.remove('hidden');
+  syncModals();
   document.getElementById('rename-name').focus(); document.getElementById('rename-name').select();
 });
 document.getElementById('rename-cancel').addEventListener('click', closeRename);
@@ -99,8 +104,15 @@ const activityEl = document.getElementById('activity');
 const latestBtn = document.getElementById('btn-latest');
 const draftKey = 'desktop-chat-draft';
 try { inputEl.value = localStorage.getItem(draftKey) || ''; } catch {}
-function saveDraft() { try { localStorage.setItem(draftKey, inputEl.value); } catch {} }
-inputEl.addEventListener('input', () => { saveDraft(); sendBtn.disabled = !inputEl.value.trim(); });
+function updateComposer() {
+  sendBtn.disabled = !inputEl.value.trim() || changingModel;
+  document.getElementById('draft-count').textContent = inputEl.value.length.toLocaleString();
+  inputEl.style.height = 'auto';
+  inputEl.style.height = Math.min(180, Math.max(48, inputEl.scrollHeight)) + 'px';
+}
+function saveDraft() { try { localStorage.setItem(draftKey, inputEl.value); } catch {} updateComposer(); }
+inputEl.addEventListener('input', saveDraft);
+updateComposer();
 sendBtn.disabled = !inputEl.value.trim();
 messagesEl.addEventListener('scroll', () => {
   stickToBottom = messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 60;
@@ -136,6 +148,13 @@ function appendBubble(role, text) {
   el._textNode = textNode;
   el._raw = text;
   messagesEl.appendChild(el);
+  if (role === 'user') {
+    const copy = document.createElement('button');
+    copy.className = 'copy-reply'; copy.textContent = 'Copy message';
+    copy.setAttribute('aria-label', 'Copy user message');
+    copy.addEventListener('click', () => window.api.copyText(el._raw));
+    el.appendChild(copy);
+  }
   scrollToBottom();
   return el;
 }
@@ -187,6 +206,7 @@ function setSending(v) {
   sendBtn.classList.toggle('hidden', v);
   stopBtn.classList.toggle('hidden', !v);
   newBtn.disabled = v;
+  document.getElementById('s-save').disabled = v;
   updateModelControls();
   activityEl.textContent = v ? 'Working…' : 'Ready';
   messagesEl.setAttribute('aria-busy', String(v));
@@ -198,11 +218,18 @@ async function send() {
   if (!text || sending || changingModel) return;
   inputEl.value = '';
   saveDraft(); stickToBottom = true;
-  appendBubble('user', text);
+  const bubble = appendBubble('user', text);
   currentAssistantEl = null;
   setSending(true);
-  try { await window.api.sendMessage(text); }
-  catch (err) { finishAssistant(); appendBubble('error', err.message || String(err)); setSending(false); }
+  function restoreDraft() {
+    bubble.classList.add('failed-send');
+    if (!inputEl.value) { inputEl.value = text; saveDraft(); }
+  }
+  try {
+    const result = await window.api.sendMessage(text);
+    if (result?.ok === false) restoreDraft();
+  }
+  catch (err) { restoreDraft(); finishAssistant(); appendBubble('error', err.message || String(err)); setSending(false); }
 }
 
 sendBtn.addEventListener('click', send);
@@ -212,6 +239,10 @@ stopBtn.addEventListener('click', async () => {
   catch (err) { appendBubble('error', err.message || String(err)); setSending(false); }
 });
 inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowUp' && e.altKey && !sending) {
+    const last = messagesEl.querySelector('.msg.user:last-of-type') || [...messagesEl.querySelectorAll('.msg.user')].at(-1);
+    if (last && !inputEl.value) { e.preventDefault(); inputEl.value = last._raw; saveDraft(); }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     send();
@@ -223,14 +254,18 @@ document.addEventListener('keydown', (e) => {
     !renameOverlay.classList.contains('hidden') ? renameOverlay :
     !settingsOverlay.classList.contains('hidden') ? settingsOverlay : null;
   if (modal && e.key === 'Tab') {
-    const controls = [...modal.querySelectorAll('button, input, select')].filter(el => !el.disabled);
+    const controls = [...modal.querySelectorAll('button, input, select, textarea, [tabindex="0"]')].filter(el => !el.disabled && el.getClientRects().length);
     const first = controls[0], last = controls[controls.length - 1];
+    if (!first) { e.preventDefault(); return; }
     if (e.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
       e.preventDefault(); last.focus();
     } else if (!e.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
       e.preventDefault(); first.focus();
     }
   }
+  if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); openFind(); }
+  if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') { e.preventDefault(); inputEl.focus(); }
+  if (!modal && (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'c' && !window.getSelection()?.toString()) { e.preventDefault(); copyChat(); }
   if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
     e.preventDefault(); if (!sending) newBtn.click();
   }
@@ -242,6 +277,8 @@ document.addEventListener('keydown', (e) => {
       closeRename();
     } else if (!settingsOverlay.classList.contains('hidden')) {
       closeSettings();
+    } else if (!document.getElementById('find-bar').classList.contains('hidden')) {
+      closeFind();
     } else {
       window.api.hidePanel();
     }
@@ -259,12 +296,15 @@ hideBtn.addEventListener('click', () => window.api.hidePanel());
 function clearTranscript() {
   messagesEl.innerHTML = '';
   currentAssistantEl = null; pendingText = ''; stickToBottom = true;
+  latestBtn.classList.add('hidden');
+  updateFind();
   inputEl.focus();
 }
 window.api.onCleared(clearTranscript);
 
 window.api.onShown(() => {
-  if (!renameOverlay.classList.contains('hidden')) document.getElementById('rename-name').focus();
+  if (!confirmOverlay.classList.contains('hidden')) document.getElementById('confirm-deny').focus();
+  else if (!renameOverlay.classList.contains('hidden')) document.getElementById('rename-name').focus();
   else if (!settingsOverlay.classList.contains('hidden')) sEndpoint.focus();
   else inputEl.focus();
 });
@@ -304,6 +344,7 @@ window.api.onEvent((event) => {
 window.api.onDone(() => {
   finishAssistant();
   setSending(false);
+  updateFind();
   if (settingsOverlay.classList.contains('hidden') && confirmOverlay.classList.contains('hidden')) inputEl.focus();
 });
 
@@ -318,10 +359,12 @@ window.api.onConfirmRequest(({ requestId, name, args, preview }) => {
   confirmTitle.textContent = `Allow ${name}?`;
   confirmBody.textContent = preview || JSON.stringify(args, null, 2);
   confirmOverlay.classList.remove('hidden');
+  syncModals();
   document.getElementById('confirm-deny').focus();
 });
 window.api.onConfirmCancelled(() => {
   activeConfirm = null; confirmOverlay.classList.add('hidden');
+  syncModals();
 });
 document.getElementById('confirm-stop').addEventListener('click', () => stopBtn.click());
 
@@ -329,6 +372,7 @@ document.getElementById('confirm-allow').addEventListener('click', () => {
   if (activeConfirm) window.api.respondConfirm(activeConfirm, true);
   activeConfirm = null;
   confirmOverlay.classList.add('hidden');
+  syncModals();
   stopBtn.focus();
 });
 
@@ -336,6 +380,7 @@ document.getElementById('confirm-deny').addEventListener('click', () => {
   if (activeConfirm) window.api.respondConfirm(activeConfirm, false);
   activeConfirm = null;
   confirmOverlay.classList.add('hidden');
+  syncModals();
   stopBtn.focus();
 });
 
@@ -364,10 +409,11 @@ async function openSettings() {
   document.getElementById('s-path').textContent = s.configPath ? `Config: ${s.configPath}` : '';
   document.getElementById('s-test-result').textContent = '';
   settingsOverlay.classList.remove('hidden');
+  syncModals();
   sEndpoint.focus();
 }
 
-function closeSettings() { settingsOverlay.classList.add('hidden'); inputEl.focus(); }
+function closeSettings() { settingsOverlay.classList.add('hidden'); syncModals(); sApiKey.value = ''; inputEl.focus(); }
 function editedSettings() {
   return { endpoint: sEndpoint.value.trim(), model: sModel.value.trim(), apiKey: sApiKey.value,
     confirmDestructive: sConfirm.checked, hotkey: sHotkey.value.trim() || 'CommandOrControl+Shift+T' };
@@ -380,13 +426,14 @@ document.getElementById('s-cancel').addEventListener('click', closeSettings);
 
 document.getElementById('s-save').addEventListener('click', async () => {
   const resultEl = document.getElementById('s-test-result');
+  const button = document.getElementById('s-save'); button.disabled = true;
   try {
     await window.api.saveSettings(editedSettings());
     await refreshModels();
     closeSettings();
   } catch (err) {
     resultEl.textContent = err.message || String(err);
-  }
+  } finally { button.disabled = sending; }
 });
 
 document.getElementById('s-test').addEventListener('click', async () => {
@@ -417,3 +464,42 @@ window.api.getSettings().then((s) => {
 
 inputEl.focus();
 refreshModels();
+
+let foundMessages = [], foundIndex = -1;
+function updateFind() {
+  const needle = document.getElementById('find-text').value.trim().normalize('NFKC').toLocaleLowerCase();
+  for (const el of messagesEl.children) el.classList.remove('find-match', 'find-current');
+  foundMessages = needle ? [...messagesEl.children].filter(el => (el._raw || el.textContent).normalize('NFKC').toLocaleLowerCase().includes(needle)) : [];
+  for (const el of foundMessages) el.classList.add('find-match');
+  foundIndex = Math.min(foundIndex, foundMessages.length - 1);
+  document.getElementById('find-count').textContent = `${foundMessages.length} matching messages`;
+  for (const id of ['find-prev', 'find-next']) document.getElementById(id).disabled = !foundMessages.length;
+}
+function navigateFind(delta) {
+  if (!foundMessages.length) return;
+  for (const el of foundMessages) el.classList.remove('find-current');
+  foundIndex = (foundIndex + delta + foundMessages.length) % foundMessages.length;
+  const el = foundMessages[foundIndex]; el.classList.add('find-current');
+  stickToBottom = false; el.scrollIntoView({block:'center'});
+  document.getElementById('find-count').textContent = `${foundIndex + 1} of ${foundMessages.length} matching messages`;
+}
+function openFind() {
+  document.getElementById('find-bar').classList.remove('hidden');
+  updateFind(); document.getElementById('find-text').focus();
+}
+function closeFind() {
+  document.getElementById('find-bar').classList.add('hidden');
+  document.getElementById('find-text').value = ''; updateFind(); inputEl.focus();
+}
+function copyChat() {
+  flushPendingText();
+  const text = [...messagesEl.querySelectorAll('.msg.user, .msg.assistant')].map(el => `## ${el.classList.contains('user') ? 'You' : 'Assistant'}\n\n${el._raw}`).join('\n\n');
+  if (text) { window.api.copyText(text); activityEl.textContent = 'Conversation copied as Markdown'; }
+}
+document.getElementById('btn-find').addEventListener('click', openFind);
+document.getElementById('find-close').addEventListener('click', closeFind);
+document.getElementById('find-text').addEventListener('input', () => { foundIndex = -1; updateFind(); });
+document.getElementById('find-text').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); navigateFind(e.shiftKey ? -1 : 1); } });
+document.getElementById('find-next').addEventListener('click', () => navigateFind(1));
+document.getElementById('find-prev').addEventListener('click', () => navigateFind(-1));
+document.getElementById('btn-copy-chat').addEventListener('click', copyChat);

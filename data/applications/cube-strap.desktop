@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Cube Strap
+GenericName=Debian Cube Builder
+Comment=Bootstrap Debian whitecubes: Chrootables workspaces or bootable VMs
+Exec=/usr/bin/cube-strap
+TryExec=/usr/bin/cube-strap
+Icon=cube-strap
+Terminal=false
+Categories=System;Development;
+Keywords=Debian;debootstrap;deb-strap;chroot;VM;QEMU;image;whitecube;bootstrap;
+StartupNotify=true
+StartupWMClass=org.whitecube.CubeStrap
+X-Wayland-Native=true

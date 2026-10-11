@@ -32,6 +32,7 @@ import { isFailure } from './hooks';
 import { applySysctlEntries, fetchSysctlBackups, restoreSysctlBackup } from './sysctlClient';
 import { loadState, saveState } from './storage';
 import { formatTimestamp } from './time';
+import { normalizeShortcut } from './shortcuts';
 import type { HostInfo, RunEvent } from './lab.d';
 import { ScriptItem, TerminalLog, ScriptStatus, Category, ViewMode, NautilusAction, ShortcutGroup } from './types';
 
@@ -55,10 +56,13 @@ const App: React.FC = () => {
   const [activeView, setActiveView] = useState<ViewMode>('Overview');
   const [activeCategory, setActiveCategory] = useState<Category | 'All'>('All');
   const [searchQuery, setSearchQuery] = useState('');
+  const [pinnedOnly, setPinnedOnly] = useState(false);
+  const [commandSort, setCommandSort] = useState('pinned');
   const [host, setHost] = useState<HostInfo | null>(null);
   const [session, setSession] = useState('');
   const [currentDirectory, setCurrentDirectory] = useState('~');
   const [running, setRunning] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [sysctlRefresh, setSysctlRefresh] = useState(0);
   const [persistSysctl, setPersistSysctl] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -96,14 +100,16 @@ const App: React.FC = () => {
   // Key Listener for Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (document.querySelector('[role="dialog"]')) return;
       if (e.ctrlKey && !e.altKey && e.key.toLowerCase() === 'k') {
         e.preventDefault();
         setPaletteOpen((o) => !o);
         return;
       }
-      if (e.altKey && !e.ctrlKey && !e.shiftKey) {
-        const combo = `ALT+${e.key.toUpperCase()}`;
-        const group = shortcutGroups.find((g) => g.shortcut.toUpperCase() === combo);
+      if (e.ctrlKey && e.code === 'Backquote') { e.preventDefault(); window.dispatchEvent(new Event('cc:focus-terminal')); return; }
+      if ((e.altKey && !e.ctrlKey && !e.shiftKey) || (e.ctrlKey && e.shiftKey && !e.altKey)) {
+        const combo = `${e.ctrlKey ? 'CTRL+SHIFT' : 'ALT'}+${e.key.toUpperCase()}`;
+        const group = shortcutGroups.find((g) => normalizeShortcut(g.shortcut) === combo);
         if (group) {
           e.preventDefault();
           setActiveOverlayGroup(group);
@@ -228,6 +234,7 @@ const App: React.FC = () => {
     }
     jobRef.current = null;
     setRunning(false);
+    setStopping(false);
   }, [addLog, addLogs, shortDir]);
 
   useEffect(() => window.lab.onRun(handleRunEvent), [handleRunEvent]);
@@ -258,7 +265,12 @@ const App: React.FC = () => {
     queued.forEach(handleRunEvent);
   };
 
-  const interrupt = () => { if (jobRef.current?.id) window.lab.kill(jobRef.current.id); };
+  const interrupt = async () => {
+    if (!jobRef.current?.id || stopping) return;
+    setStopping(true);
+    try { await window.lab.kill(jobRef.current.id); }
+    catch (e) { addLog(`Could not stop command: ${(e as Error).message}`, 'error'); setStopping(false); }
+  };
 
   const requestRun = (command: string, run: () => void, title = 'Privileged Execution') => {
     if (PRIVILEGED.test(command)) {
@@ -382,24 +394,28 @@ const App: React.FC = () => {
     }
   };
 
-  const paletteItems = useMemo<PaletteItem[]>(() => [
+  const paletteItems: PaletteItem[] = [
     ...(['Overview', 'Processes', 'Storage', 'Network', 'Services', 'Journal', 'Updates', 'Packages', 'Diagnostics', 'Activity', 'Settings', 'Display', 'Sysctl', 'Nautilus', 'Shortcuts', 'Dashboard'] as ViewMode[]).map((v) => ({
       id: `view-${v}`, label: `Go to ${v === 'Display' ? 'Display Session' : v === 'Sysctl' ? 'Kernel Settings' : v === 'Dashboard' ? 'Commands' : v}`, hint: 'view', icon: 'arrow_forward', run: () => setActiveView(v),
     })),
-    ...scripts.map((sc) => ({ id: `run-${sc.id}`, label: `Run ${sc.name}`, hint: sc.command, icon: sc.icon, run: () => handleRunRequest(sc.id) })),
+    ...scripts.slice().sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned)).map((sc) => ({ id: `run-${sc.id}`, label: `Run ${sc.name}`, hint: `${sc.command} ${(sc.tags || []).join(' ')}`, icon: sc.icon, run: () => handleRunRequest(sc.id) })),
+    ...shortcutGroups.map(group => ({ id: `group-${group.id}`, label: `Open ${group.name}`, hint: group.shortcut || 'shortcut group · unbound', icon: 'keyboard', run: () => setActiveOverlayGroup(group) })),
+    { id: 'new-command', label: 'Create a new command', hint: 'library', icon: 'add', run: () => openAddModal() },
+    { id: 'terminal', label: 'Focus terminal', hint: 'Ctrl+`', icon: 'terminal', run: () => window.dispatchEvent(new Event('cc:focus-terminal')) },
     { id: 'wallpaper', label: 'New wallpaper', hint: 'free API: picsum.photos', icon: 'wallpaper', run: () => { loadWallpaper().then((d) => addLog(`[wallpaper] ${d}`, 'success')).catch((e) => addLog(`[wallpaper] ${e.message}`, 'error')); } },
     { id: 'clear', label: 'Clear terminal', hint: 'Ctrl+L', icon: 'delete_sweep', run: () => setLogs([]) },
-  ], [scripts, loadWallpaper]); // eslint-disable-line react-hooks/exhaustive-deps
+  ];
 
   // Filter Scripts
   const filteredScripts = useMemo(() => {
     let result = activeCategory === 'All' ? scripts : scripts.filter((s) => s.category === activeCategory);
     if (searchQuery) {
       const q = searchQuery.toLowerCase();
-      result = result.filter((s) => `${s.name} ${s.description} ${s.command}`.toLowerCase().includes(q));
+      result = result.filter((s) => `${s.name} ${s.description} ${s.command} ${(s.tags || []).join(' ')}`.toLowerCase().includes(q));
     }
-    return result;
-  }, [scripts, activeCategory, searchQuery]);
+    if (pinnedOnly) result = result.filter(s => s.pinned);
+    return result.slice().sort((a, b) => commandSort === 'name' ? a.name.localeCompare(b.name) : commandSort === 'recent' ? (Date.parse(b.lastRun) || 0) - (Date.parse(a.lastRun) || 0) : Number(!!b.pinned) - Number(!!a.pinned) || a.name.localeCompare(b.name));
+  }, [scripts, activeCategory, searchQuery, pinnedOnly, commandSort]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { All: scripts.length };
@@ -428,11 +444,13 @@ const App: React.FC = () => {
   };
 
   const handleDeleteScript = (id: string) => {
-    if (confirm('Are you sure you want to remove this configuration?')) {
+    const script = scripts.find(s => s.id === id);
+    if (!script) return;
+    setConfirming({ title: 'Remove command', message: `Remove “${script.name}” from your library and shortcut groups?`, command: script.command, run: () => {
       setScripts(prev => prev.filter(s => s.id !== id));
       setShortcutGroups(prev => prev.map(g => ({ ...g, scriptIds: g.scriptIds.filter(sid => sid !== id) })));
-      addLog(`[Config] Configuration ${id} removed.`, 'error');
-    }
+      addLog(`[Config] Configuration ${id} removed.`, 'info');
+    } });
   };
 
   // Nautilus Actions Handlers
@@ -506,7 +524,7 @@ const App: React.FC = () => {
           {/* Main Content Area based on View */}
           <div className="flex-1 overflow-y-auto relative">
              
-             {activeView === 'Overview' && <Overview host={host} webApis={webApis} onToggleWeb={toggleWeb} onNavigate={setActiveView} />}
+             {activeView === 'Overview' && <Overview host={host} webApis={webApis} onToggleWeb={toggleWeb} onNavigate={setActiveView} scripts={scripts} running={running} onRun={handleRunRequest} onNew={openAddModal} />}
              {activeView === 'Storage' && <StoragePanel />}
              {activeView === 'Packages' && <PackagesPanel />}
              {activeView === 'Diagnostics' && <DiagnosticsPanel />}
@@ -539,7 +557,7 @@ const App: React.FC = () => {
                           {activeCategory === 'All' ? 'Command library' : activeCategory}
                         </h2>
                         <p className="text-white/50 text-sm">
-                          {filteredScripts.length} active configurations available
+                          {scripts.length} saved commands · {scripts.filter(s => s.pinned).length} pinned
                         </p>
                       </div>
                       
@@ -548,7 +566,8 @@ const App: React.FC = () => {
                           <span className="material-symbols-outlined absolute left-3 top-1/2 -translate-y-1/2 text-white/30 group-focus-within:text-whitecube-accent transition-colors">search</span>
                           <input 
                             type="text"
-                            placeholder="Search commands..."
+                            aria-label="Search commands and tags"
+                            placeholder="Search commands or tags…"
                             className="w-full bg-black/20 border border-white/10 rounded-full pl-10 pr-4 py-2 text-sm text-white focus:ring-1 focus:ring-whitecube-accent focus:border-whitecube-accent outline-none transition-all"
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
@@ -564,6 +583,7 @@ const App: React.FC = () => {
                       </div>
                     </div>
 
+                    <div className="flex flex-wrap items-center gap-3 mb-5 text-xs"><button aria-pressed={pinnedOnly} onClick={() => setPinnedOnly(!pinnedOnly)} className={`px-3 py-2 rounded-lg border ${pinnedOnly ? 'bg-whitecube-accent/10 border-whitecube-accent/40 text-red-200' : 'border-white/10 text-white/60'}`}>Pinned only</button><label className="flex items-center gap-2 text-white/60">Sort<select aria-label="Sort commands" value={commandSort} onChange={e => setCommandSort(e.target.value)} className="bg-white/5 border border-white/10 rounded-lg px-3 py-2"><option value="pinned">Pinned first</option><option value="name">Name</option><option value="recent">Recently run</option></select></label><span className="text-white/40 ml-auto">{filteredScripts.length} shown</span></div>
                     {filteredScripts.length === 0 ? (
                       <div className="flex flex-col items-center justify-center h-64 border-2 border-dashed border-white/10 rounded-xl text-white/30">
                         <span className="material-symbols-outlined text-4xl mb-2">search_off</span>
@@ -572,13 +592,15 @@ const App: React.FC = () => {
                     ) : (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 pb-10">
                         {filteredScripts.map(script => (
-                          <div key={script.id} className="h-48">
+                          <div key={script.id}>
                             <ScriptCard 
                               script={script} 
                               onRun={handleRunRequest}
                               onEdit={openEditModal}
                               onDelete={handleDeleteScript}
                               onToggleConfirmation={handleToggleConfirmation}
+                              onPin={id => setScripts(prev => prev.map(s => s.id === id ? { ...s, pinned: !s.pinned } : s))}
+                              busy={running}
                             />
                           </div>
                         ))}
@@ -624,6 +646,7 @@ const App: React.FC = () => {
             cwd={currentDirectory}
             prompt={host ? `${host.user}@${host.hostname}` : 'user@host'}
             running={running}
+            stopping={stopping}
           />
         </main>
       </div>

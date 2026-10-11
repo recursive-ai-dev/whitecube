@@ -1,0 +1,3 @@
+# Fontconfig keeps process-wide font caches after Pango layouts are released.
+# All application allocations remain checked.
+leak:libfontconfig.so
