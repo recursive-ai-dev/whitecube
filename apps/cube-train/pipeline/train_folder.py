@@ -181,9 +181,11 @@ class Monitor:
 
 # Hyperparameters chosen for a new run and reused when it is resumed.
 HYPERPARAMETERS = {'learning_rate': 3e-4, 'min_lr_ratio': .1, 'warmup_steps': None, 'weight_decay': .1,
-                   'grad_clip': 1.0, 'eval_interval': 50, 'seed': 1337, 'schedule': 'cosine', 'val_fraction': .05}
+                   'grad_clip': 1.0, 'eval_interval': 50, 'eval_iters': 20, 'dtype': 'auto',
+                   'seed': 1337, 'schedule': 'cosine', 'val_fraction': .05}
 # Operational controls; a resume may change them.
-CONTROLS = {'early_stop_patience': 0, 'keep_snapshots': 0, 'max_minutes': 0, 'thermal_pause': False}
+CONTROLS = {'early_stop_patience': 0, 'early_stop_min_delta': 0.0, 'log_interval': 10,
+            'keep_snapshots': 0, 'max_minutes': 0, 'thermal_pause': False}
 
 
 def read_previous_result(run):
@@ -231,11 +233,16 @@ def main():
     tuning.add_argument('--weight-decay', type=float, help='AdamW weight decay (default 0.1)')
     tuning.add_argument('--grad-clip', type=float, help='Gradient norm clip; 0 disables (default 1.0)')
     tuning.add_argument('--eval-interval', type=int, help='Validate and checkpoint every N steps (default 50)')
+    tuning.add_argument('--eval-iters', type=int, help='Validation batches of eight sequences per evaluation (default 20)')
+    tuning.add_argument('--dtype', choices=('auto', 'float32', 'bfloat16', 'float16'),
+                        help='Compute precision (default auto; resume preserves the saved actual precision)')
     tuning.add_argument('--seed', type=int, help='Seed for weights, batches and the corpus split (default 1337)')
     tuning.add_argument('--schedule', choices=('cosine', 'wsd'), help='Cosine decay, or warmup-stable-decay (default cosine)')
     tuning.add_argument('--val-fraction', type=float, help='Validation share of documents, 0.01-0.5 (default 0.05)')
     control = parser.add_argument_group('run controls (may change on resume)')
-    control.add_argument('--early-stop-patience', type=int, help='Stop after N evaluations without a new best (0 disables)')
+    control.add_argument('--early-stop-patience', type=int, help='Stop after N evaluations without meaningful improvement (0 disables)')
+    control.add_argument('--early-stop-min-delta', type=float, help='Minimum absolute validation-loss improvement (default 0; changing it resets patience history)')
+    control.add_argument('--log-interval', type=int, help='Write training progress every N steps (default 10)')
     control.add_argument('--keep-snapshots', type=int, help='Keep N step-numbered checkpoint copies (0 disables)')
     control.add_argument('--max-minutes', type=float, help='Save and stop after this many minutes of training (0 disables)')
     control.add_argument('--thermal-pause', action=argparse.BooleanOptionalAction, default=None,
@@ -264,11 +271,16 @@ def main():
         parser.error('Training bursts must be 0-3600 seconds and cooldowns greater than 0, up to 600 seconds')
     checks = {'learning_rate': (1e-6, .1), 'min_lr_ratio': (0, 1), 'weight_decay': (0, 1), 'grad_clip': (0, 100),
               'val_fraction': (.01, .5), 'warmup_steps': (0, 1_000_000), 'eval_interval': (1, 10_000_000),
+              'eval_iters': (1, 10_000), 'log_interval': (1, 10_000_000),
               'seed': (0, 2**31 - 1), 'early_stop_patience': (0, 1000), 'keep_snapshots': (0, 100), 'max_minutes': (0, 525_600)}
     for key, (low, high) in checks.items():
         value = getattr(args, key)
         if value is not None and not (math.isfinite(value) and low <= value <= high):
             parser.error(f'--{key.replace("_", "-")} must be between {low:g} and {high:g}')
+    if args.early_stop_min_delta is not None and (not math.isfinite(args.early_stop_min_delta) or args.early_stop_min_delta < 0):
+        parser.error('--early-stop-min-delta must be finite and nonnegative')
+    if args.device == 'cpu' and args.dtype == 'float16':
+        parser.error('float16 training requires CUDA; use --dtype float32 or bfloat16 on CPU')
     if args.resume and any(getattr(args, key) is not None for key in ('seed', 'val_fraction')):
         parser.error('--seed and --val-fraction apply to new runs only')
     if args.low_priority:
@@ -305,10 +317,11 @@ def main():
             args.grad_accum_steps = config["grad_accum_steps"]
             # The optimizer and LR plan are restored from the checkpoint; keep
             # the run record and the remaining settings consistent with it.
-            changed = [key for key in ('learning_rate', 'min_lr_ratio', 'warmup_steps', 'weight_decay', 'schedule')
+            changed = [key for key in ('learning_rate', 'min_lr_ratio', 'warmup_steps', 'weight_decay', 'schedule',
+                                      'eval_interval', 'eval_iters', 'dtype')
                        if getattr(args, key) is not None and getattr(args, key) != config.get(key, HYPERPARAMETERS[key])]
             if changed:
-                parser.error('Resume reuses the saved learning-rate plan and optimizer; remove ' +
+                parser.error('Resume reuses the saved optimizer, precision and evaluation plan; remove ' +
                              ', '.join('--' + key.replace('_', '-') for key in changed))
             steps = args.steps if args.steps is not None else config["steps"]
         else:
@@ -371,7 +384,8 @@ def main():
                     return
                 print(f"Training {args.model_size} model to {steps:,} total steps; batch={args.batch_size}, accumulation={args.grad_accum_steps}, context=256.")
                 print(f"Plan: {plan['schedule']} schedule, peak LR {plan['learning_rate']:g}, weight decay {plan['weight_decay']:g}, "
-                      f"clip {plan['grad_clip']:g}, evaluate every {plan['eval_interval']:,} steps, seed {plan['seed']}.", flush=True)
+                      f"clip {plan['grad_clip']:g}, precision {plan['dtype']}, evaluate {plan['eval_iters']} batches "
+                      f"every {plan['eval_interval']:,} steps, seed {plan['seed']}.", flush=True)
                 if monitor.stopped:
                     raise InterruptedError('Stopped before training.')
                 if monitor.check_health(0):
@@ -388,7 +402,9 @@ def main():
                                learning_rate=plan['learning_rate'], min_lr_ratio=plan['min_lr_ratio'],
                                warmup_steps=plan['warmup_steps'], weight_decay=plan['weight_decay'],
                                grad_clip=plan['grad_clip'], eval_interval=plan['eval_interval'], seed=plan['seed'],
+                               eval_iters=plan['eval_iters'], dtype=plan['dtype'], log_interval=controls['log_interval'],
                                schedule=plan['schedule'], early_stop_patience=controls['early_stop_patience'],
+                               early_stop_min_delta=controls['early_stop_min_delta'],
                                keep_snapshots=controls['keep_snapshots'], outcome=outcome)
                 previous = read_previous_result(run)
                 reason = outcome.get('stop_reason', 'completed')
@@ -402,6 +418,10 @@ def main():
                     'elapsed_seconds': round(elapsed, 3),
                     'total_training_seconds': round(previous.get('total_training_seconds', 0) + elapsed, 3),
                     'peak_vram_mib': outcome.get('peak_vram_mib'),
+                    'dtype': outcome.get('dtype'), 'eval_iters': outcome.get('eval_iters'),
+                    'validation_tokens_per_evaluation': outcome.get('validation_tokens_per_evaluation'),
+                    'evaluations': outcome.get('evaluations'),
+                    'evaluations_without_improvement': outcome.get('evaluations_without_improvement'),
                     'finished_at': datetime.now().astimezone().isoformat(timespec='seconds')})
                 atomic_json(run / 'status.json', {'state': 'stopped' if result[0] < steps else 'completed', 'device': args.device})
                 print(f"Checkpoint: {run / 'ckpt_latest.pt'}")

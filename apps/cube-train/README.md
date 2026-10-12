@@ -1,4 +1,4 @@
-# Whitecube Trainer 0.9.0
+# Whitecube Trainer 1.0.0
 
 Native GTK4 controls and a local small-language-model training pipeline. The
 desktop process uses the system Python and never imports PyTorch. Preparation,
@@ -81,6 +81,14 @@ use schema version 3 and include the document index checksum.
 
 ## Notebook export
 
+Exports select an installed Jupyter kernel whose Python matches the training
+environment, including existing kernels with custom names. A stale kernel for
+another environment is ignored. The setup cell prints its Python path and gives
+a specific kernel registration command when PyTorch or NumPy cannot import.
+Keep the companion folders with the notebook when moving a bundle; the setup
+cell finds parent folders and accepts an explicit `BUNDLE_DIR` override. The
+optional safetensors section skips cleanly if that package is absent.
+
 **Export notebook…** (Runs page, the run's right-click menu, any row of the
 checkpoint list, or `Ctrl+Shift+E`) writes a runnable Jupyter notebook for Best,
 Latest or a step snapshot. The default is a self-contained folder:
@@ -112,6 +120,28 @@ whitecube-train --export-notebook ~/train-out/<run> --output ~/Documents/my-note
 
 ## Training plan and run controls
 
+**Training precision** selects automatic, float32, bfloat16, or CUDA float16.
+The actual compute precision is saved in checkpoints, progress and results;
+resume preserves it and rejects conflicts. Resuming a float16 checkpoint requires
+CUDA. Automatic selection on older checkpoints retains the original behavior.
+The Train page exposes **Validation batches per evaluation** (20 by default,
+eight sequences per batch) and **Record progress every** (10 steps by default).
+Validation uses a fixed seed so checkpoint losses remain comparable. Its batch
+budget and interval belong to the saved plan; logging frequency can change on
+resume.
+
+**Minimum loss improvement for early stopping** sets the absolute decrease
+needed to reset patience. Small improvements still save Best. Evaluation counts,
+patience and the reference loss survive resume; changing the minimum improvement
+threshold resets that history. Existing checkpoints without counters start with
+a fresh history.
+
+```sh
+whitecube-train ~/train-in --5m --device cuda --dtype bfloat16 \
+  --eval-iters 40 --eval-interval 100 --log-interval 5 \
+  --early-stop-patience 8 --early-stop-min-delta 0.005
+```
+
 New runs can set the peak learning rate, final-rate fraction, warmup, weight
 decay, gradient clipping, evaluation interval, seed, validation share and a
 cosine or warmup-stable-decay (WSD) schedule. These are saved in `run.json`.
@@ -134,11 +164,37 @@ whitecube-train --list-runs     # * pinned, B/L saved checkpoints
 whitecube-train --status        # the running desktop job
 ```
 
+## Checkpoint benchmarks
+
+The Runs page's **Benchmark** tab compares Best and Latest, or evaluates any
+saved snapshot. Set the validation batch count, sequences per batch and seed,
+then enter up to eight prompts. Every selected checkpoint receives the same
+sampled held-out windows and greedy generation settings on CPU. Training and
+preview controls wait while a desktop benchmark runs.
+
+Reports are saved in the run's `benchmarks/` folder, shown newest first, and
+included in the run report. Export the most recent 20 as JSON or a comparison
+CSV. They record measured loss, perplexity, throughput, sample text, actual step
+count, runtime, checkpoint and corpus SHA256 hashes, and a hash of the sampled
+batches. Compare results using the same corpus and evaluation settings. Sampled
+windows may overlap; the token count is the measured budget, not unique coverage.
+Benchmark bits per byte excludes special token targets; the existing training
+chart conversion includes those targets and can differ slightly.
+
+```sh
+whitecube-train --benchmark ~/train-out/<run> --checkpoint best \
+  --output ~/Documents/best-benchmark.json --eval-iters 20 \
+  --batch-size 4 --seed 2026 --prompt 'Once upon a time'
+```
+
+Benchmarking checks prepared corpus integrity and rejects input changes during
+evaluation. It writes only a new report and refuses to replace an existing file.
+
 ## Runs page
 
 Runs sit in a list beside the selected run, so one click shows its details:
 stat tiles (parameters, steps, best validation, bits per byte, training time,
-disk use), the main actions and Overview / Preview / Export tabs. Rows update
+disk use), the main actions and Overview / Preview / Benchmark / Export tabs. Rows update
 in place while a job trains and carry a phase chip, Best/Latest/snapshot chips
 and a loss sparkline. Double-click or Enter opens the run's progress;
 right-click, Menu or Shift+F10 opens every run action; F2 renames; Delete moves

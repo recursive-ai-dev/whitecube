@@ -22,6 +22,7 @@ FORBIDDEN = re.compile(rb'/usr/local/|/home/[a-z][a-z0-9_-]*/')
 RUNTIME_FILES = ('/etc/whitecube/network/networks.json', '/etc/whitecube/network/wpa.conf', '/etc/whitecube/network/device.json',
                  '/etc/whitecube/network/profiles.json')
 SEARCH_DIRS = (b'/usr/local/share/applications', b'/usr/local/share/icons',
+               b'/usr/local/share/jupyter',  # Standard Jupyter kernelspec discovery root.
                b'/usr/local/share:/usr/share')  # XDG_DATA_DIRS default search roots
 # These exact strings describe paths inside the editable guest, not host installation
 # locations. Other /usr/local or /home references in the same files remain forbidden.

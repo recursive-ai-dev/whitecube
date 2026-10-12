@@ -3,13 +3,19 @@
 set -Eeuo pipefail
 
 APP_NAME="Chrootable Manager"
-APP_VERSION=2.1.0
+APP_VERSION=2.2.0
 SCRIPT_PATH=${BASH_SOURCE[0]}
 STORE_DIR=${CHROOTABLE_HOME:-/var/lib/chrootable-manager}
 DEBIAN_SUITE=${CHROOTABLE_DEBIAN_SUITE:-stable}
 DEBIAN_MIRROR=${CHROOTABLE_DEBIAN_MIRROR:-http://deb.debian.org/debian}
 FALLBACK_DNS=${CHROOTABLE_FALLBACK_DNS:-1.1.1.1 8.8.8.8}
 EPHEMERAL_SIZE=${CHROOTABLE_EPHEMERAL_SIZE:-}
+# Bootable exports add a kernel, systemd and UKI tools to a copy of the
+# workspace; the copy grows by this much first. The ESP size is for --export-disk.
+BOOT_EXTRA_MIB=2048
+BOOT_ESP_MIB=256
+BOOT_PACKAGES='linux-image-amd64 systemd-sysv systemd-resolved udev kmod systemd-ukify systemd-boot-efi'
+BOOT_COMMANDS=(mkfs.vfat mmd mcopy sgdisk xorriso mksquashfs sbsign openssl tune2fs)
 MAX_SIZE_MIB=1048576
 NON_INTERACTIVE=1
 DEMO=0
@@ -162,7 +168,9 @@ snapshot_count() {
 package_for_command() {
     case $1 in
         whiptail|debootstrap|dpkg|hostname|tar|gzip) printf '%s' "$1" ;;
-        mkfs.ext4|e2fsck|resize2fs) printf e2fsprogs ;;
+        mkfs.ext4|e2fsck|resize2fs|tune2fs) printf e2fsprogs ;;
+        mkfs.vfat) printf dosfstools ;; mmd|mcopy) printf mtools ;; sgdisk) printf gdisk ;;
+        mksquashfs) printf squashfs-tools ;; sbsign) printf sbsigntool ;; xorriso|openssl) printf '%s' "$1" ;;
         mount|umount|losetup) printf mount ;;
         mountpoint|unshare|flock) printf util-linux ;;
         ip) printf iproute2 ;;
@@ -172,9 +180,12 @@ package_for_command() {
 }
 require_root() { [[ $EUID -eq 0 ]] || { fail "This operation needs root. Run with sudo."; return 1; }; }
 check_prerequisites() {
-    local command package existing; local -a packages=()
     require_root || return
-    for command in "${REQUIRED_COMMANDS[@]}"; do
+    ensure_commands "${REQUIRED_COMMANDS[@]}"
+}
+ensure_commands() {
+    local command package existing; local -a packages=()
+    for command in "$@"; do
         [[ $command != whiptail || $NON_INTERACTIVE -eq 0 ]] || continue
         command -v "$command" >/dev/null 2>&1 && continue
         package=$(package_for_command "$command"); existing=" ${packages[*]} "
@@ -236,7 +247,7 @@ record_event() {
     exec {descriptor}>&-
 }
 begin_operation() {
-    OPERATION=$1; OP_NAME=$2; PENDING=; WORK=; GUEST_EXITED=
+    OPERATION=$1; OP_NAME=$2; PENDING=; WORK=; STAGE=; GUEST_EXITED=
     OP_LOG=$(mktemp "$LOG_DIR/$2-$1-$(date +%Y%m%d-%H%M%S)-XXXXXX.log") || return
     printf '%s  %s  %s\n' "$(timestamp)" "$1" "$2" >>"$OP_LOG"
     trap finish_operation EXIT
@@ -246,6 +257,7 @@ begin_operation() {
 finish_operation() {
     local status=$?
     if [[ -n ${PENDING:-} ]]; then rm -f -- "$PENDING" "$PENDING.meta" || true; fi
+    if [[ -n ${STAGE:-} ]]; then rm -rf -- "$STAGE" || true; fi
     if [[ -n ${WORK:-} ]]; then
         # Files the worker hands back; its mounts ended with its namespace.
         rm -f -- "$WORK/started" "$WORK/resolv.conf" "$WORK/release" "$WORK/codename" "$WORK/architecture" || true
@@ -486,6 +498,122 @@ export_image() (
     # --import verifies the archive against this file when it sits beside it.
     printf '%s  %s\n' "${checksum%% *}" "${archive##*/}" >"$archive.sha256" || return
     printf '%s\n' "$archive"
+)
+# Bootable exports start through Debian's Microsoft-signed shim, which accepts
+# the UKI because it is signed with this Machine Owner Key. Each machine
+# enrolls MOK.cer once; shim offers MokManager when it is not enrolled yet.
+ensure_signing_key() {
+    local directory="$STORE_DIR/secureboot" subject
+    SIGNING_KEY="$directory/MOK.key"; SIGNING_CERT="$directory/MOK.crt"; SIGNING_DER="$directory/MOK.cer"
+    if [[ -e $directory || -L $directory ]]; then owned_private_directory "$directory" || return
+    else install -d -m 0700 "$directory" || return; fi
+    [[ -f $SIGNING_KEY && -f $SIGNING_CERT && -f $SIGNING_DER ]] && return 0
+    info "Generating a Secure Boot signing key (Machine Owner Key) in $directory..."
+    subject="/CN=Chrootable Manager MOK ${HOSTNAME//[^A-Za-z0-9.-]/}/"
+    openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 -subj "$subject" \
+        -keyout "$SIGNING_KEY.partial" -out "$SIGNING_CERT.partial" >>"$OP_LOG" 2>&1 &&
+        openssl x509 -in "$SIGNING_CERT.partial" -outform DER -out "$SIGNING_DER.partial" >>"$OP_LOG" 2>&1 || {
+        rm -f -- "$SIGNING_KEY.partial" "$SIGNING_CERT.partial" "$SIGNING_DER.partial"; return 1;
+    }
+    # The certificate goes last: its presence marks a complete set.
+    mv -T -- "$SIGNING_KEY.partial" "$SIGNING_KEY" && mv -T -- "$SIGNING_DER.partial" "$SIGNING_DER" &&
+        mv -T -- "$SIGNING_CERT.partial" "$SIGNING_CERT" || return
+    NEW_SIGNING_KEY=1
+}
+# FAT image with shim as the removable-media loader; shim starts grubx64.efi
+# from its own directory, which here is the signed UKI.
+make_esp() {
+    local esp=$1 size_mib=$2 fat=()
+    (( size_mib < 64 )) || fat=(-F 32)
+    mkfs.vfat -C "${fat[@]}" -n CHROOTABLE "$esp" "$((size_mib * 1024))" >>"$OP_LOG" 2>&1 || return
+    export MTOOLS_SKIP_CHECK=1
+    mmd -i "$esp" ::/EFI ::/EFI/BOOT >>"$OP_LOG" 2>&1 &&
+        mcopy -i "$esp" "$STAGE/shimx64.efi" ::/EFI/BOOT/BOOTX64.EFI &&
+        mcopy -i "$esp" "$STAGE/mmx64.efi" ::/EFI/BOOT/mmx64.efi &&
+        mcopy -i "$esp" "$STAGE/grubx64.efi" ::/EFI/BOOT/grubx64.efi &&
+        mcopy -i "$esp" "$SIGNING_DER" ::/MOK.cer
+}
+gpt_disk() {
+    local disk=$1 esp=$2 root=$3 name=$4 esp_mib root_mib
+    esp_mib=$(image_size_mib "$esp") && root_mib=$(image_size_mib "$root") || return
+    truncate -s "$((esp_mib + root_mib + 2))M" "$disk" || return
+    # 8304: Linux x86-64 root, so systemd-gpt-auto-generator recognizes it too.
+    sgdisk -o -n "1:1M:+${esp_mib}M" -t 1:ef00 -c 1:ESP \
+        -n "2:$((esp_mib + 1))M:+${root_mib}M" -t 2:8304 -c "2:$name" "$disk" >>"$OP_LOG" 2>&1 || return
+    dd if="$esp" of="$disk" bs=1M seek=1 conv=notrunc status=none 2>>"$OP_LOG" &&
+        dd if="$root" of="$disk" bs=1M seek="$((esp_mib + 1))" conv=notrunc,sparse status=none 2>>"$OP_LOG"
+}
+# EFI-only hybrid: El Torito points at the appended ESP, which is also a GPT
+# partition, so the same file boots from optical media and from a USB stick.
+hybrid_iso() {
+    local iso=$1 esp=$2 tree=$3
+    xorriso -as mkisofs -iso-level 3 -R -J -V CHROOTABLE -o "$iso" -partition_offset 16 \
+        -append_partition 2 0xef "$esp" -appended_part_as_gpt \
+        -e --interval:appended_partition_2:all:: -no-emul-boot "$tree" >>"$OP_LOG" 2>&1
+}
+# A copy of the workspace gets a kernel, systemd and a UKI; the workspace itself
+# never changes. iso: squashfs root under live-boot, writes stay in RAM.
+# disk: GPT with an ESP and the copy as a persistent ext4 root partition.
+boot_export() (
+    local image=$1 kind=$2 name descriptor token output copy size_mib needed uuid='' esp esp_mib checksum
+    name=$(basename "$image" .img)
+    [[ $(metadata_value "$image" architecture unknown) == amd64 ]] || { fail "Bootable exports support amd64 workspaces only."; return 1; }
+    lock_image "$image" descriptor || return
+    assert_offline "$image" || return
+    begin_operation "export-$kind" "$name" || return
+    ensure_commands "${BOOT_COMMANDS[@]}" || return
+    ensure_signing_key || return
+    size_mib=$(image_size_mib "$image") || return
+    needed=$(allocated_bytes "$image") || return
+    require_free_space "$EXPORT_DIR" "$(( 2 * (needed + BOOT_EXTRA_MIB * 1048576) + BOOT_ESP_MIB * 1048576 ))" || return
+    STAGE=$(mktemp -d "$EXPORT_DIR/.$name.XXXXXX.stage") || return
+    token=${STAGE%.stage}; token=${token##*.}
+    output="$EXPORT_DIR/$name-$(date +%Y%m%d-%H%M%S)-$token.$kind"
+    [[ $kind != disk ]] || output=${output%.disk}.img
+    PENDING="$STAGE/output.partial"
+    make_workdir || return
+    copy="$STAGE/root.img"
+    info "Copying the workspace. Log: $OP_LOG"
+    copy_image_file "$image" "$copy" || return
+    fsck_preflight "$copy" "$OP_LOG" || { fail "The workspace filesystem needs a repair first: sudo $0 --repair $name --yes"; return 1; }
+    grow_image_file "$copy" "$size_mib" "$((size_mib + BOOT_EXTRA_MIB))" || return
+    resize2fs "$copy" >>"$OP_LOG" 2>&1 || return
+    if [[ $kind == disk ]]; then
+        # A fresh UUID, so the exported root never collides with the workspace.
+        uuid=$(</proc/sys/kernel/random/uuid) || return
+        tune2fs -U "$uuid" "$copy" >>"$OP_LOG" 2>&1 || return
+    fi
+    info "Installing a kernel and building the UKI; downloading packages takes a few minutes..."
+    run_worker boot "$copy" "$WORK" "$kind" "$name" "$STAGE" "$uuid" 3>&2 >>"$OP_LOG" 2>&1 || return
+    info "Signing the UKI with $SIGNING_CERT..."
+    sbsign --key "$SIGNING_KEY" --cert "$SIGNING_CERT" --output "$STAGE/grubx64.efi" "$STAGE/uki.efi" >>"$OP_LOG" 2>&1 || return
+    esp="$STAGE/esp.img"
+    if [[ $kind == disk ]]; then
+        esp_mib=$BOOT_ESP_MIB
+    else
+        esp_mib=$(du -cm --apparent-size -- "$STAGE"/{shimx64,mmx64,grubx64}.efi | awk 'END {print $1}') || return
+        esp_mib=$((esp_mib + 16))
+    fi
+    make_esp "$esp" "$esp_mib" || return
+    if [[ $kind == disk ]]; then
+        info "Writing the GPT disk image..."
+        gpt_disk "$PENDING" "$esp" "$copy" "$name" || return
+    else
+        info "Compressing the root filesystem..."
+        mkdir -p "$STAGE/iso/live" || return
+        run_worker squash "$copy" "$WORK" "$STAGE/iso/live/filesystem.squashfs" 3>&2 >>"$OP_LOG" 2>&1 || return
+        info "Writing the hybrid ISO..."
+        hybrid_iso "$PENDING" "$esp" "$STAGE/iso" || return
+    fi
+    info "Computing the checksum..."
+    checksum=$(sha256sum -- "$PENDING") || return
+    mv -T -- "$PENDING" "$output" || return
+    PENDING=
+    printf '%s  %s\n' "${checksum%% *}" "${output##*/}" >"$output.sha256" || return
+    [[ -z ${NEW_SIGNING_KEY:-} ]] || info "New signing key: enroll it once per machine with
+  sudo mokutil --import $SIGNING_DER
+or choose 'Enroll key from disk' > MOK.cer when shim opens MokManager at boot."
+    printf '%s\n' "$output"
 )
 # Takes --export archives and other root filesystem tarballs (tar detects gzip,
 # xz or zstd). A NAME.sha256 file beside the archive is verified first.
@@ -782,6 +910,10 @@ mount_session_devices() {
     fi
     mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs "$WORKER_ROOT/run"
 }
+# A clean environment for guest tools: host locale and variables stay out of the log.
+GUEST_ENV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive)
+# stdin to a guest path, created with ordinary permissions despite umask 077.
+guest_write() { chroot "$WORKER_ROOT" /bin/sh -c 'umask 022; mkdir -p "${1%/*}" && cat >"$1"' sh "$1"; }
 worker_main() (
     local kind=$1 image=$2 work=$3
     shift 3
@@ -807,17 +939,62 @@ worker_main() (
                 mount_session_devices || return
                 local -a package_list=()
                 read -r -a package_list <<<"$packages"
-                # A clean environment: host locale and variables stay out of the log.
-                local -a apt_env=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root LANG=C.UTF-8 DEBIAN_FRONTEND=noninteractive)
-                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get update || return
-                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get install -y --no-install-recommends "${package_list[@]}" || return
-                chroot "$WORKER_ROOT" "${apt_env[@]}" apt-get clean || return
+                chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get update || return
+                chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get install -y --no-install-recommends "${package_list[@]}" || return
+                chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get clean || return
             fi
             record_guest_details "$WORKER_ROOT" "$work"
             ;;
         export)
             mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
             tar --numeric-owner --acls --xattrs --one-file-system -C "$WORKER_ROOT" -czf "$1" . || return
+            ;;
+        boot)
+            local kind=$1 name=$2 stage=$3 uuid=$4 version cmdline unit
+            local -a packages=()
+            read -r -a packages <<<"$BOOT_PACKAGES"
+            [[ $kind != iso ]] || packages+=(live-boot)
+            mount -o loop "$image" "$WORKER_ROOT" || return
+            setup_resolv_conf "$work" "$WORKER_ROOT"
+            mount_session_devices || return
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get update || return
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get install -y --no-install-recommends --download-only "${packages[@]}" || return
+            # Only shim's files: its package scripts would install a bootloader.
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" sh -c 'rm -rf /var/tmp/chrootable-shim && mkdir /var/tmp/chrootable-shim &&
+                cd /var/tmp/chrootable-shim && apt-get download shim-signed shim-helpers-amd64-signed &&
+                for deb in *.deb; do dpkg-deb -x "$deb" files || exit; done' || return
+            # systemd-resolved turns resolv.conf into a symlink, which it cannot
+            # do while the host's file is bound over it; installing needs no network.
+            if mountpoint -q "$WORKER_ROOT/etc/resolv.conf"; then umount "$WORKER_ROOT/etc/resolv.conf" || return; fi
+            progress "Installing ${packages[*]}"
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get install -y --no-install-recommends --no-download "${packages[@]}" || return
+            version=$(chroot "$WORKER_ROOT" sh -c 'ls /boot' | sed -n 's/^vmlinuz-//p' | sort -V | tail -n 1)
+            [[ -n $version ]] && chroot "$WORKER_ROOT" test -f "/boot/initrd.img-$version" || { fail "The kernel or its initramfs is missing."; return 1; }
+            # Writes go through the guest's chroot, so its symlinks never reach the host.
+            [[ $kind != disk ]] || printf 'UUID=%s / ext4 errors=remount-ro 0 1\n' "$uuid" | guest_write /etc/fstab || return
+            printf '[Match]\nType=ether\n\n[Network]\nDHCP=yes\n' | guest_write /etc/systemd/network/80-chrootable.network || return
+            # Root is locked in a fresh workspace; consoles log in as root, like --enter.
+            for unit in getty@tty1 serial-getty@ttyS0; do
+                printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --autologin root --noclear --keep-baud 115200,38400,9600 %%I $TERM\n' |
+                    guest_write "/etc/systemd/system/$unit.service.d/autologin.conf" || return
+            done
+            printf '' | guest_write /etc/machine-id || return
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" systemctl enable systemd-networkd systemd-resolved || return
+            cmdline='quiet console=ttyS0,115200 console=tty0'
+            if [[ $kind == disk ]]; then cmdline="root=UUID=$uuid rw $cmdline"; else cmdline="boot=live $cmdline"; fi
+            progress "Building the UKI for Linux $version"
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" ukify build --linux="/boot/vmlinuz-$version" --initrd="/boot/initrd.img-$version" \
+                --uname="$version" --cmdline="$cmdline" --os-release=@/etc/os-release --output=/var/tmp/chrootable-uki.efi || return
+            chroot "$WORKER_ROOT" cat /var/tmp/chrootable-uki.efi >"$stage/uki.efi" &&
+                chroot "$WORKER_ROOT" cat /var/tmp/chrootable-shim/files/usr/lib/shim/shimx64.efi.signed >"$stage/shimx64.efi" &&
+                chroot "$WORKER_ROOT" cat /var/tmp/chrootable-shim/files/usr/lib/shim/mmx64.efi.signed >"$stage/mmx64.efi" || return
+            chroot "$WORKER_ROOT" rm -rf /var/tmp/chrootable-shim /var/tmp/chrootable-uki.efi || return
+            chroot "$WORKER_ROOT" "${GUEST_ENV[@]}" apt-get clean || return
+            ;;
+        squash)
+            mount -o loop,ro,noload "$image" "$WORKER_ROOT" || return
+            # live-boot needs neither the kernel nor the initramfs: the UKI has both.
+            mksquashfs "$WORKER_ROOT" "$1" -noappend -comp zstd -wildcards -e 'boot/vmlinuz-*' 'boot/initrd.img-*' || return
             ;;
         import)
             mount -o loop "$image" "$WORKER_ROOT" || return
@@ -1008,9 +1185,9 @@ show_logs() {
     tail -n 200 -- "$latest"
 }
 list_exports() {
-    local format=${1:-text} archive base size created checksum comma=
+    local format=${1:-text} archive base size created checksum kind comma=
     [[ $format != json ]] || printf '['
-    for archive in "$EXPORT_DIR/"*.tar.gz; do
+    for archive in "$EXPORT_DIR/"*.tar.gz "$EXPORT_DIR/"*.iso "$EXPORT_DIR/"*.img; do
         [[ -f $archive && ! -L $archive ]] || continue
         base=${archive##*/}
         size=$(stat -c%s -- "$archive") || continue
@@ -1022,9 +1199,10 @@ list_exports() {
             continue
         fi
         printf '%s{"file":' "$comma"; json_string "$base"
-        # NAME-YYYYmmdd-HHMMSS-TOKEN.tar.gz; the token never contains a hyphen.
-        base=${base%.tar.gz}
-        printf ',"workspace":'; json_string "${base%-*-*-*}"
+        case $base in *.iso) kind=iso ;; *.img) kind=disk ;; *) kind=archive ;; esac
+        # NAME-YYYYmmdd-HHMMSS-TOKEN.EXT; the token never contains a hyphen.
+        base=${base%.tar.gz}; base=${base%.iso}; base=${base%.img}
+        printf ',"kind":"%s","workspace":' "$kind"; json_string "${base%-*-*-*}"
         printf ',"path":'; json_string "$archive"
         printf ',"created_at":'; json_string "$created"
         printf ',"sha256":'; if [[ -n $checksum ]]; then json_string "$checksum"; else printf null; fi
@@ -1281,7 +1459,8 @@ image_action_menu() {
             enter "Open a $lifecycle root shell" try "Try changes in a disposable session" offline "Open a shell without host network access" \
             snapshots "Save or restore recovery points" clone "Create an independent copy" rename "Give this workspace a new name" \
             describe "Add or change a short description" resize "Expand image capacity" \
-            mode "Switch persistent / ephemeral sessions" export "Export filesystem as .tar.gz" logs "Read the latest operation log" \
+            mode "Switch persistent / ephemeral sessions" export "Export filesystem as .tar.gz" \
+            export-iso "Export a bootable live ISO (EFI)" export-disk "Export a bootable disk image (EFI)" logs "Read the latest operation log" \
             repair "Check and repair the ext4 filesystem" delete "Delete image (retain snapshots and exports)" 3>&1 1>&2 2>&3) || return 0
         case $choice in
             enter) ui_session "$image" "$lifecycle" shared ;;
@@ -1305,6 +1484,8 @@ image_action_menu() {
                 ui_run resize_image "$image" "$value" ;;
             mode) value=$(choose_lifecycle) || continue; ui_run set_lifecycle "$image" "$value" ;;
             export) ui_run export_image "$image" ;;
+            export-iso) ui_run boot_export "$image" iso ;;
+            export-disk) ui_run boot_export "$image" disk ;;
             logs) ui_view "$name / Recent log" "$(show_logs "$name")" || true ;;
             repair)
                 ui --defaultno --yesno "Run forced ext4 repair on '$name'?\n\nRepair can change filesystem data. Save a snapshot first if you need a recovery point." 12 "$UI_WIDTH" || continue
@@ -1448,6 +1629,8 @@ Create and use (root required)
   --mode NAME persistent|ephemeral  Change the default session lifecycle
   --resize NAME SIZE_MIB            Expand only; no shrinking
   --export NAME                     Export a .tar.gz with a .sha256; print its path
+  --export-iso NAME                 Bootable EFI-only hybrid ISO (live, writes stay in RAM)
+  --export-disk NAME                Bootable GPT disk image: ESP + persistent ext4 root
 
 Recovery and maintenance (root required)
   --snapshot NAME LABEL             Save an offline recovery point
@@ -1460,6 +1643,11 @@ Recovery and maintenance (root required)
 
 Profiles: minimal (default), build, python, network; --profiles shows minimum sizes.
 Sizes are MiB, up to 1048576 (1 TiB). Creation fully allocates the image.
+Bootable exports (amd64) install a kernel and systemd into a copy of the
+workspace and boot a UKI through Debian'"'"'s signed shim. The UKI is signed with
+a Machine Owner Key kept in STORE/secureboot; enroll MOK.cer once per machine
+(mokutil --import, or MokManager at first boot) when Secure Boot is on.
+Consoles log in as root automatically.
 
 Examples
   sudo chrootable-manager --create compiler 4096 persistent build
@@ -1515,7 +1703,7 @@ validate_cli() {
         --cleanup) [[ $# == 1 || ( $# == 2 && $2 == --yes ) ]] ;;
         --demo) [[ $# == 1 || ( $# == 2 && $2 == --dashboard ) ]] ;;
         --inspect|--snapshots) [[ $# == 2 || ( $# == 3 && $3 == --json ) ]] && valid_name "$2" ;;
-        --logs|--enter-isolated|--export) [[ $# == 2 ]] && valid_name "$2" ;;
+        --logs|--enter-isolated|--export|--export-iso|--export-disk) [[ $# == 2 ]] && valid_name "$2" ;;
         --enter) [[ $# == 2 || ( $# == 3 && $3 == --isolated ) ]] && valid_name "$2" ;;
         --create) [[ $# == 4 || $# == 5 ]] && valid_name "$2" && valid_size_mib "$3" && valid_lifecycle "$4" && valid_profile "${5:-minimal}" ;;
         --import) [[ $# == 5 && -n $3 ]] && valid_name "$2" && valid_size_mib "$4" && valid_lifecycle "$5" ;;
@@ -1553,6 +1741,7 @@ run_cli() {
                 --clone) clone_image "$image" "$3" ;; --resize) resize_image "$image" "$3" ;;
                 --rename) rename_image "$image" "$3" ;; --describe) describe_image "$image" "$3" ;;
                 --repair) repair_image "$image" ;; --delete) delete_image "$image" ;; --export) export_image "$image" ;;
+                --export-iso) boot_export "$image" iso ;; --export-disk) boot_export "$image" disk ;;
                 --snapshot) snapshot_image "$image" "$3" ;; --mode) set_lifecycle "$image" "$3" ;;
                 --enter|--enter-isolated)
                     [[ $operation != --enter-isolated && ${3:-} != --isolated ]] || network=isolated

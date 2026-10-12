@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sys
 import tempfile
@@ -125,9 +126,18 @@ def build_cells(run_dir, kind, *, bundle, export_dir, preview=None, has_corpus=T
     table = '\n'.join(f'| {key} | {value} |' for key, value in rows)
     if bundle:
         paths = (f"EXPORT_DIR = Path({str(export_dir)!r})  # where Whitecube Trainer wrote this bundle\n"
-                 "HERE = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()\n"
-                 "if not (HERE / 'whitecube_pipeline').is_dir() and (EXPORT_DIR / 'whitecube_pipeline').is_dir():\n"
-                 "    HERE = EXPORT_DIR  # opened from another working directory\n"
+                 "BUNDLE_DIR = None  # set to the moved bundle folder if your kernel starts elsewhere\n"
+                 "working_dir = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()\n"
+                 "candidates = ([Path(BUNDLE_DIR).expanduser()] if BUNDLE_DIR is not None else\n"
+                 "              [working_dir, *working_dir.parents, EXPORT_DIR])\n"
+                 "HERE = next((path for path in candidates if\n"
+                 "             (path / 'whitecube_pipeline' / 'tensegrity_lm.py').is_file() and\n"
+                 f"             (path / 'checkpoint' / 'ckpt_{kind}.pt').is_file()), None)\n"
+                 "if HERE is None:\n"
+                 "    raise FileNotFoundError('Notebook bundle not found. Keep the .ipynb together with '\n"
+                 "                            'whitecube_pipeline/ and checkpoint/, or set BUNDLE_DIR '\n"
+                 "                            'above to the folder containing them.')\n"
+                 "HERE = HERE.resolve()\n"
                  "PIPELINE = HERE / 'whitecube_pipeline'\n"
                  "RUN_DIR = HERE / 'run'\n"
                  f"CHECKPOINT = HERE / 'checkpoint' / 'ckpt_{kind}.pt'\n"
@@ -139,7 +149,26 @@ def build_cells(run_dir, kind, *, bundle, export_dir, preview=None, has_corpus=T
                  f"CHECKPOINT = RUN_DIR / 'ckpt_{kind}.pt'\n"
                  "DATA_DIR = RUN_DIR / 'data'\n"
                  "HERE = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()\n")
-    hint = f' Whitecube Trainer used `{python}`.' if python else ''
+    environment_hint = (f' Whitecube Trainer used {python}. Select that environment in the kernel picker.'
+                        if python else ' Select a Python environment with PyTorch and NumPy in the kernel picker.')
+    setup = '''
+## 1 · Setup
+
+Run this notebook with a kernel that has **PyTorch and NumPy**. The Python
+shown by the first cell is the notebook kernel, which can differ from the
+Python used by your Jupyter application. Matplotlib is optional for curves;
+safetensors is optional for the final weights export.
+'''
+    if python:
+        kernel_command = shlex.join([str(python), '-m', 'ipykernel', 'install', '--user', '--name', KERNEL_NAME,
+                                     '--display-name', 'Whitecube Trainer (PyTorch)'])
+        setup += (f'\nWhitecube Trainer used `{python}`. If that environment is not listed in the\n'
+                  'kernel picker, run this command in a terminal, then select **Whitecube Trainer (PyTorch)**:\n\n'
+                  f'```sh\n{kernel_command}\n```\n'
+                  'If it reports a missing ipykernel module, install it into that same environment first.\n')
+    if bundle:
+        setup += ('\nKeep the notebook with its `whitecube_pipeline/` and `checkpoint/` folders when copying it. '
+                  'If the kernel starts outside a moved bundle, set `BUNDLE_DIR` in the first cell.\n')
     cells = [
         markdown(f'''
 # {name}
@@ -153,21 +182,23 @@ Context is 256 byte tokens (bytes 0–255 plus BOS/EOS/PAD).
 | --- | --- |
 {table}
 ''' + (f'\n**Run notes:** {notes}\n' if notes else '')),
-        markdown('''
-## 1 · Setup
-
-Run this notebook with a kernel that has PyTorch and NumPy — the same Python
-environment Whitecube Trainer trains with. Matplotlib is optional (curves).'''),
+        markdown(setup),
         code(f'''
 import json, math, shutil, sys, time
 from pathlib import Path
 
-{paths}sys.path.insert(0, str(PIPELINE))
+{paths}if not (PIPELINE / 'tensegrity_lm.py').is_file():
+    raise FileNotFoundError(f'Model code not found at {{PIPELINE}}. Restore the pipeline folder or export a complete bundle.')
+if not CHECKPOINT.is_file():
+    raise FileNotFoundError(f'Checkpoint not found at {{CHECKPOINT}}. Restore the checkpoint or export a complete bundle.')
+sys.path.insert(0, str(PIPELINE))
+print('Notebook Python:', sys.executable)
 try:
     import numpy as np
     import torch
 except ImportError as error:
-    raise ImportError('This kernel has no PyTorch/NumPy. Choose the training environment as the kernel.{hint}') from error
+    raise ImportError('Cannot import PyTorch/NumPy in ' + sys.executable + '.' + {environment_hint!r} +
+                      ' Original error: ' + str(error)) from error
 from tensegrity_lm import ByteTokenizer, TensegrityConfig, TensegrityLM, evaluate, load_checkpoint
 from tensegrity_serve import decode
 
@@ -281,23 +312,31 @@ if CONTINUE_TRAINING:
     final_step, best_loss = train(DATA_DIR, WORK_DIR, steps=start + EXTRA_STEPS, batch_size={batch},
                                   grad_accum_steps={accumulation}, device=DEVICE, resume=True,
                                   schedule_steps=SCHEDULE_STEPS)
-    print(f'Continued to step {{final_step + 1:,}} · best validation {{best_loss:.4f}}')
+    print(f'Continued to step {{final_step:,}} · best validation {{best_loss:.4f}}')
     saved = load_checkpoint(str(WORK_DIR / 'ckpt_latest.pt'), 'cpu')
     model.load_state_dict(saved['model_state_dict']); model.eval()
 else:
     print('Set CONTINUE_TRAINING = True to train further in', WORK_DIR)'''),
-        markdown('## 8 · Export weights\n\nWrites `model.safetensors` and `model.config.json` (needs the `safetensors` package), then reloads them to check the round trip.'),
+        markdown('## 8 · Export weights\n\nWrites `model.safetensors` and `model.config.json` when the optional `safetensors` package is available, then reloads them to check the round trip.'),
         code('''
-from tensegrity_nb_lib import export_to_safetensors, load_from_safetensors
+try:
+    import safetensors
+except ImportError:
+    print('Weights export skipped: install safetensors in this kernel, then rerun this cell.')
+else:
+    from tensegrity_nb_lib import export_to_safetensors, load_from_safetensors
 
-EXPORT_WEIGHTS = HERE / 'safetensors'
-weights, config = export_to_safetensors(model.cpu(), cfg, str(EXPORT_WEIGHTS), name='model')
-reloaded, _ = load_from_safetensors(weights, config)
-probe = torch.tensor([list(b'Whitecube')])
-with torch.no_grad():
-    same = torch.allclose(model(probe)[0], reloaded.eval()(probe)[0], atol=1e-6)
-model.to(DEVICE)
-print('Round trip matches' if same else 'Round trip differs')'''),
+    EXPORT_WEIGHTS = HERE / 'safetensors'
+    try:
+        model.cpu()
+        weights, config = export_to_safetensors(model, cfg, str(EXPORT_WEIGHTS), name='model')
+        reloaded, _ = load_from_safetensors(weights, config)
+        probe = torch.tensor([list(b'Whitecube')])
+        with torch.no_grad():
+            same = torch.allclose(model(probe)[0], reloaded.eval()(probe)[0], atol=1e-6)
+    finally:
+        model.to(DEVICE)
+    print('Round trip matches' if same else 'Round trip differs')'''),
     ]
     return cells
 
@@ -390,9 +429,15 @@ def export(run_dir, kind, output, *, bundle=True, corpus=False, script=True, pre
             (staging / 'README.md').write_text(
                 f'# {name}\n\nNotebook bundle exported by Whitecube Trainer from `{run_dir}` '
                 f'(checkpoint `{source.name}`).\n\nOpen `{stem}.ipynb` in Jupyter or VS Code with the '
-                'training Python environment as the kernel. Everything the notebook needs is in this '
-                'folder' + ('' if corpus else '; evaluation and continued training read the original run\'s '
-                f'prepared corpus at `{run_dir / "data"}`') + '.\n', encoding='utf-8')
+                'training Python environment as the kernel. The kernel needs PyTorch and NumPy; '
+                'matplotlib (curves) and safetensors (weights export) are optional. '
+                + (f'The training Python was `{python}`. ' if python else '') +
+                'See the Setup section for kernel registration instructions.\n\n'
+                'Keep the notebook together with `whitecube_pipeline/` and `checkpoint/` when moving this '
+                'folder. Set `BUNDLE_DIR` in its first cell if the kernel starts elsewhere. '
+                + ('The prepared corpus is included.\n' if corpus else
+                   'Evaluation and continued training read the original run\'s '
+                   f'prepared corpus at `{run_dir / "data"}`.\n'), encoding='utf-8')
         for path in staging.rglob('*'):
             os.chmod(path, 0o755 if path.is_dir() else 0o644)
         os.chmod(staging, 0o755)
@@ -413,10 +458,15 @@ def main():
     parser.add_argument('--with-corpus', action='store_true', help='Copy the prepared train/val corpus too')
     parser.add_argument('--reference', action='store_true', help='Write only the notebook; reference the run in place')
     parser.add_argument('--no-script', action='store_true', help='Skip the percent-format .py copy')
+    parser.add_argument('--python', help='Training Python executable shown in setup instructions')
+    parser.add_argument('--kernel-name', help='Registered Jupyter kernel to select')
+    parser.add_argument('--kernel-display-name', help='Display name for the registered Jupyter kernel')
     args = parser.parse_args()
     try:
         path = export(args.run.expanduser(), args.checkpoint, args.output, bundle=not args.reference,
-                      corpus=args.with_corpus, script=not args.no_script)
+                      corpus=args.with_corpus, script=not args.no_script, python=args.python,
+                      kernel={'name': args.kernel_name, 'display_name': args.kernel_display_name or args.kernel_name,
+                              'language': 'python'} if args.kernel_name else None)
     except (ValueError, OSError) as error:
         parser.exit(1, f'{parser.prog}: {error}\n')
     print(path)

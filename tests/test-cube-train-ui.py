@@ -62,6 +62,32 @@ def inside(fixture, screenshots):
             assert 'Fixture log' in w.last_log and len(w.losses) == 3
             assert '1,234 tokens/s' in w.metrics_label.get_text() and '4,096 tokens processed' in w.metrics_label.get_text()
             assert 'Gradient norm 0.8' in w.metrics_label.get_text()
+            w.dtype_picker.set_selected(1)
+            w.form['eval_iters'].set_value(7); w.form['log_interval'].set_value(2)
+            w.form['early_stop_min_delta'].set_value(.025); w.save_draft()
+            prefs = trainer.preferences()
+            assert (prefs['dtype'], prefs['eval_iters'], prefs['log_interval'], prefs['early_stop_min_delta']) == ('float32', 7, 2, .025)
+            assert w.detail_tabs.get_child_by_name('benchmark') and w.benchmark_button.get_sensitive()
+            assert w.benchmark_kinds[0] == ('best', 'latest')
+            def benchmark_process(command, **kwargs):
+                output = Path(command[command.index('--output') + 1])
+                kind = command[command.index('--checkpoint') + 1]
+                report = {'kind': 'whitecube_checkpoint_benchmark', 'created_at': '2026-10-11T16:00:00Z',
+                          'checkpoint': {'name': f'ckpt_{kind}.pt', 'completed_steps': 4},
+                          'settings': {'seed': 2026}, 'validation': {'loss': 2.1, 'bits_per_byte': 3.02, 'tokens': 20480},
+                          'generation': {'samples': [{'prompt': 'A cube', 'continuation': ' learned to balance.'}]}}
+                engine.atomic_json(output, report)
+                return subprocess.CompletedProcess(command, 0, stdout=json.dumps(report), stderr='')
+            with patch.object(w, 'background', side_effect=lambda work, done: done(work(), None)), \
+                    patch.object(app.subprocess, 'run', side_effect=benchmark_process):
+                w.benchmark()
+            assert len(w.benchmark_reports) == 2 and not w.sampling
+            assert '2.1000' in w.benchmark_output.get_text() and 'learned to balance' in w.benchmark_output.get_text()
+            assert w.benchmark_json_button.get_sensitive() and w.benchmark_csv_button.get_sensitive()
+            benchmark_exports = []
+            with patch.object(w, 'choose_export', side_effect=lambda title, name, produce: benchmark_exports.append(produce())):
+                w.export_benchmarks(); w.export_benchmarks(True)
+            assert len(json.loads(benchmark_exports[0])) == 2 and 'checkpoint_sha256' in benchmark_exports[1]
             w.run_search.set_text('no matching run'); w.filter_runs()
             assert '0 of 1' in w.run_count.get_text()
             assert not w.run_list.get_row_at_index(0).get_visible()
@@ -328,10 +354,16 @@ def inside(fixture, screenshots):
         def capture_next(self):
             try: self.page = next(self.pages)
             except StopIteration:
+                self.window.stack.set_visible_child_name('runs')
+                self.window.detail_tabs.set_visible_child_name('benchmark')
+                app.GLib.timeout_add(350, lambda: self.guarded(self.capture_benchmark))
                 print('PASS: native model options, run selection/search/filters, rename, resume validation, run-settings reuse, deletion confirmation, cooling controls, effective batch summary, cached loss graph, log search/follow, draft names, contextual shortcuts, atomic report/metrics/log exports, checkpoint choices, Chat commands, invalid-start recovery, plan presets/tuning/reset, pins, notes, sorting, preview modes, chart readout, matching log lines, shortcuts dialog, in-place run rows, snapshot checkpoints, run menu, compare overlay, notebook export dialog, failed-run cleanup, text-field probe and start guard, recent corpora, drop target, notebook/rename keys')
-                self.quit(); return False
+                return False
             self.window.stack.set_visible_child_name(self.page)
             app.GLib.timeout_add(350, self.capture); return False
+        def capture_benchmark(self):
+            app.screenshot(self.window, str(screenshots / 'cube-train-benchmark.png'))
+            self.quit(); return False
         def capture(self):
             return self.guarded(self.capture_guarded)
         def capture_guarded(self):

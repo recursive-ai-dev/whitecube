@@ -16,10 +16,22 @@ for directory in (root / 'apps/cube-train', root / 'share/whitecube/cube-train')
             raise SystemExit(0)
         # Notebook export copies files only, so it runs on the system Python.
         if sys.argv[1:2] == ['--export-notebook']:
-            os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'pipeline/export_notebook.py'), *sys.argv[2:]])
+            python = trainer.preferences()['python']
+            kernel = engine.installed_kernel(python)
+            options = ['--python', python]
+            if kernel:
+                options += ['--kernel-name', kernel['name'], '--kernel-display-name', kernel['display_name']]
+            os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'pipeline/export_notebook.py'), *sys.argv[2:], *options])
+        if sys.argv[1:2] == ['--benchmark']:
+            executable = trainer.preferences()['python']
+            arguments = sys.argv[2:]
+            if arguments and not arguments[0].startswith('-'):
+                arguments = ['--run-dir', *arguments]
+            os.execv(executable, [executable, '-I', str(directory / 'pipeline/benchmark.py'), *arguments])
         if '--help' in sys.argv[1:] or '-h' in sys.argv[1:]:
             print('Whitecube Trainer summaries:\n  whitecube-train --list-runs   list runs (* pinned, B/L checkpoints)\n'
                   '  whitecube-train --status      show the running desktop job\n'
+                  '  whitecube-train --benchmark RUN --output REPORT.json [--checkpoint best|latest|stepN]\n'
                   '  whitecube-train --export-notebook RUN --output DIR [--checkpoint best|latest|stepN]\n'
                   '                                [--with-corpus] [--reference] [--no-script]\n')
         executable = trainer.preferences()['python']

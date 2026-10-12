@@ -1,5 +1,8 @@
 """0.9.0: notebook export, checkpoints, cleanup, field probe and runtime hints (system Python, no torch)."""
 import json
+import builtins
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -123,14 +126,62 @@ class NotebookExportTests(unittest.TestCase):
 
     def test_command_line_and_whitecube_train_wrapper(self):
         result = subprocess.run([sys.executable, '-I', str(HERE / 'pipeline/export_notebook.py'), str(self.run),
-                                 '--output', str(self.root / 'cli'), '--no-script'], capture_output=True, text=True)
+                                 '--output', str(self.root / 'cli'), '--no-script', '--python', sys.executable,
+                                 '--kernel-name', 'my-training-env', '--kernel-display-name', 'Training Python'],
+                                capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(Path(result.stdout.strip()).name, 'story-model.ipynb')
         self.assertFalse((self.root / 'cli/story-model.py').exists())
+        self.assertEqual(json.loads(Path(result.stdout.strip()).read_text())['metadata']['kernelspec'],
+                         {'name': 'my-training-env', 'display_name': 'Training Python', 'language': 'python'})
         again = subprocess.run([sys.executable, '-I', str(HERE / 'pipeline/export_notebook.py'), str(self.run),
                                 '--output', str(self.root / 'cli')], capture_output=True, text=True)
         self.assertEqual(again.returncode, 1)
         self.assertIn('new or empty folder', again.stderr)
+
+    def test_setup_diagnoses_a_missing_bundle_before_importing_the_model(self):
+        path = export_notebook.export(self.run, 'best', self.root / 'incomplete')
+        (path.parent / 'checkpoint/ckpt_best.pt').unlink()
+        source = ''.join(json.loads(path.read_text())['cells'][2]['source'])
+        with self.assertRaisesRegex(FileNotFoundError, 'Keep the .ipynb together'):
+            exec(source, {'__file__': str(path)})
+
+    def test_setup_finds_moved_bundle_from_a_nested_working_directory(self):
+        path = export_notebook.export(self.run, 'best', self.root / 'original', python="/tmp/Trainer's env/python")
+        destination = self.root / 'moved'
+        path.parent.rename(destination)
+        nested = destination / 'analysis'; nested.mkdir()
+        document = json.loads((destination / path.name).read_text())
+        source = ''.join(document['cells'][2]['source'])
+        namespace = {'__file__': str(nested / 'analysis.py')}
+        original_import = builtins.__import__
+
+        def missing_torch(name, *args, **kwargs):
+            if name == 'torch':
+                raise ModuleNotFoundError("No module named 'torch'")
+            return original_import(name, *args, **kwargs)
+
+        with patch('builtins.__import__', side_effect=missing_torch), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ImportError, 'Cannot import PyTorch/NumPy') as error:
+                exec(compile(source, 'setup', 'exec'), namespace)
+        self.assertEqual(namespace['HERE'], destination)
+        self.assertIn(sys.executable, str(error.exception))
+        self.assertIn("/tmp/Trainer's env/python", str(error.exception))
+        self.assertIn('ipykernel install', ''.join(document['cells'][1]['source']))
+
+    def test_weights_export_skips_an_unavailable_optional_dependency(self):
+        cells = export_notebook.build_cells(self.run, 'best', bundle=False, export_dir=self.root)
+        original_import = builtins.__import__
+
+        def missing_safetensors(name, *args, **kwargs):
+            if name == 'safetensors':
+                raise ModuleNotFoundError("No module named 'safetensors'")
+            return original_import(name, *args, **kwargs)
+
+        stream = io.StringIO()
+        with patch('builtins.__import__', side_effect=missing_safetensors), contextlib.redirect_stdout(stream):
+            exec(''.join(cells[-1]['source']), {})
+        self.assertIn('Weights export skipped', stream.getvalue())
 
 
 class EngineNotebookTests(unittest.TestCase):
@@ -180,7 +231,8 @@ class EngineNotebookTests(unittest.TestCase):
     def test_notebook_export_uses_registered_kernel_and_refuses_latest_while_training(self):
         kernel = self.root / 'jupyter/kernels' / engine.KERNEL_NAME
         kernel.mkdir(parents=True)
-        engine.atomic_json(kernel / 'kernel.json', {'argv': ['python', '-m', 'ipykernel_launcher'], 'display_name': 'WC'})
+        self.trainer.save_preferences({'python': sys.executable})
+        engine.atomic_json(kernel / 'kernel.json', {'argv': [sys.executable, '-m', 'ipykernel_launcher'], 'display_name': 'WC'})
         path = self.trainer.notebook_export('run-a', 'best', self.root / 'nb', bundle=False)
         self.assertEqual(json.loads(path.read_text())['metadata']['kernelspec']['name'], engine.KERNEL_NAME)
         running = {**self.trainer.find_run('run-a'), 'job': {'running': True}}
@@ -194,6 +246,33 @@ class EngineNotebookTests(unittest.TestCase):
         self.assertEqual(self.trainer.kernel_command('/usr/bin/python3')[-4:], ['--name', engine.KERNEL_NAME, '--display-name', 'Whitecube Trainer (PyTorch)'])
         with self.assertRaises(ValueError):
             self.trainer.kernel_command('relative/python')
+
+    def test_notebook_export_finds_the_training_environment_under_another_kernel_name(self):
+        python = self.root / 'training/bin/python'
+        python.parent.mkdir(parents=True); python.write_text('')
+        self.trainer.save_preferences({'python': str(python)})
+        kernels = self.root / 'jupyter/kernels'
+        wrong = kernels / engine.KERNEL_NAME; wrong.mkdir(parents=True)
+        engine.atomic_json(wrong / 'kernel.json', {'argv': ['/usr/bin/python3', '-m', 'ipykernel_launcher'],
+                                                  'display_name': 'Stale training kernel'})
+        right = kernels / 'tensegrity-local'; right.mkdir()
+        engine.atomic_json(right / 'kernel.json', {'argv': [str(python), '-m', 'ipykernel_launcher'],
+                                                  'display_name': 'Tensegrity Python'})
+        path = self.trainer.notebook_export('run-a', 'best', self.root / 'matched', bundle=False)
+        self.assertEqual(json.loads(path.read_text())['metadata']['kernelspec'],
+                         {'name': 'tensegrity-local', 'display_name': 'Tensegrity Python', 'language': 'python'})
+
+    def test_kernel_discovery_does_not_match_ambiguous_python_or_another_venv(self):
+        python = self.root / 'training/bin/python'
+        python.parent.mkdir(parents=True); python.symlink_to(sys.executable)
+        kernels = self.root / 'jupyter/kernels'
+        wrong = kernels / engine.KERNEL_NAME; wrong.mkdir(parents=True)
+        engine.atomic_json(wrong / 'kernel.json', {'argv': [sys.executable, '-m', 'ipykernel_launcher'],
+                                                  'display_name': 'Another environment'})
+        relative = kernels / 'relative'; relative.mkdir()
+        engine.atomic_json(relative / 'kernel.json', {'argv': ['python', '-m', 'ipykernel_launcher'],
+                                                     'display_name': 'Unknown environment'})
+        self.assertIsNone(engine.installed_kernel(str(python)))
 
     def test_jupyter_command_prefers_the_training_environment(self):
         bin_dir = self.root / 'venv/bin'; bin_dir.mkdir(parents=True)

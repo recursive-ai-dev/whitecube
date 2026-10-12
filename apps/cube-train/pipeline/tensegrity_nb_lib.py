@@ -637,17 +637,42 @@ def save_snapshot(out_dir, completed_steps, keep):
     return target
 
 
+def training_precision(requested, device_type, saved=None):
+    """Resolve AMP precision, preserving a checkpoint's actual compute dtype."""
+    choices = ('auto', 'float32', 'bfloat16', 'float16')
+    if requested is not None and requested not in choices:
+        raise ValueError('dtype must be auto, float32, bfloat16 or float16')
+    if saved is not None:
+        if not isinstance(saved, dict) or saved.get('requested') not in choices or saved.get('resolved') not in choices[1:]:
+            raise ValueError('Invalid saved precision plan')
+        if requested is not None and requested not in (saved['requested'], saved['resolved']):
+            raise ValueError('Resume dtype must match the saved precision plan; remove --dtype')
+        requested, resolved = saved['requested'], saved['resolved']
+    else:
+        requested = requested or 'auto'
+        resolved = requested
+    if device_type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA is unavailable. Select --device cpu or check the NVIDIA setup.')
+    if device_type == 'cpu' and resolved == 'float16':
+        raise ValueError('float16 training requires CUDA; use float32 or bfloat16 on CPU')
+    if device_type == 'cuda' and resolved == 'bfloat16' and not torch.cuda.is_bf16_supported():
+        raise ValueError('bfloat16 is unavailable on this CUDA device; use auto or float16 for a new run')
+    if device_type == 'mps' and resolved not in ('auto', 'float32'):
+        raise ValueError('MPS training supports auto or float32 precision')
+    return requested, pick_dtype(resolved, device_type)
+
+
 def run_training(model, optimizer, cfg, out_dir, device,
                   data_dirs, data_weights=None,
                   max_steps=1000, warmup_steps=50,
                   learning_rate=3e-4, min_lr=3e-5,
                   schedule="cosine", stable_steps=None, decay_steps=None,
                   grad_clip=1.0, batch_size=12, grad_accum_steps=1,
-                  log_interval=10, eval_interval=100, eval_iters=20,
-                  dtype="auto", start_step=0, best_val_loss=float("inf"),
+                  log_interval=10, eval_interval=None, eval_iters=None,
+                  dtype=None, start_step=0, best_val_loss=float("inf"),
                   ewc_fisher=None, ewc_old_params=None, ewc_lambda=0.0,
                   init_from="scratch", stop_requested=None, schedule_steps=None,
-                  early_stop_patience=0, keep_snapshots=0, outcome=None):
+                  early_stop_patience=0, early_stop_min_delta=0.0, keep_snapshots=0, outcome=None):
     """
     Train `model` for steps [start_step, max_steps). Checkpoints
     (ckpt_latest.pt / ckpt_best.pt) and a train_log.jsonl are written to
@@ -703,10 +728,18 @@ def run_training(model, optimizer, cfg, out_dir, device,
         preserve the complete schedule plan. On resume, omission keeps that plan;
         an explicit value replaces its horizon. Legacy checkpoints default to a
         horizon of completed steps and print a notice. Validation uses fixed
-        batches; best loss resets when the evaluation configuration changes.
+        batches; resume preserves the saved evaluation and precision plans.
+    dtype: auto, float32, bfloat16 or float16. Omission selects auto on a new
+        run and the checkpoint's resolved precision on resume. Explicit changes
+        to saved precision or evaluation settings are rejected.
+    eval_iters: validation batches of eight sequences (default 20 for new runs).
+    eval_interval: steps between validations (default 100 for new runs).
 
     early_stop_patience: stop after this many consecutive evaluations without
-        a new best validation loss (0 disables). The count restarts on resume.
+        a meaningful validation improvement (0 disables). Counts survive resume.
+    early_stop_min_delta: minimum absolute loss decrease from the last meaningful
+        improvement (default 0). Changing this threshold resets the patience
+        history. The best checkpoint always tracks the true lowest loss.
     keep_snapshots: also keep this many step-numbered copies of the latest
         checkpoint (ckpt_step00001234.pt), removing the oldest (0 disables).
     outcome: optional dict that receives stop_reason, final_loss,
@@ -718,6 +751,25 @@ def run_training(model, optimizer, cfg, out_dir, device,
         raise ValueError("init_from must be 'scratch' or 'resume'")
     if schedule not in ('cosine', 'wsd'):
         raise ValueError("schedule must be 'cosine' or 'wsd'")
+    if isinstance(early_stop_min_delta, bool) or not isinstance(early_stop_min_delta, (int, float)) or not math.isfinite(early_stop_min_delta) or early_stop_min_delta < 0:
+        raise ValueError('early_stop_min_delta must be finite and nonnegative')
+    device = str(device)
+    device_type = 'cuda' if 'cuda' in device else ('mps' if device == 'mps' else 'cpu')
+    latest_path = os.path.join(out_dir, 'ckpt_latest.pt')
+    ckpt_resume = load_checkpoint(latest_path, device) if init_from == 'resume' and os.path.exists(latest_path) else None
+    saved_training = (ckpt_resume.get('training_state') or {}) if ckpt_resume else {}
+    saved_evaluation = saved_training.get('evaluation') or {}
+    settings = {'eval_interval': (eval_interval, 'interval', 100), 'eval_iters': (eval_iters, 'iters', 20)}
+    resolved_evaluation = {}
+    for name, (requested, key, default) in settings.items():
+        if requested is not None and (isinstance(requested, bool) or not isinstance(requested, (int, np.integer)) or requested < 1):
+            raise ValueError(f'{name} must be a positive integer')
+        saved_value = saved_evaluation.get(key)
+        if saved_value is not None and requested is not None and requested != saved_value:
+            raise ValueError(f'Resume {name} must match the saved evaluation plan; remove --{name.replace("_", "-")}')
+        resolved_evaluation[name] = saved_value if saved_value is not None else (default if requested is None else requested)
+    eval_interval, eval_iters = resolved_evaluation['eval_interval'], resolved_evaluation['eval_iters']
+    dtype, amp_dtype = training_precision(dtype, device_type, saved_training.get('precision'))
     for name, value in {'early_stop_patience': early_stop_patience, 'keep_snapshots': keep_snapshots}.items():
         if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 0:
             raise ValueError(f'{name} must be a nonnegative integer')
@@ -757,11 +809,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
     weights = np.asarray(data_weights, dtype=np.float64)
     if weights.ndim != 1 or len(weights) != len(data_dirs) or not np.isfinite(weights).all() or (weights < 0).any() or not np.isfinite(weights.sum()) or weights.sum() <= 0:
         raise ValueError('Provide finite nonnegative data_weights with a positive sum, one per data directory')
-    device = str(device)
-
     os.makedirs(out_dir, exist_ok=True)
-    device_type = "cuda" if "cuda" in device else ("mps" if device == "mps" else "cpu")
-    amp_dtype = pick_dtype(dtype, device_type)
     use_amp = amp_dtype in (torch.float16, torch.bfloat16) and device_type in ("cuda", "cpu")
     # Constructed before any resume-load below (same fix as cmd_train in
     # tensegrity_lm.py): scaler must exist before scaler.load_state_dict can
@@ -775,9 +823,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
     if schedule_steps < 1:
         raise ValueError("schedule_steps must be positive")
     if init_from == "resume":
-        latest_path = os.path.join(out_dir, "ckpt_latest.pt")
-        if os.path.exists(latest_path):
-            ckpt_resume = load_checkpoint(latest_path, device)
+        if ckpt_resume is not None:
 
             cur_cfg_dict = dataclasses.asdict(cfg)
             ckpt_cfg_dict = ckpt_resume["config"]
@@ -802,7 +848,6 @@ def run_training(model, optimizer, cfg, out_dir, device,
             # must continue from the next step, not repeat the one already trained.
             start_step = ckpt_resume["step"] + 1
             best_val_loss = ckpt_resume["best_val_loss"]
-            saved_training = ckpt_resume.get("training_state")
             if saved_training:
                 batching = {'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps}
                 if saved_training.get('batching', batching) != batching:
@@ -814,7 +859,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 learning_rate, min_lr = plan["learning_rate"], plan["min_lr"]
                 base_lrs = plan["base_lrs"]
                 schedule_steps = plan["schedule_steps"] if requested_schedule_steps is None else requested_schedule_steps
-                if saved_training.get("evaluation") != {"version": 1, "seed": 2026, "iters": eval_iters}:
+                if saved_evaluation.get('version') != 1 or saved_evaluation.get('seed') != 2026:
                     best_val_loss = float("inf")
             else:
                 # Old checkpoints contain no schedule horizon. Avoid an implicit LR restart.
@@ -842,9 +887,41 @@ def run_training(model, optimizer, cfg, out_dir, device,
                      "schedule_steps": schedule_steps, "stable_steps": stable_steps,
                      "decay_steps": decay_steps, "learning_rate": learning_rate,
                      "min_lr": min_lr, "base_lrs": base_lrs},
-        "evaluation": {"version": 1, "seed": 2026, "iters": eval_iters},
+        "evaluation": {"version": 1, "seed": 2026, "iters": eval_iters, 'interval': eval_interval, 'batch_size': 8},
+        'precision': {'requested': dtype, 'resolved': str(amp_dtype).removeprefix('torch.')},
         'batching': {'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps},
     }
+    saved_stopping = saved_training.get('early_stopping') or {}
+    evaluations, stale_evaluations = 0, 0
+    early_stop_reference = best_val_loss
+    if saved_stopping and saved_stopping.get('min_delta') == early_stop_min_delta and math.isfinite(best_val_loss):
+        evaluations = saved_stopping.get('evaluations', 0)
+        stale_evaluations = saved_stopping.get('evaluations_without_improvement', 0)
+        early_stop_reference = saved_stopping.get('reference_loss', best_val_loss)
+        for value in (evaluations, stale_evaluations):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError('Invalid saved early stopping counters')
+        if not isinstance(early_stop_reference, (int, float)) or not math.isfinite(early_stop_reference):
+            raise ValueError('Invalid saved early stopping reference loss')
+    stopping_state = {'min_delta': early_stop_min_delta, 'reference_loss': early_stop_reference,
+                      'evaluations': evaluations, 'evaluations_without_improvement': stale_evaluations}
+    training_state['early_stopping'] = stopping_state
+    precision_details = {'dtype': training_state['precision']['resolved'], 'eval_iters': eval_iters,
+                         'validation_tokens_per_evaluation': eval_iters * 8 * cfg.block_size}
+
+    def record_evaluation(loss):
+        nonlocal evaluations, stale_evaluations, early_stop_reference
+        evaluations += 1
+        if loss < early_stop_reference - early_stop_min_delta:
+            early_stop_reference, stale_evaluations = loss, 0
+        else:
+            stale_evaluations += 1
+        stopping_state.update(reference_loss=early_stop_reference, evaluations=evaluations,
+                              evaluations_without_improvement=stale_evaluations)
+        outcome.update(evaluations=evaluations, evaluations_without_improvement=stale_evaluations)
+
+    print(f"Precision: {precision_details['dtype']}; validation: {eval_iters} batches / "
+          f"{precision_details['validation_tokens_per_evaluation']:,} tokens every {eval_interval} steps", flush=True)
     log_path = os.path.join(out_dir, "train_log.jsonl")
     log_file = open(log_path, "a")
 
@@ -864,8 +941,8 @@ def run_training(model, optimizer, cfg, out_dir, device,
         last_evaluated_step = None
         overflow_retries = 0
         tokens_per_step = batch_size * grad_accum_steps * cfg.block_size
-        evaluations = stale_evaluations = 0
-        outcome.update(stop_reason='completed', evaluations=0, evaluations_without_improvement=0)
+        outcome.update(stop_reason='completed', evaluations=evaluations,
+                       evaluations_without_improvement=stale_evaluations, **precision_details)
 
         while step < max_steps:
             if schedule == "wsd":
@@ -948,6 +1025,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 print(f"step {step:6d} | lr {lr0:.2e} (mult {lr_mult:.3f}) | total {accum_total:.4f} "
                       f"(ce {ce:.4f} homeo {homeo:.4f}{conf_str}) | {dt:.1f}s")
                 last_progress = {
+                    **precision_details,
                     'completed_steps': step + 1, 'planned_steps': max_steps,
                     'loss': accum_total, 'learning_rate': lr0, 'elapsed_seconds': dt,
                     'tokens_processed': (step + 1) * tokens_per_step,
@@ -983,15 +1061,13 @@ def run_training(model, optimizer, cfg, out_dir, device,
                 # so GradScaler state (fp16 loss-scale) actually survives every checkpoint.
                 improved = val_loss < best_val_loss
                 best_val_loss = min(best_val_loss, val_loss)
+                record_evaluation(val_loss)
                 save_checkpoint(os.path.join(out_dir, "ckpt_latest.pt"), model, optimizer, cfg, step, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
                 if improved:
                     save_checkpoint(os.path.join(out_dir, "ckpt_best.pt"), model, optimizer, cfg, step, best_val_loss, rng_state, scaler=scaler, training_state=training_state)
                     print(f"step {step:6d} | new best val_loss {best_val_loss:.4f} -> ckpt_best.pt")
                 if keep_snapshots:
                     save_snapshot(out_dir, step + 1, keep_snapshots)
-                evaluations += 1
-                stale_evaluations = 0 if improved else stale_evaluations + 1
-                outcome.update(evaluations=evaluations, evaluations_without_improvement=stale_evaluations)
                 if early_stop_patience and stale_evaluations >= early_stop_patience and step + 1 < max_steps:
                     step += 1
                     outcome['stop_reason'] = 'early_stop'
@@ -1012,6 +1088,8 @@ def run_training(model, optimizer, cfg, out_dir, device,
             val_loss = evaluate(model, data_dirs[0], cfg, device, device_type, amp_dtype, use_amp, eval_iters)
         if not math.isfinite(val_loss):
             raise RuntimeError('Nonfinite validation loss; checkpoint was not replaced')
+        if last_evaluated_step != step and (step > start_step or evaluations == 0):
+            record_evaluation(val_loss)
         rng_state = capture_rng_state()
         improved = val_loss < best_val_loss
         best_val_loss = min(best_val_loss, val_loss)
@@ -1030,6 +1108,7 @@ def run_training(model, optimizer, cfg, out_dir, device,
         log_file.flush()
         atomic_json(os.path.join(out_dir, 'progress.json'), {
             **last_progress,
+            **precision_details,
             'completed_steps': step, 'planned_steps': max_steps, 'best_val_loss': best_val_loss,
             'elapsed_seconds': elapsed, 'tokens_processed': step * tokens_per_step,
             'tokens_per_second': (step - start_step) * tokens_per_step / max(elapsed, 1e-9),

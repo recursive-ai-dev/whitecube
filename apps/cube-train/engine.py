@@ -28,15 +28,18 @@ LIMITS = {'steps': (1, 10_000_000), 'max_tokens': (6000, 10_000_000_000),
           'batch_size': (1, 256), 'grad_accum_steps': (1, 256), 'cpu_threads': (1, 128),
           'max_temp': (50, 90), 'max_cpu_temp': (50, 95), 'schedule_steps': (0, 10_000_000),
           'burst_seconds': (1, 3600), 'cooldown_seconds': (1, 600),
-          'warmup_steps': (0, 1_000_000), 'eval_interval': (1, 10_000_000), 'seed': (0, 2**31 - 1),
+          'warmup_steps': (0, 1_000_000), 'eval_interval': (1, 10_000_000), 'eval_iters': (1, 10000),
+          'log_interval': (1, 10_000_000), 'seed': (0, 2**31 - 1),
           'early_stop_patience': (0, 1000), 'keep_snapshots': (0, 100), 'max_minutes': (0, 525_600),
           'preview_tokens': (1, 4096), 'preview_top_k': (1, 259), 'preview_seed': (0, 2**31 - 1),
           'window_width': (600, 8192), 'window_height': (500, 8192), 'run_sort': (0, 4), 'runs_pane': (240, 900)}
 FLOAT_LIMITS = {'learning_rate': (1e-6, .1), 'min_lr_ratio': (0, 1), 'weight_decay': (0, 1), 'grad_clip': (0, 100),
+                'early_stop_min_delta': (0, 100),
                 'val_fraction': (.01, .5), 'preview_temperature': (0, 2), 'preview_top_p': (.05, 1)}
-CHOICES = {'model_size': tuple(MODEL_PRESETS), 'device': ('cuda', 'cpu'), 'schedule': ('cosine', 'wsd')}
+CHOICES = {'model_size': tuple(MODEL_PRESETS), 'device': ('cuda', 'cpu'), 'schedule': ('cosine', 'wsd'),
+           'dtype': ('auto', 'float32', 'bfloat16', 'float16')}
 # Saved with a new run and restored from its checkpoint on resume.
-PLAN_FLAGS = ('learning_rate', 'min_lr_ratio', 'weight_decay', 'grad_clip', 'eval_interval', 'seed', 'schedule', 'val_fraction')
+PLAN_FLAGS = ('learning_rate', 'min_lr_ratio', 'weight_decay', 'grad_clip', 'eval_interval', 'eval_iters', 'dtype', 'seed', 'schedule', 'val_fraction')
 STOP_REASONS = {'completed': 'Completed', 'stop_requested': 'Stopped on request', 'early_stop': 'Early stop: validation stopped improving',
                 'time_limit': 'Time limit reached', 'thermal': 'Temperature limit reached',
                 'thermal_timeout': 'Stopped: temperatures stayed high during a thermal pause'}
@@ -206,6 +209,7 @@ class Trainer:
                 'low_priority': False, 'learning_rate': 3e-4, 'min_lr_ratio': .1, 'warmup_steps': 0,
                 'weight_decay': .1, 'grad_clip': 1.0, 'eval_interval': 50, 'seed': 1337, 'schedule': 'cosine',
                 'val_fraction': .05, 'early_stop_patience': 0, 'keep_snapshots': 0, 'max_minutes': 0,
+                'dtype': 'auto', 'eval_iters': 20, 'log_interval': 10, 'early_stop_min_delta': 0.0,
                 'thermal_pause': False, 'preview_tokens': 120, 'preview_temperature': .85, 'preview_top_k': 40,
                 'preview_top_p': 1.0, 'preview_seed': 1337, 'window_width': 1060, 'window_height': 780, 'run_sort': 0,
                 'recent_datasets': [], 'runs_pane': 360}
@@ -337,6 +341,8 @@ class Trainer:
             runs.append({'id': directory.name, 'directory': str(directory), 'name': name if isinstance(name, str) and name else directory.name,
                          'size': size, 'parameters': nonnegative_int(meta.get('parameters')) or None, 'steps': nonnegative_int(meta.get('steps')),
                          'completed_steps': completed, 'loss': progress.get('loss') if finite_number(progress.get('loss')) else None,
+                         'dtype': next((value for value in (progress.get('dtype'), result.get('dtype'))
+                                        if value in ('float32', 'bfloat16', 'float16')), None),
                          'val_loss': result.get('best_val_loss') if finite_number(result.get('best_val_loss')) else None, 'phase': phase, 'prepared': prepared,
                          'best': (directory / 'ckpt_best.pt').is_file(), 'latest': (directory / 'ckpt_latest.pt').is_file(),
                          'detail': str(status.get('detail') or (job or {}).get('detail') or ''), 'job': job, 'meta': meta,
@@ -466,6 +472,51 @@ class Trainer:
                 '--max-new-tokens', str(int(tokens)), '--temperature', repr(float(temperature)),
                 '--top-k', str(int(top_k)), '--top-p', repr(float(top_p)), '--seed', str(int(seed))]
 
+    def benchmark_command(self, run_id, kind, python, *, eval_iters=20, batch_size=4,
+                          seed=2026, tokens=64, prompts=()):
+        run = self.find_run(run_id)
+        self.checkpoint_path(run_id, kind)
+        if not run['prepared']:
+            raise ValueError('Benchmarking needs this run’s prepared corpus.')
+        if self.pipeline_busy():
+            raise ValueError('Wait for training to finish before benchmarking checkpoints.')
+        executable = Path(python).expanduser()
+        if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+            raise ValueError('Choose an executable Python training environment on Train.')
+        for key, value in {'eval_iters': eval_iters, 'batch_size': batch_size,
+                           'seed': seed, 'preview_tokens': tokens}.items():
+            low, high = LIMITS[key]
+            if key == 'batch_size':
+                high = 64
+            if not finite_number(value) or value != int(value) or not low <= value <= high:
+                raise ValueError(f'Invalid benchmark {key.replace("_", " ")}.')
+        if not isinstance(prompts, (tuple, list)) or len(prompts) > 8 or any(
+                not isinstance(prompt, str) or not prompt.strip() or len(prompt.encode('utf-8')) > 4096 or '\0' in prompt
+                for prompt in prompts):
+            raise ValueError('Use up to eight prompts, each at most 4,096 UTF-8 bytes.')
+        destination = Path(run['directory']) / 'benchmarks' / f'{time.time_ns()}-{kind}-{uuid.uuid4().hex[:8]}.json'
+        command = [str(executable), '-I', str(PIPELINE / 'benchmark.py'), '--run-dir', run['directory'],
+                   '--checkpoint', kind, '--output', str(destination), '--eval-iters', str(int(eval_iters)),
+                   '--batch-size', str(int(batch_size)), '--seed', str(int(seed)), '--max-new-tokens', str(int(tokens)),
+                   '--cpu-threads', '2', '--temperature', '0']
+        for prompt in prompts:
+            command += ['--prompt', prompt]
+        return command
+
+    def benchmarks(self, run_id, limit=20):
+        directory = Path(self.find_run(run_id)['directory']) / 'benchmarks'
+        reports = []
+        for path in sorted(directory.glob('*.json'), reverse=True)[:limit]:
+            report = read_json(path, max_bytes=2 * 1024 * 1024)
+            if (report.get('kind') == 'whitecube_checkpoint_benchmark'
+                    and isinstance(report.get('checkpoint'), dict) and isinstance(report.get('validation'), dict)
+                    and finite_number(report['validation'].get('loss'))
+                    and all(isinstance(report.get(key, {}), dict) for key in ('settings', 'generation', 'corpus', 'model'))
+                    and isinstance(report.get('generation', {}).get('samples', []), list)
+                    and all(isinstance(sample, dict) for sample in report.get('generation', {}).get('samples', []))):
+                reports.append(report)
+        return reports
+
     def export_command(self, run_id, kind, destination, python):
         run = self.find_run(run_id)
         checkpoint = self.checkpoint_path(run_id, kind)
@@ -535,10 +586,10 @@ class Trainer:
         if run['job'] and run['job'].get('running') and kind == 'latest':
             raise ValueError('Latest changes while this run trains. Export Best or a snapshot, or stop the run first.')
         python = self.preferences()['python']
-        kernel = installed_kernel()
+        kernel = installed_kernel(python)
         return export_notebook.export(run['directory'], kind, destination, bundle=bundle, corpus=corpus, script=script,
                                       preview=preview, python=python, cancelled=cancelled,
-                                      kernel={'name': KERNEL_NAME, 'display_name': kernel['display_name'], 'language': 'python'} if kernel else None)
+                                      kernel={'name': kernel['name'], 'display_name': kernel['display_name'], 'language': 'python'} if kernel else None)
 
     def kernel_command(self, python):
         python = Path(python).expanduser()
@@ -570,6 +621,10 @@ class Trainer:
             values[key] = float(value)
         if values['schedule'] not in CHOICES['schedule']:
             raise ValueError('Choose a cosine or warmup-stable-decay schedule.')
+        if values['dtype'] not in CHOICES['dtype']:
+            raise ValueError('Choose automatic, float32, bfloat16 or float16 precision.')
+        if not resume_id and values['device'] == 'cpu' and values['dtype'] == 'float16':
+            raise ValueError('Float16 training requires CUDA. Choose float32, bfloat16 or automatic for CPU.')
         for key in ('stagger_training', 'low_priority', 'thermal_pause', 'deduplicate', 'shuffle_files'):
             if not isinstance(values[key], bool):
                 raise ValueError(f'{key.replace("_", " ").capitalize()} must be enabled or disabled.')
@@ -593,6 +648,8 @@ class Trainer:
                 raise ValueError('This run has no complete prepared corpus. Start a new run.')
             if run['completed_steps'] > 0 and not run['latest']:
                 raise ValueError('Continuing training needs the Latest checkpoint. Restore it from Trash or choose another run.')
+            if values['device'] == 'cpu' and run.get('dtype') == 'float16':
+                raise ValueError('This checkpoint saved float16 precision and needs CUDA to resume. Select CUDA on Train.')
             if values['steps'] <= run['completed_steps']:
                 raise ValueError(f'Resume needs a total step target above {run["completed_steps"]:,}.')
         else:
@@ -720,7 +777,7 @@ class Trainer:
             if values['warmup_steps']:
                 command += ['--warmup-steps', str(values['warmup_steps'])]
         if not prepare_only:
-            for key in ('early_stop_patience', 'keep_snapshots', 'max_minutes'):
+            for key in ('early_stop_patience', 'early_stop_min_delta', 'log_interval', 'keep_snapshots', 'max_minutes'):
                 command += ['--' + key.replace('_', '-'), str(values[key])]
             command += ['--thermal-pause' if values['thermal_pause'] else '--no-thermal-pause']
         return command
@@ -757,7 +814,7 @@ class Trainer:
                 'status': read_json(directory / 'status.json'), 'failure': read_json(directory / 'failure.json'),
                 'progress': read_json(directory / 'progress.json'), 'telemetry': latest_telemetry(directory),
                 'checkpoint_files': [str(path) for path in sorted(directory.glob('ckpt_*.pt'))],
-                'notes': run['notes'], 'previews': self.previews(run_id),
+                'notes': run['notes'], 'previews': self.previews(run_id), 'benchmarks': self.benchmarks(run_id),
                 'disk_bytes': directory_size(directory), 'metrics': read_metrics(directory)}
 
     def summary(self):
@@ -805,9 +862,44 @@ def jupyter_data_dir():
     return Path(os.environ.get('XDG_DATA_HOME') or Path.home() / '.local/share') / 'jupyter'
 
 
-def installed_kernel():
-    spec = read_json(jupyter_data_dir() / 'kernels' / KERNEL_NAME / 'kernel.json')
-    return spec if isinstance(spec.get('display_name'), str) and isinstance(spec.get('argv'), list) else None
+def installed_kernel(python=None):
+    """Find a Python kernelspec for the selected environment, including existing names.
+
+    Do not resolve executable symlinks: separate virtualenvs often share the same
+    underlying Python binary but have different installed training packages.
+    """
+    selected = os.path.abspath(os.path.expanduser(str(python))) if python else None
+    roots = [Path(part) for part in os.environ.get('JUPYTER_PATH', '').split(os.pathsep) if part]
+    roots.append(jupyter_data_dir())
+    if selected:
+        roots.append(Path(selected).parent.parent / 'share/jupyter')
+    roots.extend((Path('/usr/local/share/jupyter'), Path('/usr/share/jupyter')))
+    seen = set()
+    candidates = []
+    for root in roots:
+        try:
+            paths = sorted((root / 'kernels').glob('*/kernel.json'))
+        except OSError:
+            continue
+        for path in paths:
+            name = path.parent.name
+            if name in seen:
+                continue
+            seen.add(name)
+            spec = read_json(path)
+            argv = spec.get('argv')
+            if not (isinstance(spec.get('display_name'), str) and isinstance(argv, list)
+                    and argv and isinstance(argv[0], str)):
+                continue
+            if selected:
+                if not Path(argv[0]).is_absolute() or os.path.abspath(argv[0]) != selected:
+                    continue
+                if not os.path.isfile(selected):
+                    continue
+            elif name != KERNEL_NAME:
+                continue
+            candidates.append({**spec, 'name': name})
+    return next((spec for spec in candidates if spec['name'] == KERNEL_NAME), candidates[0] if candidates else None)
 
 
 def jupyter_command(python=None):
@@ -823,16 +915,14 @@ def jupyter_command(python=None):
     return None
 
 
-def set_notebook_kernel(path, display_name):
+def set_notebook_kernel(path, display_name, name=KERNEL_NAME):
     """Point an exported notebook at the registered training kernel."""
     path = Path(path)
     document = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(document, dict) or document.get('nbformat') != 4:
         raise ValueError('This is not a version 4 notebook.')
-    document.setdefault('metadata', {})['kernelspec'] = {'name': KERNEL_NAME, 'display_name': display_name, 'language': 'python'}
-    staging = path.with_name(f'.{path.name}.{os.getpid()}')
-    staging.write_text(json.dumps(document, indent=1, ensure_ascii=False) + '\n', encoding='utf-8')
-    os.replace(staging, path)
+    document.setdefault('metadata', {})['kernelspec'] = {'name': name, 'display_name': display_name, 'language': 'python'}
+    atomic_json(path, document)
 
 
 FIELD_PROBE = r'''

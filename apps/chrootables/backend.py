@@ -169,8 +169,8 @@ def workspace_args(action, name, value=None) -> list[str]:
         return [f'--{action}', name, value, '--yes']
     if action in ('repair', 'delete'):
         return [f'--{action}', name, '--yes']
-    if action == 'export':
-        return ['--export', name]
+    if action in ('export', 'export-iso', 'export-disk'):
+        return [f'--{action}', name]
     raise ValueError(f'Unknown action: {action}')
 
 

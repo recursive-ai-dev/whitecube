@@ -89,13 +89,16 @@ Desktop Chat includes a private Electron runtime, its sandbox helper and require
 **Whitecube Trainer** (`cube-train`) is a native GTK4 app for local 1M, 2M, 5M and 10M models.
 It selects datasets, saves named runs in `~/train-out`, monitors progress/loss/temperature,
 supports Stop/Resume, previews checkpoints, and opens them directly in Chat.
+Trainer 1.0 adds precision and validation controls, early stopping that remembers
+patience on resume, reproducible checkpoint benchmarks with JSON/CSV reports,
+and portable notebooks that select the configured training Python kernel.
 Optional timed cooling breaks, lower training priority, and CPU/GPU temperature
 limits help manage heat. Runs or individual checkpoints can be moved to Trash
 after confirmation; restoring Latest restores the ability to resume.
 The complete model pipeline lives in `apps/cube-train/pipeline` and ships with the deb.
 `whitecube-train --5m` uses the same pipeline from the command line. Training uses the
 configured PyTorch Python environment; system GTK remains independent of that environment.
-See `docs/TRAINER-IMPROVEMENTS.txt` for the twenty improvements and shortcuts.
+See [the Trainer guide](apps/cube-train/README.md) for the workflow and CLI options.
 The **Talk to** picker discovers `~/train-out/*/ckpt_*.pt`, including Best and Latest.
 Choose a checkpoint to start a new chat; **Rename** saves its display name without changing training files.
 Local inference starts automatically on CPU using Trainer's configured environment (or the

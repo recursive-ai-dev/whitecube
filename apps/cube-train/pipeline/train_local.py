@@ -1,6 +1,7 @@
 """Local 1M/2M/5M/10M Tensegrity training (legacy 4M/8M supported)."""
 import argparse
 import json
+import math
 from dataclasses import asdict
 from pathlib import Path
 import tempfile
@@ -9,7 +10,7 @@ import numpy as np
 import torch
 
 from tensegrity_lm import TensegrityConfig, TensegrityLM, prepare_data, load_checkpoint
-from tensegrity_nb_lib import run_training
+from tensegrity_nb_lib import run_training, training_precision
 from prepare_folder import prepare_folder
 from model_presets import MODEL_PRESETS
 from files import atomic_json
@@ -45,9 +46,11 @@ def wsd_plan(horizon, warmup_steps):
 def train(data_dir, out_dir, *, steps=1000, batch_size=4,
           grad_accum_steps=4, device="cuda", resume=False, stop_requested=None, schedule_steps=None, model_size=None,
           learning_rate=3e-4, min_lr_ratio=.1, warmup_steps=None, weight_decay=.1, grad_clip=1.0,
-          eval_interval=50, seed=1337, schedule='cosine', early_stop_patience=0, keep_snapshots=0, outcome=None):
+          eval_interval=None, eval_iters=None, log_interval=None, dtype=None,
+          seed=1337, schedule='cosine', early_stop_patience=0, early_stop_min_delta=0.0, keep_snapshots=0, outcome=None):
     for name, value in {'steps': steps, 'batch_size': batch_size, 'grad_accum_steps': grad_accum_steps,
-                        'eval_interval': eval_interval,
+                        **{key: value for key, value in {'eval_interval': eval_interval, 'eval_iters': eval_iters,
+                                                        'log_interval': log_interval}.items() if value is not None},
                         **({'schedule_steps': schedule_steps} if schedule_steps is not None else {})}.items():
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f'{name} must be a positive integer')
@@ -61,6 +64,8 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
             raise ValueError(f'{name} must be between {low:g} and {high:g}')
     if schedule not in ('cosine', 'wsd'):
         raise ValueError('schedule must be cosine or wsd')
+    if isinstance(early_stop_min_delta, bool) or not isinstance(early_stop_min_delta, (int, float)) or not math.isfinite(early_stop_min_delta) or early_stop_min_delta < 0:
+        raise ValueError('early_stop_min_delta must be finite and nonnegative')
     if device not in ('cpu', 'cuda'):
         raise ValueError('device must be cpu or cuda')
     if device == "cuda" and not torch.cuda.is_available():
@@ -71,15 +76,23 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
     cfg = local_config(model_size or "1m")
     out_dir = Path(out_dir).resolve()
     ckpt_path = out_dir / "ckpt_latest.pt"
+    saved_training = {}
     if resume:
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"No checkpoint to resume: {ckpt_path}")
-        cfg = TensegrityConfig(**load_checkpoint(str(ckpt_path), "cpu")["config"])
+        checkpoint = load_checkpoint(str(ckpt_path), 'cpu')
+        cfg = TensegrityConfig(**checkpoint['config'])
+        saved_training = checkpoint.get('training_state') or {}
         if model_size is not None and asdict(cfg) != asdict(local_config(model_size)):
             raise ValueError(f"--{model_size} conflicts with the checkpoint model. "
                              "Resume without a size flag or start a new run.")
     elif ckpt_path.exists():
         raise FileExistsError("This run has a checkpoint. Use --resume or a new --out-dir.")
+    training_precision(dtype, device, saved_training.get('precision'))
+    for name, value, key in (('eval_iters', eval_iters, 'iters'), ('eval_interval', eval_interval, 'interval')):
+        saved = (saved_training.get('evaluation') or {}).get(key)
+        if value is not None and saved is not None and value != saved:
+            raise ValueError(f'Resume {name} must match the saved evaluation plan; remove --{name.replace("_", "-")}')
     from corpus_artifacts import verify_corpus
     verify_corpus(data_dir, minimum=cfg.block_size + 1, vocab_size=cfg.vocab_size,
                   stop_requested=(lambda: stop_requested(0)) if stop_requested else None)
@@ -109,12 +122,14 @@ def train(data_dir, out_dir, *, steps=1000, batch_size=4,
         learning_rate=learning_rate, min_lr=learning_rate * min_lr_ratio,
         schedule=schedule, stable_steps=stable, decay_steps=decay, grad_clip=grad_clip,
         batch_size=batch_size, grad_accum_steps=grad_accum_steps,
-        log_interval=1 if steps <= 10 else 10,
-        eval_interval=eval_interval, eval_iters=20,
-        dtype="auto",
+        log_interval=log_interval if log_interval is not None else (1 if steps <= 10 else 10),
+        eval_interval=eval_interval if eval_interval is not None else (saved_training.get('evaluation') or {}).get('interval', 50),
+        eval_iters=eval_iters,
+        dtype=dtype,
         init_from="resume" if resume else "scratch",
         stop_requested=stop_requested, schedule_steps=schedule_steps,
-        early_stop_patience=early_stop_patience, keep_snapshots=keep_snapshots, outcome=outcome,
+        early_stop_patience=early_stop_patience, early_stop_min_delta=early_stop_min_delta,
+        keep_snapshots=keep_snapshots, outcome=outcome,
     )
     if not np.isfinite(result[1]):
         raise RuntimeError("Validation loss is nonfinite")
@@ -135,6 +150,13 @@ def main():
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--grad-accum-steps", type=int, default=4)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    p.add_argument('--dtype', choices=('auto', 'float32', 'bfloat16', 'float16'),
+                   help='Compute precision (default auto; resume preserves saved precision)')
+    p.add_argument('--eval-iters', type=int, help='Validation batches of eight sequences (default 20; resume reuses saved value)')
+    p.add_argument('--eval-interval', type=int, help='Validate every N steps (default 50; resume reuses saved value)')
+    p.add_argument('--log-interval', type=int, help='Write progress every N steps (default 1 for <=10 steps, otherwise 10)')
+    p.add_argument('--early-stop-patience', type=int, default=0, help='Stop after N validations without meaningful improvement (0 disables)')
+    p.add_argument('--early-stop-min-delta', type=float, default=0.0, help='Minimum absolute validation-loss improvement (default 0)')
     p.add_argument("--resume", action="store_true")
     p.add_argument("--smoke-test", action="store_true")
     args = p.parse_args()
@@ -150,9 +172,13 @@ def main():
             corpus.write_text("\n".join(json.dumps({"text": f"Story {i}. " + "The robot learned to balance. " * 40}) for i in range(40)))
             prepare_folder(corpus, tmp / "data", val_fraction=0.1)
             train(tmp / "data", tmp / "run", steps=3, batch_size=2,
-                  grad_accum_steps=1, device=args.device, model_size=args.model_size)
+                  grad_accum_steps=1, device=args.device, model_size=args.model_size, dtype=args.dtype,
+                  eval_iters=args.eval_iters, eval_interval=args.eval_interval, log_interval=args.log_interval,
+                  early_stop_patience=args.early_stop_patience, early_stop_min_delta=args.early_stop_min_delta)
             train(tmp / "data", tmp / "run", steps=4, batch_size=2,
-                  grad_accum_steps=1, device=args.device, resume=True, model_size=args.model_size)
+                  grad_accum_steps=1, device=args.device, resume=True, model_size=args.model_size, dtype=args.dtype,
+                  eval_iters=args.eval_iters, eval_interval=args.eval_interval, log_interval=args.log_interval,
+                  early_stop_patience=args.early_stop_patience, early_stop_min_delta=args.early_stop_min_delta)
         return
     if bool(args.data) == bool(args.data_dir):
         p.error("Provide exactly one of --data or --data-dir")
@@ -166,7 +192,9 @@ def main():
             prepare_folder(args.data, data_dir, val_fraction=0.05)
     train(data_dir, args.out_dir, steps=args.steps, batch_size=args.batch_size,
           grad_accum_steps=args.grad_accum_steps, device=args.device, resume=args.resume,
-          schedule_steps=args.schedule_steps, model_size=args.model_size)
+          schedule_steps=args.schedule_steps, model_size=args.model_size, dtype=args.dtype,
+          eval_iters=args.eval_iters, eval_interval=args.eval_interval, log_interval=args.log_interval,
+          early_stop_patience=args.early_stop_patience, early_stop_min_delta=args.early_stop_min_delta)
 
 
 if __name__ == "__main__":

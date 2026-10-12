@@ -1467,9 +1467,26 @@ class ChrootablesWindow(Adw.ApplicationWindow):
 
     def ask_export(self):
         name = self.selected
-        self.ask(f'Export {name}', 'Packs the filesystem into a .tar.gz with a .sha256 checksum in the store’s exports directory.',
-                 'Export', lambda _value: self.action(f'Export of {name}', 'export', select=name,
-                                                      success=lambda result: f'Exported to {result.stdout.strip()}'))
+        dialog = Adw.AlertDialog.new(
+            f'Export {name}',
+            'Archive: the filesystem as a .tar.gz, for importing elsewhere.\n'
+            'Live ISO / Disk image: a copy gets a kernel and systemd and boots through a signed UKI '
+            '(EFI only, amd64). The ISO keeps changes in RAM; the disk image keeps them. '
+            'With Secure Boot on, enroll the store’s secureboot/MOK.cer once per machine.')
+        dialog.add_response('cancel', 'Cancel')
+        for response, text in (('export', 'Archive'), ('export-iso', 'Live ISO'), ('export-disk', 'Disk image')):
+            dialog.add_response(response, text)
+        dialog.set_response_appearance('export', Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response('export')
+        dialog.set_close_response('cancel')
+
+        def respond(_dialog, response):
+            if response == 'cancel':
+                return
+            self.action(f'Export of {name}', response, select=name,
+                        success=lambda result: f'Exported to {(result.stdout.strip().splitlines() or [''])[-1]}')
+        dialog.connect('response', respond)
+        dialog.present(self)
 
     def ask_repair(self):
         name = self.selected
@@ -1798,9 +1815,12 @@ class ChrootablesWindow(Adw.ApplicationWindow):
                 text.append(label(f"{item.get('workspace', '?')} · {short_time(item.get('created_at'))} · {backend.human_bytes(item.get('size_bytes'))}", 'muted'))
                 row.append(text)
                 row.append(chip('sha256' if item.get('sha256') else 'no checksum', 'ready' if item.get('sha256') else 'warn'))
-                use = button('Use', lambda e=item: self.use_archive(e['path'], e.get('size_bytes')), icon='go-next-symbolic')
-                use.set_valign(Gtk.Align.CENTER)
-                row.append(use)
+                if item.get('kind', 'archive') == 'archive':
+                    use = button('Use', lambda e=item: self.use_archive(e['path'], e.get('size_bytes')), icon='go-next-symbolic')
+                    use.set_valign(Gtk.Align.CENTER)
+                    row.append(use)
+                else:
+                    row.append(chip('boot ISO' if item['kind'] == 'iso' else 'boot disk', 'ready'))
                 self.export_list.append(row)
         self.background(self.manager.exports, loaded)
 

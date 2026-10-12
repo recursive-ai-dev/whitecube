@@ -40,6 +40,18 @@ filesystem tarball (`--import`, checksum verified when present). `--cleanup`
 finds files left behind by operations that were killed, and removes them with
 `--yes`.
 
+**Bootable exports** (amd64): `--export-iso` writes an EFI-only hybrid ISO
+(squashfs root under live-boot, writes stay in RAM) and `--export-disk` a GPT
+disk image (ESP plus the workspace as a persistent ext4 root). Both work on a
+copy grown by 2 GiB that gets `linux-image-amd64`, systemd, networkd/resolved
+and a UKI built with `ukify`; the workspace itself is untouched. The ESP holds
+Debian's Microsoft-signed shim as `BOOTX64.EFI` and the UKI as `grubx64.efi`,
+signed with a Machine Owner Key generated once in `STORE/secureboot/`. With
+Secure Boot on, enroll `MOK.cer` per machine (`mokutil --import`, or *Enroll key
+from disk* in MokManager, which shim opens on first boot; the ESP carries a
+copy). Consoles (tty1, ttyS0) log in as root automatically. A kernel upgrade
+inside a booted disk image does not rebuild its UKI.
+
 Every image keeps adjacent metadata: suite, release, architecture, profile,
 size, description, creation and last-use times, clone or import origin.
 

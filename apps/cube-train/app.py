@@ -21,7 +21,7 @@ import export_notebook
 from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 from gi.repository import Pango
 
-VERSION = '0.9.0'
+VERSION = '1.0.0'
 PLAN_PRESETS = (('Custom', None), ('Smoke test · 20 steps', 20), ('Short · 1,000 steps', 1000),
                 ('Standard · 5,000 steps', 5000), ('Long · 20,000 steps', 20_000))
 RUN_SORTS = ('Newest first', 'Oldest first', 'Name', 'Best validation loss', 'Model size')
@@ -239,6 +239,48 @@ def checkpoint_line(item):
     return ' · '.join(parts)
 
 
+def benchmark_rows(reports):
+    """Flatten reproducible measurements for the on-screen table and CSV export."""
+    rows = []
+    for report in reports:
+        checkpoint = report.get('checkpoint', {})
+        validation = report.get('validation', {})
+        settings = report.get('settings', {})
+        artifacts = report.get('corpus', {}).get('artifacts', {})
+        val_artifact = artifacts.get('val.bin', {}) if isinstance(artifacts, dict) else {}
+        rows.append({'checkpoint': checkpoint.get('name', 'Unknown'), 'steps': checkpoint.get('completed_steps'),
+                     'validation_loss': validation.get('loss'), 'bits_per_byte': validation.get('bits_per_byte'),
+                     'perplexity': validation.get('perplexity'), 'validation_tokens': validation.get('tokens'),
+                     'validation_tokens_per_second': validation.get('tokens_per_second'),
+                     'seed': settings.get('seed'), 'batch_sha256': validation.get('batch_sha256'),
+                     'eval_iters': settings.get('eval_iters'), 'batch_size': settings.get('batch_size'),
+                     'val_corpus_sha256': val_artifact.get('sha256') if isinstance(val_artifact, dict) else None,
+                     'checkpoint_sha256': checkpoint.get('sha256'), 'created_at': report.get('created_at')})
+    return rows
+
+
+def benchmark_text(reports):
+    if not reports:
+        return 'No benchmarks yet. Run an evaluation to compare checkpoints and save repeatable text samples.'
+    lines = ['CHECKPOINT          STEPS       LOSS     BITS/BYTE']
+    for row in benchmark_rows(reports):
+        name = str(row['checkpoint']).removeprefix('ckpt_').removesuffix('.pt')
+        loss, bits = row['validation_loss'], row['bits_per_byte']
+        steps = engine.nonnegative_int(row['steps'])
+        loss_text = f'{loss:.4f}' if finite_number(loss) else '—'
+        bits_text = f'{bits:.4f}' if finite_number(bits) else '—'
+        lines.append(f'{name[:18]:18} {steps:7,d}  {loss_text:>9}  {bits_text:>10}')
+    lines.append('\nNewest first. Compare reports with the same corpus, seed and evaluation budget.')
+    for report in reports[:2]:
+        settings = report.get('settings', {})
+        validation = report.get('validation', {})
+        lines.append(f'\n{report["checkpoint"].get("name", "Checkpoint")} · {report.get("created_at", "")}\n'
+                     f'Seed {settings.get("seed", "—")} · {engine.nonnegative_int(validation.get("tokens")):,} validation tokens')
+        for sample in report.get('generation', {}).get('samples', []):
+            lines.append(f'\nPrompt: {sample.get("prompt", "")}\n{sample.get("continuation", "")}')
+    return '\n'.join(lines)
+
+
 def load_snippet(checkpoint):
     """Python that loads a checkpoint in any notebook or script."""
     return (f"import sys\nsys.path.insert(0, {str(engine.PIPELINE)!r})\n"
@@ -311,6 +353,10 @@ def run_details(run, disk_bytes=None):
         plan.append('WSD schedule' if meta['schedule'] == 'wsd' else 'cosine schedule')
     if finite_number(meta.get('seed')):
         plan.append(f'seed {meta["seed"]}')
+    if (dtype := run.get('dtype') or meta.get('dtype')) in engine.CHOICES['dtype']:
+        plan.append(f'{dtype} precision')
+    if finite_number(meta.get('eval_iters')):
+        plan.append(f'{meta["eval_iters"]} validation batches')
     if plan:
         lines.append(' · '.join(plan))
     if isinstance(meta.get('dataset'), str):
@@ -611,6 +657,12 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.device_picker.set_selected(0 if self.values.get('device') == 'cuda' else 1)
         self.device_picker.connect('notify::selected', lambda *_: self.queue_save())
         self.field(page, 'Train on', self.device_picker)
+        self.dtype_picker = Gtk.DropDown.new_from_strings(['Automatic', 'Float32 · full precision',
+                                                          'Bfloat16 · mixed precision', 'Float16 · CUDA mixed precision'])
+        self.dtype_picker.set_selected(engine.CHOICES['dtype'].index(self.values['dtype']))
+        self.dtype_picker.connect('notify::selected', lambda *_: self.queue_save())
+        self.field(page, 'Training precision', self.dtype_picker,
+                   'Automatic selects a supported precision. Resume keeps the precision saved in the checkpoint.')
         runtime = box(False, 8)
         runtime.append(self.entry('python'))
         self.check_button = button('Check runtime', self.check_runtime)
@@ -641,12 +693,15 @@ class TrainerWindow(Adw.ApplicationWindow):
         entries = [('learning_rate', 'Peak learning rate', 1e-6, .1, 1e-5, 6), ('min_lr_ratio', 'Final rate (fraction of peak)', 0, 1, .01, 2),
                    ('warmup_steps', 'Warmup steps (0 = automatic)', 0, 1_000_000, 1, 0), ('weight_decay', 'Weight decay', 0, 1, .01, 2),
                    ('grad_clip', 'Gradient clip (0 = off)', 0, 100, .1, 2), ('eval_interval', 'Validate every (steps)', 1, 10_000_000, 1, 0),
+                   ('eval_iters', 'Validation batches per evaluation', 1, 10000, 1, 0),
+                   ('log_interval', 'Record progress every (steps)', 1, 10_000_000, 1, 0),
                    ('seed', 'Seed', 0, 2**31 - 1, 1, 0), ('val_fraction', 'Validation share', .01, .5, .01, 2)]
         for index, (key, title, low, high, step, digits) in enumerate(entries):
             cell = box(spacing=5); cell.set_hexpand(True)
             self.field(cell, title, self.spin(key, low, high, step, digits))
             grid.attach(cell, index % 2, index // 2, 1, 1)
         knobs.append(grid)
+        knobs.append(label('Validation uses the same held-out batches each time. More batches give a broader measurement and take longer.', 'dim-label'))
         self.schedule_picker = Gtk.DropDown.new_from_strings(['Cosine decay', 'Warmup, hold, then decay (WSD)'])
         self.schedule_picker.set_selected(engine.CHOICES['schedule'].index(self.values['schedule']))
         self.schedule_picker.connect('notify::selected', lambda *_: self.queue_save())
@@ -660,6 +715,8 @@ class TrainerWindow(Adw.ApplicationWindow):
                 ('max_minutes', 'Time limit in minutes (0 = none)', 0, 525_600, 'Saves a checkpoint and stops; resume continues later.'),
                 ('keep_snapshots', 'Keep step-numbered checkpoint snapshots (0 = off)', 0, 100, 'Each snapshot is a full checkpoint copy.')]:
             self.field(limits, title, self.spin(key, low, high), hint)
+        self.field(limits, 'Minimum loss improvement for early stopping', self.spin('early_stop_min_delta', 0, 100, .001, 4),
+                   'Loss must improve by this amount to reset patience. The best checkpoint still saves every improvement. Patience survives resume when this threshold matches.')
         controls.set_child(limits); page.append(controls)
         advanced = Gtk.Expander(label='Advanced training settings')
         options = box(spacing=12)
@@ -830,6 +887,38 @@ class TrainerWindow(Adw.ApplicationWindow):
         preview.append(preview_actions)
         self.preview_history = label('', 'dim-label', True); preview.append(self.preview_history)
 
+        benchmark = box(spacing=12)
+        self.detail_tabs.add_titled(benchmark, 'benchmark', 'Benchmark')
+        benchmark.append(label('Evaluate checkpoints on fixed held-out batches and generate repeatable samples on CPU. '
+                               'Reports keep the checkpoint and corpus fingerprints with each measurement.', 'dim-label'))
+        self.benchmark_kinds = []
+        self.benchmark_picker = Gtk.DropDown.new_from_strings(['No checkpoints'])
+        self.field(benchmark, 'Checkpoints to evaluate', self.benchmark_picker)
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        self.benchmark_controls = {}
+        for index, (key, title, low, high, value) in enumerate([
+                ('eval_iters', 'Validation batches', 1, 1000, 20), ('batch_size', 'Sequences per batch', 1, 32, 4),
+                ('seed', 'Evaluation seed', 0, 2**31 - 1, 2026), ('tokens', 'Sample length (bytes)', 1, 512, 64)]):
+            widget = Gtk.SpinButton.new_with_range(low, high, 1); widget.set_value(value)
+            self.benchmark_controls[key] = widget
+            group = box(spacing=5); group.set_hexpand(True); self.field(group, title, widget)
+            grid.attach(group, index % 2, index // 2, 1, 1)
+        benchmark.append(grid)
+        self.benchmark_prompts = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD_CHAR, accepts_tab=False)
+        self.benchmark_prompts.set_size_request(-1, 80)
+        self.benchmark_prompts.update_property([Gtk.AccessibleProperty.LABEL], ['Benchmark prompts, one per line'])
+        self.benchmark_prompts.get_buffer().set_text('Once upon a time\nThe purpose of learning is\nA small robot')
+        frame = Gtk.Frame(); frame.set_child(self.benchmark_prompts)
+        self.field(benchmark, 'Prompts (one per line, up to eight)', frame,
+                   'Greedy decoding keeps samples repeatable. Each checkpoint receives the same prompts and evaluation batches.')
+        self.benchmark_button = button('Run benchmark', self.benchmark, True)
+        self.benchmark_json_button = button('Export benchmarks as JSON…', lambda: self.export_benchmarks(False))
+        self.benchmark_csv_button = button('Export comparison as CSV…', lambda: self.export_benchmarks(True))
+        benchmark.append(flow((self.benchmark_button, self.benchmark_json_button, self.benchmark_csv_button)))
+        self.benchmark_status = label('', 'dim-label', True); benchmark.append(self.benchmark_status)
+        self.benchmark_output = label(benchmark_text([]), 'mono', True); benchmark.append(self.benchmark_output)
+        self.benchmark_reports = []
+
         exports = box(spacing=12)
         self.detail_tabs.add_titled(exports, 'export', 'Export')
         notebook = box(spacing=8); notebook.add_css_class('card')
@@ -919,6 +1008,7 @@ class TrainerWindow(Adw.ApplicationWindow):
                 values[key] = widget.get_text()
         values.update(model_size=engine.DESKTOP_SIZES[self.size_picker.get_selected()], device='cuda' if self.device_picker.get_selected() == 0 else 'cpu',
                       schedule=engine.CHOICES['schedule'][self.schedule_picker.get_selected()],
+                      dtype=engine.CHOICES['dtype'][self.dtype_picker.get_selected()],
                       run_sort=self.run_sort.get_selected() if hasattr(self, 'run_sort') else self.values['run_sort'])
         return values
 
@@ -1158,6 +1248,7 @@ class TrainerWindow(Adw.ApplicationWindow):
                 widget.set_text(defaults[key])
         self.size_picker.set_selected(engine.DESKTOP_SIZES.index(defaults['model_size']))
         self.schedule_picker.set_selected(engine.CHOICES['schedule'].index(defaults['schedule']))
+        self.dtype_picker.set_selected(engine.CHOICES['dtype'].index(defaults['dtype']))
         if not self.runtime_info or self.runtime_info.get('cuda'):
             self.device_picker.set_selected(0)
         self.queue_save(); self.notify('Training settings reset. Corpus, Python and run name are unchanged.')
@@ -1220,6 +1311,8 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.device_picker.set_selected(0 if run['meta']['device'] == 'cuda' else 1)
         if run['meta'].get('schedule') in engine.CHOICES['schedule']:
             self.schedule_picker.set_selected(engine.CHOICES['schedule'].index(run['meta']['schedule']))
+        self.dtype_picker.set_selected(engine.CHOICES['dtype'].index(run['meta'].get('dtype', 'auto'))
+                                       if run['meta'].get('dtype', 'auto') in engine.CHOICES['dtype'] else 0)
         if run['meta'].get('warmup_steps') is None and 'warmup_steps' in run['meta']:
             self.form['warmup_steps'].set_value(0)
         self.form['name'].set_text((run['name'][:73] + ' (copy)')[:80])
@@ -1348,9 +1441,10 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.preview_request += 1; self.clear_preview()
             self.last_log = None; self.metrics_signature = None
             self.load_notes(next((run for run in runs if run['id'] == self.selected_id), None))
-            self.show_preview_history(); self.measure_disk()
+            self.show_preview_history(); self.measure_disk(); self.show_benchmarks()
         if force:
             self.throughput_cache.clear(); self.measure_total_disk()
+            self.show_benchmarks()
         self.update_run_list(runs, force)
         run = next((run for run in runs if run['id'] == self.selected_id), None)
         for widget in (self.start_button, self.prepare_button):
@@ -1371,6 +1465,8 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.command_button.set_sensitive(bool(run and run['prepared'] and run['meta']))
         self.reuse_corpus_button.set_sensitive(bool(run and run['prepared'] and run['meta']))
         self.weights_button.set_sensitive(bool(run and (run['best'] or run['latest'])))
+        self.benchmark_button.set_sensitive(bool(run and run['prepared'] and (run['best'] or run['latest'] or run['snapshots'])
+                                                 and not busy and not self.sampling))
         kinds = (('best',), ('latest',), ('best', 'latest'))[self.sample_kind.get_selected()]
         self.sample_button.set_sensitive(bool(run and all(run[kind] for kind in kinds) and not busy and not self.sampling))
         self.notebook_button.set_sensitive(bool(run and (run['best'] or run['latest'] or run['snapshots'])))
@@ -1637,6 +1733,12 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.checkpoint_items = self.trainer.checkpoints(run['id']) if run else []
         except (ValueError, OSError):
             self.checkpoint_items = []
+        self.benchmark_kinds = [(item['kind'],) for item in self.checkpoint_items]
+        titles = [item['label'] for item in self.checkpoint_items]
+        if run and run['best'] and run['latest']:
+            self.benchmark_kinds.insert(0, ('best', 'latest')); titles.insert(0, 'Compare Best and Latest')
+        self.benchmark_picker.set_model(Gtk.StringList.new(titles or ['No checkpoints']))
+        self.benchmark_picker.set_selected(0)
         child = self.checkpoint_box.get_first_child()
         while child:
             following = child.get_next_sibling(); self.checkpoint_box.remove(child); child = following
@@ -1898,14 +2000,14 @@ class TrainerWindow(Adw.ApplicationWindow):
         command = self.trainer.kernel_command(python) if Path(python).expanduser().is_file() else None
         def work():
             note = ''
-            kernel = engine.installed_kernel()
+            kernel = engine.installed_kernel(python)
             if not kernel and command:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=120)
-                kernel = engine.installed_kernel()
+                kernel = engine.installed_kernel(python)
                 if result.returncode or not kernel:
                     note = ' The training Python could not register a kernel (it needs ipykernel); choose a kernel with PyTorch in Jupyter.'
             if kernel:
-                engine.set_notebook_kernel(path, kernel['display_name'])
+                engine.set_notebook_kernel(path, kernel['display_name'], kernel['name'])
             subprocess.Popen([*launcher, str(path)], cwd=str(Path(path).parent), stdin=subprocess.DEVNULL,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
             return note
@@ -2254,6 +2356,57 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.refresh()
             return False
         self.background(work, done)
+
+    def show_benchmarks(self):
+        run = self.current_run()
+        try:
+            self.benchmark_reports = self.trainer.benchmarks(run['id']) if run else []
+        except (ValueError, OSError):
+            self.benchmark_reports = []
+        self.benchmark_output.set_text(benchmark_text(self.benchmark_reports))
+        for widget in (self.benchmark_json_button, self.benchmark_csv_button):
+            widget.set_sensitive(bool(self.benchmark_reports))
+
+    def benchmark(self):
+        run = self.current_run()
+        if not run or self.sampling or self.launching or self.trainer.active_job() or not self.benchmark_kinds:
+            self.notify('Choose a prepared run and wait for training or preview to finish.'); return
+        index = self.benchmark_picker.get_selected()
+        if index >= len(self.benchmark_kinds):
+            return
+        settings = {}
+        for key, widget in self.benchmark_controls.items():
+            widget.update(); settings[key] = int(widget.get_value())
+        buffer = self.benchmark_prompts.get_buffer()
+        prompts = [text.strip() for text in buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False).splitlines() if text.strip()]
+        try:
+            commands = [self.trainer.benchmark_command(run['id'], kind, self.form['python'].get_text(), prompts=prompts, **settings)
+                        for kind in self.benchmark_kinds[index]]
+        except (ValueError, OSError) as error:
+            self.notify(error); return
+        self.sampling = True; self.refresh()
+        self.benchmark_status.set_text(f'Evaluating {run["name"]} on CPU… Results are saved in its benchmarks folder.')
+        def work():
+            for command in commands:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=1800)
+                if result.returncode:
+                    raise ValueError(result.stderr[-1500:] or 'Benchmark failed.')
+            return len(commands)
+        def done(count, error):
+            self.sampling = False
+            self.benchmark_status.set_text(str(error) if error else f'{count} checkpoint benchmark(s) saved for {run["name"]}.')
+            self.show_benchmarks(); self.refresh(True)
+            if error: self.notify(error)
+        self.background(work, done)
+
+    def export_benchmarks(self, csv_format=False):
+        run = self.current_run()
+        if not run or not self.benchmark_reports:
+            return
+        records = self.benchmark_reports[:]
+        content = metrics_csv(benchmark_rows(records)) if csv_format else json.dumps(records, indent=2, ensure_ascii=False, allow_nan=False) + '\n'
+        extension = 'csv' if csv_format else 'json'
+        self.choose_export('Export checkpoint benchmarks', f'{run["id"]}-benchmarks.{extension}', lambda: content)
 
     def save_preview(self):
         record = self.preview_result

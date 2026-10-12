@@ -1,3 +1,56 @@
+# Whitecube Trainer 1.0.0: reproducible training and checkpoint benchmarks
+
+## Training
+
+- Select automatic, float32, bfloat16 or CUDA float16 precision in the desktop or
+  CLI. Checkpoints preserve actual precision; unsupported or conflicting resume
+  requests fail before optimizer/model state changes.
+- Configure fixed validation batches and progress logging frequency. Validation
+  settings are preserved on resume; results record actual precision and token budget.
+- Early stopping has a minimum improvement threshold and persistent evaluation
+  counters. Best still tracks the true lowest loss, including small improvements.
+- Legacy checkpoints remain usable, with fresh patience history when absent.
+
+## Benchmark workflow
+
+- Runs has a Benchmark tab for Best, Latest, both, or step snapshots, with fixed
+  held-out windows, configurable evaluation budget and repeatable prompt samples.
+- CPU reports measure cross-entropy, raw-byte bits per byte, perplexity and
+  throughput, and preserve exact checkpoint/data/batch fingerprints and settings.
+- Save report history per run and export JSON or comparison CSV; run reports
+  include benchmarks. The CLI exposes the same workflow with `--benchmark`.
+- Corpus corruption, changing inputs and existing report destinations are rejected.
+
+## Notebook loading repair
+
+- Select a Jupyter kernelspec matching the chosen training Python, including
+  pre-existing custom names. Ignore stale kernels pointing at a different Python.
+  The reported failing notebook was valid but selected system Python without PyTorch.
+- Carry kernel metadata and Python hints through CLI export as well as the desktop.
+- Find moved bundles from parent folders, allow an explicit bundle directory,
+  and diagnose missing dependencies, model code and checkpoints in the setup cell.
+- Treat safetensors as optional; restore model device if its export fails.
+- Correct an existing execution-test fixture that shadowed `TestCase.run`, so
+  notebook execution, continuation and moved-bundle tests actually run.
+
+## 1.0.0 verification
+
+| Check | Result |
+| --- | --- |
+| Complete trainer suite in clean CPU runtime | 211 discovered; 22 GTK tests skipped there; 188 passed initially and the temperature-gated worker test passed on a dedicated rerun after cooling |
+| System Python engine tests | 72 passed, including GTK presentation coverage |
+| System Python app tests | 18 passed |
+| Executed notebook cells after final export fix | 4 passed: generation, validation, continuation, safetensors and moved-bundle execution |
+| Native Wayland UI | Passed, including saved precision controls, Best/Latest benchmark flow, history and JSON/CSV export |
+| Packaging/install-tree checks | 22 passed |
+| Existing exported notebook | Validated and executed loading, generation and probabilities through its matching Jupyter kernel |
+
+Real training tests used CPU float32 and bfloat16. CUDA capability checks used
+fixtures; no GPU training was run. The configured training interpreter's missing
+SymPy/Torch Python sources were restored from matching, hash-verified package
+sources and its CPU optimizer probe then passed with CUDA still detected. The
+repair and notebook metadata fix each have local recovery records.
+
 # Whitecube Trainer 0.9.0: notebook export and 16 upgrades
 
 Tests and documentation are not counted.
