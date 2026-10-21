@@ -264,12 +264,35 @@ class ImprovementsTests(ProjectFixture):
         worker = self.worker('build')
         output = self.project.iso_tree / 'filesystem.squashfs'
         with contextlib.redirect_stdout(io.StringIO()): worker.compress_tree(output)
-        subprocess.run(['unsquashfs', '-no-progress', '-processors', '1', '-d', str(self.path / 'unpacked'), str(output)], check=True, capture_output=True)
+        # Production compression retains metadata; unprivileged fixture
+        # extraction must not try to apply this host's security labels.
+        subprocess.run(['unsquashfs', '-user-xattrs', '-no-progress', '-processors', '1', '-d', str(self.path / 'unpacked'), str(output)], check=True, capture_output=True)
         self.assertEqual((self.path / 'unpacked/config').read_text(), 'original')
         events = [c for c in worker.emit.call_args_list if c.args[0] == 'progress']
         self.assertTrue(events, 'Compression did not report tool progress')
         self.assertEqual(events[-1].kwargs['progress'], 1)
         self.assertIn('eta_seconds', events[-1].kwargs)
+
+    @unittest.skipUnless(shutil.which('mksquashfs') and shutil.which('unsquashfs'), 'squashfs tools unavailable')
+    def test_real_compression_preserves_guest_metadata(self):
+        self.trees()
+        config = self.project.rootfs / 'config'
+        try:
+            os.setxattr(config, 'user.cube-editor-test', b'guest metadata')
+        except OSError as error:
+            self.skipTest(f'Fixture filesystem does not support user xattrs: {error}')
+        config.chmod(0o751)
+        (self.project.rootfs / 'config-link').symlink_to('config')
+        self.project.save(compression='gzip', processors=1, memory_mb=128)
+        output = self.project.iso_tree / 'filesystem.squashfs'
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.worker('build').compress_tree(output)
+        unpacked = self.path / 'metadata-unpacked'
+        subprocess.run(['unsquashfs', '-user-xattrs', '-no-progress', '-processors', '1',
+                        '-d', str(unpacked), str(output)], check=True, capture_output=True)
+        self.assertEqual(os.getxattr(unpacked / 'config', 'user.cube-editor-test'), b'guest metadata')
+        self.assertEqual((unpacked / 'config').stat().st_mode & 0o777, 0o751)
+        self.assertEqual(os.readlink(unpacked / 'config-link'), 'config')
 
     @unittest.skipUnless(Path('/usr/share/OVMF/OVMF_CODE_4M.fd').is_file(), 'OVMF unavailable')
     def test_uefi_installer_reuses_nvram_for_installed_reboot(self):

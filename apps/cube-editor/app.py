@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -26,6 +27,18 @@ gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
 VERSION = '0.4.0'
+MIN_ADWAITA = (1, 5)
+COMPRESSIONS = ['zstd', 'xz', 'gzip', 'lz4', 'lzo']
+
+
+def check_runtime():
+    version = (Adw.get_major_version(), Adw.get_minor_version())
+    if version < MIN_ADWAITA:
+        raise engine.CubeError(
+            f'Cube Editor requires libadwaita 1.5 or newer (found {version[0]}.{version[1]}). '
+            'Upgrade libadwaita-1-0 and gir1.2-adw-1 before starting the editor.')
+
+
 STAGES = [
     ('source', 'Source', 'media-optical-symbolic'),
     ('customize', 'Customize', 'applications-system-symbolic'),
@@ -142,6 +155,9 @@ class EditorWindow(Adw.ApplicationWindow):
         self.entries = {}
         self.field_errors = {}
         self.selected_release = None
+        self.verified_release = None
+        self.release_monitor = None
+        self.release_monitor_path = None
         self.test_disk = None
         self.editing_payload = None
         self.payloads = []
@@ -340,7 +356,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.entry(packages, 'Remove', 'remove_packages', '', 'Example: thunderbird  —  check the plan before applying.')
         packages.append(button('Preview package changes', lambda: self.start_job('packages')))
         page.append(packages)
-        custom = card('Your Bash script', 'A complete Bash script runs as root inside the image. Loops, functions and heredocs are supported. Stop on the first error.')
+        custom = card('Your Bash script', 'A complete Bash script runs with host root privileges inside the image. Use only trusted images and scripts. Loops, functions and heredocs are supported. Stop on the first error.')
         self.commands = Gtk.TextView(monospace=True)
         self.commands.set_top_margin(12); self.commands.set_bottom_margin(12)
         self.commands.set_left_margin(12); self.commands.set_right_margin(12)
@@ -361,7 +377,7 @@ class EditorWindow(Adw.ApplicationWindow):
         transfer.append(button('Export recipe', lambda: self.save_file('Export recipe', self.export_recipe, 'recipe.json')))
         transfer.append(button('Preview complete customization plan', lambda: self.show_plan('customize')))
         page.append(transfer)
-        tip = card('A terminal with a boundary', 'The editor stays in your user session. Extraction and image changes open a dedicated terminal for sudo authentication, and the chroot gets its own mount namespace.')
+        tip = card('Trusted images and root access', 'Image commands, package maintainer scripts and the image terminal run with host root privileges after sudo authentication. They can read or modify files on this computer. The chroot and namespaces do not provide a security sandbox. Use only images, packages and recipes you trust as host root code.')
         page.append(tip)
 
     def make_files(self, page):
@@ -399,7 +415,7 @@ class EditorWindow(Adw.ApplicationWindow):
         title = box(spacing=6); title.set_hexpand(True)
         title.append(label('Filesystem compression', 'section-title'))
         title.append(label('zstd builds quickly; xz usually produces a smaller image.', 'help', True))
-        self.compression = Gtk.DropDown.new_from_strings(['zstd', 'xz', 'gzip', 'lz4'])
+        self.compression = Gtk.DropDown.new_from_strings(COMPRESSIONS)
         self.compression.connect('notify::selected', self.mark_changed)
         row.append(title); row.append(self.compression); settings.append(row)
         self.processors = Gtk.SpinButton.new_with_range(1, 256, 1); self.processors.set_value(2)
@@ -598,8 +614,10 @@ class EditorWindow(Adw.ApplicationWindow):
         if not self.project or self.busy: return
         try:
             recipe, missing = engine.import_recipe(path)
+            if not self.save_project():
+                self.toast('Correct the highlighted fields before importing a recipe.'); return
             self.project.save(recipe=recipe)
-            self.hydrate()
+            self.hydrate_recipe(recipe)
             if missing:
                 self.text_dialog('Recipe files to locate', 'Update these local paths before applying:\n' + '\n'.join(missing))
             else:
@@ -639,17 +657,56 @@ class EditorWindow(Adw.ApplicationWindow):
         self.selected_release = self.release_choices[index] if index < len(self.release_choices) else None
         self.update_release_display()
 
+    @staticmethod
+    def release_identity(path):
+        try:
+            info = path.stat()
+            if not stat.S_ISREG(info.st_mode): return None
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        except (OSError, AttributeError):
+            return None
+
+    def watch_release(self, path):
+        if path == self.release_monitor_path and self.release_monitor: return
+        if self.release_monitor:
+            self.release_monitor.cancel()
+        self.release_monitor = None
+        if path != self.release_monitor_path:
+            self.verified_release = None
+        self.release_monitor_path = path
+        if path and path.is_file():
+            try:
+                self.release_monitor = Gio.File.new_for_path(str(path)).monitor_file(Gio.FileMonitorFlags.NONE, None)
+                self.release_monitor.connect('changed', lambda *_: self.update_release_display())
+            except GLib.Error:
+                pass
+
+    def remember_release_digest(self, path, digest, identity):
+        # The identity must cover the whole hash operation, not just its completion.
+        if path == self.selected_output() and identity and identity == self.release_identity(path):
+            self.verified_release = (path, identity, digest)
+        self.update_release_display()
+
     def update_release_display(self):
         path = self.selected_output()
-        if path and path.is_file():
+        self.watch_release(path)
+        identity = self.release_identity(path)
+        verified = self.verified_release
+        if verified and (verified[0] != path or verified[1] != identity):
+            self.verified_release = verified = None
+        digest = verified[2] if verified else None
+        if identity:
             self.release_name.set_text(path.name)
-            self.release_path.set_text(f'{path}\n{path.stat().st_size / 1024**3:.2f} GB · ready to test')
+            self.release_path.set_text(f'{path}\n{identity[2] / 1024**3:.2f} GB · ready to test')
         elif self.project:
             self.release_name.set_text(self.project.data.get('output_name', 'Waiting for a build.'))
             self.release_path.set_text('Build a release or select an available previous release.')
         if self.project:
             checks = [c for c in self.project.data.get('release_checks', []) if c.get('path') == str(path)]
-            self.history_summary.set_text('\n'.join(f"{c['kind']}: {c['outcome']} · SHA256 {c['sha256'][:12]} · {c.get('note', '')}" for c in checks[-8:]) or 'No recorded checks for this output.')
+            heading = (f'Current ISO · SHA256 {digest[:12]}' if digest else
+                       'Historical checks only. Verify this release to identify the current ISO contents.')
+            rows = [f"{'Current' if digest == c['sha256'] else 'Historical'} · {c['kind']}: {c['outcome']} · SHA256 {c['sha256'][:12]} · {c.get('note', '')}" for c in checks[-8:]]
+            self.history_summary.set_text('\n'.join([heading] + rows) if checks else 'No recorded checks for this output.')
         self.refresh_buttons()
 
     def create_test_disk(self):
@@ -697,8 +754,9 @@ class EditorWindow(Adw.ApplicationWindow):
         outcome = ['not tested', 'passed', 'failed'][self.check_outcome.get_selected()]
         note = self.entries['check_note'].get_text()
         worker, path = self.worker, self.selected_output()
+        identity = self.release_identity(path)
         self.background('Recording check for exact ISO hash…', lambda: worker.record_check(kind, outcome, note, path),
-                        lambda _: self.update_release_display())
+                        lambda result: self.remember_release_digest(path, result['sha256'], identity))
 
     @staticmethod
     def is_log_error(line):
@@ -773,13 +831,14 @@ class EditorWindow(Adw.ApplicationWindow):
         return errors
 
     def resource_settings(self):
-        return dict(compression=['zstd', 'xz', 'gzip', 'lz4'][self.compression.get_selected()],
+        return dict(compression=COMPRESSIONS[self.compression.get_selected()],
                     processors=self.processors.get_value_as_int(), memory_mb=self.build_memory.get_value_as_int(),
                     compression_level=self.compression_level.get_value_as_int())
 
     def mark_changed(self, *_):
+        if self.hydrating: return
         self.refresh_buttons()
-        if self.hydrating or not self.project or self.busy:
+        if not self.project or self.busy:
             return
         self.saved_label.set_text('SAVING…')
         if self.save_timer:
@@ -882,13 +941,22 @@ class EditorWindow(Adw.ApplicationWindow):
         if self.project and not self.save_project():
             self.toast('Correct the highlighted fields before switching projects.'); return
         try:
-            self.project = engine.Project.load(path)
-            self.selected_release = None
-            self.worker = engine.Engine(self.project, on_event=self.on_event)
-            self.hydrate(); self.refresh_recent()
-            self.restore_log()
-            self.render_log()
-            self.selected_release = None
+            candidate = engine.Project.load(path)
+            candidate_worker = engine.Engine(candidate, on_event=self.on_event)
+            prepared = self.prepare_hydration(candidate)
+            previous = (self.project, self.worker, self.selected_release)
+            if self.save_timer:
+                GLib.source_remove(self.save_timer); self.save_timer = None
+            try:
+                self.project, self.worker, self.selected_release = candidate, candidate_worker, None
+                self.hydrate(prepared)
+            except Exception:
+                self.project, self.worker, self.selected_release = previous
+                if self.project:
+                    self.hydrate()
+                raise
+            self.refresh_recent()
+            self.restore_log(); self.render_log()
             self.test_disk = None
             self.disk_label.set_text('No test disk selected.')
             self.log(f'Opened project: {self.project.directory}')
@@ -896,32 +964,29 @@ class EditorWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.toast(str(exc)); self.log(f'Open failed: {exc}')
 
-    def hydrate(self):
-        self.hydrating = True
-        data = self.project.data
-        for key in ['name', 'source_iso', 'output_dir', 'volume_id', 'output_name']:
-            if key in data: self.entries[key].set_text(str(data[key]))
-        self.entries['base_dir'].set_text(str(self.project.directory.parent))
-        recipe = data.get('recipe', {})
-        for key in ['install_packages', 'remove_packages']:
-            self.entries[key].set_text(' '.join(recipe.get(key, [])))
-        self.original_commands = engine.recipe_scripts(recipe)
-        self.original_script_text = '\n'.join(self.original_commands)
-        self.commands.get_buffer().set_text(self.original_script_text)
-        self.editing_payload = None
-        self.payloads = list(recipe.get('payloads', []))
-        if recipe.get('desktop_deb'): self.entries['desktop_deb'].set_text(recipe['desktop_deb'])
-        self.inject_switch.set_active(bool(recipe.get('desktop_deb')))
-        compression = data.get('compression', 'zstd')
-        if compression in ['zstd', 'xz', 'gzip', 'lz4']:
-            self.compression.set_selected(['zstd', 'xz', 'gzip', 'lz4'].index(compression))
-        self.processors.set_value(data.get('processors', 2))
-        self.build_memory.set_value(data.get('memory_mb', 1024))
-        self.compression_level.set_value(data.get('compression_level', 0))
-        self.auto_snapshot.set_active(data.get('auto_snapshot', True))
-        self.source_hash.set_text(data.get('source_sha256', ''))
-        self.entries['source_checksum'].set_text(data.get('source_expected_sha256', ''))
-        report = engine.recovery_report(self.project)
+    def hydrate_recipe(self, recipe):
+        engine.validate_recipe(recipe)
+        hydrating, self.hydrating = self.hydrating, True
+        try:
+            for key in ['install_packages', 'remove_packages']:
+                self.entries[key].set_text(' '.join(engine.package_list(recipe.get(key, []))))
+            self.original_commands = engine.recipe_scripts(recipe)
+            self.original_script_text = '\n'.join(self.original_commands)
+            self.commands.get_buffer().set_text(self.original_script_text)
+            self.editing_payload = None
+            self.payloads = list(recipe.get('payloads', []))
+            self.entries['desktop_deb'].set_text(recipe.get('desktop_deb', ''))
+            self.inject_switch.set_active(bool(recipe.get('desktop_deb')))
+            self.refresh_payloads()
+        finally:
+            self.hydrating = hydrating
+        self.refresh_buttons()
+
+    def prepare_hydration(self, project):
+        # Complete fallible document/ filesystem reads before replacing a window's project.
+        engine.validate_recipe(project.data.get('recipe', {}))
+        self.inspection_display(project.data.get('inspection', {}))
+        report = engine.recovery_report(project)
         recovery_text = f"Project state: {report['state']}"
         if report['active_operation']: recovery_text += '\nAnother operation currently holds this project.'
         elif report['interrupted']: recovery_text += '\n' + report['recommendation']
@@ -929,14 +994,35 @@ class EditorWindow(Adw.ApplicationWindow):
         if report['environment_backups']: recovery_text += '\nGuest DNS or service-policy backups need recovery.'
         if report['pending_whiteouts']: recovery_text += '\nInterrupted boot-layer deletion markers need recovery.'
         if report['staging']: recovery_text += f"\n{len(report['staging'])} unfinished build artifact(s) can be retained by recovery."
-        self.recovery_label.set_text(recovery_text)
-        self.project_label.set_text(data.get('name', 'Project'))
-        self.project_state.set_text(str(data.get('state', 'created')).replace('_', ' ').capitalize())
-        self.saved_label.set_text('SAVED LOCALLY')
-        self.hydrating = False
-        self.refresh_payloads(); self.refresh_release(); self.refresh_buttons()
-        inspection = data.get('inspection', {})
-        if inspection: self.show_inspection(inspection)
+        if report.get('output_staging'):
+            recovery_text += '\n' + report['output_staging_note']
+        return recovery_text
+
+    def hydrate(self, prepared=None):
+        recovery_text = self.prepare_hydration(self.project) if prepared is None else prepared
+        hydrating, self.hydrating = self.hydrating, True
+        try:
+            data = self.project.data
+            for key in ['name', 'source_iso', 'output_dir', 'volume_id', 'output_name']:
+                self.entries[key].set_text(str(data[key]))
+            self.entries['base_dir'].set_text(str(self.project.directory.parent))
+            self.hydrate_recipe(data.get('recipe', {}))
+            self.compression.set_selected(COMPRESSIONS.index(data.get('compression', 'zstd')))
+            self.processors.set_value(data.get('processors', 2))
+            self.build_memory.set_value(data.get('memory_mb', 1024))
+            self.compression_level.set_value(data.get('compression_level', 0))
+            self.auto_snapshot.set_active(data.get('auto_snapshot', True))
+            self.source_hash.set_text(data.get('source_sha256', ''))
+            self.entries['source_checksum'].set_text(data.get('source_expected_sha256', ''))
+            self.recovery_label.set_text(recovery_text)
+            self.project_label.set_text(data.get('name', 'Project'))
+            self.project_state.set_text(str(data.get('state', 'created')).replace('_', ' ').capitalize())
+            self.saved_label.set_text('SAVED LOCALLY')
+            self.refresh_release()
+            self.show_inspection(data.get('inspection', {}))
+        finally:
+            self.hydrating = hydrating
+        self.refresh_buttons()
 
     def inspect_project(self):
         if not self.project:
@@ -964,31 +1050,46 @@ class EditorWindow(Adw.ApplicationWindow):
             self.refresh_buttons()
         return False
 
-    def show_inspection(self, data):
+    @staticmethod
+    def inspection_display(data):
+        if not data:
+            return [], None, 'Inspect the current source image to see its filesystem and boot entries.'
         if not isinstance(data, dict):
-            self.inspect_label.set_text(str(data)); return
-        self.hydrating = True
+            raise engine.CubeError('The saved inspection must be an object.')
         paths = data.get('squashfs_paths', [])
-        if paths:
-            self.root_selector.set_model(Gtk.StringList.new(paths))
-            selected = data.get('squashfs_path', paths[-1])
-            self.root_selector.set_selected(paths.index(selected) if selected in paths else len(paths) - 1)
-            self.root_selector_box.set_visible(True)
-            self.root_selector.set_sensitive(not (self.project.directory / '.extracted').is_file())
-        self.hydrating = False
+        if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+            raise engine.CubeError('The saved live filesystem choices must be a list of paths.')
+        selected = data.get('squashfs_path', paths[-1] if paths else None)
         size = data.get('size_bytes', 0) / 1024 ** 3
         firmware = ' + '.join(name for name, key in [('BIOS', 'bios'), ('UEFI', 'uefi')] if data.get(key)) or 'No boot entries detected'
         chain = data.get('layer_chain', [])
         fragments = [f'{size:.2f} GB  ·  {firmware}  ·  {len(chain)} filesystem layer(s)',
                      ' → '.join(Path(path).name for path in chain)]
         fragments.extend(data.get('warnings', []))
-        self.inspect_label.set_text('\n'.join(fragments))
+        return paths, selected, '\n'.join(fragments)
+
+    def show_inspection(self, data):
+        paths, selected, summary = self.inspection_display(data)
+        hydrating, self.hydrating = self.hydrating, True
+        try:
+            self.root_selector.set_model(Gtk.StringList.new(paths))
+            if paths:
+                self.root_selector.set_selected(paths.index(selected) if selected in paths else len(paths) - 1)
+            self.root_selector_box.set_visible(bool(paths))
+            self.refresh_root_selector()
+            self.inspect_label.set_text(summary)
+        finally:
+            self.hydrating = hydrating
 
     def select_root(self, *_):
         if self.hydrating or self.busy or not self.project: return
         selected = self.root_selector.get_selected_item()
         if selected:
             path = selected.get_string()
+            if path not in self.project.data.get('inspection', {}).get('squashfs_paths', []):
+                self.show_inspection(self.project.data.get('inspection', {}))
+                return
+            if (self.project.directory / '.extracted').is_file(): return
             if path != self.project.data.get('squashfs_path'):
                 self.project.save(squashfs_path=path)
                 self.inspect_project()
@@ -1137,7 +1238,15 @@ class EditorWindow(Adw.ApplicationWindow):
         if message: self.status.set_text(message)
         for widget in list(self.entries.values()) + [self.commands, self.compression, self.inject_switch, self.auto_snapshot, self.processors, self.build_memory, self.compression_level, self.payload_policy]:
             widget.set_sensitive(not state)
+        self.refresh_root_selector()
         self.refresh_buttons()
+
+    def refresh_root_selector(self):
+        # The live root is fixed once extracted and must not change during a job.
+        if not hasattr(self, 'root_selector_box'): return
+        extracted = self.project is not None and (self.project.directory / '.extracted').is_file()
+        choices = self.root_selector.get_model().get_n_items() > 0 and self.root_selector_box.get_visible()
+        self.root_selector.set_sensitive(choices and self.project is not None and not extracted and not self.busy)
 
     def start_job(self, action, confirmed=False):
         if self.busy or not self.project: return
@@ -1150,6 +1259,8 @@ class EditorWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.toast(str(exc)); return
         self.navigate('activity')
+        if action in ('customize', 'terminal', 'packages', 'build'):
+            self.log('Trusted-image operation: image executables and package scripts run with host root privileges and can modify this computer.')
         self.log(f'→ {action.capitalize()}\n{shlex.join(command)}')
         self.running_action = action
         self.set_busy(True, f'{action.capitalize()} — follow the dedicated image terminal for authentication.')
@@ -1281,11 +1392,13 @@ class EditorWindow(Adw.ApplicationWindow):
     def verify_release(self):
         path = self.selected_output()
         if not path or self.busy: return
+        identity = self.release_identity(path)
         self.set_busy(True, 'Verifying release checksum…')
         self.navigate('activity')
         def work():
             try:
                 result = self.worker.verify_release(path, record=True)
+                result['identity'] = identity
                 if not result.get('success'):
                     raise engine.CubeError('Checksum mismatch. The ISO differs from its release checksum.')
                 GLib.idle_add(self.verify_done, result, None)
@@ -1294,8 +1407,11 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def verify_done(self, result, error):
         self.set_busy(False)
-        if error: self.toast(error); self.log(f'Verification failed: {error}'); self.status.set_text('Release verification failed.')
+        if error:
+            self.update_release_display()
+            self.toast(error); self.log(f'Verification failed: {error}'); self.status.set_text('Release verification failed.')
         else:
+            self.remember_release_digest(Path(result['path']), result['actual'], result['identity'])
             self.log(f'Verified release: {result}'); self.toast('Release checksum verified.')
             self.status.set_text('The release matches its SHA-256 checksum.')
         return False
@@ -1383,11 +1499,14 @@ class EditorWindow(Adw.ApplicationWindow):
             self.toast('Correct the highlighted fields before closing.'); return True
         if self.save_timer:
             GLib.source_remove(self.save_timer); self.save_timer = None
+        if self.release_monitor:
+            self.release_monitor.cancel()
         return False
 
 
 class EditorApp(Adw.Application):
     def __init__(self, options):
+        check_runtime()
         GLib.set_prgname('org.whitecube.CubeEditor')
         super().__init__(application_id='org.whitecube.CubeEditor', flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.options = options
@@ -1424,7 +1543,11 @@ def main():
     parser.add_argument('--screenshot', type=Path, help='Render a preview PNG and exit')
     parser.add_argument('--page', choices=[stage[0] for stage in STAGES], help='Initial studio page')
     options = parser.parse_args()
-    return EditorApp(options).run([sys.argv[0]])
+    try:
+        return EditorApp(options).run([sys.argv[0]])
+    except engine.CubeError as exc:
+        print(f'cube-editor: {exc}', file=sys.stderr)
+        return 2
 
 
 if __name__ == '__main__':

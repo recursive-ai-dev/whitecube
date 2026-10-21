@@ -70,6 +70,14 @@ Extract, customize, terminal, and build operations open a Foot terminal and use
 finish a manual editing session. Follow the operation log if extraction or
 package installation fails; an incomplete operation is not a successful build.
 
+Use only trusted images, packages, payloads and recipes. Guest executables,
+package maintainer scripts and terminal commands run with **host root
+privileges**. The chroot and private mount/PID namespaces organize the editing
+session; they do not provide a security sandbox. Guest code can access or modify
+host files, including through proc. Inspecting or recording an ISO digest does
+not establish that its code is safe. Use a disposable VM with no valuable host
+data or credentials attached when working with images you do not trust.
+
 QEMU is optional. BIOS boot tests need `qemu-system-x86_64`; UEFI tests additionally
 need OVMF firmware. KVM acceleration is used when the current account can access
 `/dev/kvm`. The ISO’s original boot records are replayed during export; no claim
@@ -112,7 +120,10 @@ The workbench now includes these sixteen workflow improvements:
    change before Apply recipe refreshes the indexes.
 8. **Source integrity.** Supply a publisher SHA256 or checksum-file line, or record
    a digest without an expected value. Extraction hashes the source and checks
-   any recorded digest. Recording a digest alone does not authenticate the source.
+   any recorded digest. Builds verify the source again and replay boot records
+   from a private verified copy, so changes to the original during export cannot
+   change the released boot data. Allow space for this extra source copy.
+   Recording a digest alone does not authenticate the source.
 9. **Release history.** Every successful build appends its path, hash, size, recipe
    and build settings to project history. Test & release can select old releases
    for checksum verification and VM booting while their files remain available.
@@ -143,7 +154,9 @@ The workbench now includes these sixteen workflow improvements:
 16. **Recorded release checks.** Checksum outcomes are saved automatically. Record
     BIOS/UEFI live or installer outcomes and notes manually after testing. Every
     check includes the actual ISO SHA256, so replacing an ISO does not transfer
-    an earlier passing result to its new contents. Launching QEMU does not mark
+    an earlier passing result to its new contents. The display labels checks as
+    historical until the selected ISO is hashed in the current session, and
+    invalidates that verification when the file changes. Launching QEMU does not mark
     a boot or installation test as passed.
 
 Restore points, recovery and package previews use the same authenticated private
@@ -151,6 +164,26 @@ worker as other filesystem operations. A retained recovery copy is not an
 off-device backup. The installer VM workflow still needs a person to exercise
 the guest and assess the result; automated tests use small synthetic images and
 do not certify a particular distribution or installer.
+
+Recovery, restore points and guest editing remain available if the source ISO
+has been moved or deleted. Extraction and rebuilding still require the original
+source. Incomplete restoration of temporary DNS or service-policy files fails
+the operation and blocks builds until recovery succeeds. Successful releases
+never replace an existing ISO or release sidecar, including files created by
+another process while export is running.
+
+Kernel refresh follows the guest's `/vmlinuz` or `/boot/vmlinuz` selection, or
+uses version ordering when no default is present. It requires a matching
+initramfs and module directory, then updates the files referenced by supported
+GRUB/syslinux configurations or an unambiguous conventional live-image layout.
+Changed kernels with unsupported or ambiguous mappings stop the build. An
+unchanged kernel inventory from extraction permits retaining an unsupported
+source layout; older projects without that baseline may need re-extraction.
+
+Interrupted unique export directories in a shared output folder are reported
+for review rather than automatically moved, since another project may still be
+using them. If recovery reports a missing original environment backup, restore
+a saved point or repair the original file and journal explicitly before building.
 
 ## Developer commands
 
@@ -191,7 +224,7 @@ python3 -m unittest discover -s apps/cube-editor/tests -v
 
 The core external tools are `xorriso`, `unsquashfs`, `mksquashfs`, `sudo`,
 `unshare`, `mount`, `chroot`, and `foot`. The UI uses Python GI bindings for GTK 4
-and libadwaita. Layered Calamares integration uses `python3-yaml` to preserve and
+and libadwaita 1.5 or newer. Layered Calamares integration uses `python3-yaml` to preserve and
 validate configuration structure. Privileged mount operations use a private
 mount namespace.
 

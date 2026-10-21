@@ -89,6 +89,11 @@ runtime=(foot fuzzel swaylock swaybg python3 python3-gi python3-cairo python3-gi
   dhcpcd-base iproute2 nftables seatd
   libmpv2 libwayland-egl1)   # cube-player: libmpv is not bundled (it reaches X11 and gets security updates from Debian)
 for p in "${runtime[@]}"; do pkgs[$p]=1; done
+# Cube Editor uses Adw.Dialog (introduced in libadwaita 1.5). Constrain both
+# the typelib and its runtime, replacing any unconstrained scanner entries.
+unset 'pkgs[gir1.2-adw-1]' 'pkgs[libadwaita-1-0]'
+pkgs['gir1.2-adw-1 (>= 1.5)']=1
+pkgs['libadwaita-1-0 (>= 1.5)']=1
 depends=$(printf '%s\n' "${!pkgs[@]}" | sort | paste -sd',' | sed 's/,/, /g')
 [[ -z ${pkgs[whitecube-desktop]:-} ]] || { echo "build-deb.sh: dependency scanner found an unbundled library owned by whitecube-desktop" >&2; exit 1; }
 

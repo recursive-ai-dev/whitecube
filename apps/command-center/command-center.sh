@@ -1,1 +1,0 @@
-whitecube-command-center.sh

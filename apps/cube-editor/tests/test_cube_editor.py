@@ -272,7 +272,9 @@ class ISOIntegrationTests(ProjectFixture):
         (filesystem / "etc/os-release").write_text("PRETTY_NAME=\"Cube Editor Test\"\n")
         names = ["minimal.squashfs", "minimal.standard.squashfs", "minimal.standard.live.squashfs"] if chained else ["filesystem.squashfs"]
         for name in names:
-            run(["mksquashfs", str(filesystem), str(tree / "casper" / name), "-noappend", "-processors", "1", "-quiet"])
+            # Synthetic boot fixtures should not inherit host SELinux labels.
+            # Guest metadata preservation has separate compression coverage.
+            run(["mksquashfs", str(filesystem), str(tree / "casper" / name), "-noappend", "-no-xattrs", "-processors", "1", "-quiet"])
         command = ["xorriso", "-as", "mkisofs", "-o", str(self.source), "-V", "CUBE_SYNTHETIC"]
         if bootable:
             (tree / "boot").mkdir()
@@ -308,7 +310,7 @@ class ISOIntegrationTests(ProjectFixture):
         run(["unsquashfs", "-d", str(extracted), str(squash)])
         (extracted / "etc/cube-editor").write_text("customized\n")
         squash.unlink()
-        run(["mksquashfs", str(extracted), str(squash), "-noappend", "-processors", "1", "-quiet"])
+        run(["mksquashfs", str(extracted), str(squash), "-noappend", "-no-xattrs", "-processors", "1", "-quiet"])
         self.project.save(inspection=original, squashfs_path=original["squashfs_path"])
         checksum_tree(self.project.iso_tree, original["boot_image_paths"] + [original["boot_catalog"]])
         release = rebuild_iso(self.project, run)

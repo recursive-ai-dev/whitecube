@@ -10,6 +10,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 from collections import deque
+import ctypes
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -21,11 +24,13 @@ import stat
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 
 from engine import (Project, CubeError, Cancelled, atomic_json, atomic_text, guest_destination,
                     inspect_iso, package_list, utcnow, validate_recipe, recipe_scripts,
                     build_resources, storage_preflight, sha256_file, recovery_report)
+from kernel import kernel_inventory, refresh_kernel
 
 
 def copy_payload(source, destination, root, overwrite='replace'):
@@ -91,57 +96,146 @@ def checksum_tree(tree, excluded=(), check_cancel=lambda: None):
         atomic_text(tree / name, "".join(sha_lines))
 
 
-def rebuild_iso(project, run, check_cancel=lambda: None):
-    """Replay original BIOS/UEFI/system area, including hidden EFI partitions.
+def _same_file(path, identity):
+    try:
+        current = path.lstat()
+        return (current.st_dev, current.st_ino) == identity
+    except FileNotFoundError:
+        return False
 
-    Public helper is intentionally usable unprivileged for synthetic integration
-    tests. ISO extraction and customization are done by Worker beforehand.
+
+def _verified_source(project, destination, check_cancel):
+    """Copy and hash the bytes that the exporter will actually read.
+
+    A separate, read-only copy prevents an in-place write or pathname replacement
+    of the original ISO from changing boot replay after verification.
+    """
+    source = Path(project.data["source_iso"])
+    try:
+        with source.open("rb") as incoming, destination.open("xb") as outgoing:
+            before = os.fstat(incoming.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise CubeError("Source ISO must be a regular file")
+            digest = hashlib.sha256()
+            for block in iter(lambda: incoming.read(4 * 1024 * 1024), b""):
+                check_cancel()
+                outgoing.write(block)
+                digest.update(block)
+            after = os.fstat(incoming.fileno())
+            current = source.stat()
+            identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            if identity(before) != identity(after) or identity(before) != identity(current):
+                raise CubeError("Source ISO changed while preparing the verified export copy")
+            if before.st_size != project.data.get("source_size") or before.st_mtime_ns != project.data.get("source_mtime_ns"):
+                raise CubeError("Source ISO changed since this project was created")
+            actual = digest.hexdigest()
+            if project.data.get("source_sha256") and actual != project.data["source_sha256"]:
+                raise CubeError("Source ISO no longer matches its recorded SHA256")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        destination.chmod(0o444)
+        return actual
+    except FileNotFoundError as error:
+        raise CubeError("Source ISO was moved or deleted") from error
+
+
+def _publish_noreplace(source, destination):
+    try:
+        os.link(source, destination, follow_symlinks=False)
+        return
+    except OSError as error:
+        if error.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EMLINK):
+            raise
+        # FAT/exFAT and some network filesystems do not implement hard links.
+        # Linux renameat2 provides the same no-clobber guarantee on those paths.
+        rename = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+        if rename is None:
+            raise CubeError("This output filesystem does not support safe no-replace publication; choose another release folder") from error
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number), str(destination))
+
+
+def rebuild_iso(project, run, check_cancel=lambda: None):
+    """Publish a coordinated release without replacing any existing artifact.
+
+    A destination lock coordinates different projects. No-replace publication
+    fails if an uncoordinated writer creates any destination. Publish
+    the ISO last so its appearance indicates both sidecars are already present.
+    The helper also works unprivileged for synthetic integration tests.
     """
     output = project.output_path
     output.parent.mkdir(parents=True, exist_ok=True)
-    if output.exists() or output.is_symlink():
-        raise CubeError(f"Output already exists. Choose another output name: {output.name}")
-    temporary = output.with_name("." + output.name + ".building")
-    if temporary.exists() or temporary.is_symlink():
-        raise CubeError(f"An unfinished output already exists: {temporary}. Move it before retrying.")
-    for suffix in (".sha256", ".release.json"):
-        sidecar = Path(str(output) + suffix)
-        if sidecar.exists() or sidecar.is_symlink():
-            raise CubeError(f"An existing release sidecar would be overwritten: {sidecar.name}")
-    command = ["xorriso", "-indev", project.data["source_iso"], "-outdev", str(temporary),
-               "-boot_image", "any", "replay", "-update_r", str(project.iso_tree), "/",
-               "-volid", project.data.get("volume_id", "CUBE_EDITOR")[:32], "-commit", "-end"]
-    promoted = False
+    lock_path = output.with_name("." + output.name + ".publish.lock")
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     created = []
     try:
-        run(command)
-        digest = hashlib.sha256()
-        with temporary.open("rb") as stream:
-            for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise CubeError("Release publication lock must be a regular file")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise CubeError(f"Another build is publishing this output: {output.name}") from error
+        owner = project.directory.stat()
+        if os.geteuid() == 0:
+            os.fchown(lock_fd, owner.st_uid, owner.st_gid)
+        destinations = [Path(str(output) + suffix) for suffix in (".sha256", ".release.json")] + [output]
+        for destination in destinations:
+            if destination.exists() or destination.is_symlink():
+                raise CubeError(f"Release artifact already exists; choose another output name: {destination.name}")
+        legacy = output.with_name("." + output.name + ".building")
+        if legacy.exists() or legacy.is_symlink():
+            raise CubeError(f"An unfinished output already exists: {legacy}. Run Recover project before retrying.")
+        with tempfile.TemporaryDirectory(prefix="." + output.name + ".", suffix=".building", dir=output.parent) as directory:
+            staging = Path(directory)
+            # Root owns the source copy; the desktop exporter can read it and
+            # writes only in its separate subdirectory.
+            staging.chmod(0o755)
+            source_copy = staging / "source.iso"
+            source_sha = _verified_source(project, source_copy, check_cancel)
+            export = staging / "export"
+            export.mkdir(mode=0o700)
+            if os.geteuid() == 0:
+                os.chown(export, owner.st_uid, owner.st_gid)
+            temporary = export / output.name
+            command = ["xorriso", "-indev", str(source_copy), "-outdev", str(temporary),
+                       "-boot_image", "any", "replay", "-update_r", str(project.iso_tree), "/",
+                       "-volid", project.data.get("volume_id", "CUBE_EDITOR")[:32], "-commit", "-end"]
+            run(command)
+            sha = sha256_file(temporary, lambda done, total: check_cancel())
+            release = {"path": str(output), "sha256": sha, "size_bytes": temporary.stat().st_size,
+                       "completed_at": utcnow(), "source_iso": project.data["source_iso"],
+                       "volume_id": project.data.get("volume_id"), "compression": project.data.get("compression"),
+                       "recipe": project.data.get("recipe", {}), "source_sha256": source_sha,
+                       "processors": project.data.get("processors", 2), "memory_mb": project.data.get("memory_mb", 1024),
+                       "compression_level": project.data.get("compression_level", 0)}
+            checksum = staging / "checksum"
+            manifest = staging / "release.json"
+            checksum.write_text(f"{sha}  {output.name}\n")
+            manifest.write_text(json.dumps(release, indent=2, ensure_ascii=False) + "\n")
+            for staged, destination in zip((checksum, manifest, temporary), destinations):
                 check_cancel()
-                digest.update(block)
-        os.replace(temporary, output)
-        promoted = True
-        sha = digest.hexdigest()
-        sidecar = Path(str(output) + ".sha256")
-        atomic_text(sidecar, f"{sha}  {output.name}\n")
-        created.append(sidecar)
-        release = {"path": str(output), "sha256": sha, "size_bytes": output.stat().st_size,
-                   "completed_at": utcnow(), "source_iso": project.data["source_iso"],
-                   "volume_id": project.data.get("volume_id"), "compression": project.data.get("compression"),
-                   "recipe": project.data.get("recipe", {}), 'source_sha256': project.data.get('source_sha256', ''),
-                   'processors': project.data.get('processors', 2), 'memory_mb': project.data.get('memory_mb', 1024),
-                   'compression_level': project.data.get('compression_level', 0)}
-        atomic_json(Path(str(output) + ".release.json"), release)
-        created.append(Path(str(output) + ".release.json"))
-        return release
+                info = staged.lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise CubeError("Exporter produced an invalid release artifact")
+                try:
+                    _publish_noreplace(staged, destination)
+                except FileExistsError as error:
+                    raise CubeError(f"Release artifact appeared during export; nothing was overwritten: {destination.name}") from error
+                created.append((destination, (info.st_dev, info.st_ino)))
+            return release
     except BaseException:
-        temporary.unlink(missing_ok=True)
-        for artifact in created:
-            artifact.unlink(missing_ok=True)
-        if promoted:
-            output.unlink(missing_ok=True)
+        for artifact, identity in reversed(created):
+            # Another writer may have replaced an artifact after publication.
+            # Never delete that writer's file while rolling back our attempt.
+            if _same_file(artifact, identity):
+                artifact.unlink(missing_ok=True)
         raise
+    finally:
+        os.close(lock_fd)
+        # Keep the lock inode: unlinking it would split concurrent flock users.
 
 
 class Worker:
@@ -171,11 +265,12 @@ class Worker:
         for name in ("cube-editor.json", "events.jsonl", ".operation.lock", "iso", "rootfs", "layers", "overlay", "baseline-paths.json", ".extracted", 'restore-point', '.restore-point.building', '.restore.building', 'recovery', '.guest-environment.json', '.whiteouts.json'):
             if (p.directory / name).is_symlink():
                 raise CubeError(f"Project control path cannot be a symlink: {name}")
-        source = Path(p.data["source_iso"]).resolve()
-        if not source.is_file():
-            raise CubeError("Source ISO was moved or deleted")
-        if source.stat().st_size != p.data.get("source_size") or source.stat().st_mtime_ns != p.data.get("source_mtime_ns"):
-            raise CubeError("Source ISO changed since this project was created. Create a new project for the changed source.")
+        if self.action in ("extract", "build"):
+            source = Path(p.data["source_iso"]).resolve()
+            if not source.is_file():
+                raise CubeError("Source ISO was moved or deleted")
+            if source.stat().st_size != p.data.get("source_size") or source.stat().st_mtime_ns != p.data.get("source_mtime_ns"):
+                raise CubeError("Source ISO changed since this project was created. Create a new project for the changed source.")
         p.output_path
         if self.action == 'build': build_resources(p.data)
 
@@ -238,29 +333,33 @@ class Worker:
         if user:
             kwargs.update(user=self.uid, group=self.gid, extra_groups=[])
         if not interactive:
-            kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # Tool output is logged, not parsed strictly; undecodable bytes must not abort the tool.
+            kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
         self.child_interactive = interactive
         self.child = subprocess.Popen(command, **kwargs)
         lines = [] if capture else deque(maxlen=100)
         started = time.monotonic()
-        if not interactive:
-            for line in self.child.stdout:
-                lines.append(line)
-                self.emit("log", line.rstrip())
-                if Path(command[0]).name in ('unsquashfs', 'mksquashfs', 'xorriso'):
-                    match = re.search(r'(\d+(?:\.\d+)?)\s*%', line) or re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*', line)
-                    if match:
-                        fraction = min(1, float(match.group(1)) / 100)
-                        elapsed = time.monotonic() - started
-                        self.emit('progress', f'{Path(command[0]).name}: {fraction:.0%}',
-                                  progress=fraction, phase=Path(command[0]).name, elapsed_seconds=elapsed,
-                                  eta_seconds=elapsed * (1 - fraction) / fraction if fraction > .01 else None)
-                print(line, end="", flush=True)
-                self.check_cancel()
-        code = self.child.wait()
-        if self.child.stdout:
-            self.child.stdout.close()
-        self.child = None
+        try:
+            # A cancel requested while Popen ran found no child to signal.
+            self.check_cancel()
+            if not interactive:
+                for line in self.child.stdout:
+                    lines.append(line)
+                    self.emit("log", line.rstrip())
+                    if Path(command[0]).name in ('unsquashfs', 'mksquashfs', 'xorriso'):
+                        match = re.search(r'(\d+(?:\.\d+)?)\s*%', line) or re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*', line)
+                        if match:
+                            fraction = min(1, float(match.group(1)) / 100)
+                            elapsed = time.monotonic() - started
+                            self.emit('progress', f'{Path(command[0]).name}: {fraction:.0%}',
+                                      progress=fraction, phase=Path(command[0]).name, elapsed_seconds=elapsed,
+                                      eta_seconds=elapsed * (1 - fraction) / fraction if fraction > .01 else None)
+                    print(line, end="", flush=True)
+                    self.check_cancel()
+            code = self.child.wait()
+        finally:
+            # Callers clean up the tree after an error; the tool must be gone first.
+            self.stop_child()
         self.check_cancel()
         if code and check:
             raise CubeError(f"{command[0]} exited with status {code}: {''.join(lines)[-1200:]}")
@@ -270,10 +369,34 @@ class Worker:
         self.run(command)
         self.mounts.append(str(target))
 
+    def stop_child(self):
+        """Kill and reap the current tool, if any."""
+        child, self.child = self.child, None
+        if not child:
+            return
+        try:
+            if child.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    if self.child_interactive:
+                        child.kill()
+                    else:
+                        os.killpg(child.pid, signal.SIGKILL)
+            child.wait()
+        finally:
+            if child.stdout:
+                child.stdout.close()
+
     def cleanup_mounts(self):
+        """Unmount in reverse order; failed targets stay listed for a retry."""
+        failures, retained = [], []
         for target in reversed(self.mounts):
-            subprocess.run(["umount", "-l", "--", target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.mounts.clear()
+            result = subprocess.run(["umount", "-l", "--", target], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if result.returncode:
+                retained.append(target)
+                failures.append(f"{target}: {(result.stdout or '').strip() or f'umount exited with status {result.returncode}'}")
+        self.mounts = list(reversed(retained))
+        if failures:
+            raise CubeError("Could not unmount " + "; ".join(failures))
 
     def ensure_extracted(self):
         if not (self.project.directory / ".extracted").is_file() or not self.project.rootfs.is_dir():
@@ -303,10 +426,17 @@ class Worker:
         self.emit('log', f'Retained recovery artifact: {target}')
         return target
 
+    def ensure_clean_environment(self):
+        paths = ('.guest-environment.json', '.backup-etc-resolv.conf', '.backup-usr-sbin-policy-rc.d')
+        if any((self.project.directory / name).exists() or (self.project.directory / name).is_symlink() for name in paths):
+            raise CubeError('Guest environment restoration is incomplete. Run Recover project before continuing.')
+
     def snapshot(self):
         self.ensure_extracted()
-        if recovery_report(self.project)['environment_backups'] or (self.project.directory / '.whiteouts.json').exists():
-            raise CubeError('Guest environment backups need recovery before saving a restore point')
+        self.ensure_clean_environment()
+        whiteouts = self.project.directory / '.whiteouts.json'
+        if whiteouts.exists() or whiteouts.is_symlink():
+            raise CubeError('Deletion markers need recovery before saving a restore point')
         self.check_storage('snapshot')
         p = self.project
         staging = p.directory / '.restore-point.building'
@@ -383,7 +513,14 @@ class Worker:
         report = recovery_report(p)
         journal = p.directory / '.guest-environment.json'
         environment = json.loads(journal.read_text()) if journal.is_file() else {}
+        if not isinstance(environment, dict) or any(key not in ('etc/resolv.conf', 'usr/sbin/policy-rc.d') or type(value) is not bool
+                                                    for key, value in environment.items()):
+            raise CubeError('Guest environment recovery journal is invalid; original backups have been retained')
         if report['extracted']:
+            for relative, existed in environment.items():
+                backup = p.directory / ('.backup-' + relative.replace('/', '-'))
+                if existed and not (backup.exists() or backup.is_symlink()):
+                    raise CubeError(f'Original guest environment backup is missing for /{relative}; restore a saved point or resolve it manually before clearing the recovery journal')
             for relative in ('etc/resolv.conf', 'usr/sbin/policy-rc.d'):
                 destination = guest_destination(p.rootfs, '/' + str(Path(relative).parent)) / Path(relative).name
                 backup = p.directory / ('.backup-' + relative.replace('/', '-'))
@@ -393,6 +530,10 @@ class Worker:
                     self.emit('log', f'Restored guest environment file: /{relative}')
                 elif environment.get(relative) is False and (destination.exists() or destination.is_symlink()):
                     self.quarantine(destination)
+                if relative in environment:
+                    environment.pop(relative)
+                    atomic_json(journal, environment)
+                    self.user_ownership(journal)
             if journal.exists(): self.quarantine(journal)
         if not report['extracted']:
             for name in ('rootfs', 'iso', 'layers', 'overlay', 'baseline-paths.json', '.extracted'):
@@ -407,7 +548,22 @@ class Worker:
                 self.quarantine(path)
         for value in report['staging']:
             path = Path(value)
-            if path.exists() and not path.is_symlink():
+            if not path.exists() or path.is_symlink():
+                continue
+            if path.parent == p.output_path.parent:
+                lock_path = path.parent / ('.' + p.output_path.name + '.publish.lock')
+                lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                try:
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError as error:
+                        raise CubeError('Another project is publishing this output; retry recovery after it finishes') from error
+                    self.user_ownership(lock_path)
+                    if path.exists():
+                        self.quarantine(path)
+                finally:
+                    os.close(lock_fd)
+            else:
                 self.quarantine(path)
         whiteouts = p.directory / '.whiteouts.json'
         if whiteouts.exists():
@@ -424,6 +580,7 @@ class Worker:
 
     def packages(self):
         self.ensure_extracted()
+        self.ensure_clean_environment()
         recipe = self.project.data.get('recipe', {})
         validate_recipe(recipe, self.project.rootfs, check_files=True)
         output = []
@@ -511,15 +668,16 @@ class Worker:
         (p.directory / ".extracted").write_text(utcnow() + "\n")
         self.user_ownership(p.directory / ".extracted")
         inspection["extracted"] = True
-        self.save(state="ready", inspection=inspection)
+        self.save(state="ready", inspection=inspection, kernel_baseline=kernel_inventory(p.rootfs, self.check_cancel))
         self.emit("progress", "Live filesystem is ready for customization", progress=1.0)
 
     @contextlib.contextmanager
     def chroot_environment(self):
         root = self.project.rootfs
-        if (self.project.directory / '.guest-environment.json').exists():
-            raise CubeError('Interrupted guest environment needs Recover project before opening another session')
+        self.ensure_clean_environment()
         restored = []
+        entries = {}
+        journal = self.project.directory / '.guest-environment.json'
         try:
             for directory in ("/proc", "/sys", "/dev", "/run"):
                 target = guest_destination(root, directory)
@@ -543,49 +701,55 @@ class Worker:
             # Rename originals rather than following guest symlinks into host paths.
             for relative, contents, mode in (("etc/resolv.conf", Path("/etc/resolv.conf").read_bytes(), 0o644),
                     ("usr/sbin/policy-rc.d", b"#!/bin/sh\nexit 101\n", 0o755)):
-                destination = root / relative
-                if destination.parent.resolve().is_relative_to(root.resolve()) is False:
-                    raise CubeError(f"Guest path escapes image: {relative}")
+                destination = guest_destination(root, '/' + str(Path(relative).parent)) / Path(relative).name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                parent = destination.parent.stat()
                 backup = self.project.directory / (".backup-" + relative.replace("/", "-"))
                 if backup.exists() or backup.is_symlink():
                     raise CubeError(f"Unrestored environment backup exists: {backup.name}")
                 existed = destination.exists() or destination.is_symlink()
-                journal = self.project.directory / '.guest-environment.json'
-                entries = json.loads(journal.read_text()) if journal.exists() else {}
                 entries[relative] = existed
                 atomic_json(journal, entries)
                 self.user_ownership(journal)
                 if existed:
                     destination.rename(backup)
-                restored.append((destination, backup, existed))
-                destination.parent.mkdir(parents=True, exist_ok=True)
+                restored.append((relative, destination, backup, existed, (parent.st_dev, parent.st_ino)))
                 destination.write_bytes(contents)
                 destination.chmod(mode)
             yield
         finally:
-            cleanup_ok = True
+            failures = []
+            for relative, destination, backup, existed, parent_identity in reversed(restored):
+                try:
+                    parent = guest_destination(root, '/' + str(Path(relative).parent))
+                    if not _same_file(parent, parent_identity):
+                        raise CubeError(f"Guest parent directory changed for /{relative}")
+                    if destination.is_dir() and not destination.is_symlink():
+                        raise CubeError(f"Guest environment file became a directory: /{relative}")
+                    if existed and not (backup.exists() or backup.is_symlink()):
+                        raise CubeError(f"Original guest environment backup is missing: {backup.name}")
+                    destination.unlink(missing_ok=True)
+                    if existed:
+                        backup.rename(destination)
+                    entries.pop(relative, None)
+                    # Persist each successful restoration. If interrupted after
+                    # rename but before this write, recovery refuses uncertainty.
+                    atomic_json(journal, entries)
+                    self.user_ownership(journal)
+                except (OSError, CubeError) as error:
+                    failures.append(str(error))
+                    self.emit("log", f"Environment restoration needs attention: {error}; backup at {backup}")
             try:
-                for destination, backup, existed in reversed(restored):
-                    try:
-                        if not destination.parent.resolve().is_relative_to(root.resolve()):
-                            cleanup_ok = False
-                            self.emit("log", f"Retained original backup because guest path changed: {backup}")
-                            continue
-                        if destination.is_dir() and not destination.is_symlink():
-                            cleanup_ok = False
-                            self.emit("log", f"Retained original backup because guest file became a directory: {backup}")
-                            continue
-                        destination.unlink(missing_ok=True)
-                        if existed:
-                            backup.rename(destination)
-                    except OSError as error:
-                        cleanup_ok = False
-                        self.emit("log", f"Environment restoration needs attention: {error}; backup at {backup}")
-            finally:
                 self.cleanup_mounts()
-                if cleanup_ok and not any((self.project.directory / name).exists() or (self.project.directory / name).is_symlink()
-                           for name in ('.backup-etc-resolv.conf', '.backup-usr-sbin-policy-rc.d')):
-                    (self.project.directory / '.guest-environment.json').unlink(missing_ok=True)
+            except Exception as error:
+                failures.append(f"Guest mount cleanup failed: {error}")
+            remaining_backups = any((self.project.directory / name).exists() or (self.project.directory / name).is_symlink()
+                                    for name in ('.backup-etc-resolv.conf', '.backup-usr-sbin-policy-rc.d'))
+            if not entries and not remaining_backups and not failures:
+                journal.unlink(missing_ok=True)
+            if failures or entries or remaining_backups:
+                detail = '; '.join(failures) or 'Unresolved original environment files remain'
+                raise CubeError('Guest environment restoration is incomplete. Run Recover project before continuing. ' + detail)
 
     def guest(self, command, **kwargs):
         environment = ["/usr/bin/env", "-i", "HOME=/root", "USER=root", "LOGNAME=root", "LC_ALL=C.UTF-8",
@@ -612,6 +776,7 @@ class Worker:
 
     def customize(self):
         self.ensure_extracted()
+        self.ensure_clean_environment()
         recipe = self.project.data.get("recipe", {})
         install = package_list(recipe.get("install_packages", []))
         remove = package_list(recipe.get("remove_packages", []))
@@ -657,6 +822,7 @@ class Worker:
 
     def terminal(self):
         self.ensure_extracted()
+        self.ensure_clean_environment()
         if self.project.data.get('auto_snapshot', True):
             self.snapshot()
         self.save(state="terminal", last_error="")
@@ -827,18 +993,7 @@ class Worker:
             if not item.is_symlink() and item.is_file():
                 size += item.stat().st_size
         atomic_text(Path(str(base) + ".size"), str(size) + "\n")
-        # Refresh the kernel/initramfs as a matched pair when both were generated
-        # inside the guest. Retain original filenames referenced by boot menus.
-        boot = guest_destination(p.rootfs, "/boot")
-        kernels = sorted((path for path in boot.glob("vmlinuz-*") if path.is_file() and not path.is_symlink()), key=lambda path: path.stat().st_mtime_ns)
-        if kernels:
-            kernel = kernels[-1]
-            initrd = kernel.with_name("initrd.img-" + kernel.name.removeprefix("vmlinuz-"))
-            guest_destination(p.rootfs, "/" + str(initrd.relative_to(p.rootfs)))
-            if initrd.is_file() and (squash.parent / "vmlinuz").exists() and (squash.parent / "initrd").exists():
-                shutil.copy2(kernel, squash.parent / "vmlinuz")
-                shutil.copy2(initrd, squash.parent / "initrd")
-                self.emit("log", f"Refreshed live kernel and initramfs: {kernel.name}")
+        refresh_kernel(p, self.emit, self.check_cancel)
         info = p.iso_tree / ".disk/info"
         if info.exists() and not info.is_symlink():
             atomic_text(info, p.data["name"] + " — Cube Editor — " + utcnow() + "\n")
@@ -881,9 +1036,10 @@ class Worker:
 
     def build(self):
         self.ensure_extracted()
+        self.ensure_clean_environment()
         self.check_storage('build')
         p = self.project
-        if (p.directory / '.whiteouts.json').exists():
+        if (p.directory / '.whiteouts.json').exists() or (p.directory / '.whiteouts.json').is_symlink():
             raise CubeError('Interrupted deletion markers need Recover project before building')
         compression = p.data.get("compression", "xz")
         if compression not in ("xz", "zstd", "gzip", "lz4", "lzo"):
@@ -922,30 +1078,48 @@ class Worker:
         signal.signal(signal.SIGINT, self.request_cancel)
         watcher = threading.Thread(target=self.watch_cancel, daemon=True)
         watcher.start()
-        locked = False
         try:
             with self.project.lock():
-                locked = True
-                self.user_ownership(self.project.directory / ".operation.lock")
-                self.emit("started", f"Starting {self.action}", pid=os.getpid())
-                getattr(self, self.action)()
+                failure = None
+                try:
+                    self.user_ownership(self.project.directory / ".operation.lock")
+                    self.emit("started", f"Starting {self.action}", pid=os.getpid())
+                    if self.action in ('customize', 'terminal', 'packages', 'build'):
+                        self.emit("log", "Trust requirement: image binaries and package scripts run with host root privileges. The chroot and namespaces are not a security sandbox; use only trusted images and recipes.")
+                    getattr(self, self.action)()
+                except (Exception, KeyboardInterrupt) as error:
+                    failure = error
+                finally:
+                    # A failed or cancelled tool can still be writing the tree.
+                    # Keep the project locked until it is reaped and unmounted.
+                    try:
+                        self.stop_child()
+                    except Exception as error:
+                        if failure is None:
+                            failure = error
+                    try:
+                        self.cleanup_mounts()
+                    except Exception as error:
+                        if failure is None:
+                            failure = error
+                        else:
+                            with contextlib.suppress(Exception):
+                                self.emit("log", f"Guest mount cleanup also failed: {error}")
+                if failure is not None:
+                    cancelled = isinstance(failure, Cancelled) or self.cancelled.is_set()
+                    self.save(state="cancelled" if cancelled else "error", last_error=str(failure))
+                    self.emit("finished", str(failure), success=False, cancelled=cancelled)
+                    return 130 if cancelled else 1
                 self.emit("finished", f"{self.action.title()} complete", success=True)
-            return 0
+                return 0
         except (Exception, KeyboardInterrupt) as error:
+            # Lock acquisition and status-writing failures must also shut down
+            # the controller cleanly, without saving over another operation.
             cancelled = isinstance(error, Cancelled) or self.cancelled.is_set()
-            if locked:
-                self.save(state="cancelled" if cancelled else "error", last_error=str(error))
-            self.emit("finished", str(error), success=False, cancelled=cancelled)
+            with contextlib.suppress(Exception):
+                self.emit("finished", str(error), success=False, cancelled=cancelled)
             return 130 if cancelled else 1
         finally:
-            if self.child and self.child.poll() is None:
-                with contextlib.suppress(ProcessLookupError):
-                    if self.child_interactive:
-                        self.child.kill()
-                    else:
-                        os.killpg(self.child.pid, signal.SIGKILL)
-                self.child.wait()
-            self.cleanup_mounts()
             self.stop_watcher.set()
 
 

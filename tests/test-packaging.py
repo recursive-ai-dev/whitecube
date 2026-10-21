@@ -97,7 +97,7 @@ class Tree(unittest.TestCase):
 
     def test_cube_editor_runtime_and_desktop_integration_are_shipped(self):
         editor = self.stage / 'usr/share/whitecube/cube-editor'
-        for name in ('app.py', 'engine.py', 'worker.py', 'COPYING', 'NOTICE'):
+        for name in ('app.py', 'engine.py', 'worker.py', 'kernel.py', 'COPYING', 'NOTICE'):
             self.assertTrue((editor / name).is_file(), name)
             self.assertTrue(os.access(editor / name, os.R_OK), name)
         entry = (self.stage / 'usr/share/applications/cube-editor.desktop').read_text()

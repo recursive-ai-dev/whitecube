@@ -1,0 +1,419 @@
+Cube Editor project audit
+
+Audited on 15 October 2026 at commit 6b6d0e1e359bd892a8472c49595c73639e86765d.
+Scope: apps/cube-editor, its repository launcher and desktop entry, relevant
+packaging and build integration, and editor tests. This is an audit of the
+editor in the current working directory, not every application in Whitecube.
+
+The audit found 16 issues: 4 high priority (P1), 9 medium priority (P2), and
+3 low priority (P3). The most consequential issues concern execution of guest
+code with host privileges, lost project metadata, competing release writes,
+and successful builds containing an unrestored guest environment.
+
+P1 means address before relying on the affected operation for valuable data or
+untrusted input. P2 means a reproducible correctness or compatibility problem
+with a narrower trigger. P3 means robustness, developer portability, or an API
+edge case. The guest isolation finding is conditional on untrusted guest code;
+it is not a passwordless privilege escalation for another desktop account.
+
+The working tree was clean before and after the audit. Production files were
+not edited. All probes, downloaded tool sources, binaries, and logs are beside
+this report in /tmp/cube-editor-audit-20261015-WibViu.
+
+1. P1 Guest processes can access the host root through proc
+
+References: worker.py:517-541, worker.py:590-594, worker.py:965-971;
+app.py:364-365.
+
+The worker creates mount and PID namespaces, mounts proc in the guest, and
+executes guest binaries as root without creating a user namespace or dropping
+host capabilities. The worker itself remains outside the chroot in that PID
+namespace. Guest code can reach its root through /proc/1/root. Mount privacy
+does not stop ordinary writes through that path. Guest package maintainer
+scripts and image-provided executables therefore require the same trust as
+host root commands. The UI's description of a terminal boundary does not
+explain that consequence.
+
+Evidence: proc_boundary.py reproduced the filesystem exposure in an isolated
+user namespace. A chrooted child changed a disposable sentinel outside the
+guest through /proc/1/root; exit status was 0. No sudo or system-file write was
+used. The application runs the corresponding guest commands with full sudo
+privileges, which makes the exposed host paths more consequential.
+
+Fix: decide and enforce the trust model. To support untrusted images, run guest
+execution in a VM or a properly isolated environment with mapped identities,
+restricted capabilities, and no external root exposed through proc. Hiding one
+proc path alone does not contain a guest that retains host root capabilities.
+For a trusted-image workflow, state the root-code trust requirement explicitly.
+
+The Linux man-pages project documents that chroot does not provide a security
+sandbox and describes proc root links:
+https://man7.org/linux/man-pages/man2/chroot.2.html
+
+2. P1 Recording a release check can discard newer project state
+
+References: engine.py:599-605 and engine.py:330-341.
+
+_save_check reads the latest release_checks while holding the project lock but
+does not replace self.project.data with the latest document. Project.save skips
+its usual reload when already inside a lock. A stale Engine then writes its
+old document plus the new check, overwriting unrelated changes made by another
+window or CLI operation.
+
+Evidence: reproduce.py test_01 loaded a second project instance, then changed
+the name, state, last_build and releases through the first. Recording a check
+through the stale instance restored the original name and state, emptied
+last_build, and removed releases. Both release checks can survive, so the
+existing stale-check regression does not detect this loss.
+
+Fix: reload and merge the entire current document inside the transaction before
+saving checks. Make the transaction API enforce this invariant for all callers.
+Add a regression that verifies unrelated fields and release history survive.
+
+3. P1 Publication can overwrite a release created during export
+
+References: worker.py:100-110, worker.py:117-135.
+
+rebuild_iso checks that the destination and sidecars do not exist before a
+potentially long export, then uses os.replace to publish them. There is no
+destination reservation or lock shared by projects. A release or sidecar that
+appears after the initial check is replaced. The per-project lock does not
+protect a shared release folder used by another project or process.
+
+Evidence: reproduce.py test_03 created a competing ISO and checksum during the
+export callback. Publication overwrote both. The initial existence checks and
+the existing sidecar regression do not cover this interleaving.
+
+Fix: reserve the destination exclusively, use unique staging paths, and publish
+with a no-replace operation. Coordinate all artifacts for a release and ensure
+failure cleanup can remove only artifacts owned by that publication attempt.
+
+4. P1 Unrestored guest environment files can enter a successful release
+
+References: worker.py:565-588, worker.py:656-666, worker.py:882-908.
+
+When a guest changes a temporary environment-file path into a directory or
+redirects its parent, cleanup logs the problem and keeps the backups but does
+not fail the operation. customize and terminal can still save a successful
+state. Build rejects a pending whiteout journal but does not reject the guest
+environment journal or DNS/service-policy backups. It can compress temporary
+host DNS and the temporary policy-rc.d into the image after interruption or
+failed cleanup.
+
+Evidence: reproduce.py test_08 changed resolv.conf into a directory during a
+simulated guest command. customize returned with state customized and retained
+the environment journal and original DNS backup. Test_02 independently left
+temporary DNS and a recovery journal in an extracted project; build proceeded
+through compression and saved state built. External export/compression were
+substituted in these two probes; the operation guards and state changes were
+the production code.
+
+Fix: fail the operation when environment restoration is incomplete and require
+recovery before any build. Check the journal and both backup paths, including
+symlinks, before mutating or compressing the root.
+
+5. P2 Build does not verify the source digest that its release records
+
+References: worker.py:174-178, worker.py:457-461, worker.py:111-113,
+worker.py:129-134.
+
+Extraction checks the recorded SHA256. Build later reopens the source for boot
+record replay, checking only size and modification time in validate. Replacing
+the source with different contents while preserving those attributes passes
+validation, yet the release still records the earlier source_sha256.
+
+Evidence: reproduce.py test_05 recorded a hash, changed every source byte,
+restored its original size and mtime, and passed build validation. No matching
+source hash check exists in the build path.
+
+Fix: verify the recorded source digest before replay, and ensure the file used
+by the exporter cannot change between verification and use. Fail without
+publishing when source identity or contents differ.
+
+6. P2 Recovery and restore require an available unchanged source ISO
+
+References: worker.py:161-180 and worker.py:964-971.
+
+Every action runs the same source existence and timestamp validation, including
+recover, restore, snapshot, terminal, and package preview. Moving or deleting a
+large source ISO prevents restoring DNS backups or restoring saved project
+trees, although those operations can work entirely from retained project data.
+
+Evidence: reproduce.py test_04 removed the source and called validation for a
+recover worker. It failed with Source ISO was moved or deleted before recovery
+could begin.
+
+Fix: validate source availability only for operations that read it. Keep the
+project-path and ownership checks for all operations. Recovery should remain
+available when an external input is missing or damaged.
+
+7. P2 Kernel refresh can silently retain or choose the wrong boot pair
+
+References: worker.py:830-841.
+
+Refresh handles only the exact ISO filenames vmlinuz and initrd beside the
+selected squashfs. Other layouts such as /live/initrd.img receive no refresh.
+It also chooses a guest kernel by file mtime rather than the guest's selected
+default or a version-aware policy. A rebuilt root can therefore disagree with
+the kernel/initramfs referenced by its boot configuration, especially after
+kernel installation or removal.
+
+Evidence: reproduce.py test_06 supplied a new guest kernel/initramfs and an ISO
+using /live/vmlinuz plus /live/initrd.img. Both ISO files remained old. Test_07
+selected 6.1 through the guest vmlinuz link but gave 6.0 the newer mtime; refresh
+copied 6.0 into the ISO.
+
+Fix: identify the actual boot file mappings, honor the guest's selected kernel,
+and verify a matching initramfs and module set. Reject an ambiguous unsupported
+kernel layout when a kernel change requires propagation.
+
+8. P2 Recipe import discards pending unrelated form edits
+
+References: app.py:597-602, app.py:780-787, app.py:899-904.
+
+Import writes the recipe to the current on-disk project and then hydrates all
+form fields. It does not flush pending autosave edits first. If import occurs
+before the 550 ms autosave, unrelated changes such as the project name or
+volume label disappear.
+
+Evidence: gui_probes.py changed the project name and volume label, then imported
+a valid recipe immediately. Both fields reverted to their saved values. The
+probe used real GTK widgets on a private Broadway display.
+
+Fix: preserve or save unrelated form edits before import, and hydrate only the
+recipe fields being replaced. Add a GUI regression without waiting for autosave.
+
+9. P2 A valid text package list changes meaning during GUI hydration
+
+References: engine.py:89-96, engine.py:131-132, engine.py:266-272,
+app.py:905-907.
+
+Recipe validation accepts package lists as text or arrays. The GUI assumes an
+array and applies ' '.join directly. A valid imported install_packages value
+of curl becomes c u r l, which recipe() then saves as four package names. CLI
+and UI handling of the same accepted recipe are inconsistent.
+
+Evidence: gui_probes.py saved an accepted text package list and hydrated the
+project. The entry became c u r l and recipe() returned ['c', 'u', 'r', 'l'].
+
+Fix: normalize package lists to arrays at import/load boundaries, or reject
+noncanonical representations consistently. Use package_list before joining UI
+values and test both accepted representations.
+
+10. P2 Old passing checks remain presented for changed ISO contents
+
+References: app.py:642-652.
+
+Release-check display filters by path only. Replacing an ISO at that path keeps
+the old passed rows in the selected output's summary. A short historical hash
+appears beside the result, but the current contents are not checked or clearly
+distinguished from that prior result. The stored checks retain their hashes;
+the defect is their presentation for the currently selected file.
+
+Evidence: gui_probes.py recorded a passing BIOS result, replaced the ISO with
+different bytes, and refreshed the display. It continued to show BIOS live:
+passed for the old hash under that output.
+
+Fix: show historical checks as historical until the current file's digest is
+known. Associate current pass/fail presentation with the verified digest and
+invalidate cached presentation when the selected file changes.
+
+11. P2 A previous image's live-root choices remain available
+
+References: app.py:937-939, app.py:970-978, app.py:987-994.
+
+show_inspection updates the root selector only for a nonempty path list. An
+empty inspection does not clear or hide the old model. Loading a project with
+no inspection also leaves the previous inspection UI intact. The selector can
+therefore offer a root that is absent from the current image; selecting it
+saves that path and makes the next inspection reject the project selection.
+
+Evidence: gui_probes.py displayed an image with /casper/old.squashfs and then
+an inspection with no supported roots. The old selector remained visible and
+still selected the old path.
+
+Fix: reset inspection text and selector state on project changes and empty
+results. Populate choices solely from the current project's inspection and
+validate the choice before saving it.
+
+12. P3 A non-object event can crash the operation controller
+
+References: engine.py:642-653, engine.py:664-671.
+
+The event reader catches JSON syntax errors but assumes every successfully
+decoded value is an object. A valid JSON scalar such as null raises
+AttributeError at event.get. Engine.run then exits without its normal process
+cleanup. The UI can return to idle while its operation process remains alive.
+The normal worker emits objects, so this requires a damaged or externally
+modified event log.
+
+Evidence: reproduce.py test_09 ran a small temporary child that appended null
+to the event log. Engine.run raised AttributeError. The probe itself waited
+for and closed the temporary child afterwards.
+
+Fix: validate event type and required field types, skip or report invalid
+records, and put child lifecycle cleanup in a finally block that also runs
+when event parsing fails.
+
+13. P3 Reentrant project locking is not safe across threads
+
+References: engine.py:370-389.
+
+_lock_depth is shared by all threads using one Project. Any thread observes a
+positive depth and skips flock, even when another thread owns the transaction.
+Separate Project instances receive cross-process protection, but two threads
+sharing an instance can enter the protected section together. Current GUI
+busy-state guards reduce the normal UI exposure; this affects concurrent API
+use and future background work.
+
+Evidence: reproduce.py test_10 held a lock in one thread and entered the same
+Project.lock from another thread before the first transaction exited.
+
+Fix: combine a Python reentrant mutex with flock, or track the owning thread
+and enforce mutual exclusion for other threads. Preserve same-thread reentrancy.
+
+14. P2 Saved project validation checks only the schema number
+
+References: engine.py:319-328, engine.py:359-367, engine.py:819-821;
+app.py:879-900.
+
+Project.load accepts any object with schema equal to 1, without required fields
+or field-type checks. A structurally incomplete document then fails later in
+ordinary commands. The CLI does not catch KeyError or TypeError, so the user
+gets a traceback. The GUI assigns the new project before hydration succeeds,
+which can also leave partially initialized project state after a failed open.
+
+Evidence: reproduce.py test_11 loaded {'schema': 1} successfully, then ran the
+build-plan CLI against it. The CLI failed with an uncaught KeyError traceback.
+
+Fix: validate and normalize the complete project document at the boundary,
+provide explicit defaults for optional fields, and report CubeError for bad
+input. Open a candidate project fully before replacing the window's current
+project, and restore hydration flags on exceptions.
+
+15. P2 The package does not enforce the libadwaita API version it uses
+
+References: app.py:24-26, app.py:1330, app.py:1339;
+packaging/build-deb.sh:86-92.
+
+The app uses Adw.Dialog, introduced in libadwaita 1.5. The package declares
+gir1.2-adw-1 without a minimum version, and require_version('Adw', '1') selects
+the introspection namespace rather than requiring libadwaita 1.5. An older
+runtime can satisfy installation dependencies and then fail when opening
+Commands or a text dialog. This is a compatibility finding from the declared
+dependency contract; the available runtime here was 1.9.4.
+
+Fix: require gir1.2-adw-1 >= 1.5 with the corresponding runtime dependency, or
+provide a compatible dialog implementation for older supported distributions.
+Add a startup version check that gives a useful error.
+
+The API's introduction is documented by the upstream project:
+https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1.5/class.Dialog.html
+
+16. P3 Synthetic ISO tests inherit nonportable host SELinux attributes
+
+References: tests/test_cube_editor.py:267-275, tests/test_cube_editor.py:308;
+tests/test_improvements.py:261-267.
+
+Synthetic files acquire this host's security.selinux label. mksquashfs stores
+extended attributes by default, and the tests subsequently extract as an
+unprivileged account. unsquashfs cannot restore that label and exits with status
+2, causing two otherwise relevant integration tests to fail on this host.
+
+Evidence: with locally built real ISO tools, the unmodified suite produced one
+failure and one error. The first explicitly reported inability to restore
+security.selinux. Excluding just that host label during synthetic image creation
+made both pass. This adjustment was a temporary tool wrapper; no repository
+test or production code was changed.
+
+Fix: build portable synthetic fixtures with a deliberate xattr policy. Test
+preservation of relevant user and guest metadata separately rather than relying
+on labels inherited from the developer's host filesystem.
+
+Validation results and practical limits
+
+The baseline command was:
+  python3 -I -m unittest discover -s apps/cube-editor/tests -v
+It ran 43 tests: 38 passed and 5 were skipped because ISO tools, qemu-img and
+OVMF were unavailable.
+
+Temporary builds of upstream squashfs-tools 4.6.1 and xorriso 1.5.6.pl02 enabled
+three skipped tests. The first unmodified run had 39 passing, 2 failing and
+2 skipped tests because of the SELinux fixture issue. With only the synthetic
+fixture label excluded, the result was 41 passing and 2 skipped. Those passes
+include real squashfs compression/extraction, layered-image inspection, and
+ISO roundtrip verification of BIOS/UEFI boot metadata and hidden EFI contents.
+The synthetic ISO tests do not actually boot a guest.
+
+The repository GUI action test passed using a private GTK Broadway display.
+Four additional probes using real GTK widgets reproduced findings 8-11.
+The normal Wayland screenshot runner could not start because build/whitecube
+was unavailable. Broadway action success does not establish screenshot output
+or Wayland rendering correctness; no screenshot artifact was produced.
+
+The audit added 11 disposable core/API probes and one separate user-namespace
+proc demonstration. Together with the 4 GUI probes, all 16 custom failure-case
+probes reproduced their intended current behavior. A passing custom probe means
+the defect was reproduced, not that the defect was fixed.
+
+The repository BUILD.sh failed before compilation could complete because native
+development dependencies were absent, including wlroots-0.18, Wayland,
+xkbcommon, pangocairo, cairo, gio and libinput. The compiler reported a missing
+wayland-server-core.h. No system packages were installed to bypass that limit.
+
+tests/test-packaging.py had 3 passing dependency tests, 1 environment error
+because dpkg-query is absent on this host, and its install-tree class was
+skipped because the native build was unavailable. A .deb was not produced or
+installed. QEMU/OVMF execution and a complete real installer workflow remain
+unverified. No authenticated production worker was launched.
+
+Useful existing protections include package-option validation, rejection of
+payload destination symlinks, staged ISO output, atomic metadata replacement,
+bounded worker output capture, preservation of previous restore points, and
+release checks that store actual file hashes. The existing tests exercise
+several of these protections successfully. They do not call Worker.execute or
+Worker.validate, and do not exercise the real authenticated mount lifecycle.
+
+Suggested repair sequence
+
+First fix lost metadata and release overwrite races, reject dirty guest state,
+and establish the guest trust boundary. Then fix source integrity and offline
+recovery, kernel propagation, and the import/display inconsistencies. Follow
+with schema validation, runtime constraints and event/locking robustness.
+Convert the audit probes into tests that assert the desired safe behavior.
+Run the complete build and privileged lifecycle tests on the supported Debian
+environment, followed by actual BIOS and UEFI live and installer tests.
+
+Reproduction artifacts
+
+  reproduce.py       11 core and API defect probes
+  proc_boundary.py   Safe proc-root exposure demonstration
+  gui_probes.py      4 GTK defect probes
+  run_ui.py          Private Broadway runner for the existing GUI test or probes
+  probes.log        Core probe results
+  gui-actions.log   Existing GUI action-test result
+  gui-probes.log    Additional GUI probe results
+  integration-tests.log  Final 41-pass 2-skip editor test result
+  fixture-tools/mksquashfs  Wrapper excluding security.selinux for this test run
+
+Run the core probes:
+  python3 /tmp/cube-editor-audit-20261015-WibViu/reproduce.py
+
+Run the safe namespace demonstration:
+  unshare --user --map-root-user --mount --pid --fork python3 /tmp/cube-editor-audit-20261015-WibViu/proc_boundary.py
+
+Run the additional GUI probes:
+  python3 /tmp/cube-editor-audit-20261015-WibViu/run_ui.py /tmp/cube-editor-audit-20261015-WibViu/gui_probes.py
+
+Run the enhanced existing suite from the repository root:
+  PATH=/tmp/cube-editor-audit-20261015-WibViu/fixture-tools:/tmp/cube-editor-audit-20261015-WibViu/xorriso-1.5.6/xorriso:/tmp/cube-editor-audit-20261015-WibViu/squashfs-tools/squashfs-tools:$PATH python3 -I -m unittest discover -s apps/cube-editor/tests -v
+
+Tool source provenance:
+  squashfs-tools tag 4.6.1, commit d8cb82d9840330f9344ec37b992595b5d7b44184
+  https://github.com/plougher/squashfs-tools
+  https://www.gnu.org/software/xorriso/xorriso-1.5.6.pl02.tar.gz
+  Downloaded xorriso archive SHA256:
+  786f9f5df9865cc5b0c1fecee3d2c0f5e04cab8c9a859bd1c9c7ccd4964fdae1
+  The archive hash records the bytes used for this audit, not a publisher
+  signature verification. The temporary squashfs build enabled gzip and zstd;
+  xz, lz4 and lzo compressor implementations were not tested here.

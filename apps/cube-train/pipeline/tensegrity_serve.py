@@ -129,9 +129,10 @@ class ModelStore:
     def _load(self, run):
         t0 = time.time()
         ckpt = load_checkpoint(run["checkpoint"], "cpu")
-        cfg = TensegrityConfig(**ckpt["config"])
+        cfg = TensegrityConfig.from_dict(ckpt["config"], warn_unknown=False)
         model = TensegrityLM(cfg)
-        model.load_state_dict(ckpt["model_state_dict"])
+        from tensegrity_lm import normalize_state_dict
+        model.load_state_dict(normalize_state_dict(ckpt["model_state_dict"]))
         model.to(self.device)
         model.eval()
         loaded = (model, cfg, ckpt.get("step"), ckpt.get("best_val_loss"))
@@ -239,11 +240,15 @@ def decode(model, prompt_ids, *, temperature, top_k, top_p, max_new_tokens):
     device = next(model.parameters()).device
     seq = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     past = None
+    K = getattr(model.cfg, "byte_mix_kernel", 0)
     for _ in range(max_new_tokens):
         length = seq.size(1)
         if past is None or length > model.cfg.block_size:
             window = seq if length <= model.cfg.block_size else seq[:, -model.cfg.block_size:]
             logits, past, _ = model.forward_incremental(window, None, 0)
+        elif K and length > 1:
+            ctx = seq[:, max(0, length - K):length - 1]
+            logits, past, _ = model.forward_incremental(seq[:, -1:], past, length - 1, ctx)
         else:
             logits, past, _ = model.forward_incremental(seq[:, -1:], past, length - 1)
         token = sample(logits[:, -1, :], temperature, top_k, top_p)

@@ -8,11 +8,14 @@ This module never needs root; privileged filesystem work lives in worker.py.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import contextlib
+import copy
 import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -212,7 +215,7 @@ def storage_preflight(project, action):
         requests = [(project.directory, source_size * 10 + reserve, 'ISO tree, expanded layers and editable root')]
     elif action == 'build':
         requests = [(project.directory, root_size * 2 + reserve, 'Live and installer compression staging'),
-                    (project.output_path.parent, iso_size + root_size * 2 + reserve, 'ISO export and staging')]
+                    (project.output_path.parent, source_size + iso_size + root_size * 2 + reserve, 'Verified source copy, ISO export and staging')]
     elif action in ('snapshot', 'customize', 'terminal', 'restore'):
         if action in ('snapshot', 'restore') or project.data.get('auto_snapshot', True):
             if action == 'restore':
@@ -243,6 +246,9 @@ def recovery_report(project):
     output = project.output_path
     if output.with_name('.' + output.name + '.building').exists():
         staging.append(str(output.with_name('.' + output.name + '.building')))
+    # Shared output directories can contain another project's active export.
+    # Report unique publication staging separately from recoverable project files.
+    output_staging = [str(path) for path in output.parent.glob('.' + output.name + '.*.building')]
     backups = [str(project.directory / name) for name in ('.backup-etc-resolv.conf', '.backup-usr-sbin-policy-rc.d', '.guest-environment.json')
                if (project.directory / name).exists() or (project.directory / name).is_symlink()]
     try:
@@ -250,7 +256,9 @@ def recovery_report(project):
         active = False
     except CubeError:
         active = True
-    return {'state': state, 'active_operation': active, 'interrupted': interrupted and not active, 'extracted': extracted, 'staging': staging, 'environment_backups': backups, 'pending_whiteouts': (project.directory / '.whiteouts.json').exists(),
+    return {'state': state, 'active_operation': active, 'interrupted': interrupted and not active, 'extracted': extracted, 'staging': staging,
+            'output_staging': output_staging, 'output_staging_note': 'Shared publication staging requires review; it may belong to another active project.' if output_staging else '',
+            'environment_backups': backups, 'pending_whiteouts': (project.directory / '.whiteouts.json').exists(),
             'restore_available': (project.directory / 'restore-point/manifest.json').is_file(),
             'recommendation': ('Restore the saved point or retry the failed operation after reviewing Activity.' if extracted else
                                'Quarantine partial extraction with Recover project, then extract again.'),
@@ -264,12 +272,111 @@ def export_recipe(project, path):
 
 
 def import_recipe(path):
-    value = json.loads(Path(path).read_text())
+    try:
+        value = json.loads(Path(path).read_text())
+    except (OSError, ValueError) as error:
+        raise CubeError(f'Cannot read recipe: {error}') from error
     if not isinstance(value, dict) or value.get('format') != 'cube-editor-recipe' or value.get('version') != 1:
         raise CubeError('Unsupported recipe format')
     recipe = value.get('recipe')
     missing = validate_recipe(recipe)
-    return recipe, missing
+    return normalize_recipe(recipe), missing
+
+
+def normalize_recipe(recipe):
+    """Accept the portable text form, but keep package lists canonical in memory."""
+    validate_recipe(recipe)
+    result = copy.deepcopy(recipe)
+    for key in ('install_packages', 'remove_packages'):
+        if key in result:
+            result[key] = package_list(result[key])
+    return result
+
+
+def normalize_project(data):
+    """Validate persisted structure without requiring external inputs to exist."""
+    if not isinstance(data, dict) or type(data.get('schema')) is not int or data['schema'] != 1:
+        raise CubeError('This project uses an unsupported schema')
+    result = copy.deepcopy(data)
+
+    def text_field(value, key, required=False):
+        if key not in value or not isinstance(value[key], str) or '\0' in value[key]:
+            raise CubeError(f'Project field {key!r} must be text')
+        if required and not value[key].strip():
+            raise CubeError(f'Project field {key!r} cannot be empty')
+
+    for key in ('id', 'name', 'source_iso', 'output_dir'):
+        text_field(result, key, required=True)
+    for key in ('source_iso', 'output_dir'):
+        if not Path(result[key]).expanduser().is_absolute():
+            raise CubeError(f'Project field {key!r} must be an absolute path')
+    for key in ('source_size', 'source_mtime_ns'):
+        if type(result.get(key)) is not int or (key == 'source_size' and result[key] < 0):
+            raise CubeError(f'Project field {key!r} must be an integer' + (' at least zero' if key == 'source_size' else ''))
+    defaults = {'created_at': '', 'updated_at': '', 'output_name': 'cube-editor.iso',
+                'volume_id': 'CUBE_EDITOR', 'compression': 'xz', 'state': 'new',
+                'squashfs_path': '', 'last_error': '', 'source_sha256': '',
+                'source_expected_sha256': '', 'source_verified_at': '',
+                'processors': 2, 'memory_mb': 1024, 'compression_level': 0,
+                'auto_snapshot': True, 'inspection': {}, 'recipe': {},
+                'last_build': {}, 'releases': [], 'release_checks': []}
+    for key, default in defaults.items():
+        result.setdefault(key, default)
+        if isinstance(default, str):
+            text_field(result, key)
+    name = result['output_name']
+    if Path(name).name != name or not name.lower().endswith('.iso'):
+        raise CubeError('Output name must be an ISO filename without directory components')
+    if type(result['auto_snapshot']) is not bool:
+        raise CubeError('Project field auto_snapshot must be true or false')
+    build_resources(result)
+    result['recipe'] = normalize_recipe(result['recipe'])
+    inspection = result['inspection']
+    if not isinstance(inspection, dict):
+        raise CubeError('Project inspection must be an object')
+    for key in ('squashfs_paths', 'layer_chain', 'warnings', 'kernel_paths', 'boot_image_paths'):
+        if key in inspection and (not isinstance(inspection[key], list) or any(not isinstance(item, str) for item in inspection[key])):
+            raise CubeError(f'Project inspection {key!r} must be a list of text values')
+    for key in ('volume_id', 'squashfs_path', 'boot_catalog'):
+        if key in inspection:
+            text_field(inspection, key)
+    for key in ('layers', 'can_rebuild', 'bootable', 'bios', 'uefi', 'extracted'):
+        if key in inspection and type(inspection[key]) is not bool:
+            raise CubeError(f'Project inspection {key!r} must be true or false')
+    if 'size_bytes' in inspection and (type(inspection['size_bytes']) is not int or inspection['size_bytes'] < 0):
+        raise CubeError('Project inspection size_bytes must be a nonnegative integer')
+
+    def release(value, label):
+        if not isinstance(value, dict):
+            raise CubeError(f'Project {label} must be an object')
+        for key in ('path', 'sha256', 'completed_at', 'source_iso', 'source_sha256', 'volume_id', 'compression'):
+            if key in value:
+                text_field(value, key)
+        if 'size_bytes' in value and (type(value['size_bytes']) is not int or value['size_bytes'] < 0):
+            raise CubeError(f'Project {label} size_bytes must be a nonnegative integer')
+        if 'recipe' in value:
+            value['recipe'] = normalize_recipe(value['recipe'])
+        build_resources(value)
+
+    release(result['last_build'], 'last_build')
+    if not isinstance(result['releases'], list):
+        raise CubeError('Project releases must be a list')
+    for item in result['releases']:
+        release(item, 'release')
+    if not isinstance(result['release_checks'], list):
+        raise CubeError('Project release_checks must be a list')
+    for check in result['release_checks']:
+        if not isinstance(check, dict):
+            raise CubeError('Each project release check must be an object')
+        for key in ('kind', 'outcome', 'path', 'sha256', 'checked_at'):
+            text_field(check, key, required=True)
+        check.setdefault('note', '')
+        text_field(check, 'note')
+        if check['kind'] not in ('checksum', 'BIOS live', 'UEFI live', 'BIOS installer', 'UEFI installer'):
+            raise CubeError('Unknown project release check kind')
+        if check['outcome'] not in ('passed', 'failed', 'not tested'):
+            raise CubeError('Unknown project release check outcome')
+    return result
 
 
 def guest_destination(root, destination):
@@ -291,7 +398,8 @@ def guest_destination(root, destination):
 class Project:
     def __init__(self, directory, data):
         self.directory = Path(directory).expanduser().resolve()
-        self.data = data
+        self.data = normalize_project(data)
+        self._mutex = threading.RLock()
         self._lock_depth = 0
 
     @classmethod
@@ -321,24 +429,21 @@ class Project:
         directory = Path(path).expanduser()
         if directory.name == "cube-editor.json":
             directory = directory.parent
-        with (directory / "cube-editor.json").open() as stream:
-            data = json.load(stream)
-        if not isinstance(data, dict) or data.get("schema") != 1:
-            raise CubeError("This project uses an unsupported schema")
-        return cls(directory, data)
+        return cls(directory, cls._read(directory / 'cube-editor.json'))
+
+    @staticmethod
+    def _read(path):
+        try:
+            with path.open() as stream:
+                return normalize_project(json.load(stream))
+        except (OSError, ValueError) as error:
+            raise CubeError(f'Cannot read project {path}: {error}') from error
 
     def save(self, **updates):
-        if not self._lock_depth:
-            with self.lock():
-                # A stale window may update recipe fields, but must preserve
-                # the most recent worker state and release metadata.
-                path = self.directory / "cube-editor.json"
-                if path.exists():
-                    self.data = json.loads(path.read_text())
-                return self.save(**updates)
-        self.data.update(updates)
-        self.data["updated_at"] = utcnow()
-        atomic_json(self.directory / "cube-editor.json", self.data)
+        with self.lock():
+            current = normalize_project({**self.data, **updates, 'updated_at': utcnow()})
+            atomic_json(self.directory / "cube-editor.json", current)
+            self.data = current
         return self
 
     def remember(self):
@@ -369,24 +474,29 @@ class Project:
 
     @contextlib.contextmanager
     def lock(self):
-        if self._lock_depth:
-            self._lock_depth += 1
-            try:
-                yield
-            finally:
-                self._lock_depth -= 1
-            return
-        with (self.directory / ".operation.lock").open("a+") as stream:
-            try:
-                fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise CubeError("Another operation is already using this project") from error
-            try:
-                self._lock_depth = 1
-                yield
-            finally:
-                self._lock_depth = 0
-                fcntl.flock(stream, fcntl.LOCK_UN)
+        """Serialize threads and processes, refreshing data at transaction entry."""
+        with self._mutex:
+            if self._lock_depth:
+                self._lock_depth += 1
+                try:
+                    yield
+                finally:
+                    self._lock_depth -= 1
+                return
+            with (self.directory / ".operation.lock").open("a+") as stream:
+                try:
+                    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise CubeError("Another operation is already using this project") from error
+                try:
+                    path = self.directory / 'cube-editor.json'
+                    if path.exists():
+                        self.data = self._read(path)
+                    self._lock_depth = 1
+                    yield
+                finally:
+                    self._lock_depth = 0
+                    fcntl.flock(stream, fcntl.LOCK_UN)
 
     def check_available(self):
         with self.lock():
@@ -454,6 +564,38 @@ def inspect_iso(source_iso, selected=""):
             "extracted": False, "boot_image_paths": boot_paths, "boot_catalog": catalog.group(1).strip() if catalog else ""}
 
 
+def worker_event(line):
+    """Ignore damaged event records before passing values to controller or UI."""
+    try:
+        event = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(event, dict) or not isinstance(event.get('type'), str) or not event['type']:
+        return None
+    for key in ('message', 'time', 'action'):
+        if key in event and not isinstance(event[key], str):
+            return None
+    if event.get('job') is not None and not isinstance(event['job'], str):
+        return None
+    for key in ('success', 'cancelled'):
+        if key in event and type(event[key]) is not bool:
+            return None
+    if event['type'] == 'finished' and type(event.get('success')) is not bool:
+        return None
+    for key in ('progress', 'fraction', 'elapsed_seconds', 'eta_seconds'):
+        if key in event and event[key] is not None:
+            if type(event[key]) not in (int, float):
+                return None
+            try:
+                if not math.isfinite(event[key]):
+                    return None
+            except OverflowError:
+                return None
+    if 'pid' in event and (type(event['pid']) is not int or event['pid'] <= 0):
+        return None
+    return event
+
+
 class Engine:
     def __init__(self, project, on_event=None):
         self.project = project
@@ -468,12 +610,13 @@ class Engine:
         self.on_event(event)
 
     def inspect_source(self):
-        self.project.check_available()
-        result = inspect_iso(self.project.data["source_iso"], self.project.data.get("squashfs_path", ""))
-        result["extracted"] = (self.project.directory / ".extracted").exists()
-        if result["extracted"]:
-            result["kernel_paths"] = [str(p.relative_to(self.project.rootfs)) for p in (self.project.rootfs / "boot").glob("vmlinuz*")]
-        self.project.save(inspection=result, squashfs_path=result["squashfs_path"])
+        # Hold the lock throughout so the selected root cannot change underneath the inspection.
+        with self.project.lock():
+            result = inspect_iso(self.project.data["source_iso"], self.project.data.get("squashfs_path", ""))
+            result["extracted"] = (self.project.directory / ".extracted").exists()
+            if result["extracted"]:
+                result["kernel_paths"] = [str(p.relative_to(self.project.rootfs)) for p in (self.project.rootfs / "boot").glob("vmlinuz*")]
+            self.project.save(inspection=result, squashfs_path=result["squashfs_path"])
         return result
 
     def worker_command(self, action):
@@ -534,9 +677,10 @@ class Engine:
         if action == "build":
             squash = p.iso_tree / selected.lstrip('/')
             staged_squash = squash.with_name('.' + squash.name + '.building')
-            staged_iso = p.output_path.with_name('.' + p.output_path.name + '.building')
+            staging = p.output_path.with_name('.' + p.output_path.name + '.<unique>.building')
+            staged_iso = staging / 'export' / p.output_path.name
             return [["mksquashfs", str(p.rootfs), str(staged_squash), '-percentage', "-noappend", "-comp", p.data.get("compression", "xz"), *build_resources(p.data), '-wildcards', '-e', 'proc/*', 'sys/*', 'dev/*', 'run/*', 'tmp/*'],
-                    ["xorriso", "-indev", p.data["source_iso"], "-outdev", str(staged_iso), "-boot_image", "any", "replay",
+                    ["xorriso", "-indev", str(staging / 'source.iso'), "-outdev", str(staged_iso), "-boot_image", "any", "replay",
                      "-update_r", str(p.iso_tree), "/", "-volid", p.data.get("volume_id", "CUBE_EDITOR"), "-commit", "-end"]]
         raise CubeError(f"Unknown action: {action}")
 
@@ -558,8 +702,9 @@ class Engine:
                       'Compress a clean installer root when required.',
                       'Add temporary deletion markers for the boot layer, compress it, then remove the markers.',
                       'Recompute ISO integrity manifests, excluding boot records.',
-                      'Replay source BIOS/UEFI boot records into a staged ISO.',
-                      'Hash and promote the ISO, write checksum/release sidecars, append release history.']
+                      'Reserve the destination and create unique staging (shown as <unique> in the commands).',
+                      'Copy and verify the source digest; replay BIOS/UEFI boot records from that read-only copy.',
+                      'Hash the staged ISO, publish checksum/release sidecars and ISO without replacing existing files, append release history.']
         elif action == 'extract':
             steps += ['Verify the recorded source hash when available.', 'Extract the ISO and selected squashfs layers.',
                       'Compose layered roots in a private OverlayFS mount, then copy the merged root.',
@@ -598,8 +743,7 @@ class Engine:
 
     def _save_check(self, kind, outcome, note, iso, actual):
         with self.project.lock():
-            current = Project.load(self.project.directory).data
-            checks = current.get('release_checks', [])
+            checks = list(self.project.data.get('release_checks', []))
             checks.append({'kind': kind, 'outcome': outcome, 'note': note, 'path': str(iso),
                            'sha256': actual, 'checked_at': utcnow()})
             self.project.save(release_checks=checks)
@@ -615,65 +759,100 @@ class Engine:
         cancel_file = self.project.directory / ".cancel"
         cancel_file.unlink(missing_ok=True)
         events = self.project.directory / "events.jsonl"
-        offset = events.stat().st_size if events.exists() else 0
+        info = events.stat() if events.exists() else None
+        offset = info.st_size if info else 0
+        event_identity = (info.st_dev, info.st_ino) if info else None
         self.emit({"type": "state", "message": "Starting interactive worker"})
         try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
         except FileNotFoundError as error:
             raise CubeError(f"Required command is missing: {command[0]}") from error
-        output_lines = []
-        def read_output():
-            for line in self.process.stdout:
-                output_lines.append(line)
-                self.emit({"type": "log", "message": line.rstrip()})
-        reader = threading.Thread(target=read_output, daemon=True)
-        reader.start()
+        process = self.process
+        output_lines = deque(maxlen=128)
+        reader_errors = []
+        reader = None
         terminal = None
         partial = ""
-        while self.process.poll() is None:
-            if events.exists():
-                with events.open() as stream:
+
+        def read_output():
+            try:
+                for line in process.stdout:
+                    output_lines.append(line[-4000:])
+                    self.emit({"type": "log", "message": line.rstrip()})
+            except Exception as error:
+                reader_errors.append(error)
+
+        def tail_events(final=False):
+            nonlocal offset, partial, terminal, event_identity
+            try:
+                with events.open(errors='replace') as stream:
+                    info = os.fstat(stream.fileno())
+                    identity = (info.st_dev, info.st_ino)
+                    if identity != event_identity or info.st_size < offset:
+                        offset, partial = 0, ''
+                    event_identity = identity
                     stream.seek(offset)
                     chunk = stream.read()
                     offset = stream.tell()
-                partial += chunk
-                lines = partial.split("\n")
-                partial = lines.pop()
-                for line in lines:
+            except FileNotFoundError:
+                return
+            partial += chunk
+            lines = partial.split("\n")
+            partial = '' if final else lines.pop()
+            for line in lines:
+                event = worker_event(line)
+                if event is None or event.get('job') not in (None, self.job_id):
+                    continue
+                if event['type'] == 'started':
+                    self._worker_started = True
+                if event['type'] == 'finished':
+                    terminal = event
+                self.emit(event)
+
+        try:
+            reader = threading.Thread(target=read_output, daemon=True)
+            reader.start()
+            while process.poll() is None:
+                tail_events()
+                if reader_errors:
+                    raise reader_errors[0]
+                if self._cancelled.is_set() and not self._worker_started and self._cancel_time and time.monotonic() - self._cancel_time > 1:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
+                time.sleep(0.1)
+            # The final event can arrive between the last tail and terminal exit.
+            tail_events(final=True)
+            reader.join(timeout=2)
+            if reader_errors:
+                raise reader_errors[0]
+            code = process.returncode
+        finally:
+            if process.poll() is None:
+                # Give an authenticated worker a chance to unwind guest mounts.
+                with contextlib.suppress(OSError):
+                    cancel_file.touch()
+                if self._worker_started and Path(command[0]).name == 'foot':
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=3)
+                if process.poll() is None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGTERM)
                     try:
-                        event = json.loads(line)
-                    except ValueError:
-                        continue
-                    if event.get("job") not in (None, self.job_id):
-                        continue
-                    self.emit(event)
-                    if event.get("type") == "started":
-                        self._worker_started = True
-                    if event.get("type") == "finished":
-                        terminal = event
-            if self._cancelled.is_set() and not self._worker_started and self._cancel_time and time.monotonic() - self._cancel_time > 1:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(self.process.pid, signal.SIGTERM)
-            time.sleep(0.1)
-        reader.join(timeout=2)
-        # The final event can arrive between the last tail and terminal exit.
-        if events.exists():
-            with events.open() as stream:
-                stream.seek(offset)
-                for line in (partial + stream.read()).splitlines():
-                    try:
-                        event = json.loads(line)
-                        if event.get("job") not in (None, self.job_id):
-                            continue
-                        self.emit(event)
-                        if event.get("type") == "finished":
-                            terminal = event
-                    except ValueError:
-                        continue
-        code = self.process.returncode
-        if self.process.stdout:
-            self.process.stdout.close()
-        self.process = None
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+            if reader is not None and reader.ident is not None:
+                reader.join(timeout=2)
+                if reader.is_alive():
+                    # A descendant may have inherited stdout after its parent exited.
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    reader.join(timeout=2)
+            if process.stdout and (reader is None or not reader.is_alive()):
+                process.stdout.close()
+            self.process = None
         if self._cancelled.is_set() or (terminal and terminal.get("cancelled")):
             raise Cancelled("Operation cancelled. The original ISO is unchanged.")
         if terminal:
@@ -692,8 +871,10 @@ class Engine:
         (self.project.directory / ".cancel").touch()
         # The privileged worker observes the file, terminates its process group,
         # and unwinds guest mounts before foot exits. No sudo kill is necessary.
-        if self.process and Path(self.process.args[0]).name != "foot":
-            os.killpg(self.process.pid, signal.SIGTERM)
+        process = self.process
+        if process and Path(process.args[0]).name != "foot":
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
 
     def qemu_command(self, memory=4096, uefi=False, disk=None, installed=False, iso=None):
         iso = Path(iso) if iso else self.project.output_path

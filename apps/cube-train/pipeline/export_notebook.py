@@ -372,6 +372,9 @@ def bundle_size(run_dir, kind, *, bundle=True, corpus=False):
             if path.is_file():
                 total += path.stat().st_size
         total += sum((PIPELINE / f'{name}.py').stat().st_size for name in module_closure())
+        tensegrity_pkg = PIPELINE / 'tensegrity'
+        if tensegrity_pkg.is_dir():
+            total += sum(path.stat().st_size for path in sorted(tensegrity_pkg.glob('*.py')))
         if corpus:
             total += sum((Path(run_dir) / 'data' / name).stat().st_size for name in CORPUS_FILES
                          if (Path(run_dir) / 'data' / name).is_file())
@@ -411,6 +414,10 @@ def export(run_dir, kind, output, *, bundle=True, corpus=False, script=True, pre
         if bundle:
             for module in module_closure():
                 copy_file(PIPELINE / f'{module}.py', staging / 'whitecube_pipeline' / f'{module}.py', cancelled)
+            tensegrity_pkg = PIPELINE / 'tensegrity'
+            if tensegrity_pkg.is_dir():
+                for pkg_file in sorted(tensegrity_pkg.glob('*.py')):
+                    copy_file(pkg_file, staging / 'whitecube_pipeline' / 'tensegrity' / pkg_file.name, cancelled)
             copy_file(source, staging / 'checkpoint' / source.name, cancelled)
             for item in RUN_FILES:
                 if (run_dir / item).is_file():
