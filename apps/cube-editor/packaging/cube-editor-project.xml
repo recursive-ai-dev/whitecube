@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-cube-editor-project">
+    <comment>Cube Editor project</comment>
+    <sub-class-of type="application/json"/>
+    <glob pattern="cube-editor.json" weight="80"/>
+    <icon name="org.whitecube.CubeEditor.Standalone"/>
+  </mime-type>
+</mime-info>

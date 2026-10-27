@@ -29,15 +29,19 @@ import threading
 import time
 import uuid
 
+# Standalone launchers use isolated Python; allow only sibling application modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+VERSION = '0.5.0'
 DEFAULT_PROJECTS = Path.home() / "cubic/work"
 DEFAULT_OUTPUT = Path.home() / "cubic/complete"
 DEFAULT_SOURCE = Path.home() / "cubic/iso/lubuntu-26.04.1-desktop-amd64.iso"
 WORKER = Path(__file__).resolve().with_name("worker.py")
 REQUIRED = {"xorriso": "Read and replay ISO boot records", "unsquashfs": "Extract live filesystems",
             "mksquashfs": "Rebuild live filesystems", "sudo": "Authenticate filesystem operations",
-            "unshare": "Keep mounts private", "foot": "Interactive terminal and authentication",
+            "unshare": "Keep mounts private",
             "chroot": "Run commands inside the image", "mount": "Private guest mounts"}
 OPTIONAL = {"qemu-system-x86_64": "Boot-test the completed ISO", "qemu-img": "Create installer test disks", "dpkg-deb": "Inspect desktop packages"}
+TERMINALS = ('foot', 'qterminal', 'gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm')
 
 
 class CubeError(RuntimeError):
@@ -85,8 +89,51 @@ def atomic_text(path, contents):
 
 
 def dependencies():
-    return [{"name": name, "purpose": purpose, "available": bool(shutil.which(name)), "required": required}
-            for required, mapping in ((True, REQUIRED), (False, OPTIONAL)) for name, purpose in mapping.items()]
+    result = [{"name": name, "purpose": purpose, "available": bool(shutil.which(name)), "required": required}
+              for required, mapping in ((True, REQUIRED), (False, OPTIONAL)) for name, purpose in mapping.items()]
+    try:
+        terminal = terminal_command(['true'])[0]
+        result.append({'name': Path(terminal).name, 'purpose': 'Interactive terminal and authentication',
+                       'available': True, 'required': True})
+    except CubeError as error:
+        result.append({'name': 'terminal', 'purpose': str(error), 'available': False, 'required': True})
+    return result
+
+
+def terminal_command(command, title='Cube Editor'):
+    """Select a terminal that stays attached to its child, preserving argv boundaries.
+
+    Foot needs Wayland; LXQt, GNOME, KDE and Xfce terminals also support X11.
+    Server-based terminals need explicit wait/separate flags for job monitoring.
+    The override is one supported executable, never a shell expression.
+    """
+    override = os.environ.get('CUBE_EDITOR_TERMINAL', '')
+    candidates = [override] if override else list(TERMINALS) + ['x-terminal-emulator']
+    for candidate in candidates:
+        executable = shutil.which(candidate)
+        if not executable:
+            continue
+        name = Path(executable).name
+        if name == 'x-terminal-emulator':
+            name = Path(executable).resolve().name
+        if name not in TERMINALS:
+            continue
+        if name == 'foot' and not os.environ.get('WAYLAND_DISPLAY'):
+            continue
+        prefixes = {
+            'foot': [executable, '--title', title],
+            'qterminal': [executable, '-e'],
+            'gnome-terminal': [executable, '--wait', '--title', title, '--'],
+            'konsole': [executable, '--separate', '-p', 'tabtitle=' + title, '-e'],
+            'xfce4-terminal': [executable, '--disable-server', '--title', title, '--execute'],
+            'xterm': [executable, '-T', title, '-e'],
+        }
+        return prefixes[name] + list(command)
+    if override:
+        raise CubeError('CUBE_EDITOR_TERMINAL must name an installed supported terminal: ' + ', '.join(TERMINALS)
+                        + '. Foot also requires a Wayland session.')
+    raise CubeError('Install QTerminal, GNOME Terminal, Konsole, Xfce Terminal, xterm, or Foot (Wayland) '
+                    'to authenticate image operations.')
 
 
 def package_list(value):
@@ -605,6 +652,7 @@ class Engine:
         self.job_id = uuid.uuid4().hex
         self._worker_started = False
         self._cancel_time = None
+        self._interactive_worker = False
 
     def emit(self, event):
         self.on_event(event)
@@ -622,8 +670,9 @@ class Engine:
     def worker_command(self, action):
         if action not in ("extract", "customize", "terminal", "build", "snapshot", "restore", "recover", "packages"):
             raise CubeError(f"Unknown worker action: {action}")
-        return ["foot", "--title", f"Cube Editor · {action.title()}", "sudo", "--", "/usr/bin/python3",
-                str(WORKER), "--project", str(self.project.directory), "--action", action, "--job", self.job_id]
+        return terminal_command(["sudo", "--", "/usr/bin/python3", str(WORKER),
+                                 "--project", str(self.project.directory), "--action", action,
+                                 "--job", self.job_id], f"Cube Editor · {action.title()}")
 
     def extract_command(self):
         return self.worker_command("extract")
@@ -750,12 +799,13 @@ class Engine:
         return checks[-1]
 
     def run(self, command):
-        """Launch an argv array, following the worker event log through foot."""
+        """Launch an argv array, following authenticated worker events."""
         if not isinstance(command, (tuple, list)) or not command or any(not isinstance(arg, str) for arg in command):
             raise CubeError("Commands must be argument arrays")
         self._cancelled.clear()
         self._worker_started = False
         self._cancel_time = None
+        self._interactive_worker = Path(command[0]).name in (*TERMINALS, 'x-terminal-emulator') or str(WORKER) in command
         cancel_file = self.project.directory / ".cancel"
         cancel_file.unlink(missing_ok=True)
         events = self.project.directory / "events.jsonl"
@@ -831,7 +881,7 @@ class Engine:
                 # Give an authenticated worker a chance to unwind guest mounts.
                 with contextlib.suppress(OSError):
                     cancel_file.touch()
-                if self._worker_started and Path(command[0]).name == 'foot':
+                if self._worker_started and self._interactive_worker:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         process.wait(timeout=3)
                 if process.poll() is None:
@@ -859,7 +909,7 @@ class Engine:
             if not terminal.get("success"):
                 raise CubeError(terminal.get("message", "Worker failed"))
             return terminal
-        if "foot" == Path(command[0]).name:
+        if self._interactive_worker:
             raise CubeError("Worker did not finish. Authentication may have been cancelled, or the terminal closed. " + "".join(output_lines)[-1000:])
         if code:
             raise CubeError(f"Command exited with status {code}")
@@ -870,9 +920,9 @@ class Engine:
         self._cancel_time = time.monotonic()
         (self.project.directory / ".cancel").touch()
         # The privileged worker observes the file, terminates its process group,
-        # and unwinds guest mounts before foot exits. No sudo kill is necessary.
+        # and unwinds guest mounts before the terminal exits. No sudo kill is necessary.
         process = self.process
-        if process and Path(process.args[0]).name != "foot":
+        if process and not self._interactive_worker:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGTERM)
 
@@ -944,8 +994,15 @@ class Engine:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Cube Editor ISO workflow")
+    parser.add_argument('--version', action='version', version=f'cube-editor {VERSION}')
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("dependencies")
+    doctor = sub.add_parser('doctor', help='Check this workstation and an optional project')
+    doctor.add_argument('project', nargs='?')
+    report = sub.add_parser('report', help='Export an independently verified HTML release report')
+    report.add_argument('project')
+    report.add_argument('file', help='New .html report path')
+    report.add_argument('--release', help='Release ISO path (defaults to project output)')
     inspect = sub.add_parser("inspect")
     inspect.add_argument("iso")
     create = sub.add_parser("create")
@@ -966,6 +1023,12 @@ def main(argv=None):
     try:
         if args.command == "dependencies":
             value = dependencies()
+        elif args.command == 'doctor':
+            from diagnostics import diagnose
+            value = diagnose(Project.load(args.project) if args.project else None)
+        elif args.command == 'report':
+            from diagnostics import export_release_report
+            value = export_release_report(Project.load(args.project), args.file, release=args.release)
         elif args.command == "inspect":
             value = inspect_iso(args.iso)
         elif args.command == "create":
@@ -996,11 +1059,17 @@ def main(argv=None):
             else:
                 value = engine.run(engine.worker_command(args.action))
         print(json.dumps(value, indent=2))
-        return 1 if (args.command == "verify" and not value["success"]) or (args.command == 'preflight' and not value['sufficient']) else 0
+        failed = ((args.command == 'verify' and not value['success']) or
+                  (args.command == 'preflight' and not value['sufficient']) or
+                  (args.command == 'doctor' and not value['ready']) or
+                  (args.command == 'report' and not value['verification']['success']))
+        return 1 if failed else 0
     except (CubeError, OSError, ValueError) as error:
         print(f"cube-editor: {error}", file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
+    # Lazy sibling imports must share CubeError and project types with the CLI.
+    sys.modules['engine'] = sys.modules[__name__]
     raise SystemExit(main())

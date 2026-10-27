@@ -142,7 +142,8 @@ class PromptRepository:
         now = datetime.now().isoformat()
         with closing(self.db.get_connection()) as conn, conn:
             # Hold the write transaction across the snapshot and update.
-            conn.execute("BEGIN IMMEDIATE")
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             prompt.folder_id = self._nullify_missing_folder(conn, prompt.folder_id)
             prompt.template_id = self._nullify_missing_template(conn, prompt.template_id)
             # Check if prompt exists
@@ -602,6 +603,16 @@ class PromptRepository:
             return None
         if not self._exists(conn, "folders", parent_id):
             return None
+        # Reparenting to any descendant would turn the folder tree into a
+        # cycle; deleting one node would then cascade across the whole cycle.
+        seen = {folder.id}
+        current = parent_id
+        while current:
+            if current in seen:
+                return None
+            seen.add(current)
+            row = conn.execute("SELECT parent_id FROM folders WHERE id = ?", (current,)).fetchone()
+            current = row[0] if row else None
         return parent_id
 
     def _get_tags_for_prompt(self, conn: sqlite3.Connection, prompt_id: str) -> List[str]:

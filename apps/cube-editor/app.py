@@ -26,9 +26,39 @@ gi.require_version('Gtk', '4.0')
 gi.require_version('Adw', '1')
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango
 
-VERSION = '0.4.0'
+VERSION = engine.VERSION
+APP_ID = 'org.whitecube.CubeEditor.Standalone' if os.environ.get('CUBE_EDITOR_STANDALONE') == '1' else 'org.whitecube.CubeEditor'
 MIN_ADWAITA = (1, 5)
 COMPRESSIONS = ['zstd', 'xz', 'gzip', 'lz4', 'lzo']
+THEMES = ['system', 'light', 'dark']
+
+
+def preferences_path():
+    config = Path(os.environ.get('XDG_CONFIG_HOME', '')).expanduser()
+    if not config.is_absolute():
+        config = Path.home() / '.config'
+    return config / 'cube-editor/preferences.json'
+
+
+def load_preferences():
+    """Ignore corrupt preferences; project documents have separate validation."""
+    result = {'width': 1180, 'height': 820, 'maximized': False, 'stage': 'source', 'theme': 'system'}
+    try:
+        data = json.loads(preferences_path().read_text())
+        if not isinstance(data, dict):
+            return result
+        for key, low, high in [('width', 720, 3840), ('height', 600, 2160)]:
+            if type(data.get(key)) is int and low <= data[key] <= high:
+                result[key] = data[key]
+        if type(data.get('maximized')) is bool:
+            result['maximized'] = data['maximized']
+        if data.get('theme') in THEMES:
+            result['theme'] = data['theme']
+        if data.get('stage') in [stage[0] for stage in STAGES]:
+            result['stage'] = data['stage']
+    except (OSError, ValueError):
+        pass
+    return result
 
 
 def check_runtime():
@@ -105,6 +135,19 @@ def scroll(child, min_height=0):
     return widget
 
 
+class ActionRow(Gtk.FlowBox):
+    """Wrap actions at their natural width instead of widening the window."""
+    def __init__(self):
+        super().__init__(selection_mode=Gtk.SelectionMode.NONE, homogeneous=False,
+                         min_children_per_line=1, max_children_per_line=5,
+                         column_spacing=8, row_spacing=8)
+        self.set_valign(Gtk.Align.START)
+
+    def append(self, child):
+        self.insert(child, -1)
+        child.get_parent().set_focusable(False)
+
+
 class CubeArt(Gtk.DrawingArea):
     """Cairo geometry, rendered natively and kept crisp at any scale."""
     def __init__(self):
@@ -114,10 +157,13 @@ class CubeArt(Gtk.DrawingArea):
         self.set_draw_func(self.draw)
 
     def draw(self, area, cr, width, height):
+        dark = Adw.StyleManager.get_default().get_dark()
+        ink = (.93, .93, .94) if dark else (.07, .07, .07)
+        paper = (.15, .16, .18) if dark else (1, 1, 1)
         cr.translate(width / 2, height / 2)
         scale = min(width / 220, height / 190)
         cr.scale(scale, scale)
-        cr.set_source_rgba(.07, .07, .07, .14)
+        cr.set_source_rgba(*ink, .14)
         cr.set_line_width(1)
         for r in [48, 69, 91]:
             cr.arc(0, 0, r, 0, 2 * math.pi)
@@ -126,25 +172,30 @@ class CubeArt(Gtk.DrawingArea):
             cr.rectangle(x, y, 5, 5)
             cr.fill()
         points = [(0, -58), (58, -28), (58, 35), (0, 65), (-58, 35), (-58, -28)]
-        cr.set_source_rgb(.07, .07, .07)
+        cr.set_source_rgb(*ink)
         cr.move_to(*points[0])
         for p in points[1:]:
             cr.line_to(*p)
         cr.close_path()
         cr.fill()
         cr.set_line_width(2)
-        cr.set_source_rgb(1, 1, 1)
+        cr.set_source_rgb(*paper)
         cr.move_to(-58, -28); cr.line_to(0, 3); cr.line_to(58, -28)
         cr.move_to(0, 3); cr.line_to(0, 65)
         cr.stroke()
-        cr.set_source_rgba(1, 1, 1, .55)
+        cr.set_source_rgba(*paper, .55)
         cr.move_to(0, -43); cr.line_to(42, -22); cr.line_to(0, -1); cr.line_to(-42, -22)
         cr.close_path(); cr.stroke()
 
 
 class EditorWindow(Adw.ApplicationWindow):
     def __init__(self, app, initial=None):
-        super().__init__(application=app, title='cube-editor', default_width=1180, default_height=820)
+        self.preferences = load_preferences()
+        super().__init__(application=app, title='cube-editor',
+                         default_width=self.preferences['width'], default_height=self.preferences['height'])
+        self.set_size_request(720, 600)
+        if self.preferences['maximized']:
+            self.maximize()
         self.project = None
         self.pick_dirs = {}  # last folder per picker kind, for this session
         self.worker = None
@@ -175,16 +226,21 @@ class EditorWindow(Adw.ApplicationWindow):
         title = Adw.WindowTitle(title='cube-editor', subtitle='Whitecube image studio')
         header.set_title_widget(title)
         header.pack_start(button('Open project', self.open_project, icon='folder-open-symbolic'))
-        header.pack_end(button('Commands', self.palette, css='flat', icon='system-search-symbolic'))
+        commands_button = Gtk.Button(icon_name='system-search-symbolic', tooltip_text='Find a command (Ctrl K)')
+        commands_button.add_css_class('flat')
+        commands_button.connect('clicked', lambda *_: self.palette())
+        header.pack_end(commands_button)
         self.saved_label = label('LOCAL WORKSPACE', 'chip')
         header.pack_end(self.saved_label)
         self.context_action = button('Create project', self.run_context_action, 'primary')
         header.pack_end(self.context_action)
+        header.pack_end(self.make_menu())
         layout.append(header)
         body = box(False, 0)
         body.set_vexpand(True)
         layout.append(body)
-        body.append(self.make_rail())
+        self.rail = self.make_rail()
+        body.append(self.rail)
         self.stack = Gtk.Stack()
         self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
         self.stack.set_transition_duration(140)
@@ -214,8 +270,14 @@ class EditorWindow(Adw.ApplicationWindow):
         self.progress.set_size_request(160, -1)
         self.progress.set_visible(False)
         footer.append(self.progress)
-        footer.append(label('Ctrl K  commands  ·  Ctrl S  save', 'shortcut'))
+        shortcuts = label('Ctrl K  commands  ·  Ctrl S  save', 'shortcut')
+        footer.append(shortcuts)
         layout.append(footer)
+        compact = Adw.Breakpoint.new(Adw.BreakpointCondition.parse('max-width: 1000px'))
+        compact.add_setter(self.rail, 'visible', False)
+        compact.add_setter(self.saved_label, 'visible', False)
+        compact.add_setter(shortcuts, 'visible', False)
+        self.add_breakpoint(compact)
         self.key_controller = Gtk.EventControllerKey()
         self.key_controller.connect('key-pressed', self.on_key)
         self.add_controller(self.key_controller)
@@ -226,6 +288,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.refresh_recent()
         if initial:
             self.load_project(initial)
+        self.navigate(self.preferences['stage'])
         self.connect('close-request', self.on_close)
 
     def make_rail(self):
@@ -248,8 +311,96 @@ class EditorWindow(Adw.ApplicationWindow):
         self.project_state = label('A clean slate.', 'dim-label', True)
         project.append(self.project_label); project.append(self.project_state)
         rail.append(project)
-        rail.append(label('WHITE CUBE / 0.4', 'rail-caption'))
+        rail.append(label('WHITE CUBE / 0.5', 'rail-caption'))
         return rail
+
+    def make_menu(self):
+        menu = Gtk.MenuButton(icon_name='open-menu-symbolic', tooltip_text='Studio menu')
+        menu.add_css_class('flat')
+        popover = Gtk.Popover()
+        content = box(spacing=6, css='studio-menu')
+        content.append(label('STUDIO', 'eyebrow'))
+        for name, title, icon in STAGES:
+            def navigate(n=name):
+                popover.popdown(); self.navigate(n)
+            content.append(button(title, navigate, css='flat', icon=icon))
+        content.append(Gtk.Separator())
+        for title, callback in [('Appearance & preferences', self.show_preferences),
+                                ('System diagnostics', self.show_diagnostics),
+                                ('Keyboard shortcuts', self.show_shortcuts),
+                                ('About Cube Editor', self.show_about)]:
+            def activate(cb=callback):
+                popover.popdown(); cb()
+            content.append(button(title, activate, css='flat'))
+        popover.set_child(content); menu.set_popover(popover)
+        return menu
+
+    def persist_preferences(self):
+        width, height = self.get_default_size()
+        self.preferences.update(width=max(720, min(3840, width)), height=max(600, min(2160, height)),
+                                maximized=self.is_maximized(), stage=self.current_stage)
+        try:
+            engine.atomic_json(preferences_path(), self.preferences)
+        except OSError as exc:
+            self.toast(f'Could not save preferences: {exc}')
+
+    def show_preferences(self):
+        dialog = Adw.Dialog(title='Appearance & preferences', content_width=480, content_height=360)
+        view = Adw.ToolbarView(); view.add_top_bar(Adw.HeaderBar())
+        content = box(spacing=16, css='palette')
+        content.append(label('Make the studio yours', 'section-title'))
+        content.append(label('Appearance', 'help'))
+        themes = Gtk.DropDown.new_from_strings(['Follow system', 'Light', 'Dark'])
+        themes.set_selected(THEMES.index(self.preferences['theme']))
+        def changed(*_):
+            self.preferences['theme'] = THEMES[themes.get_selected()]
+            self.get_application().apply_theme(self.preferences['theme'])
+            self.persist_preferences()
+        themes.connect('notify::selected', changed); content.append(themes)
+        content.append(label('Window size, maximized state and the current studio page are remembered when you close the editor.', 'help', True))
+        content.append(label('Project files and recipes are saved separately in your workspace.', 'help', True))
+        view.set_content(content); dialog.set_child(view); dialog.present(self)
+
+    def show_shortcuts(self):
+        dialog = Adw.Dialog(title='Keyboard shortcuts', content_width=480, content_height=420)
+        view = Adw.ToolbarView(); view.add_top_bar(Adw.HeaderBar())
+        content = box(spacing=16, css='palette')
+        for keys, description in [('Ctrl K', 'Find a command'), ('Ctrl O', 'Open a project'),
+                                  ('Ctrl S', 'Save project'), ('Ctrl 1 … Ctrl 6', 'Jump to a studio page'),
+                                  ('Ctrl ,', 'Appearance & preferences'), ('F1', 'Keyboard shortcuts'),
+                                  ('↑ / ↓ · Enter', 'Choose and run a palette command'), ('Esc', 'Close a dialog')]:
+            row = box(False, 16)
+            text = label(description, 'help', True); text.set_hexpand(True)
+            row.append(text); row.append(label(keys, 'kbd')); content.append(row)
+        view.set_content(scroll(content)); dialog.set_child(view); dialog.present(self)
+
+    def show_about(self):
+        dialog = Adw.AboutDialog(application_name='Cube Editor', application_icon=APP_ID,
+                                 developer_name='Whitecube contributors', version=VERSION,
+                                 comments='A local image studio for Ubuntu and Debian live images.',
+                                 license_type=Gtk.License.APACHE_2_0)
+        dialog.set_copyright('© Whitecube contributors')
+        dialog.add_credit_section('Workflow inspiration', ['Cubic, by PJ Singh'])
+        dialog.present(self)
+
+    def show_diagnostics(self):
+        import diagnostics
+        def completed(report):
+            lines = ['READY' if report['ready'] else 'ACTION NEEDED', '']
+            lines.extend(f"{check['status'].upper()} / {check['label']}\n{check['detail']}\n" for check in report['checks'])
+            self.text_dialog('System diagnostics', '\n'.join(lines))
+        self.background('Checking system readiness…', lambda: diagnostics.diagnose(self.project), completed,
+                        require_project=False)
+
+    def export_release_report(self, path):
+        if not self.project or self.busy:
+            return
+        if not self.save_project():
+            return
+        import diagnostics
+        self.background('Preparing release report…',
+                        lambda: diagnostics.export_release_report(self.project, path, release=self.selected_output()),
+                        lambda result: self.toast(f'Release report saved to {path}'))
 
     def entry(self, parent, title, key, default='', hint=None, picker=None):
         holder = box(spacing=6)
@@ -279,6 +430,17 @@ class EditorWindow(Adw.ApplicationWindow):
         words.append(label('Your image.\nYour rules.', 'hero-title'))
         words.append(label('Start with a Linux ISO. Add your tools, your desktop,\nand your ideas. Build something worth booting.', 'lede', True))
         hero.append(words); hero.append(CubeArt()); page.append(hero)
+        overview = card('Project overview')
+        self.overview_title = label('Start with a source image', 'workspace-name', True)
+        self.overview_detail = label('Create a workspace or open a recent project to continue.', 'help', True)
+        self.overview_next = label('NEXT / Create & inspect image', 'next-step', True)
+        overview.append(self.overview_title); overview.append(self.overview_detail); overview.append(self.overview_next)
+        self.overview_steps = box(False, 8)
+        self.overview_badges = []
+        for title in ['Inspect', 'Extract', 'Customize', 'Release']:
+            badge = label(title, 'chip'); self.overview_steps.append(badge); self.overview_badges.append(badge)
+        overview.append(self.overview_steps)
+        page.append(overview)
         stats = box(False, 12)
         for value, caption in [('01 → 06', 'A GUIDED BUILD'), ('100% local', 'YOUR FILES STAY HERE'), ('BIOS + UEFI', 'ORIGINAL BOOT PRESERVED')]:
             item = card(); item.set_hexpand(True)
@@ -295,7 +457,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.entry(right, 'Project workspace', 'base_dir', str(Path.home() / 'cubic/work'), picker='folder')
         pair.append(left); pair.append(right); source.append(pair)
         self.entry(source, 'Release folder', 'output_dir', str(Path.home() / 'cubic/complete'), picker='folder')
-        actions = box(False, 10)
+        actions = ActionRow()
         self.create_button = button('Create & inspect image', self.create_project, 'primary', 'list-add-symbolic')
         self.action_buttons.append(self.create_button)
         actions.append(self.create_button)
@@ -315,7 +477,7 @@ class EditorWindow(Adw.ApplicationWindow):
         ready.append(self.root_selector_box)
         self.inspect_label = label('Create a project to inspect the image, its filesystem and its boot entries.', 'help', True)
         ready.append(self.inspect_label)
-        act = box(False, 10)
+        act = ActionRow()
         self.extract_button = button('Extract filesystem', lambda: self.start_job('extract'), 'primary', 'package-x-generic-symbolic')
         self.action_buttons.append(self.extract_button)
         act.append(self.extract_button)
@@ -364,7 +526,7 @@ class EditorWindow(Adw.ApplicationWindow):
         pane = scroll(self.commands, 120); pane.add_css_class('code-wrap')
         custom.append(pane)
         custom.append(label('Tip: use the image terminal for exploratory changes; put repeatable changes here.', 'help', True))
-        actions = box(False, 10)
+        actions = ActionRow()
         self.apply_button = button('Apply recipe', lambda: self.start_job('customize'), 'primary', 'emblem-ok-symbolic')
         self.terminal_button = button('Open image terminal', lambda: self.start_job('terminal'), icon='utilities-terminal-symbolic')
         self.action_buttons.extend([self.apply_button, self.terminal_button])
@@ -432,7 +594,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.plan_view.set_top_margin(12); self.plan_view.set_left_margin(12)
         self.plan_view.set_bottom_margin(12); self.plan_view.set_right_margin(12)
         plan.append(scroll(self.plan_view, 165))
-        actions = box(False, 10)
+        actions = ActionRow()
         self.build_button = button('Build release image', lambda: self.start_job('build'), 'primary', 'system-run-symbolic')
         self.action_buttons.append(self.build_button)
         actions.append(self.build_button)
@@ -464,7 +626,7 @@ class EditorWindow(Adw.ApplicationWindow):
         firmware.append(label('Firmware', 'section-title'))
         self.firmware = Gtk.DropDown.new_from_strings(['BIOS', 'UEFI'])
         firmware.append(self.firmware); row.append(firmware); vm.append(row)
-        actions = box(False, 10)
+        actions = ActionRow()
         self.vm_button = button('Boot in QEMU', self.launch_vm, 'primary', 'media-playback-start-symbolic')
         self.action_buttons.append(self.vm_button)
         actions.append(self.vm_button)
@@ -483,6 +645,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.release_selector = Gtk.DropDown.new_from_strings(['Current output'])
         self.release_selector.connect('notify::selected', self.select_release); history.append(self.release_selector)
         self.history_summary = label('', 'help', True); history.append(self.history_summary)
+        history.append(button('Export release report', lambda: self.save_file('Export release report', self.export_release_report, 'release-report.html')))
         page.append(history)
         installer = card('Installer test', 'Create a disposable 32 GiB virtual disk, install into it, then reboot from disk. Disk changes persist until you discard the test disk.')
         installer.append(button('Create test disk', self.create_test_disk))
@@ -502,7 +665,7 @@ class EditorWindow(Adw.ApplicationWindow):
 
     def make_activity(self, page):
         page.append(label('Follow every operation. Failed commands stay visible, and your saved project can be reopened at any time.', 'lede', True))
-        actions = box(False, 10)
+        actions = ActionRow()
         self.cancel_button = button('Cancel current operation', self.cancel_job)
         self.cancel_button.set_sensitive(False)
         actions.append(self.cancel_button)
@@ -521,7 +684,7 @@ class EditorWindow(Adw.ApplicationWindow):
         console = box(css='console'); console.set_vexpand(True)
         self.log_scroll = scroll(self.log_view, 350)
         console.append(self.log_scroll); page.append(console)
-        self.log('cube-editor 0.4.0 — workbench ready. Choose a source, or reopen a project.')
+        self.log(f'cube-editor {VERSION} — workbench ready. Choose a source, or reopen a project.')
 
     def navigate(self, name):
         self.current_stage = name
@@ -557,8 +720,8 @@ class EditorWindow(Adw.ApplicationWindow):
             dialog.destroy()
         chooser.connect('response', response); chooser.show()
 
-    def background(self, message, task, completed=None):
-        if self.busy or not self.project:
+    def background(self, message, task, completed=None, require_project=True):
+        if self.busy or (require_project and not self.project):
             return
         self.set_busy(True, message)
         def work():
@@ -1095,13 +1258,15 @@ class EditorWindow(Adw.ApplicationWindow):
                 self.inspect_project()
 
     def refresh_dependencies(self):
+        while self.tools_box.get_first_child():
+            self.tools_box.remove(self.tools_box.get_first_child())
         try:
             deps = engine.dependencies()
             if isinstance(deps, dict): items = deps.items()
             else: items = [(x['name'], x['available']) if isinstance(x, dict)
                           else (str(x), bool(shutil.which(str(x)))) for x in deps]
         except Exception:
-            items = [(name, bool(shutil.which(name))) for name in ['xorriso', 'unsquashfs', 'mksquashfs', 'sudo', 'foot', 'qemu-system-x86_64']]
+            items = [(name, bool(shutil.which(name))) for name in ['xorriso', 'unsquashfs', 'mksquashfs', 'sudo', 'qemu-system-x86_64']]
         for name, found in items:
             if isinstance(found, dict): found = found.get('available', found.get('found', False))
             badge = label(f'{"✓" if found else "○"}  {name}', 'chip')
@@ -1223,6 +1388,55 @@ class EditorWindow(Adw.ApplicationWindow):
             }[name]
             self.context_action.set_label(title)
             self.context_action.set_sensitive(enabled)
+        self.refresh_overview()
+
+    def refresh_overview(self):
+        if not hasattr(self, 'overview_title'):
+            return
+        completed = [False] * 4
+        if not self.project:
+            title = 'Start with a source image'
+            detail = 'Create a workspace or open a recent project to continue.'
+            next_step = 'Create & inspect image'
+        else:
+            data = self.project.data
+            state = data.get('state', 'new')
+            extracted = (self.project.directory / '.extracted').is_file()
+            inspected = bool(data.get('inspection'))
+            releases = data.get('releases', [])
+            recipe = self.recipe()
+            title = data.get('name', 'Project')
+            detail = f"{state.replace('_', ' ').capitalize()} · {Path(data['source_iso']).name}\n"
+            detail += f"{len(recipe['install_packages'])} packages to install · {len(recipe['remove_packages'])} to remove · {len(recipe['payloads'])} overlays · {len(releases)} releases"
+            completed = [inspected, extracted, state in ('customized', 'built'), bool(releases or data.get('last_build'))]
+            if self.busy:
+                next_step = 'Operation in progress — follow Activity'
+            elif state in ('error', 'cancelled', 'extracting', 'customizing', 'building', 'restoring'):
+                next_step = 'Review Activity and recovery status before continuing'
+            elif self.source_changed():
+                next_step = 'Create a project for the newly selected source'
+            elif not Path(data['source_iso']).is_file():
+                next_step = 'Source ISO is missing; recovery and image editing remain available'
+            elif not inspected:
+                next_step = 'Inspect the source image'
+            elif not data.get('inspection', {}).get('can_rebuild'):
+                next_step = 'Review source inspection — this layout cannot be rebuilt'
+            elif not extracted:
+                next_step = 'Extract the live filesystem'
+            elif self.validate_fields():
+                next_step = 'Correct highlighted fields before continuing'
+            elif completed[3]:
+                next_step = 'Verify and boot-test the selected release'
+            else:
+                next_step = 'Apply your recipe, then build a release'
+        self.overview_title.set_text(title)
+        self.overview_detail.set_text(detail)
+        self.overview_next.set_text('NEXT / ' + next_step)
+        for badge, ready in zip(self.overview_badges, completed):
+            if ready:
+                badge.add_css_class('ready')
+            else:
+                badge.remove_css_class('ready')
 
     def source_changed(self):
         if not self.project: return False
@@ -1452,23 +1666,72 @@ class EditorWindow(Adw.ApplicationWindow):
         view.set_content(child); dialog.set_child(view); dialog.present(self)
 
     def palette(self):
-        dialog = Adw.Dialog(title='Commands', content_width=560, content_height=440)
+        dialog = Adw.Dialog(title='Commands', content_width=620, content_height=520)
         view = Adw.ToolbarView(); view.add_top_bar(Adw.HeaderBar())
         content = box(spacing=14, css='palette')
         search = Gtk.SearchEntry(placeholder_text='Jump to a page or run an action…')
         content.append(search)
         commands = [('Go to ' + title, lambda n=name: self.navigate(n)) for name, title, _ in STAGES]
         commands += [('Open project', self.open_project), ('Save project', self.save_project), ('Inspect source', self.inspect_project),
-                     ('Copy recipe JSON', self.copy_recipe), ('Open image terminal', lambda: self.start_job('terminal'))]
-        listing = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+                     ('Copy recipe JSON', self.copy_recipe), ('Open image terminal', lambda: self.start_job('terminal')),
+                     ('Apply recipe', lambda: self.start_job('customize')), ('Build release image', lambda: self.start_job('build')),
+                     ('Verify release', self.verify_release), ('Cancel current operation', self.cancel_job),
+                     ('System diagnostics', self.show_diagnostics), ('Appearance & preferences', self.show_preferences),
+                     ('Keyboard shortcuts', self.show_shortcuts), ('About Cube Editor', self.show_about)]
+        listing = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         content.append(scroll(listing))
+        empty = label('No matching commands. Try a page name, build, verify or preferences.', 'help', True)
+        content.append(empty)
+        content.append(label('↑ / ↓ choose · Enter run · Esc close', 'shortcut'))
+        self.palette_search, self.palette_list = search, listing
+        self.palette_empty = empty
+        requirements = {'Save project': bool(self.project) and not self.busy,
+                        'Inspect source': bool(self.project) and not self.busy,
+                        'Copy recipe JSON': bool(self.project),
+                        'Open image terminal': self.terminal_button.get_sensitive(),
+                        'Apply recipe': self.apply_button.get_sensitive(),
+                        'Build release image': self.build_button.get_sensitive(),
+                        'Verify release': self.verify_button.get_sensitive(),
+                        'Cancel current operation': self.cancel_button.get_sensitive()}
         def populate(*_):
             while listing.get_first_child(): listing.remove(listing.get_first_child())
-            query = search.get_text().lower()
+            words = search.get_text().casefold().split()
+            first = None
+            count = 0
             for name, callback in commands:
-                if query in name.lower():
+                if all(word in name.casefold() for word in words):
                     def activate(cb=callback): dialog.close(); cb()
-                    listing.append(button(name, activate, css='flat'))
+                    item = button(name, activate, css='flat')
+                    enabled = requirements.get(name, True)
+                    item.set_sensitive(enabled)
+                    item.set_tooltip_text(None if enabled else 'Open a project and finish the required workflow steps first.')
+                    listing.append(item)
+                    row = item.get_parent(); row.set_selectable(enabled)
+                    if enabled and first is None: first = row
+                    count += 1
+            if first: listing.select_row(first)
+            empty.set_visible(count == 0)
+        def activate_selected(*_):
+            row = listing.get_selected_row()
+            if row and row.get_child().get_sensitive():
+                row.get_child().emit('clicked')
+        def key_pressed(controller, keyval, keycode, state):
+            if keyval not in (Gdk.KEY_Up, Gdk.KEY_Down):
+                return False
+            enabled = []
+            row = listing.get_first_child()
+            while row:
+                if row.get_selectable(): enabled.append(row)
+                row = row.get_next_sibling()
+            if enabled:
+                current = listing.get_selected_row()
+                index = enabled.index(current) if current in enabled else -1
+                selected = enabled[(index + (1 if keyval == Gdk.KEY_Down else -1)) % len(enabled)]
+                listing.select_row(selected)
+            return True
+        keys = Gtk.EventControllerKey(); keys.connect('key-pressed', key_pressed); search.add_controller(keys)
+        search.connect('activate', activate_selected)
+        listing.connect('row-activated', lambda listing, row: activate_selected())
         search.connect('search-changed', populate); populate()
         view.set_content(content); dialog.set_child(view); dialog.present(self)
         search.grab_focus()
@@ -1478,8 +1741,10 @@ class EditorWindow(Adw.ApplicationWindow):
             if keyval in (Gdk.KEY_k, Gdk.KEY_K): self.palette(); return True
             if keyval in (Gdk.KEY_s, Gdk.KEY_S): self.save_project(); return True
             if keyval in (Gdk.KEY_o, Gdk.KEY_O): self.open_project(); return True
+            if keyval == Gdk.KEY_comma: self.show_preferences(); return True
             if Gdk.KEY_1 <= keyval <= Gdk.KEY_6:
                 self.navigate(STAGES[keyval - Gdk.KEY_1][0]); return True
+        if keyval == Gdk.KEY_F1: self.show_shortcuts(); return True
         return False
 
     def on_drop(self, target, file, x, y):
@@ -1501,22 +1766,45 @@ class EditorWindow(Adw.ApplicationWindow):
             GLib.source_remove(self.save_timer); self.save_timer = None
         if self.release_monitor:
             self.release_monitor.cancel()
+        self.persist_preferences()
         return False
 
 
 class EditorApp(Adw.Application):
     def __init__(self, options):
         check_runtime()
-        GLib.set_prgname('org.whitecube.CubeEditor')
-        super().__init__(application_id='org.whitecube.CubeEditor', flags=Gio.ApplicationFlags.NON_UNIQUE)
+        GLib.set_prgname(APP_ID)
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.options = options
         self.window = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.FORCE_LIGHT)
         provider = Gtk.CssProvider(); provider.load_from_path(str(HERE / 'style.css'))
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+        self.theme_provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.theme_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 2)
+        manager = Adw.StyleManager.get_default()
+        manager.connect('notify::dark', lambda *_: self.refresh_theme())
+        self.apply_theme(load_preferences()['theme'])
+
+    def apply_theme(self, theme):
+        schemes = {'system': Adw.ColorScheme.DEFAULT, 'light': Adw.ColorScheme.FORCE_LIGHT, 'dark': Adw.ColorScheme.FORCE_DARK}
+        Adw.StyleManager.get_default().set_color_scheme(schemes.get(theme, Adw.ColorScheme.DEFAULT))
+        self.refresh_theme()
+
+    def refresh_theme(self):
+        dark = Adw.StyleManager.get_default().get_dark()
+        colors = {'cube_canvas': '#191b1e', 'cube_surface': '#24272b', 'cube_header': '#202327',
+                  'cube_control': '#30343a', 'cube_paper': '#2b2f35', 'cube_ink': '#eeeeef',
+                  'cube_muted': '#b9bdc4', 'cube_secondary': '#c4c8cf', 'cube_hover': '#d2d5db'} if dark else {
+                  'cube_canvas': '#d0d0d0', 'cube_surface': '#efefef', 'cube_header': '#f5f5f5',
+                  'cube_control': '#ececec', 'cube_paper': '#ffffff', 'cube_ink': '#111111',
+                  'cube_muted': '#444444', 'cube_secondary': '#3f3f3f', 'cube_hover': '#333333'}
+        css = '\n'.join(f'@define-color {name} {value};' for name, value in colors.items())
+        self.theme_provider.load_from_data(css.encode())
+        for window in self.get_windows():
+            window.queue_draw()
 
     def do_activate(self):
         if not self.window: self.window = EditorWindow(self, self.options.project)

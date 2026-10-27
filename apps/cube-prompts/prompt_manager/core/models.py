@@ -7,7 +7,7 @@ orphans (never crash); Prompt.tags holds Tag *names* (canonical: strip,
 lstrip("#"), lower, dedupe); temperature clamped 0.0-2.0 (fallback 0.7);
 use_count floored at 0; is_favorite uses explicit string handling.
 VariableSpec derivation must stay via Prompt/Template.variable_specs().
-Round-trip: JSON lossless (except revisions); CSV preserves prompt ids;
+Round-trip: JSON includes revisions, presets, and runs; CSV preserves prompt ids;
 Markdown is lossy (no reimport).
 """
 

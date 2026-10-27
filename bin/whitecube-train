@@ -6,35 +6,8 @@ from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
 for directory in (root / 'apps/cube-train', root / 'share/whitecube/cube-train'):
-    if (directory / 'engine.py').is_file():
-        sys.path.insert(0, str(directory))
-        import engine
-        trainer = engine.Trainer()
-        # Read-only summaries that need neither PyTorch nor the training lock.
-        if sys.argv[1:] in (['--list-runs'], ['--status']):
-            print(trainer.summary() if sys.argv[1] == '--list-runs' else trainer.status_text())
-            raise SystemExit(0)
-        # Notebook export copies files only, so it runs on the system Python.
-        if sys.argv[1:2] == ['--export-notebook']:
-            python = trainer.preferences()['python']
-            kernel = engine.installed_kernel(python)
-            options = ['--python', python]
-            if kernel:
-                options += ['--kernel-name', kernel['name'], '--kernel-display-name', kernel['display_name']]
-            os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'pipeline/export_notebook.py'), *sys.argv[2:], *options])
-        if sys.argv[1:2] == ['--benchmark']:
-            executable = trainer.preferences()['python']
-            arguments = sys.argv[2:]
-            if arguments and not arguments[0].startswith('-'):
-                arguments = ['--run-dir', *arguments]
-            os.execv(executable, [executable, '-I', str(directory / 'pipeline/benchmark.py'), *arguments])
-        if '--help' in sys.argv[1:] or '-h' in sys.argv[1:]:
-            print('Whitecube Trainer summaries:\n  whitecube-train --list-runs   list runs (* pinned, B/L checkpoints)\n'
-                  '  whitecube-train --status      show the running desktop job\n'
-                  '  whitecube-train --benchmark RUN --output REPORT.json [--checkpoint best|latest|stepN]\n'
-                  '  whitecube-train --export-notebook RUN --output DIR [--checkpoint best|latest|stepN]\n'
-                  '                                [--with-corpus] [--reference] [--no-script]\n')
-        executable = trainer.preferences()['python']
-        os.execv(executable, [executable, '-u', str(directory / 'pipeline/train_supervisor.py'), *sys.argv[1:]])
+    if (directory / 'cli.py').is_file():
+        os.environ.setdefault('WHITECUBE_TRAIN_COMMAND', 'whitecube-train')
+        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'cli.py'), *sys.argv[1:]])
 print('whitecube-train: pipeline files are missing; reinstall whitecube-desktop', file=sys.stderr)
 raise SystemExit(1)

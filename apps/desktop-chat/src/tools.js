@@ -4,10 +4,10 @@ const path = require('path');
 const os = require('os');
 
 function resolvePath(p) {
-  if (!p) throw new Error('path is required');
+  if (typeof p !== 'string' || !p.trim() || p.includes('\0') || p.length > 4096) throw new Error('A valid file path is required.');
   let expanded = p;
-  if (expanded.startsWith('~')) {
-    expanded = path.join(os.homedir(), expanded.slice(1));
+  if (expanded === '~' || expanded.startsWith('~/')) {
+    expanded = path.join(os.homedir(), expanded.slice(2));
   }
   return path.resolve(expanded);
 }
@@ -15,54 +15,113 @@ function resolvePath(p) {
 const MAX_READ_BYTES = 30 * 1024;
 const MAX_READ_LINES = 800;
 const MAX_DIR_ENTRIES = 300;
+const MAX_EDIT_BYTES = 8 * 1024 * 1024;
+const MAX_SCAN_BYTES = 32 * 1024 * 1024;
 
-async function read_file({ path: rawPath, offset, limit }) {
+async function bytePage(handle, byteOffset, size) {
+  const data = Buffer.alloc(MAX_READ_BYTES);
+  const { bytesRead } = await handle.read(data, 0, data.length, byteOffset);
+  const bytes = data.subarray(0, bytesRead);
+  if (bytes.includes(0)) throw new Error('This appears to be a binary file. Read a text file instead.');
+  const next = byteOffset + bytesRead;
+  return `[bytes ${byteOffset}-${next} of ${size}]\n${bytes.toString('utf8')}` +
+    (next < size ? `\n\n[call read_file with byte_offset: ${next} to continue]` : '');
+}
+
+async function read_file({ path: rawPath, offset = 1, limit = MAX_READ_LINES, byte_offset }) {
   const target = resolvePath(rawPath);
+  if (!Number.isInteger(offset) || offset < 1) throw new Error('offset must be a positive line number.');
+  if (!Number.isInteger(limit) || limit < 1 || limit > MAX_READ_LINES) throw new Error(`limit must be between 1 and ${MAX_READ_LINES}.`);
+  if (byte_offset !== undefined && (!Number.isSafeInteger(byte_offset) || byte_offset < 0)) throw new Error('byte_offset must be a nonnegative whole number.');
   const stat = await fsp.stat(target);
   if (stat.isDirectory()) {
-    const entries = await fsp.readdir(target, { withFileTypes: true });
-    const names = entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).sort();
-    const shown = names.slice(0, MAX_DIR_ENTRIES);
-    const more =
-      names.length > MAX_DIR_ENTRIES
-        ? `\n… ${names.length - MAX_DIR_ENTRIES} more entries (${names.length} total)`
-        : '';
-    return `[directory listing for ${target}]\n${shown.join('\n')}${more}`;
+    const names = [];
+    let more = false;
+    for await (const entry of await fsp.opendir(target)) {
+      if (names.length === MAX_DIR_ENTRIES) { more = true; break; }
+      names.push(entry.isDirectory() ? `${entry.name}/` : entry.name);
+    }
+    return `[directory listing for ${target}]\n${names.sort().join('\n')}${more ? '\n… more entries (listing limited to 300)' : ''}`;
   }
-
-  const raw = await fsp.readFile(target, 'utf8');
-  const allLines = raw.split('\n');
-  const startIdx = Math.max(0, (offset ?? 1) - 1);
-  const maxLines = limit ?? MAX_READ_LINES;
-
-  const outLines = [];
-  let bytes = 0;
-  let i = startIdx;
-  for (; i < allLines.length && outLines.length < maxLines; i++) {
-    const numbered = `${i + 1}\t${allLines[i]}`;
-    const lineBytes = Buffer.byteLength(numbered, 'utf8') + 1;
-    if (bytes + lineBytes > MAX_READ_BYTES) break;
-    outLines.push(numbered);
-    bytes += lineBytes;
+  if (!stat.isFile()) throw new Error('Only regular text files and directories can be read.');
+  const handle = await fsp.open(target, 'r');
+  try {
+    if (byte_offset !== undefined) return await bytePage(handle, byte_offset, stat.size);
+    const lines = [];
+    let line = 1, position = 0, lineStart = 0, pending = Buffer.alloc(0), outputBytes = 0;
+    const chunk = Buffer.alloc(16 * 1024);
+    while (position < stat.size) {
+      if (position >= MAX_SCAN_BYTES) throw new Error(`Line offset requires scanning more than 32 MB. Use byte_offset: ${position} to continue by bytes.`);
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (!bytesRead) break;
+      const data = chunk.subarray(0, bytesRead);
+      if (data.includes(0)) throw new Error('This appears to be a binary file. Read a text file instead.');
+      let cursor = 0;
+      while (cursor < bytesRead) {
+        const newline = data.indexOf(10, cursor);
+        const end = newline < 0 ? bytesRead : newline;
+        if (line >= offset) {
+          pending = Buffer.concat([pending, data.subarray(cursor, end)]);
+          if (pending.length > MAX_READ_BYTES - 32) {
+            if (!lines.length) return await bytePage(handle, lineStart, stat.size);
+            return `${lines.join('\n')}\n\n[showing lines ${offset}-${line - 1}; call read_file with offset: ${line} to continue]`;
+          }
+        }
+        if (newline < 0) break;
+        if (line >= offset) {
+          const numbered = `${line}\t${pending.toString('utf8').replace(/\r$/, '')}`;
+          if (outputBytes + Buffer.byteLength(numbered) > MAX_READ_BYTES || lines.length >= limit) {
+            return `${lines.join('\n')}\n\n[showing lines ${offset}-${line - 1}; call read_file with offset: ${line} to continue]`;
+          }
+          lines.push(numbered); outputBytes += Buffer.byteLength(numbered) + 1;
+        }
+        line++; pending = Buffer.alloc(0);
+        lineStart = position + newline + 1;
+        cursor = newline + 1;
+      }
+      position += bytesRead;
+    }
+    if (line >= offset && pending.length) {
+      if (lines.length >= limit || outputBytes + pending.length > MAX_READ_BYTES) return `${lines.join('\n')}\n\n[call read_file with offset: ${line} to continue]`;
+      lines.push(`${line}\t${pending.toString('utf8')}`);
+    }
+    return lines.join('\n') || (stat.size ? `[No text at line ${offset}; the file has ${line} lines.]` : '[Empty file]');
+  } finally {
+    await handle.close();
   }
+}
 
-  const truncated = i < allLines.length;
-  const footer = truncated
-    ? `\n\n[showing lines ${startIdx + 1}-${i} of ${allLines.length}; call read_file again with offset: ${i + 1} to continue]`
-    : '';
-  return outLines.join('\n') + footer;
+function textArgument(value, name) {
+  if (typeof value !== 'string') throw new Error(`${name} must be text.`);
+  if (Buffer.byteLength(value) > MAX_EDIT_BYTES) throw new Error(`${name} exceeds the 8 MB editing limit.`);
+  return value;
+}
+
+async function atomicWrite(target, content) {
+  let permissions = 0o600;
+  try { target = await fsp.realpath(target); permissions = (await fsp.stat(target)).mode & 0o777; }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  const temporary = `${target}.desktop-chat-${require('crypto').randomUUID()}`;
+  try {
+    await fsp.writeFile(temporary, content, { encoding: 'utf8', flag: 'wx', mode: permissions });
+    await fsp.rename(temporary, target);
+  } finally { await fsp.unlink(temporary).catch(() => {}); }
 }
 
 async function write_file({ path: rawPath, content }) {
+  textArgument(content, 'content');
   const target = resolvePath(rawPath);
-  await fsp.mkdir(path.dirname(target), { recursive: true });
   const existed = fs.existsSync(target);
-  await fsp.writeFile(target, content ?? '', 'utf8');
+  await atomicWrite(target, content);
   return `${existed ? 'Overwrote' : 'Created'} ${target} (${Buffer.byteLength(content ?? '', 'utf8')} bytes)`;
 }
 
 async function edit_file({ path: rawPath, old_string, new_string, replace_all }) {
   const target = resolvePath(rawPath);
+  textArgument(old_string, 'old_string'); textArgument(new_string, 'new_string');
+  if (replace_all !== undefined && typeof replace_all !== 'boolean') throw new Error('replace_all must be true or false.');
+  if ((await fsp.stat(target)).size > MAX_EDIT_BYTES) throw new Error('File exceeds the 8 MB editing limit.');
   const original = await fsp.readFile(target, 'utf8');
 
   if (old_string === '') {
@@ -83,19 +142,22 @@ async function edit_file({ path: rawPath, old_string, new_string, replace_all })
     ? original.split(old_string).join(new_string ?? '')
     : original.replace(old_string, new_string ?? '');
 
-  await fsp.writeFile(target, updated, 'utf8');
+  textArgument(updated, 'Updated file');
+  await atomicWrite(target, updated);
   return `Edited ${target} (${occurrences} replacement${occurrences === 1 ? '' : 's'})`;
 }
 
 async function move_file({ source, destination }) {
   const src = resolvePath(source);
   const dest = resolvePath(destination);
+  try { await fsp.lstat(dest); throw new Error('Destination already exists. Choose another destination to avoid overwriting it.'); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
   await fsp.mkdir(path.dirname(dest), { recursive: true });
   try {
     await fsp.rename(src, dest);
   } catch (err) {
     if (err.code === 'EXDEV') {
-      await fsp.copyFile(src, dest);
+      await fsp.copyFile(src, dest, fs.constants.COPYFILE_EXCL);
       await fsp.unlink(src);
     } else {
       throw err;
@@ -119,6 +181,7 @@ const TOOL_DEFS = [
           path: { type: 'string', description: 'Absolute path, or ~-relative path' },
           offset: { type: 'integer', description: '1-based line number to start reading from (default 1)' },
           limit: { type: 'integer', description: 'Max number of lines to return (default ~800, capped by a byte budget too)' }
+          ,byte_offset: { type: 'integer', description: 'Optional 0-based byte offset for reading very long lines or large files; use the continuation offset from a previous result.' }
         },
         required: ['path']
       }
@@ -178,7 +241,8 @@ const DESTRUCTIVE_TOOLS = new Set(['write_file', 'edit_file', 'move_file']);
 const IMPLEMENTATIONS = { read_file, write_file, edit_file, move_file };
 
 async function execute(name, args) {
-  const fn = IMPLEMENTATIONS[name];
+  if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Tool arguments must be an object.');
+  const fn = Object.hasOwn(IMPLEMENTATIONS, name) && IMPLEMENTATIONS[name];
   if (!fn) throw new Error(`Unknown tool: ${name}`);
   return fn(args);
 }
@@ -228,12 +292,14 @@ function diffLines(oldStr, newStr) {
 
 async function previewTool(name, args) {
   if (name === 'write_file') {
+    textArgument(args.content, 'content');
     const target = resolvePath(args.path);
     let existing = null;
     try {
+      if ((await fsp.stat(target)).size > MAX_EDIT_BYTES) return `OVERWRITE: ${target}\n\nExisting file exceeds 8 MB; preview omitted.\n\n${truncateForPreview(args.content)}`;
       existing = await fsp.readFile(target, 'utf8');
     } catch (e) {
-      // file doesn't exist yet — treat as a new file
+      if (e.code !== 'ENOENT') throw e;
     }
     if (existing === null) {
       return `NEW FILE: ${target}\n\n${truncateForPreview(args.content ?? '')}`;

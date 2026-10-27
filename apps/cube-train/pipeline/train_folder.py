@@ -1,5 +1,4 @@
 """Train a local 1M/2M/5M/10M Tensegrity model from ~/train-in."""
-import argparse
 from datetime import datetime
 import fcntl
 import json
@@ -14,10 +13,12 @@ import traceback
 import torch
 
 from prepare_folder import prepare_folder
-from train_local import train, MODEL_PRESETS, add_model_size_flags
+from train_local import train, MODEL_PRESETS
 from files import atomic_json
 from train_supervisor import cpu_temperature
 from pacing import TrainingPacer
+from training_options import (build_parser, default_output_root, resume_hint,
+                              THERMAL_PAUSE_MARGIN, THERMAL_RESUME_MARGIN, THERMAL_PAUSE_LIMIT)
 
 
 class Tee:
@@ -61,11 +62,6 @@ class PreparationProgress:
         if changed:
             print(detail, flush=True)
         self.last_phase, self.next_update = phase, now + .25
-
-
-THERMAL_PAUSE_MARGIN = 5      # pause this far below a stop limit
-THERMAL_RESUME_MARGIN = 10    # resume once this far below the limit
-THERMAL_PAUSE_LIMIT = 15 * 60  # stop if cooling takes longer than this
 
 
 class Monitor:
@@ -199,54 +195,7 @@ def read_previous_result(run):
 
 def main():
     home = Path.home()
-    parser = argparse.ArgumentParser(description=__doc__)
-    add_model_size_flags(parser)
-    parser.add_argument("dataset", nargs="?", type=Path, default=home / "train-in",
-                        help='Raw corpus file/folder or an existing prepared data folder')
-    parser.add_argument("--max-tokens", type=int, default=20_000_000,
-                        help="Corpus cap including validation; not a GPU memory limit (default 20M byte tokens)")
-    parser.add_argument("--column", help="Override text field; dotted fields such as document.html supported")
-    parser.add_argument('--deduplicate', action='store_true', help='Remove exact duplicate documents before the token cap')
-    parser.add_argument('--shuffle-files', action='store_true', help='Shuffle source shards with the split seed before applying the cap')
-    parser.add_argument('--min-document-bytes', type=int, default=0, help='Skip documents below this retained UTF-8 byte length (0 disables)')
-    parser.add_argument('--max-document-bytes', type=int, default=0, help='Truncate each document at this UTF-8 byte length (0 disables)')
-    parser.add_argument('--batch-rows', type=int, default=32, help='Parquet rows decoded per batch (default 32)')
-    parser.add_argument("--steps", type=int, help="Total optimizer steps; default one corpus-equivalent token budget")
-    parser.add_argument("--schedule-steps", type=int, help="Explicit LR decay horizon; defaults to saved plan on resume")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--grad-accum-steps", type=int, default=4)
-    parser.add_argument("--max-temp", type=int, default=70, help="Stop and checkpoint at this GPU temperature (default 70 C)")
-    parser.add_argument("--max-cpu-temp", type=int, default=85, help="CPU temperature watchdog limit (default 85 C)")
-    parser.add_argument("--cpu-threads", type=int, default=2, help="PyTorch CPU thread limit (default 2)")
-    parser.add_argument('--burst-seconds', type=float, default=0, help='Stagger training: work for this many seconds before cooling (0 disables)')
-    parser.add_argument('--cooldown-seconds', type=float, default=10, help='Seconds to pause between training bursts (default 10)')
-    parser.add_argument('--low-priority', action='store_true', help='Run training with reduced CPU priority and idle disk I/O priority')
-    parser.add_argument("--run-dir", type=Path, help="New run directory, default ~/train-out/<timestamp>")
-    parser.add_argument('--name', default='', help='Friendly run name (training folder keeps its stable ID)')
-    parser.add_argument("--resume", type=Path, help="Resume an existing run directory; input files are not re-parsed")
-    parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
-    tuning = parser.add_argument_group('training plan (new runs; resume reuses the saved values)')
-    tuning.add_argument('--learning-rate', type=float, help='Peak learning rate (default 3e-4)')
-    tuning.add_argument('--min-lr-ratio', type=float, help='Final learning rate as a fraction of the peak (default 0.1)')
-    tuning.add_argument('--warmup-steps', type=int, help='Linear warmup steps (default: a tenth of the plan, up to 50)')
-    tuning.add_argument('--weight-decay', type=float, help='AdamW weight decay (default 0.1)')
-    tuning.add_argument('--grad-clip', type=float, help='Gradient norm clip; 0 disables (default 1.0)')
-    tuning.add_argument('--eval-interval', type=int, help='Validate and checkpoint every N steps (default 50)')
-    tuning.add_argument('--eval-iters', type=int, help='Validation batches of eight sequences per evaluation (default 20)')
-    tuning.add_argument('--dtype', choices=('auto', 'float32', 'bfloat16', 'float16'),
-                        help='Compute precision (default auto; resume preserves the saved actual precision)')
-    tuning.add_argument('--seed', type=int, help='Seed for weights, batches and the corpus split (default 1337)')
-    tuning.add_argument('--schedule', choices=('cosine', 'wsd'), help='Cosine decay, or warmup-stable-decay (default cosine)')
-    tuning.add_argument('--val-fraction', type=float, help='Validation share of documents, 0.01-0.5 (default 0.05)')
-    control = parser.add_argument_group('run controls (may change on resume)')
-    control.add_argument('--early-stop-patience', type=int, help='Stop after N evaluations without meaningful improvement (0 disables)')
-    control.add_argument('--early-stop-min-delta', type=float, help='Minimum absolute validation-loss improvement (default 0; changing it resets patience history)')
-    control.add_argument('--log-interval', type=int, help='Write training progress every N steps (default 10)')
-    control.add_argument('--keep-snapshots', type=int, help='Keep N step-numbered checkpoint copies (0 disables)')
-    control.add_argument('--max-minutes', type=float, help='Save and stop after this many minutes of training (0 disables)')
-    control.add_argument('--thermal-pause', action=argparse.BooleanOptionalAction, default=None,
-                         help=f'Pause {THERMAL_PAUSE_MARGIN} °C below a stop limit until {THERMAL_RESUME_MARGIN} °C below it')
+    parser = build_parser()
     args = parser.parse_args()
     if len(args.name.strip()) > 80 or any(ord(c) < 32 or ord(c) == 127 for c in args.name):
         parser.error('Use a run name of up to 80 characters without line breaks')
@@ -326,7 +275,7 @@ def main():
             steps = args.steps if args.steps is not None else config["steps"]
         else:
             args.model_size = args.model_size or "1m"
-            run = (args.run_dir or home / "train-out" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")).expanduser().resolve()
+            run = (args.run_dir or default_output_root(home) / datetime.now().strftime("%Y%m%d-%H%M%S-%f")).expanduser().resolve()
             run.mkdir(parents=True, exist_ok=False)
             data = run / "data"
             steps = None
@@ -380,7 +329,7 @@ def main():
                 atomic_json(run / 'run.json', config)
                 if args.prepare_only:
                     atomic_json(run / 'status.json', {'state': 'prepared', 'device': args.device})
-                    print(f"Prepared. Start training with: train --resume {run}")
+                    print(f"Prepared. Start training with: {resume_hint(run)}")
                     return
                 print(f"Training {args.model_size} model to {steps:,} total steps; batch={args.batch_size}, accumulation={args.grad_accum_steps}, context=256.")
                 print(f"Plan: {plan['schedule']} schedule, peak LR {plan['learning_rate']:g}, weight decay {plan['weight_decay']:g}, "
@@ -425,7 +374,7 @@ def main():
                     'finished_at': datetime.now().astimezone().isoformat(timespec='seconds')})
                 atomic_json(run / 'status.json', {'state': 'stopped' if result[0] < steps else 'completed', 'device': args.device})
                 print(f"Checkpoint: {run / 'ckpt_latest.pt'}")
-                print(f"Continue with: train --resume {run} --steps {max(steps, result[0]) + 1000}")
+                print(f"Continue with: {resume_hint(run, max(steps, result[0]) + 1000)}")
             except InterruptedError as error:
                 atomic_json(run / 'status.json', {'state': 'stopped', 'detail': str(error)})
                 print(str(error), flush=True)

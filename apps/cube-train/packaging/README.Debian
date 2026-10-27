@@ -1,0 +1,48 @@
+Whitecube Trainer standalone package
+===================================
+
+The upstream NOTICE covers the full Whitecube repository. This standalone
+package contains Trainer, its pipeline, the GTK theme and trainer icon only.
+It does not bundle the compositor, Electron, wlroots, cairo or other apps.
+
+Launch Whitecube Trainer from your applications menu or run:
+
+    whitecube-trainer
+    whitecube-trainer-cli --help
+    whitecube-trainer-cli --doctor
+
+The standalone commands deliberately differ from cube-train and whitecube-train
+provided by whitecube-desktop, so the packages can coexist without overwriting
+one another. No Whitecube compositor or desktop session is required. GTK uses
+your current Wayland or X11 desktop and honors GDK_BACKEND when explicitly set.
+
+Training runtime
+----------------
+The desktop never imports PyTorch. Select a Python interpreter in Train, then
+use Check runtime. The recommended python3-torch and python3-numpy packages
+provide a system CPU runtime. Existing CUDA virtual environments can be selected
+instead. PyArrow is optional for Parquet, safetensors for weights export and
+Jupyter/ipykernel for notebook execution. Nothing is downloaded by package
+maintainer scripts; this package has no maintainer scripts.
+
+GTK >= 4.12 and libadwaita >= 1.5 are required. Older distributions must upgrade
+these libraries before this package can be installed.
+
+User data
+---------
+Runs default to ~/train-out (override WHITECUBE_TRAIN_OUT). Preferences are in
+$XDG_CONFIG_HOME/whitecube/trainer.json, with ~/.config as the default.
+Jobs use $XDG_STATE_HOME/whitecube/trainer, with ~/.local/state as the default.
+Removing the package preserves runs, environments and settings.
+
+Rebuilding
+----------
+From apps/cube-train:
+
+    ./packaging/build-deb.sh
+
+Output goes to dist/whitecube-trainer_<version>_all.deb with a SHA256 sidecar.
+--output-dir, --version and --epoch are supported. SOURCE_DATE_EPOCH or the
+repository's latest commit timestamp makes identical source builds reproducible.
+The build requires Python 3, git, dpkg and dpkg-deb; it performs no installation,
+network access, compilation or privileged actions.

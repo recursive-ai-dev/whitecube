@@ -1,0 +1,17 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Whitecube Trainer
+
+Files: *
+Copyright: 2026 recursive-ai-dev and Whitecube contributors
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0.
+ On Debian systems the complete text is available in
+ /usr/share/common-licenses/Apache-2.0, and a copy is included as LICENSE.
+
+Files: usr/share/metainfo/org.whitecube.Trainer.metainfo.xml
+Copyright: 2026 Whitecube contributors
+License: CC0-1.0
+ To the extent possible under law, the authors waive all copyright and related
+ or neighboring rights to this package metadata under CC0 1.0 Universal.
+ The complete legal text is available at
+ https://creativecommons.org/publicdomain/zero/1.0/legalcode

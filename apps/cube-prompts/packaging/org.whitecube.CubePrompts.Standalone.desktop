@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Cube Prompts Studio
+GenericName=Prompt Library and Test Bench
+Comment=Organize, template, compare and export AI prompts
+Exec=/usr/bin/cube-prompts-studio
+TryExec=/usr/bin/cube-prompts-studio
+Icon=org.whitecube.CubePrompts.Standalone
+Terminal=false
+Categories=Development;
+Keywords=prompt;AI;LLM;template;library;Ollama;
+StartupNotify=true
+StartupWMClass=org.whitecube.CubePrompts
+X-Wayland-Native=true

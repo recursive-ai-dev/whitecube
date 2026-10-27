@@ -79,7 +79,13 @@ find "$share/boot-theme" -name __pycache__ -prune -exec rm -rf {} +
 cp -a workspace "$share/workspace"
 cp -a apps/desktop-chat "$share/desktop-chat"
 cp -a apps/cube-apps "$share/cube-apps"
-cp -a apps/cube-train "$share/cube-train"
+# Keep local training environments and standalone build artifacts out of the desktop.
+install -d -m 0755 "$share/cube-train"
+for f in apps/cube-train/*.py apps/cube-train/*.md; do
+  install -m 0644 "$f" "$share/cube-train/$(basename "$f")"
+done
+cp -a apps/cube-train/pipeline "$share/cube-train/pipeline"
+find "$share/cube-train/pipeline" -name __pycache__ -prune -exec rm -rf {} +
 install -d -m 0755 "$share/cube-editor"
 # Exclude the extracted AppImage and development-only directories before copying.
 while IFS= read -r -d '' source; do
@@ -89,7 +95,7 @@ while IFS= read -r -d '' source; do
   else
     install -m 0644 "$source" "$share/cube-editor/$relative"
   fi
-done < <(find apps/cube-editor -mindepth 1 \( -type d \( -name upstream -o -name tests -o -name __pycache__ \) -prune \) -o \( -type d -o -type f \) -print0)
+done < <(find apps/cube-editor -mindepth 1 \( -type d \( -name upstream -o -name tests -o -name packaging -o -name __pycache__ \) -prune \) -o \( -type d -o -type f \) -print0)
 rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/cube-apps/tests" "$share/cube-apps/shot.sh" "$share/cube-train/tests"
 # Chrootables: the window runs from /usr/share; its manager is a command of its own (CLI and menu),
 # which the window finds as /usr/bin/chrootable-manager.

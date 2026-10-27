@@ -1,5 +1,7 @@
-const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, screen, nativeImage, clipboard } = require('electron');
+const { app, BrowserWindow, Tray, Menu, globalShortcut, ipcMain, screen, nativeImage, clipboard, dialog } = require('electron');
 const path = require('path');
+const fs = require('node:fs');
+const { History, sourceOf, exportMarkdown } = require('./src/history');
 const config = require('./src/config');
 const { runAgentTurn } = require('./src/llm');
 const { needsApiKey, validateSettings } = require('./src/endpoint');
@@ -27,7 +29,7 @@ function parseArgs(argv) {
 const firstArgs = parseArgs(process.argv.slice(1));
 
 const SYSTEM_PROMPT =
-  'You are a desktop assistant running locally on the user\'s Linux machine (Debian 13 trixie, Wayland-native custom desktop). ' +
+  'You are a desktop assistant running locally on the user\'s Linux desktop. ' +
   'You have tools to read, write, edit, and move files anywhere on the filesystem: read_file, write_file, ' +
   'edit_file, move_file. Paths may be absolute or start with ~. Use tools whenever the user asks you to ' +
   'inspect or change files. Be precise and careful with destructive operations (write_file, edit_file, move_file) ' +
@@ -46,33 +48,85 @@ let isQuitting = false;
 let conversation = [{ role: 'system', content: SYSTEM_PROMPT }];
 let pendingConfirms = new Map();
 let currentAbort = null;
+let history = null;
+let activeChat = null;
+let historyTimer = null;
+let transcriptAssistant = null;
+function getHistory() {
+  if (!history) history = new History(path.join(app.getPath('userData'), 'conversations'));
+  return history;
+}
+function ensureChat() {
+  if (!activeChat) {
+    activeChat = getHistory().current() || getHistory().create(config.load());
+    conversation = [{ role: 'system', content: SYSTEM_PROMPT }, ...activeChat.context];
+  }
+  return activeChat;
+}
+function notifyChats() { if (windowReady) win.webContents.send('chats:changed'); }
+function saveConversation() {
+  clearTimeout(historyTimer); historyTimer = null;
+  if (!activeChat) return;
+  activeChat.context = conversation.filter(m => m.role !== 'system');
+  activeChat.updatedAt = new Date().toISOString();
+  getHistory().save(activeChat);
+}
+function recordEvent(event) {
+  if (!activeChat) return;
+  if (event.type === 'text-delta') {
+    if (!transcriptAssistant) {
+      transcriptAssistant = { role: 'assistant', content: '' };
+      activeChat.messages.push(transcriptAssistant);
+    }
+    transcriptAssistant.content += event.text;
+  } else if (['tool-call', 'tool-result', 'tool-error', 'tool-declined', 'notice', 'error'].includes(event.type)) {
+    transcriptAssistant = null;
+    const content = event.type === 'notice' ? event.text : event.type === 'error' ? event.message :
+      `${event.name}: ${event.result || event.error || event.preview || (event.type === 'tool-declined' ? 'Declined' : JSON.stringify(event.args || {}))}`;
+    activeChat.messages.push({ role: event.type === 'notice' ? 'notice' : event.type === 'error' ? 'error' : 'tool', content: String(content).slice(0, 40000) });
+  } else return;
+  if (!historyTimer) historyTimer = setTimeout(() => {
+    historyTimer = null;
+    try { saveConversation(); } catch (err) { console.error('Could not save conversation:', err.message); }
+  }, 750);
+}
+
 
 function freshConversation() {
   if (currentAbort) throw new Error('Stop the current reply before starting a new chat.');
+  activeChat = getHistory().create(config.load());
   conversation = [{ role: 'system', content: SYSTEM_PROMPT }];
+  transcriptAssistant = null;
+  notifyChats();
+  return activeChat;
 }
 
 function createWindow() {
   windowReady = false;
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
   const { x, y, width } = display.workArea;
-  const winWidth = 760;
-  const winHeight = 640;
+  const winWidth = Math.min(1080, width || 1080);
+  const winHeight = Math.min(780, Math.max(480, (display.workArea.height || 900) - 80));
 
   win = new BrowserWindow({
     width: winWidth,
+    minWidth: 560,
+    minHeight: 480,
+    title: 'Desktop Chat',
+    icon: path.join(__dirname, 'assets/icon.png'),
     height: winHeight,
     x: Math.round(x + (width - winWidth) / 2),
     y: y + 40,
     frame: false,
     show: false,
     alwaysOnTop: true,
-    skipTaskbar: true,
+    skipTaskbar: false,
     resizable: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
 
@@ -82,6 +136,10 @@ function createWindow() {
     pendingOpen = null;
     if (open !== null) showWindow(open);
   });
+  win.webContents.on('will-navigate', event => event.preventDefault());
+  win.webContents.setWindowOpenHandler?.(() => ({ action: 'deny' }));
+  win.webContents.session?.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  win.webContents.on('render-process-gone', () => { currentAbort?.abort(); });
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
   win.on('close', (e) => {
@@ -209,6 +267,7 @@ if (!gotLock) {
 
   app.on('will-quit', () => {
     currentAbort?.abort();
+    try { saveConversation(); } catch (err) { console.error(err.message); }
     localModels.stop();
     globalShortcut.unregisterAll();
   });
@@ -221,7 +280,8 @@ function publicSettings(s) {
     endpoint: s.endpoint, model: s.model, apiKey: s.apiKey, confirmDestructive: s.confirmDestructive,
     hotkey: s.hotkey, keyStorage: s.keyStorage, configPath: config.configPath(),
     needsKey: s.chatSource !== 'local' && needsApiKey(s.endpoint),
-    chatSource: s.chatSource, checkpointId: s.checkpointId
+    chatSource: s.chatSource, checkpointId: s.checkpointId,
+    toolsEnabled: s.toolsEnabled, temperature: s.temperature, maxTokens: s.maxTokens
   };
 }
 
@@ -230,7 +290,8 @@ ipcMain.handle('settings:get', () => publicSettings(config.load()));
 function modelList() {
   const s = config.load();
   return { directory: localModels.directory, items: localModels.list(s.modelAliases),
-    chatSource: s.chatSource, checkpointId: s.checkpointId, apiModel: s.model };
+    chatSource: s.chatSource, checkpointId: s.checkpointId,
+    toolsEnabled: s.toolsEnabled, temperature: s.temperature, maxTokens: s.maxTokens, apiModel: s.model };
 }
 function requestCheckpoint(id) {
   try {
@@ -311,8 +372,7 @@ ipcMain.handle('settings:clear-key', () => {
 });
 
 ipcMain.handle('chat:new', () => {
-  freshConversation();
-  return true;
+  return freshConversation();
 });
 
 ipcMain.handle('chat:cancel', () => {
@@ -347,6 +407,7 @@ ipcMain.handle('chat:send', async (evt, userText) => {
     });
 
   const onEvent = (event) => {
+    recordEvent(event);
     evt.sender.send('chat:event', event);
   };
 
@@ -364,7 +425,22 @@ ipcMain.handle('chat:send', async (evt, userText) => {
     if (needsApiKey(settings.endpoint) && !settings.apiKey) {
       throw new Error('No API key set. Open Settings and configure your endpoint, model, and key. A localhost server needs no key.');
     }
-    conversation.push({ role: 'user', content: userText.trim() });
+    ensureChat();
+    const profile = sourceOf(config.load());
+    if (activeChat.messages.length && activeChat.source.chatSource === 'api' &&
+        (activeChat.source.endpoint !== profile.endpoint || activeChat.source.model !== profile.model)) {
+      throw new Error('The API endpoint or model has changed since this chat was saved. Start a new chat to use the new settings.');
+    }
+    activeChat.source = profile;
+    const message = { role: 'user', content: userText.trim() };
+    transcriptAssistant = null;
+    activeChat.messages.push({ ...message });
+    if (!activeChat.customTitle && activeChat.messages.filter(m => m.role === 'user').length === 1) {
+      activeChat.title = userText.trim().replace(/\s+/g, ' ').slice(0, 80);
+    }
+    conversation.push(message);
+    saveConversation();
+    notifyChats();
     await runAgentTurn({
       settings,
       messages: conversation,
@@ -382,7 +458,13 @@ ipcMain.handle('chat:send', async (evt, userText) => {
   } finally {
     for (const resolve of pendingConfirms.values()) resolve(false);
     pendingConfirms.clear();
+    try { saveConversation(); } catch (err) {
+      failure = `Could not save conversation: ${err.message}`;
+      evt.sender.send('chat:event', { type: 'error', message: failure });
+    }
+    transcriptAssistant = null;
     currentAbort = null;
+    notifyChats();
     evt.sender.send('chat:done');
   }
 
@@ -399,4 +481,53 @@ ipcMain.on('panel:hide', () => {
 
 ipcMain.on('panel:show', () => {
   showWindow(false);
+});
+
+// Saved conversations use opaque IDs; renderer input never becomes a file path.
+ipcMain.handle('chats:list', (_evt, query = '') => getHistory().list(query));
+ipcMain.handle('chats:current', () => ensureChat());
+ipcMain.handle('chats:get', (_evt, id) => getHistory().get(id));
+ipcMain.handle('chats:select', (_evt, id) => {
+  if (currentAbort) throw new Error('Stop the reply before switching conversations.');
+  const chat = getHistory().get(id);
+  const current = config.load();
+  if (chat.source.chatSource === 'local') {
+    config.save({ chatSource: 'local', checkpointId: chat.source.checkpointId });
+  } else {
+    config.save({ chatSource: 'api', ...(current.endpoint === chat.source.endpoint ? { model: chat.source.model } : {}) });
+  }
+  getHistory().activate(chat);
+  activeChat = chat;
+  conversation = [{ role: 'system', content: SYSTEM_PROMPT }, ...chat.context];
+  transcriptAssistant = null;
+  return chat;
+});
+ipcMain.handle('chats:rename', (_evt, id, title) => {
+  if (currentAbort) throw new Error('Stop the reply before renaming conversations.');
+  const chat = getHistory().rename(id, title);
+  if (activeChat?.id === id) activeChat.title = chat.title, activeChat.customTitle = true;
+  notifyChats();
+  return chat;
+});
+ipcMain.handle('chats:delete', (_evt, id) => {
+  if (currentAbort) throw new Error('Stop the reply before deleting conversations.');
+  getHistory().delete(id);
+  if (activeChat?.id === id) {
+    activeChat = null;
+    ensureChat();
+    getHistory().activate(activeChat);
+  }
+  notifyChats();
+  return { activeChat: ensureChat() };
+});
+ipcMain.handle('chats:export', async (_evt, id, format = 'markdown') => {
+  if (!['markdown', 'json'].includes(format)) throw new Error('Choose Markdown or JSON export.');
+  const chat = getHistory().get(id);
+  const ext = format === 'json' ? 'json' : 'md';
+  const filename = chat.title.replace(/[^a-zA-Z0-9 _-]/g, '').slice(0, 60) || 'conversation';
+  const result = await dialog.showSaveDialog(win, { title: 'Export conversation', defaultPath: `${filename}.${ext}`,
+    filters: [{ name: format === 'json' ? 'JSON' : 'Markdown', extensions: [ext] }] });
+  if (result.canceled || !result.filePath) return { cancelled: true };
+  fs.writeFileSync(result.filePath, format === 'json' ? JSON.stringify({ title: chat.title, createdAt: chat.createdAt, messages: chat.messages }, null, 2) : exportMarkdown(chat), { mode: 0o600 });
+  return { cancelled: false, path: result.filePath };
 });

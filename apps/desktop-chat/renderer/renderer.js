@@ -5,6 +5,14 @@ const stopBtn = document.getElementById('btn-stop');
 const newBtn = document.getElementById('btn-new');
 const hideBtn = document.getElementById('btn-hide');
 const settingsBtn = document.getElementById('btn-settings');
+const chatDialogOverlay = document.getElementById('chat-dialog-overlay');
+const emptyState = document.getElementById('empty-state');
+const chatList = document.getElementById('chat-list');
+let currentChat = null;
+let switchingChat = true;
+let chatDialogAction = null;
+let chatListRequest = 0;
+let turnUsage = null;
 
 const settingsOverlay = document.getElementById('settings-overlay');
 const confirmOverlay = document.getElementById('confirm-overlay');
@@ -18,12 +26,12 @@ let changingModel = false;
 let renamingId = null;
 
 function syncModals() {
-  document.getElementById('app').inert = [settingsOverlay, confirmOverlay, renameOverlay].some(el => !el.classList.contains('hidden'));
+  document.getElementById('app').inert = [settingsOverlay, confirmOverlay, renameOverlay, chatDialogOverlay].some(el => !el.classList.contains('hidden'));
 }
 
 function updateModelControls() {
-  modelPicker.disabled = sending || changingModel;
-  refreshModelsBtn.disabled = sending || changingModel;
+  modelPicker.disabled = sending || changingModel || switchingChat;
+  refreshModelsBtn.disabled = sending || changingModel || switchingChat;
   renameModelBtn.disabled = sending || changingModel || !modelData?.items.some(item => item.id === modelPicker.value);
 }
 
@@ -102,15 +110,18 @@ let sending = false;
 let stickToBottom = true;
 const activityEl = document.getElementById('activity');
 const latestBtn = document.getElementById('btn-latest');
-const draftKey = 'desktop-chat-draft';
-try { inputEl.value = localStorage.getItem(draftKey) || ''; } catch {}
+function draftKey() { return `desktop-chat-draft:${currentChat?.id || 'unsaved'}`; }
+function loadDraft() {
+  try { inputEl.value = localStorage.getItem(draftKey()) || ''; } catch { inputEl.value = ''; }
+  updateComposer();
+}
 function updateComposer() {
-  sendBtn.disabled = !inputEl.value.trim() || changingModel;
+  sendBtn.disabled = !inputEl.value.trim() || changingModel || switchingChat || sending;
   document.getElementById('draft-count').textContent = inputEl.value.length.toLocaleString();
   inputEl.style.height = 'auto';
   inputEl.style.height = Math.min(180, Math.max(48, inputEl.scrollHeight)) + 'px';
 }
-function saveDraft() { try { localStorage.setItem(draftKey, inputEl.value); } catch {} updateComposer(); }
+function saveDraft() { try { localStorage.setItem(draftKey(), inputEl.value); } catch {} updateComposer(); }
 inputEl.addEventListener('input', saveDraft);
 updateComposer();
 sendBtn.disabled = !inputEl.value.trim();
@@ -148,6 +159,7 @@ function appendBubble(role, text) {
   el._textNode = textNode;
   el._raw = text;
   messagesEl.appendChild(el);
+  updateEmptyState();
   if (role === 'user') {
     const copy = document.createElement('button');
     copy.className = 'copy-reply'; copy.textContent = 'Copy message';
@@ -193,6 +205,7 @@ function appendToolBubble(html) {
   el.className = 'msg tool';
   el.innerHTML = html;
   messagesEl.appendChild(el);
+  updateEmptyState();
   scrollToBottom();
   return el;
 }
@@ -206,16 +219,19 @@ function setSending(v) {
   sendBtn.classList.toggle('hidden', v);
   stopBtn.classList.toggle('hidden', !v);
   newBtn.disabled = v;
+  document.body.classList.toggle('sending', v);
+  updateChatControls();
   document.getElementById('s-save').disabled = v;
   updateModelControls();
   activityEl.textContent = v ? 'Working…' : 'Ready';
   messagesEl.setAttribute('aria-busy', String(v));
-  sendBtn.disabled = !inputEl.value.trim();
+  updateComposer();
 }
 
 async function send() {
   const text = inputEl.value.trim();
-  if (!text || sending || changingModel) return;
+  if (!text || sending || changingModel || switchingChat) return;
+  turnUsage = null;
   inputEl.value = '';
   saveDraft(); stickToBottom = true;
   const bubble = appendBubble('user', text);
@@ -252,6 +268,7 @@ inputEl.addEventListener('keydown', (e) => {
 document.addEventListener('keydown', (e) => {
   const modal = !confirmOverlay.classList.contains('hidden') ? confirmOverlay :
     !renameOverlay.classList.contains('hidden') ? renameOverlay :
+    !chatDialogOverlay.classList.contains('hidden') ? chatDialogOverlay :
     !settingsOverlay.classList.contains('hidden') ? settingsOverlay : null;
   if (modal && e.key === 'Tab') {
     const controls = [...modal.querySelectorAll('button, input, select, textarea, [tabindex="0"]')].filter(el => !el.disabled && el.getClientRects().length);
@@ -263,6 +280,7 @@ document.addEventListener('keydown', (e) => {
       e.preventDefault(); first.focus();
     }
   }
+  if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') { e.preventDefault(); toggleSidebar(); }
   if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') { e.preventDefault(); openFind(); }
   if (!modal && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'l') { e.preventDefault(); inputEl.focus(); }
   if (!modal && (e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'c' && !window.getSelection()?.toString()) { e.preventDefault(); copyChat(); }
@@ -273,12 +291,16 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     if (!confirmOverlay.classList.contains('hidden')) {
       // require explicit choice
+    } else if (!chatDialogOverlay.classList.contains('hidden')) {
+      closeChatDialog();
     } else if (!renameOverlay.classList.contains('hidden')) {
       closeRename();
     } else if (!settingsOverlay.classList.contains('hidden')) {
       closeSettings();
     } else if (!document.getElementById('find-bar').classList.contains('hidden')) {
       closeFind();
+    } else if (!document.body.classList.contains('sidebar-hidden') && window.innerWidth <= 660) {
+      toggleSidebar(false);
     } else {
       window.api.hidePanel();
     }
@@ -286,9 +308,11 @@ document.addEventListener('keydown', (e) => {
 });
 
 newBtn.addEventListener('click', async () => {
-  if (sending) return;
-  try { await window.api.newChat(); clearTranscript(); }
+  if (sending || switchingChat) return;
+  saveDraft(); switchingChat = true; updateChatControls(); updateComposer();
+  try { renderChat(await window.api.newChat()); await refreshChats(); }
   catch (err) { appendBubble('error', err.message || String(err)); }
+  finally { switchingChat = false; updateChatControls(); updateComposer(); }
 });
 
 hideBtn.addEventListener('click', () => window.api.hidePanel());
@@ -298,12 +322,16 @@ function clearTranscript() {
   currentAssistantEl = null; pendingText = ''; stickToBottom = true;
   latestBtn.classList.add('hidden');
   updateFind();
+  updateEmptyState();
   inputEl.focus();
 }
-window.api.onCleared(clearTranscript);
+window.api.onCleared(() => {
+  window.api.getCurrentChat().then(chat => { if (!sending) { renderChat(chat); refreshChats(); } }).catch(showHistoryError);
+});
 
 window.api.onShown(() => {
   if (!confirmOverlay.classList.contains('hidden')) document.getElementById('confirm-deny').focus();
+  else if (!chatDialogOverlay.classList.contains('hidden')) document.getElementById('chat-name').focus();
   else if (!renameOverlay.classList.contains('hidden')) document.getElementById('rename-name').focus();
   else if (!settingsOverlay.classList.contains('hidden')) sEndpoint.focus();
   else inputEl.focus();
@@ -332,6 +360,8 @@ window.api.onEvent((event) => {
     );
   } else if (event.type === 'tool-declined') {
     appendToolBubble(`<span class="tool-name tool-error">✗ ${escapeHtml(event.name)} declined</span>`);
+  } else if (event.type === 'usage') {
+    turnUsage = event.usage;
   } else if (event.type === 'notice') {
     finishAssistant();
     appendBubble('notice', event.text);
@@ -344,6 +374,8 @@ window.api.onEvent((event) => {
 window.api.onDone(() => {
   finishAssistant();
   setSending(false);
+  if (turnUsage?.total_tokens) activityEl.textContent = `Reply complete · ${Number(turnUsage.total_tokens).toLocaleString()} tokens used`;
+  refreshChats();
   updateFind();
   if (settingsOverlay.classList.contains('hidden') && confirmOverlay.classList.contains('hidden')) inputEl.focus();
 });
@@ -402,6 +434,9 @@ async function openSettings() {
   sApiKey.value = s.apiKey || '';
   sConfirm.checked = !!s.confirmDestructive;
   sHotkey.value = s.hotkey || '';
+  document.getElementById('s-temperature').value = s.temperature ?? 0.7;
+  document.getElementById('s-max-tokens').value = s.maxTokens ?? 8192;
+  document.getElementById('s-tools').checked = s.toolsEnabled !== false;
   sKeyStorage.textContent =
     s.keyStorage === 'encrypted'
       ? 'API key is encrypted at rest via the OS keyring.'
@@ -416,7 +451,9 @@ async function openSettings() {
 function closeSettings() { settingsOverlay.classList.add('hidden'); syncModals(); sApiKey.value = ''; inputEl.focus(); }
 function editedSettings() {
   return { endpoint: sEndpoint.value.trim(), model: sModel.value.trim(), apiKey: sApiKey.value,
-    confirmDestructive: sConfirm.checked, hotkey: sHotkey.value.trim() || 'CommandOrControl+Shift+T' };
+    confirmDestructive: sConfirm.checked, hotkey: sHotkey.value.trim() || 'CommandOrControl+Shift+T',
+    toolsEnabled: document.getElementById('s-tools').checked, temperature: Number(document.getElementById('s-temperature').value),
+    maxTokens: Number(document.getElementById('s-max-tokens').value) };
 }
 
 window.api.onSettingsOpen(openSettings);
@@ -454,16 +491,6 @@ document.getElementById('s-clear').addEventListener('click', async () => {
     await window.api.clearKey(); sApiKey.value = ''; resultEl.textContent = 'Key cleared (saved).';
   } catch (err) { resultEl.textContent = err.message || String(err); }
 });
-
-// first run: if no endpoint/model configured, nudge into settings
-window.api.getSettings().then((s) => {
-  if (s.needsKey && !s.apiKey) {
-    appendBubble('assistant', 'Choose a local checkpoint in Talk to, or set your API endpoint, model, and key in Settings (⚙). Local checkpoints need no API key.');
-  }
-}).catch(err => appendBubble('error', err.message || String(err)));
-
-inputEl.focus();
-refreshModels();
 
 let foundMessages = [], foundIndex = -1;
 function updateFind() {
@@ -503,3 +530,148 @@ document.getElementById('find-text').addEventListener('keydown', e => { if (e.ke
 document.getElementById('find-next').addEventListener('click', () => navigateFind(1));
 document.getElementById('find-prev').addEventListener('click', () => navigateFind(-1));
 document.getElementById('btn-copy-chat').addEventListener('click', copyChat);
+
+
+// Saved conversations are owned by the main process. The renderer keeps only
+// drafts and presentation state; tools, credentials and file writes stay in IPC.
+function updateEmptyState() {
+  emptyState.classList.toggle('hidden', messagesEl.children.length > 0);
+}
+function updateChatControls() {
+  const blocked = sending || switchingChat;
+  document.getElementById('btn-sidebar-new').disabled = blocked;
+  newBtn.disabled = blocked;
+  document.getElementById('btn-chat-rename').disabled = blocked || !currentChat;
+  document.getElementById('btn-chat-delete').disabled = blocked || !currentChat;
+  document.getElementById('btn-export').disabled = blocked || !currentChat;
+  for (const button of chatList.querySelectorAll('button')) button.disabled = blocked;
+}
+function showHistoryError(err) { activityEl.textContent = err.message || String(err); }
+function chatDate(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+async function refreshChats() {
+  const request = ++chatListRequest;
+  try {
+    const list = await window.api.listChats(document.getElementById('chat-search').value.trim());
+    if (request !== chatListRequest) return;
+    chatList.replaceChildren();
+    if (!list.length) {
+      const hint = document.createElement('p'); hint.className = 'chat-empty';
+      hint.textContent = document.getElementById('chat-search').value.trim() ? 'No conversations match your search.' : 'Your conversations will appear here.';
+      chatList.appendChild(hint);
+    }
+    for (const chat of list) {
+      const button = document.createElement('button'); button.className = 'chat-item';
+      const active = chat.id === currentChat?.id;
+      button.classList.toggle('active', active); button.setAttribute('aria-current', active ? 'true' : 'false');
+      button.setAttribute('role', 'listitem'); button.title = chat.title || 'New conversation';
+      for (const [cls, text] of [['chat-item-title', chat.title || 'New conversation'], ['chat-item-preview', chat.preview || 'Start with a message'], ['chat-item-meta', `${chatDate(chat.updatedAt)} · ${chat.messageCount || 0} messages`]]) {
+        const el = document.createElement('span'); el.className = cls; el.textContent = text; button.appendChild(el);
+      }
+      button.addEventListener('click', () => selectSavedChat(chat.id));
+      chatList.appendChild(button);
+    }
+    updateChatControls();
+    // Renames and automatic titles can arrive after a streamed reply.
+    const active = list.find(chat => chat.id === currentChat?.id);
+    if (active) { currentChat.title = active.title; document.getElementById('chat-title').textContent = active.title; }
+  } catch (err) { showHistoryError(err); }
+}
+function renderChat(chat) {
+  if (!chat) return;
+  currentChat = chat;
+  clearTranscript();
+  document.getElementById('chat-title').textContent = chat.title || 'New conversation';
+  for (const message of chat.messages || []) {
+    if (message.role === 'system' || (!message.content && message.role !== 'tool')) continue;
+    const role = ['user', 'assistant', 'tool', 'notice', 'error'].includes(message.role) ? message.role : 'notice';
+    const content = typeof message.content === 'string' ? message.content : JSON.stringify(message.content ?? '');
+    const bubble = appendBubble(role, content);
+    if (role === 'assistant') { currentAssistantEl = bubble; finishAssistant(); }
+  }
+  loadDraft(); updateEmptyState(); updateFind(); updateChatControls();
+  activityEl.textContent = 'Ready';
+  if (window.innerWidth <= 660) toggleSidebar(false);
+  inputEl.focus();
+}
+async function selectSavedChat(id) {
+  if (sending || switchingChat || id === currentChat?.id) return;
+  saveDraft(); switchingChat = true; updateChatControls(); updateComposer();
+  try { renderChat(await window.api.selectChat(id)); await Promise.all([refreshChats(), refreshModels()]); }
+  catch (err) { showHistoryError(err); }
+  finally { switchingChat = false; updateChatControls(); updateComposer(); updateModelControls(); }
+}
+function toggleSidebar(show) {
+  const visible = typeof show === 'boolean' ? show : document.body.classList.contains('sidebar-hidden');
+  document.body.classList.toggle('sidebar-hidden', !visible);
+  document.getElementById('btn-sidebar').setAttribute('aria-expanded', String(visible));
+  if (visible) document.getElementById('chat-search').focus();
+}
+function closeChatDialog() {
+  chatDialogOverlay.classList.add('hidden'); syncModals(); inputEl.focus();
+}
+function openChatDialog(action) {
+  if (!currentChat || sending || switchingChat) return;
+  chatDialogAction = action;
+  const removing = action === 'delete';
+  document.getElementById('chat-dialog-title').textContent = removing ? 'Delete conversation?' : 'Rename conversation';
+  document.getElementById('chat-dialog-description').textContent = removing ? `“${currentChat.title}” will be permanently removed from this device.` : 'Give this conversation a name you can find later.';
+  document.getElementById('chat-name-label').classList.toggle('hidden', removing);
+  const name = document.getElementById('chat-name'); name.classList.toggle('hidden', removing); name.value = currentChat.title || '';
+  const save = document.getElementById('chat-dialog-save'); save.textContent = removing ? 'Delete conversation' : 'Save name'; save.classList.toggle('danger', removing);
+  document.getElementById('chat-dialog-error').textContent = '';
+  chatDialogOverlay.classList.remove('hidden'); syncModals();
+  if (removing) document.getElementById('chat-dialog-cancel').focus(); else { name.focus(); name.select(); }
+}
+document.getElementById('btn-sidebar').addEventListener('click', () => toggleSidebar());
+document.getElementById('btn-sidebar-new').addEventListener('click', () => newBtn.click());
+document.getElementById('chat-search').addEventListener('input', refreshChats);
+document.getElementById('btn-chat-rename').addEventListener('click', () => openChatDialog('rename'));
+document.getElementById('btn-chat-delete').addEventListener('click', () => openChatDialog('delete'));
+document.getElementById('chat-dialog-cancel').addEventListener('click', closeChatDialog);
+document.getElementById('chat-dialog').addEventListener('submit', async e => {
+  e.preventDefault(); if (!currentChat) return;
+  const button = document.getElementById('chat-dialog-save'); button.disabled = true;
+  try {
+    if (chatDialogAction === 'delete') {
+      const oldId = currentChat.id;
+      const result = await window.api.deleteChat(currentChat.id);
+      try { localStorage.removeItem(`desktop-chat-draft:${oldId}`); } catch {}
+      renderChat(result.activeChat || await window.api.getCurrentChat());
+    } else {
+      const title = document.getElementById('chat-name').value.trim();
+      if (!title) throw new Error('Enter a conversation name.');
+      const chat = await window.api.renameChat(currentChat.id, title);
+      currentChat.title = chat.title; document.getElementById('chat-title').textContent = chat.title;
+    }
+    closeChatDialog(); await refreshChats();
+  } catch (err) { document.getElementById('chat-dialog-error').textContent = err.message || String(err); }
+  finally { button.disabled = false; }
+});
+document.getElementById('btn-export').addEventListener('click', async () => {
+  if (!currentChat || sending) return;
+  try {
+    const result = await window.api.exportChat(currentChat.id, 'markdown');
+    if (!result.cancelled) activityEl.textContent = `Saved to ${result.path}`;
+  } catch (err) { showHistoryError(err); }
+});
+document.getElementById('btn-setup').addEventListener('click', openSettings);
+for (const button of document.querySelectorAll('.starter')) button.addEventListener('click', () => {
+  inputEl.value = button.dataset.prompt; saveDraft(); inputEl.focus();
+});
+window.api.onChatsChanged(() => refreshChats());
+async function initializeWorkspace() {
+  if (window.innerWidth <= 660) toggleSidebar(false);
+  updateChatControls(); updateComposer(); updateModelControls();
+  try {
+    renderChat(await window.api.getCurrentChat());
+    await Promise.all([refreshChats(), refreshModels()]);
+    const settings = await window.api.getSettings();
+    if (settings.needsKey && !settings.apiKey && !messagesEl.children.length) activityEl.textContent = 'Choose a local model or configure your API connection in Settings';
+  } catch (err) { showHistoryError(err); }
+  finally { switchingChat = false; updateChatControls(); updateComposer(); updateModelControls(); }
+}
+initializeWorkspace();

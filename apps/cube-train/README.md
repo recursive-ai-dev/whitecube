@@ -1,8 +1,76 @@
-# Whitecube Trainer 1.0.0
+# Whitecube Trainer 1.1.0
 
 Native GTK4 controls and a local small-language-model training pipeline. The
 desktop process uses the system Python and never imports PyTorch. Preparation,
 training and CPU previews run in the Python environment selected in the app.
+
+## Install the standalone Debian package
+
+Build from this directory, without root or the Whitecube compositor:
+
+```sh
+./packaging/build-deb.sh
+sudo apt install ./dist/whitecube-trainer_1.1.0_all.deb
+whitecube-trainer
+```
+
+The package runs on an existing Wayland or X11 desktop. It requires Python 3.10+,
+GTK 4.12+ and libadwaita 1.5+ (for example Ubuntu 24.04 or newer). It installs an
+application menu entry, icon, desktop actions and the complete local pipeline.
+The standalone commands are `whitecube-trainer` and `whitecube-trainer-cli`, so
+it can coexist with `whitecube-desktop`. The checkout and full desktop keep
+their `cube-train` and `whitecube-train` commands. All CLI examples below work
+with `whitecube-trainer-cli` in a standalone installation.
+
+APT recommends system PyTorch and NumPy for CPU training. If you already have a
+training environment, use `sudo apt install --no-install-recommends
+./dist/whitecube-trainer_1.1.0_all.deb`, then select that environment's Python in
+Train. PyArrow is optional for Parquet input. The package does not bundle a GPU
+runtime or download dependencies from installation scripts. Removing it preserves
+your runs and preferences.
+
+Builds include a `.sha256` sidecar and use `SOURCE_DATE_EPOCH` (or the latest
+repository commit timestamp) for reproducible archives. See
+[packaging/README.Debian](packaging/README.Debian) for package layout and options.
+
+## System readiness and run comparisons
+
+**System** in the navigation rail (`Ctrl+4`) checks the current training draft:
+desktop libraries, selected interpreter, a CPU optimizer step, CUDA access,
+requested precision, optional Parquet support, corpus path accessibility and
+free/writable output, state and preferences storage. Checks run in the background;
+repair instructions and JSON copy/export make failures easier to diagnose.
+This checks access to the corpus; use **Inspect** and preparation for contents
+and split validation.
+
+```sh
+whitecube-trainer-cli --doctor --check-runtime --json
+whitecube-trainer-cli --doctor --check-runtime --python /absolute/path/to/venv/bin/python --device cpu
+```
+
+Readiness is read-only and never installs anything. Without `--check-runtime`,
+the CLI checks paths and desktop libraries and marks the training runtime as
+unverified. A failed required check returns exit code 1.
+
+**Runs → Compare runs** displays up to 20 visible runs, or the selected run
+against a chosen second run. Compare model size, steps, saved best validation
+loss, bits per byte, training rate and cumulative training time. Export the
+displayed snapshot to JSON or spreadsheet-safe CSV; both retain comparability
+warnings. Filters and selection changes mark an earlier comparison as stale.
+
+```sh
+whitecube-trainer-cli --compare-runs
+whitecube-trainer-cli --compare-runs RUN_ID_1 RUN_ID_2 --json
+whitecube-trainer-cli --compare-runs RUN_ID_1 RUN_ID_2 --csv > comparison.csv
+```
+
+Only runs with matching recorded corpus checksums, evaluation budgets, context
+and actual precision receive a lowest-loss label. Missing records and different
+corpora produce explicit warnings. The view reads saved metadata without loading
+checkpoints or hashing large corpora; use **Benchmark** for fresh, controlled
+checkpoint measurements. Throughput is the last saved training rate and depends
+on device and batching. Help, version, summaries, comparisons and diagnostics
+work before a training runtime is installed.
 
 ## Start from this checkout
 

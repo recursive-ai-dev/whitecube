@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Name=Whitecube Trainer
+GenericName=Small Language Model Training
+Comment=Prepare corpora, train local models, compare checkpoints and export notebooks
+Exec=whitecube-trainer
+TryExec=whitecube-trainer
+Icon=whitecube-trainer
+Terminal=false
+Categories=Science;ArtificialIntelligence;
+Keywords=AI;Model;Train;Training;Checkpoint;Tensegrity;PyTorch;
+StartupNotify=true
+StartupWMClass=org.whitecube.Trainer
+Actions=NewRun;Runs;
+
+[Desktop Action NewRun]
+Name=New training run
+Exec=whitecube-trainer --page train
+
+[Desktop Action Runs]
+Name=Browse training runs
+Exec=whitecube-trainer --page runs

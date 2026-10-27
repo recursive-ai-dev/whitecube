@@ -18,20 +18,22 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / 'cube-apps'))
 import engine
 import export_notebook
+import diagnostics
+import cli
 from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 from gi.repository import Pango
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 PLAN_PRESETS = (('Custom', None), ('Smoke test · 20 steps', 20), ('Short · 1,000 steps', 1000),
                 ('Standard · 5,000 steps', 5000), ('Long · 20,000 steps', 20_000))
 RUN_SORTS = ('Newest first', 'Oldest first', 'Name', 'Best validation loss', 'Model size')
-SHORTCUTS = (('Ctrl+1 / Ctrl+2 / Ctrl+3', 'Train, Runs and Progress pages'), ('Ctrl+N', 'New run draft'),
+SHORTCUTS = (('Ctrl+1 / Ctrl+2 / Ctrl+3 / Ctrl+4', 'Train, Runs, Progress and System pages'), ('Ctrl+N', 'New run draft'),
              ('Ctrl+Enter', 'Start training (Train) or resume (Runs)'), ('Ctrl+F', 'Search runs or the log'),
              ('Ctrl+P', 'Preview the selected checkpoint'), ('Ctrl+E', 'Export the selected run report'),
              ('Ctrl+Shift+E', 'Export the selected run as a Jupyter notebook'), ('F2', 'Rename the selected run'),
              ('Delete', 'Move the selected run to Trash (run list focused)'), ('Menu / Shift+F10', 'Run actions menu'),
              ('Double-click / Enter', 'Open a run on the Progress page'), ('F5', 'Refresh'), ('F1', 'Show keyboard shortcuts'))
-PAGES = (('train', '01', 'Train'), ('runs', '02', 'Runs'), ('activity', '03', 'Progress'))
+PAGES = (('train', '01', 'Train'), ('runs', '02', 'Runs'), ('activity', '03', 'Progress'), ('system', '04', 'System'))
 RED = (.784, .063, .18)
 # Whitecube Trainer layer over cube_theme: black rail, stat tiles, chips and a terminal-style log.
 TRAINER_CSS = '''
@@ -74,7 +76,7 @@ frame.card { padding: 0; }
 .console { border: 2px solid #111; box-shadow: 6px 6px 0 rgba(0,0,0,.32); background: #111; }
 .console textview, .console textview text { background: #111; color: #e6e6e6; font-family: "DejaVu Sans Mono", monospace; font-size: 9px; }
 .drop-hover { outline: 3px dashed #111; outline-offset: -6px; }
-stackswitcher.cube-tabs button { padding: 3px 14px; }
+.cube-tabs button { padding: 3px 8px; }
 dialog.floating sheet { border-radius: 0; border: 2px solid #111; box-shadow: 8px 8px 0 rgba(0,0,0,.35); }
 '''
 
@@ -184,6 +186,36 @@ def metrics_csv(metrics):
         if isinstance(item, dict):
             writer.writerow([spreadsheet_text(item.get(field, '')) for field in fields])
     return stream.getvalue()
+
+
+def diagnostic_summary(report):
+    """Keep missing checks distinct from an explicitly successful report."""
+    checks = report.get('checks', [])
+    errors = sum(item.get('status') == 'error' for item in checks)
+    warnings = sum(item.get('status') == 'warning' for item in checks)
+    passed = sum(item.get('status') == 'ok' for item in checks)
+    if not checks:
+        return 'No checks were reported. Refresh to check this system.'
+    state = 'Action needed' if errors else 'Ready with recommendations' if warnings else 'Ready'
+    return f'{state} · {passed} passed · {warnings} recommendations · {errors} problems'
+
+
+def comparison_summary(report):
+    count = len(report.get('runs', []))
+    if not count:
+        return 'No runs match this comparison. Choose another filter or create a run.'
+    if count == 1:
+        return 'One run selected. Include another run to compare results.'
+    if not report.get('comparable'):
+        return f'{count} runs · Validation losses need a common corpus and evaluation plan for a fair comparison.'
+    best = next((run for run in report['runs'] if run['id'] == report.get('best_run_id')), None)
+    return f'{count} comparable runs' + (f' · Lowest validation loss: {best["name"]}' if best else '')
+
+
+def comparison_rows(report):
+    fields = ('id', 'name', 'model_size', 'device', 'status', 'step', 'parameters', 'val_loss',
+              'bits_per_byte', 'tokens_per_second', 'training_seconds', 'corpus_fingerprint')
+    return [{key: run.get(key) for key in fields} for run in report.get('runs', [])]
 
 
 def write_export(path, text):
@@ -425,6 +457,11 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.compare_signature = None
         self.field_probe = {}
         self.last_notebook = None
+        self.readiness_report = None
+        self.readiness_checking = False
+        self.comparison_report = None
+        self.comparison_loading = False
+        self.comparison_run_ids = []
         self.actions = {}
         self.toast = Adw.ToastOverlay()
         self.set_content(self.toast)
@@ -447,6 +484,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.build_train()
         self.build_runs()
         self.build_activity()
+        self.build_system()
         footer = box(False, 12)
         footer.set_margin_top(12); footer.set_margin_bottom(12)
         footer.set_margin_start(18); footer.set_margin_end(18)
@@ -509,8 +547,12 @@ class TrainerWindow(Adw.ApplicationWindow):
                 self.form['dataset'].grab_focus_without_selecting()
             elif current == 'runs':
                 (row or self.run_search).grab_focus()
+            elif current == 'system':
+                self.readiness_button.grab_focus()
             else:
                 self.log_view.grab_focus()
+        if current == 'system' and hasattr(self, 'readiness_button') and self.readiness_report is None:
+            self.check_readiness()
 
     def install_actions(self):
         """Window actions shared by the run context menu, the ⋯ menu and shortcuts."""
@@ -594,7 +636,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         page = self.page('train', 'Train')
         page.append(label('NEW RUN', 'eyebrow'))
         page.append(label('Create a small language model', 'page-title'))
-        page.append(label('Train on your local text, Markdown, JSONL, or Parquet corpus. Checkpoints appear in Desktop Chat. Models use a 256-byte context and learn prose continuation.', 'dim-label'))
+        page.append(label('Train on your local text, Markdown, JSONL, or Parquet corpus. Preview checkpoints here, or open them in Desktop Chat when installed. Models use a 256-byte context and learn prose continuation.', 'dim-label'))
         corpus = box(False, 8)
         corpus.append(self.entry('dataset', '~/train-in'))
         corpus.append(button('Folder…', lambda: self.choose_dataset(True)))
@@ -791,7 +833,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         inner.append(self.cleanup_button)
         paned.set_start_child(side)
 
-        detail_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        detail_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         page = box(spacing=14)
         for setter in ('set_margin_top', 'set_margin_bottom', 'set_margin_start', 'set_margin_end'):
             getattr(page, setter)(22)
@@ -804,7 +846,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.detail_title = label('Choose a run', 'detail-name'); page.append(self.detail_title)
         self.detail_path = label('', 'mono'); page.append(self.detail_path)
         self.detail_tiles = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, column_spacing=10, row_spacing=10,
-                                        min_children_per_line=3, max_children_per_line=3, homogeneous=True)
+                                        min_children_per_line=2, max_children_per_line=3, homogeneous=True)
         page.append(self.detail_tiles)
         self.resume_button = button('Resume run', self.resume, True)
         self.best_button = button('Chat with Best', lambda: self.chat('best'))
@@ -817,7 +859,15 @@ class TrainerWindow(Adw.ApplicationWindow):
         more.set_menu_model(self.run_menu_model())
         page.append(flow((self.resume_button, self.notebook_button, self.best_button, self.latest_button, self.pin_button, self.rename_button, more)))
         self.detail_tabs = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, vhomogeneous=False)
-        tabs = Gtk.StackSwitcher(stack=self.detail_tabs, halign=Gtk.Align.START); tabs.add_css_class('cube-tabs')
+        tabs = Adw.WrapBox(child_spacing=0, line_spacing=4); tabs.add_css_class('cube-tabs')
+        self.detail_tab_buttons = {}
+        previous = None
+        for name, title in (('overview', 'Overview'), ('preview', 'Preview'), ('benchmark', 'Benchmark'), ('compare', 'Compare'), ('export', 'Export')):
+            tab = Gtk.ToggleButton(label=title)
+            if previous is not None: tab.set_group(previous)
+            tab.connect('toggled', lambda widget, name=name: self.detail_tabs.set_visible_child_name(name) if widget.get_active() else None)
+            self.detail_tab_buttons[name] = tab; tabs.append(tab); previous = tab
+        self.detail_tabs.connect('notify::visible-child-name', lambda *_: self.detail_tab_buttons[self.detail_tabs.get_visible_child_name()].set_active(True))
         page.append(tabs); page.append(self.detail_tabs)
 
         overview = box(spacing=12)
@@ -919,6 +969,31 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.benchmark_output = label(benchmark_text([]), 'mono', True); benchmark.append(self.benchmark_output)
         self.benchmark_reports = []
 
+        comparison = box(spacing=12)
+        self.detail_tabs.add_titled(comparison, 'compare', 'Compare')
+        comparison.append(label('Compare saved results across model sizes, training plans and runtimes. '
+                                'The comparison reads run records; checkpoints stay on disk.', 'dim-label'))
+        self.comparison_scope = Gtk.DropDown.new_from_strings(['Visible runs (up to 20)', 'Selected run + another'])
+        self.comparison_picker = Gtk.DropDown.new_from_strings(['No other run'])
+        self.comparison_scope.connect('notify::selected', lambda *_: self.comparison_scope_changed())
+        self.comparison_picker.connect('notify::selected', lambda *_: self.comparison_stale())
+        self.field(comparison, 'Include', self.comparison_scope,
+                   'Visible runs follow the search, filter and sort order in the run list. The selected run appears first.')
+        self.field(comparison, 'Other run', self.comparison_picker)
+        self.comparison_picker.set_sensitive(False)
+        self.comparison_refresh = button('Compare runs', self.compare_runs, True)
+        self.comparison_json = button('Export JSON…', lambda: self.export_comparison(False))
+        self.comparison_csv = button('Export CSV…', lambda: self.export_comparison(True))
+        self.comparison_json.set_sensitive(False); self.comparison_csv.set_sensitive(False)
+        comparison.append(flow((self.comparison_refresh, self.comparison_json, self.comparison_csv)))
+        self.comparison_status = label('Choose the runs to include, then compare their saved results.', 'dim-label', True)
+        comparison.append(self.comparison_status)
+        self.comparison_warning = label('', 'dim-label', True); comparison.append(self.comparison_warning)
+        self.comparison_grid = Gtk.Grid(column_spacing=18, row_spacing=10)
+        comparison_scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                                              vscrollbar_policy=Gtk.PolicyType.NEVER, min_content_height=40)
+        comparison_scroll.set_child(self.comparison_grid); comparison.append(comparison_scroll)
+
         exports = box(spacing=12)
         self.detail_tabs.add_titled(exports, 'export', 'Export')
         notebook = box(spacing=8); notebook.add_css_class('card')
@@ -942,6 +1017,142 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.command_button = button('Copy resume command', self.copy_resume_command)
         weights.append(flow((self.weights_button, self.report_button, self.metrics_button, self.command_button)))
         exports.append(weights)
+
+    def comparison_scope_changed(self):
+        self.comparison_picker.set_sensitive(self.comparison_scope.get_selected() == 1)
+        self.comparison_stale()
+
+    def comparison_stale(self):
+        if (hasattr(self, 'comparison_status') and self.comparison_report
+                and self.comparison_selection() != [run['id'] for run in self.comparison_report.get('runs', [])]):
+            self.comparison_status.set_text('Selection changed. Compare again to refresh the displayed results.')
+
+    def update_comparison_options(self, runs):
+        candidates = [run for run in sort_runs(runs, self.run_sort.get_selected()) if run['id'] != self.selected_id]
+        ids = [run['id'] for run in candidates]
+        if ids == self.comparison_run_ids:
+            return
+        index = self.comparison_picker.get_selected()
+        previous = self.comparison_run_ids[index] if index < len(self.comparison_run_ids) else None
+        self.comparison_run_ids = ids
+        self.comparison_picker.set_model(Gtk.StringList.new([f'{run["name"]} · {run["size"].upper()}' for run in candidates] or ['No other run']))
+        self.comparison_picker.set_selected(ids.index(previous) if previous in ids else 0)
+        self.comparison_stale()
+
+    def comparison_selection(self):
+        if self.comparison_scope.get_selected() == 1:
+            index = self.comparison_picker.get_selected()
+            other = self.comparison_run_ids[index] if index < len(self.comparison_run_ids) else None
+            return list(dict.fromkeys(run_id for run_id in (self.selected_id, other) if run_id))
+        ids = [run_id for run_id in self.row_order if self.run_rows[run_id].get_visible()]
+        if self.selected_id in ids:
+            ids.remove(self.selected_id); ids.insert(0, self.selected_id)
+        return ids[:20]
+
+    def compare_runs(self):
+        if self.comparison_loading:
+            return
+        ids = self.comparison_selection()
+        self.comparison_loading = True; self.comparison_refresh.set_sensitive(False)
+        self.comparison_status.set_text('Reading saved results…')
+        def done(report, error):
+            self.comparison_loading = False; self.comparison_refresh.set_sensitive(True)
+            if error:
+                self.comparison_status.set_text(f'Unable to compare runs: {error}'); return
+            self.comparison_report = report
+            self.comparison_status.set_text(comparison_summary(report))
+            if ids != self.comparison_selection():
+                self.comparison_status.set_text(self.comparison_status.get_text() + '\nSelection changed during comparison. Compare again for the current selection.')
+            self.comparison_warning.set_text('\n'.join([*report.get('warnings', []), *report.get('notes', [])]))
+            self.comparison_json.set_sensitive(bool(report.get('runs')))
+            self.comparison_csv.set_sensitive(bool(report.get('runs')))
+            child = self.comparison_grid.get_first_child()
+            while child:
+                following = child.get_next_sibling(); self.comparison_grid.remove(child); child = following
+            headings = ('Run / state', 'Model / device', 'Steps', 'Best validation', 'Bits / byte', 'Tokens / s', 'Training time')
+            for column, title in enumerate(headings):
+                self.comparison_grid.attach(label(title, 'heading'), column, 0, 1, 1)
+            for row, run in enumerate(report.get('runs', []), 1):
+                number = lambda value, places=3: f'{value:,.{places}f}' if finite_number(value) else '—'
+                name = run['name']
+                if report.get('comparable') and run['id'] == report.get('best_run_id'):
+                    name += ' · LOWEST LOSS'
+                values = (f'{name}\n{run.get("status", "unknown")}',
+                          f'{run.get("model_size", "—")} / {run.get("device", "—")}',
+                          number(run.get('step'), 0), number(run.get('val_loss'), 4), number(run.get('bits_per_byte')),
+                          number(run.get('tokens_per_second'), 0), format_duration(run.get('training_seconds')))
+                for column, value in enumerate(values):
+                    self.comparison_grid.attach(label(value, 'mono', True), column, row, 1, 1)
+        self.background(lambda: self.trainer.compare_runs(ids), done)
+
+    def export_comparison(self, csv_format=False):
+        if not self.comparison_report:
+            return
+        # Capture the displayed snapshot before showing the chooser.
+        report = self.comparison_report
+        text = cli.comparison_csv(report) if csv_format else json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + '\n'
+        self.choose_export('Export run comparison', 'run-comparison.' + ('csv' if csv_format else 'json'), lambda: text)
+
+    def build_system(self):
+        page = self.page('system', 'System readiness')
+        page.append(label('SYSTEM', 'eyebrow'))
+        page.append(label('Ready to train', 'page-title'))
+        page.append(label('Check the selected Python environment, desktop libraries, corpus access and storage. '
+                          'The runtime check runs a small CPU optimizer step in your training Python. '
+                          'Use Inspect on Train to examine corpus formats and text fields.', 'dim-label'))
+        self.readiness_button = button('Check system', self.check_readiness, True)
+        self.readiness_copy = button('Copy report', self.copy_readiness)
+        self.readiness_export = button('Export report…', self.export_readiness)
+        self.readiness_copy.set_sensitive(False); self.readiness_export.set_sensitive(False)
+        page.append(flow((self.readiness_button, self.readiness_copy, self.readiness_export)))
+        self.readiness_status = label('Select this page or Check system to inspect the current training draft.', 'heading', True)
+        page.append(self.readiness_status)
+        self.readiness_checks = box(spacing=14); page.append(self.readiness_checks)
+        page.append(button('Edit training settings', lambda: self.stack.set_visible_child_name('train')))
+
+    def check_readiness(self):
+        if self.readiness_checking or self.closed:
+            return
+        values = self.form_values()
+        self.readiness_checking = True; self.readiness_button.set_sensitive(False)
+        self.readiness_status.set_text('Checking this system and the selected training environment…')
+        def done(report, error):
+            self.readiness_checking = False; self.readiness_button.set_sensitive(True)
+            if error:
+                self.readiness_status.set_text(f'Unable to complete diagnostics: {error}'); return
+            self.readiness_report = report
+            self.readiness_status.set_text(diagnostic_summary(report))
+            if values != self.form_values():
+                self.readiness_status.set_text(self.readiness_status.get_text() + '\nSettings changed during this check. Check again for the current draft.')
+            self.readiness_copy.set_sensitive(True); self.readiness_export.set_sensitive(True)
+            child = self.readiness_checks.get_first_child()
+            while child:
+                following = child.get_next_sibling(); self.readiness_checks.remove(child); child = following
+            states = {'ok': 'PASS', 'warning': 'RECOMMENDATION', 'error': 'ACTION NEEDED'}
+            for check in report.get('checks', []):
+                card = box(spacing=6); card.add_css_class('card')
+                heading = box(False, 10)
+                chip = label(states.get(check.get('status'), 'UNKNOWN'), 'chip')
+                if check.get('status') == 'error': chip.add_css_class('alert')
+                heading.append(chip); heading.append(label(check.get('title', 'System check'), 'heading'))
+                detail = label(check.get('detail', ''), 'dim-label', True)
+                detail.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+                card.append(heading); card.append(detail)
+                if check.get('remedy'):
+                    remedy = label(check['remedy'], 'mono', True)
+                    remedy.set_wrap_mode(Pango.WrapMode.WORD_CHAR); card.append(remedy)
+                self.readiness_checks.append(card)
+        self.background(lambda: diagnostics.collect_diagnostics(self.trainer, check_runtime=True, values=values), done)
+
+    def copy_readiness(self):
+        if self.readiness_report:
+            text = json.dumps(self.readiness_report, indent=2, ensure_ascii=False, allow_nan=False) + '\n'
+            self.get_display().get_clipboard().set(text); self.notify('System report copied')
+
+    def export_readiness(self):
+        if self.readiness_report:
+            text = json.dumps(self.readiness_report, indent=2, ensure_ascii=False, allow_nan=False) + '\n'
+            self.choose_export('Export system report', 'whitecube-system.json', lambda: text)
 
     def build_activity(self):
         page = self.page('activity', 'Progress & logs')
@@ -1272,6 +1483,8 @@ class TrainerWindow(Adw.ApplicationWindow):
             row = row.get_next_sibling()
         disk = f' · {format_bytes(self.total_disk)} on disk' if self.total_disk is not None else ''
         self.run_count.set_text(f'{count} of {len(self.runs)} runs{disk}' + (' · No matching runs. Clear the search or change the filter.' if self.runs and not count else ''))
+        if hasattr(self, 'comparison_status'):
+            self.comparison_stale()
 
     def update_resume_action(self):
         if not hasattr(self, 'resume_button'):
@@ -1458,8 +1671,11 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.open_button.set_sensitive(bool(run))
         self.duplicate_button.set_sensitive(bool(run and run['meta']))
         self.metrics_button.set_sensitive(bool(run))
-        self.best_button.set_sensitive(bool(run and run['best']))
-        self.latest_button.set_sensitive(bool(run and run['latest']))
+        chat_available = os.access('/usr/bin/desktop-chat', os.X_OK)
+        self.best_button.set_sensitive(bool(run and run['best'] and chat_available))
+        self.latest_button.set_sensitive(bool(run and run['latest'] and chat_available))
+        for widget in (self.best_button, self.latest_button):
+            widget.set_tooltip_text('Open checkpoint in Desktop Chat' if chat_available else 'Install Desktop Chat to use this integration. Preview is available in the Preview tab.')
         self.pin_button.set_sensitive(bool(run and run['meta']))
         self.pin_button.set_label('Unpin' if run and run['pinned'] else 'Pin')
         self.command_button.set_sensitive(bool(run and run['prepared'] and run['meta']))
@@ -1478,6 +1694,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.show_detail_header(run)
         self.update_checkpoints(run)
         self.update_compare_options(runs)
+        self.update_comparison_options(runs)
         self.update_rail_job(active, runs)
         if run:
             self.run_detail.set_text(run_details(run, getattr(self, 'run_disk', {}).get(run['id'])))
@@ -2291,6 +2508,8 @@ class TrainerWindow(Adw.ApplicationWindow):
                            lambda: json.dumps(self.trainer.report(run_id), indent=2, ensure_ascii=False) + '\n')
 
     def chat(self, kind):
+        if not os.access('/usr/bin/desktop-chat', os.X_OK):
+            self.notify('Desktop Chat is not installed. Generate text in the Preview tab.'); return
         try:
             subprocess.Popen(self.trainer.chat_command(self.selected_id, kind), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (ValueError, OSError) as error:
@@ -2624,8 +2843,8 @@ class TrainerWindow(Adw.ApplicationWindow):
         if key == Gdk.KEY_F2 and self.rename_button.get_sensitive():
             self.rename(); return True
         if state & Gdk.ModifierType.CONTROL_MASK:
-            if key in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3):
-                self.stack.set_visible_child_name(('train', 'runs', 'activity')[key - Gdk.KEY_1]); return True
+            if key in (Gdk.KEY_1, Gdk.KEY_2, Gdk.KEY_3, Gdk.KEY_4):
+                self.stack.set_visible_child_name(('train', 'runs', 'activity', 'system')[key - Gdk.KEY_1]); return True
             if key in (Gdk.KEY_n, Gdk.KEY_N): self.new_run(); return True
             if key in (Gdk.KEY_f, Gdk.KEY_F):
                 if self.stack.get_visible_child_name() == 'runs': self.run_search.grab_focus()
@@ -2639,7 +2858,11 @@ class TrainerWindow(Adw.ApplicationWindow):
                 page = self.stack.get_visible_child_name()
                 if page == 'train' and self.start_button.get_sensitive(): self.start(); return True
                 if page == 'runs' and self.resume_button.get_sensitive(): self.resume(); return True
-        if key == Gdk.KEY_F5: self.refresh(True); return True
+        if key == Gdk.KEY_F5:
+            if self.stack.get_visible_child_name() == 'system': self.check_readiness()
+            elif self.stack.get_visible_child_name() == 'runs' and self.detail_tabs.get_visible_child_name() == 'compare': self.compare_runs()
+            else: self.refresh(True)
+            return True
         if key == Gdk.KEY_F1: self.show_shortcuts(); return True
         return False
 
@@ -2673,7 +2896,7 @@ class TrainerApp(Adw.Application):
 def main():
     parser = argparse.ArgumentParser(description='Whitecube Trainer — native small-model workshop')
     parser.add_argument('--version', action='version', version=f'Whitecube Trainer {VERSION}')
-    parser.add_argument('--page', choices=('train', 'runs', 'activity'))
+    parser.add_argument('--page', choices=('train', 'runs', 'activity', 'system'))
     parser.add_argument('--screenshot', type=Path)
     parser.add_argument('--no-probe', action='store_true', help='Skip automatic runtime probe (for screenshots/testing)')
     options = parser.parse_args()

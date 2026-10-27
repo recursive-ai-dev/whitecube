@@ -1,3 +1,79 @@
+# Whitecube Trainer 1.1.0: standalone installation and experiment comparison
+
+## Desktop and diagnostics
+
+- System readiness page in the navigation rail, available with Ctrl+4.
+- Background checks of GTK/libadwaita, selected Python, CPU optimizer execution,
+  CUDA availability, precision support and optional Parquet support.
+- Read-only output/state/config access and free-space checks with a conservative
+  corpus/checkpoint storage estimate, plus corpus path accessibility checks.
+- Specific repair guidance, report copying and JSON export; changed drafts mark
+  earlier reports as stale.
+- Responsive Runs section buttons and stat tiles at the default window width;
+  long diagnostic paths and repair commands wrap inside the available space.
+- Desktop Chat actions show their optional dependency and disable when absent.
+
+## Run comparison and command line
+
+- Runs > Compare runs supports the filtered/sorted visible set (up to 20), or
+  the selected run against another run.
+- Compare steps, parameters, model/device, best loss, bits per byte, last training
+  throughput and cumulative training time without importing the model runtime.
+- Rank losses only for matching recorded corpus artifacts and complete evaluation
+  plans, including actual compute precision. Missing metadata and conflicting
+  corpora or settings produce warnings instead of a winner.
+- Reused corpora match by artifact checksums and token format, independently of
+  their source location. Comparisons explicitly distinguish recorded fingerprints
+  from a fresh integrity check.
+- JSON and spreadsheet-safe CSV snapshots retain comparability and warnings.
+  A selection change marks the displayed comparison as stale.
+- A shared headless CLI supports --doctor, --compare-runs and --version alongside
+  the existing training, resume, benchmark and notebook workflows.
+- Full training help uses the same lightweight parser as training, so help works
+  before PyTorch is installed. Runtime settings remain in the selected environment.
+
+## Debian distribution
+
+- Build an independent Architecture: all package without root, a compositor build,
+  network access or compilation. The package contains the app, pipeline and theme.
+- Separate whitecube-trainer and whitecube-trainer-cli launchers, menu actions,
+  scalable icon and AppStream metadata coexist with whitecube-desktop.
+- Declared GTK4/libadwaita/Python dependencies and optional CPU training packages;
+  existing virtual environments remain selectable for CPU or CUDA.
+- Launch on the current Wayland or X11 desktop, with isolated system Python and
+  package-relative lookup that also works when verifying an extracted archive.
+- Root-owned archive metadata, file checksums, reproducible timestamps and a SHA256
+  sidecar. Atomic archive publication and an output-directory build lock.
+- No installation scripts, services or changes to user data. Build-only environments
+  and artifacts are excluded from standalone and full-desktop package payloads.
+- Reusable packaging/smoke-test.py checks an extracted archive with isolated HOME/XDG
+  directories and a real CPU runtime: readiness, train, resume, corpus reuse,
+  comparison, preview, checkpoint benchmark and notebook export.
+
+## 1.1.0 verification
+
+- Full CPU runtime suite: 253 tests in 286 seconds; 223 passed, 29 skipped
+  because GTK bindings are provided by system Python, and one worker integration
+  test failed its initial cooling requirement (CPU remained above 85 °C for
+  60 seconds). That test did not start training. The complete suite log is
+  `dist/test-runtime.log`.
+- Separate system-Python checks: 72 engine tests, 24 desktop tests (including a
+  native GTK workflow), 17 comparison/CLI tests, 10 diagnostics tests and five
+  lightweight parser/output-routing tests passed. Counts overlap the full suite.
+- Eight standalone packaging checks passed, including byte-identical repeat
+  builds, payload checksums, extracted headless launchers and a real GTK window
+  under an isolated Broadway backend. Desktop and AppStream metadata validated.
+- APT installation simulation on Ubuntu 26.04 resolves the package with no
+  removals. The package was built and extracted; it was not installed on the host.
+- Actual extracted-package CPU training prepared 32 documents, trained a real
+  2M model, and saved Best/Latest checkpoints. CPU temperature reached its
+  configured 95 °C limit after the first step, so the two-step acceptance run
+  stopped safely. The extended package acceptance script was not completed;
+  source-level CPU resume, benchmarks, previews and notebook execution passed
+  in the full runtime suite. No thermal controls were disabled.
+- CUDA hardware training was not exercised. A fresh isolated CPU environment
+  used PyTorch 2.14.1+cpu, NumPy 2.5.2 and optional Parquet/notebook/export packages.
+
 # Whitecube Trainer 1.0.0: reproducible training and checkpoint benchmarks
 
 ## Training

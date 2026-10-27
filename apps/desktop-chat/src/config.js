@@ -10,6 +10,9 @@ const DEFAULTS = {
   apiKeyPlain: '',
   apiKeyEncrypted: '',
   confirmDestructive: true,
+  toolsEnabled: true,
+  temperature: 0.7,
+  maxTokens: 8192,
   hotkey: 'CommandOrControl+Shift+T',
   chatSource: 'api',
   checkpointId: '',
@@ -54,6 +57,9 @@ function load() {
     model: cfg.model,
     apiKey,
     confirmDestructive: typeof cfg.confirmDestructive === 'boolean' ? cfg.confirmDestructive : true,
+    toolsEnabled: typeof cfg.toolsEnabled === 'boolean' ? cfg.toolsEnabled : true,
+    temperature: typeof cfg.temperature === 'number' && Number.isFinite(cfg.temperature) && cfg.temperature >= 0 && cfg.temperature <= 2 ? cfg.temperature : DEFAULTS.temperature,
+    maxTokens: Number.isInteger(cfg.maxTokens) && cfg.maxTokens >= 1 && cfg.maxTokens <= 32768 ? cfg.maxTokens : DEFAULTS.maxTokens,
     hotkey: typeof cfg.hotkey === 'string' ? cfg.hotkey : DEFAULTS.hotkey,
     keyStorage: canEncrypt() ? 'encrypted' : 'plaintext',
     chatSource: cfg.chatSource === 'local' ? 'local' : 'api',
@@ -72,7 +78,7 @@ function save(settings) {
   }
 
   const out = { ...DEFAULTS, ...existingRaw };
-  for (const key of ['endpoint', 'model', 'confirmDestructive', 'hotkey', 'chatSource', 'checkpointId', 'modelAliases']) {
+  for (const key of ['endpoint', 'model', 'confirmDestructive', 'toolsEnabled', 'temperature', 'maxTokens', 'hotkey', 'chatSource', 'checkpointId', 'modelAliases']) {
     if (settings[key] !== undefined) out[key] = settings[key];
   }
   const validated = validateSettings(out);
@@ -84,6 +90,7 @@ function save(settings) {
   if (!out.modelAliases || typeof out.modelAliases !== 'object' || Array.isArray(out.modelAliases)) throw new Error('Invalid checkpoint names.');
 
   if (typeof settings.apiKey === 'string') {
+    validateSettings({ ...out, apiKey: settings.apiKey });
     if (canEncrypt() && settings.apiKey) {
       out.apiKeyEncrypted = safeStorage.encryptString(settings.apiKey).toString('base64');
       out.apiKeyPlain = '';

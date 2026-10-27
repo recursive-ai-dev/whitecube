@@ -1,0 +1,56 @@
+.TH CUBE-EDITOR 1 "October 2026" "Cube Editor 0.5.0" "User Commands"
+.SH NAME
+cube-editor-studio, cube-editor-cli \- customize and rebuild Linux live images
+.SH SYNOPSIS
+.B cube-editor-studio
+.RI [ project ]
+.RI [ --page " page" ]
+.br
+.B cube-editor-cli
+.I command
+.RI [ arguments ]
+.SH DESCRIPTION
+Cube Editor Studio is a GTK 4 desktop workspace for persistent Ubuntu and
+Debian live ISO projects, package recipes, payload files, restore points,
+recovery, image exports and virtual machine tests.
+.PP
+The standalone package installs alongside Whitecube's bundled editor without
+replacing its launcher. Use cube-editor-studio for the standalone application.
+.SH OPTIONS
+.TP
+.B --version
+Print the installed version without opening a display.
+.TP
+.B --help
+Show the available options or CLI commands.
+.TP
+.B --cli
+Pass subsequent arguments to the CLI when using cube-editor-studio.
+.SH EXAMPLES
+.nf
+cube-editor-studio /path/to/project
+cube-editor-cli dependencies
+cube-editor-cli inspect /path/to/source.iso
+cube-editor-cli plan /path/to/project build
+.fi
+.SH PRIVILEGES
+The interface runs as your normal user. Filesystem operations authenticate with
+sudo inside a terminal. Guest executables and recipes run with host root
+privileges; use only trusted inputs. The chroot is not a security sandbox.
+.SH FILES
+.TP
+.I ~/.config/cube-editor/recent.json
+Recent projects.
+.TP
+.I ~/cubic/work
+Default project directory.
+.TP
+.I ~/cubic/complete
+Default output directory.
+.TP
+.I /usr/share/doc/cube-editor/README.md.gz
+Full workflow and recovery documentation.
+.SH SEE ALSO
+.BR xorriso (1),
+.BR mksquashfs (1),
+.BR qemu-system-x86_64 (1)

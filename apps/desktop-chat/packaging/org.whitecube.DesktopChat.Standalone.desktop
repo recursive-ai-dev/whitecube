@@ -1,0 +1,19 @@
+[Desktop Entry]
+Name=Desktop Chat
+Comment=AI workspace with saved chats, local models and file tools
+Exec=whitecube-chat --show
+Icon=org.whitecube.DesktopChat.Standalone
+Terminal=false
+Type=Application
+Categories=Utility;Chat;
+Keywords=AI;Assistant;Chat;Models;Whitecube;
+StartupWMClass=desktop-chat
+Actions=NewWindow;Settings;
+
+[Desktop Action NewWindow]
+Name=Show chat
+Exec=whitecube-chat --show
+
+[Desktop Action Settings]
+Name=Settings
+Exec=whitecube-chat --settings

@@ -1,23 +1,70 @@
 #!/bin/sh
-# Wayland-native launcher for desktop-chat (whitecube has no X).
-# Usage: desktop-chat [--toggle|--show|--hide|--settings|--quit] [--checkpoint RUN/ckpt_best.pt]
-# The system package owns its runtime; source checkouts can use local Electron.
+# Source and packaged launcher. Keep app arguments literal and runtime private.
+set -eu
 script_path=$(readlink -f -- "$0") || exit 1
 app_dir=${script_path%/*}
 cd -- "$app_dir" || exit 1
-export MOZ_ENABLE_WAYLAND=1 ELECTRON_OZONE_PLATFORM_HINT=wayland
-unset DISPLAY
+case ${1:-} in
+  -h|--help)
+    cat <<'HELP'
+Usage: whitecube-chat [OPTION]
+Open the Desktop Chat workspace. Repeated launches control the running app.
+
+  --show                     Show the window
+  --hide                     Start or leave the window hidden
+  --toggle                   Toggle the window
+  --settings, --configure     Open settings
+  --checkpoint RUN/FILE.pt    Select a trained local checkpoint
+  --quit                     Quit the running app
+  --version                  Print application and bundled runtime versions
+  --help                     Show this help
+
+Configure an OpenAI-compatible endpoint in Settings. A localhost server needs
+no key. Trained checkpoints additionally need the Whitecube training runtime.
+
+DESKTOP_CHAT_RUNTIME overrides the Electron executable.
+DESKTOP_CHAT_OZONE_PLATFORM selects auto, wayland or x11 (normally automatic).
+HELP
+    exit 0 ;;
+  --version)
+    if [ -f "$app_dir/VERSION" ]; then
+      version=$(cat "$app_dir/VERSION")
+    else
+      version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$app_dir/package.json" | head -n 1)
+    fi
+    printf 'Desktop Chat %s\n' "$version"
+    exit 0 ;;
+esac
 unset ELECTRON_RUN_AS_NODE
-runtime=${DESKTOP_CHAT_RUNTIME:-"$app_dir/../../../lib/whitecube/desktop-chat-runtime/electron"}
-if [ -x "$runtime" ]; then
-  exec "$runtime" --ozone-platform=wayland "$app_dir" "$@"
+platform=${DESKTOP_CHAT_OZONE_PLATFORM:-${ELECTRON_OZONE_PLATFORM_HINT:-}}
+if [ -z "$platform" ]; then
+  if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+    platform=wayland
+  elif [ -n "${DISPLAY:-}" ]; then
+    platform=x11
+  else
+    platform=auto
+  fi
+fi
+case $platform in auto|wayland|x11) ;; *) printf '%s\n' 'Desktop Chat: platform must be auto, wayland or x11.' >&2; exit 2 ;; esac
+export ELECTRON_OZONE_PLATFORM_HINT=$platform
+# Standalone Debian layout, existing Whitecube layout, source checkout, PATH.
+if [ -n "${DESKTOP_CHAT_RUNTIME:-}" ]; then
+  runtime=$DESKTOP_CHAT_RUNTIME
+  if [ ! -x "$runtime" ]; then
+    printf '%s\n' 'Desktop Chat: DESKTOP_CHAT_RUNTIME is not executable.' >&2
+    exit 127
+  fi
+elif [ -x "$app_dir/../runtime/electron" ]; then
+  runtime=$app_dir/../runtime/electron
+elif [ -x "$app_dir/../../../lib/whitecube/desktop-chat-runtime/electron" ]; then
+  runtime=$app_dir/../../../lib/whitecube/desktop-chat-runtime/electron
 elif [ -x "$app_dir/node_modules/.bin/electron" ]; then
-  exec "$app_dir/node_modules/.bin/electron" --ozone-platform=wayland "$app_dir" "$@"
+  runtime=$app_dir/node_modules/.bin/electron
 elif command -v electron >/dev/null 2>&1; then
-  exec electron --ozone-platform=wayland "$app_dir" "$@"
+  runtime=electron
+else
+  printf '%s\n' 'Desktop Chat: Electron is missing. Reinstall whitecube-desktop-chat, or run npm ci in the source checkout.' >&2
+  exit 127
 fi
-printf '%s\n' 'Desktop Chat: Electron is not installed or is missing from PATH.' >&2
-if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v foot >/dev/null 2>&1; then
-  foot -T 'Desktop Chat could not start' /bin/sh -c 'printf "%s\n" "Desktop Chat runtime is missing. Reinstall whitecube-desktop to restore it." "Press Enter to close."; read -r reply' &
-fi
-exit 127
+exec "$runtime" "--ozone-platform=$platform" "$app_dir" "$@"

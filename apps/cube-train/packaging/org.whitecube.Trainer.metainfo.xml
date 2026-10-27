@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.whitecube.Trainer</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>Whitecube Trainer</name>
+  <url type="homepage">https://github.com/recursive-ai-dev/whitecube</url>
+  <developer id="io.github.recursive-ai-dev"><name>Whitecube contributors</name></developer>
+  <summary>Train and compare small local language models</summary>
+  <description>
+    <p>A native desktop workshop for preparing corpora, training small CPU or CUDA language models, and comparing saved checkpoints.</p>
+    <p>Monitor training metrics, resume interrupted runs, generate text previews, benchmark checkpoints, and export portable Jupyter notebooks.</p>
+    <p>The desktop uses GTK4 and libadwaita. Training runs in a Python environment you select, independently of the desktop process.</p>
+  </description>
+  <launchable type="desktop-id">whitecube-trainer.desktop</launchable>
+  <provides><binary>whitecube-trainer</binary><binary>whitecube-trainer-cli</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <supports><control>pointing</control><control>keyboard</control></supports>
+</component>

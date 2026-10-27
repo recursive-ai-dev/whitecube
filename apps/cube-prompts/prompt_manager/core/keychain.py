@@ -73,7 +73,7 @@ def _xor_cipher(data: bytes, key: bytes) -> bytes:
 
 
 class KeyVault:
-    """Store secrets in a native OS keyring, never in an application disk file."""
+    """Store secrets in a native keyring or the explicitly chosen private file."""
 
     def __init__(self, use_keyring: bool = True, vault_path: Optional[Path] = None,
                  private_file: Optional[Path] = None):
@@ -83,6 +83,7 @@ class KeyVault:
         self._session: Dict[str, str] = {}
         self._probed = False
         self._cached_backend = None
+        self._lock = RLock()
 
     def _store(self):
         """The keyring backend, or None when secrets go to the private file.
@@ -117,20 +118,28 @@ class KeyVault:
             return {}
         except (OSError, ValueError):
             raise CredentialStoreError(f"Could not read {self.private_file}.") from None
-        return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in data.items()):
+            raise CredentialStoreError("Invalid credential file. Restore a valid copy before saving credentials.")
+        return data
 
     def _write_private(self, data: Dict[str, str]) -> None:
         directory = self.private_file.parent
-        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd, name = tempfile.mkstemp(prefix=".credentials-", dir=directory)
+        name = None
         try:
-            os.fchmod(fd, 0o600)
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+            fd, name = tempfile.mkstemp(prefix=".credentials-", dir=directory)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                os.fchmod(stream.fileno(), 0o600)
                 json.dump(data, stream, indent=2, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(name, self.private_file)
         except OSError:
-            Path(name).unlink(missing_ok=True)
             raise CredentialStoreError(f"Could not save credentials to {self.private_file}.") from None
+        finally:
+            if name is not None:
+                Path(name).unlink(missing_ok=True)
 
     def _backend(self, required: bool = False):
         try:
@@ -154,6 +163,10 @@ class KeyVault:
             return None
 
     def _get(self, name: str) -> str:
+        with self._lock:
+            return self._get_locked(name)
+
+    def _get_locked(self, name: str) -> str:
         if not self._use_keyring:
             return self._session.get(name, "")
         if self.private_file is not None:
@@ -171,6 +184,10 @@ class KeyVault:
             raise CredentialStoreError("Could not read the OS keyring. Unlock it and retry.") from None
 
     def _set(self, name: str, value: str) -> None:
+        with self._lock:
+            self._set_locked(name, value)
+
+    def _set_locked(self, name: str, value: str) -> None:
         if not self._use_keyring:
             if value:
                 self._session[name] = value

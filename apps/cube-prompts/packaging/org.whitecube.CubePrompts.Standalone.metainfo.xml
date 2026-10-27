@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.whitecube.CubePrompts.Standalone</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0 AND MIT</project_license>
+  <developer id="org.whitecube"><name>Whitecube contributors</name></developer>
+  <name>Cube Prompts Studio</name>
+  <summary>A local prompt library and model comparison workbench</summary>
+  <description>
+    <p>Keep your prompt library on your own computer. Organize reusable prompts,
+    fill template variables, review revisions, and export your work.</p>
+    <p>Compare responses from supported AI providers or a local Ollama server.
+    API credentials are stored separately from library backups.</p>
+  </description>
+  <launchable type="desktop-id">org.whitecube.CubePrompts.Standalone.desktop</launchable>
+  <provides><binary>cube-prompts-studio</binary></provides>
+  <url type="homepage">https://github.com/recursive-ai-dev/whitecube</url>
+  <content_rating type="oars-1.1"/>
+</component>

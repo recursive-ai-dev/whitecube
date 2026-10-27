@@ -4,6 +4,9 @@ const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const os = require('node:os');
+const directories = [];
+test.after(() => { for (const directory of directories) fs.rmSync(directory, { recursive: true, force: true }); });
 
 async function start(args, overrides = {}) {
   const windows = [];
@@ -29,6 +32,9 @@ async function start(args, overrides = {}) {
     setContextMenu() {}
   }
   const app = new EventEmitter();
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-chat-main-'));
+  directories.push(directory);
+  app.getPath = () => directory;
   app.commandLine = { appendSwitch() {} };
   app.requestSingleInstanceLock = data => { app.launchData = data; return true; };
   app.whenReady = () => Promise.resolve();
@@ -51,6 +57,8 @@ async function start(args, overrides = {}) {
     require(name) {
       if (name === 'electron') return electron;
       if (name === 'path') return path;
+      if (name === 'node:fs') return fs;
+      if (name === './src/history') return require('../src/history');
       if (name === './src/config') return { load: () => settings, save: value => Object.assign(settings, value), configPath: () => '/test/config.json' };
       if (name === './src/local-models') return { LocalModels: class {
         constructor() { this.directory = '/test/train-out'; Object.assign(this, overrides.localModels); }

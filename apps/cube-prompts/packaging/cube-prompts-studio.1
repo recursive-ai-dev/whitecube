@@ -1,0 +1,37 @@
+.TH CUBE-PROMPTS-STUDIO 1 "October 2026" "Cube Prompts" "User Commands"
+.SH NAME
+cube-prompts-studio \- local prompt library and AI comparison workbench
+.SH SYNOPSIS
+.B cube-prompts-studio
+.RI [ options ]
+.SH DESCRIPTION
+Organize AI prompts, fill template variables, save revisions, export libraries,
+and compare responses from supported providers or local Ollama models.
+The library and editor work without an Internet connection.
+.SH OPTIONS
+.TP
+.B \-\-help
+Display available options and exit.
+.TP
+.B \-\-version
+Display the application version and exit.
+.TP
+.BI \-\-page " PAGE"
+Start on library, run, templates, history, export, or settings.
+.TP
+.BI \-\-screenshot " FILE"
+Render a preview PNG and exit. Requires a graphical display.
+.SH FILES
+.TP
+.I $XDG_DATA_HOME/cube-prompts/prompts.db
+SQLite library, defaulting to ~/.local/share/cube-prompts/prompts.db.
+.TP
+.I $XDG_CONFIG_HOME/cube-prompts/settings.json
+Application settings, defaulting to ~/.config/cube-prompts/settings.json.
+.TP
+.I $XDG_CONFIG_HOME/cube-prompts/credentials.json
+Private credential fallback when no supported OS keyring is available.
+.SH NOTES
+The standalone package coexists with Whitecube Desktop. Its command is
+cube-prompts-studio, while Whitecube's command remains cube-prompts.
+Both use the same per-user library. Removing the package preserves user data.

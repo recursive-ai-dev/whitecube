@@ -1,9 +1,10 @@
 """Database connection, schema management, and migrations for Prompt Manager."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 import sqlite3
 import uuid
+import threading
 from typing import Optional
 from prompt_manager.config import DATABASE_PATH, ensure_directories
 
@@ -90,6 +91,30 @@ CREATE TABLE IF NOT EXISTS prompt_revisions (
     template_content TEXT NOT NULL,
     system_instruction TEXT DEFAULT '',
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS arena_runs (
+    id TEXT PRIMARY KEY,
+    prompt_id TEXT REFERENCES prompts(id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    system_instruction TEXT NOT NULL,
+    variables_json TEXT NOT NULL DEFAULT '{}',
+    temperature REAL NOT NULL DEFAULT 0.7,
+    max_tokens INTEGER NOT NULL DEFAULT 2048,
+    responses_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS arena_runs_prompt_created ON arena_runs(prompt_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS arena_runs_created ON arena_runs(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS variable_presets (
+    id TEXT PRIMARY KEY,
+    prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    values_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(prompt_id, name)
 );
 """
 
@@ -191,6 +216,7 @@ class Database:
     """SQLite Database manager for Prompt Manager."""
 
     def __init__(self, db_path: Optional[Path] = None):
+        self._local = threading.local()
         if db_path is None:
             ensure_directories()
             self.db_path = DATABASE_PATH
@@ -205,24 +231,61 @@ class Database:
         self._init_db()
 
     def get_connection(self) -> sqlite3.Connection:
+        active = getattr(self._local, "connection", None)
+        if active is not None:
+            return _BorrowedConnection(active)
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA busy_timeout = 10000;")
         return conn
+
+    @contextmanager
+    def transaction(self):
+        """Group repository operations atomically, on this thread only.
+
+        Repository methods can keep their normal connection scopes; borrowed
+        connections leave commit, rollback and close to this outer scope.
+        """
+        if getattr(self._local, "connection", None) is not None:
+            raise RuntimeError("Nested library transactions are not supported")
+        conn = self.get_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._local.connection = conn
+            yield
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            self._local.connection = None
+            conn.close()
 
     def _init_db(self) -> None:
         """Initialize database schema and seed default prompts if empty."""
         with closing(self.get_connection()) as conn, conn:
+            existed = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='prompts'").fetchone() is not None
+            indexed = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             conn.executescript(BASE_SCHEMA_SQL)
             if self.fts_enabled:
                 conn.executescript(FTS_SCHEMA_SQL)
             self._migrate_add_template_infrastructure(conn)
+            run_columns = {row[1] for row in conn.execute("PRAGMA table_info(arena_runs)")}
+            if "max_tokens" not in run_columns:
+                conn.execute("ALTER TABLE arena_runs ADD COLUMN max_tokens INTEGER NOT NULL DEFAULT 2048")
+
+            if self.fts_enabled:
+                if "prompts_fts" not in indexed:
+                    conn.execute("INSERT INTO prompts_fts(id, title, description, template_content, system_instruction) SELECT id, title, description, template_content, system_instruction FROM prompts")
+                if "templates_fts" not in indexed:
+                    conn.execute("INSERT INTO templates_fts(id, name, description, content, system_instruction, category) SELECT id, name, description, content, system_instruction, category FROM prompt_templates")
 
             # Check if any prompt exists
             cursor = conn.execute("SELECT COUNT(*) FROM prompts")
             count = cursor.fetchone()[0]
-            if count == 0:
+            if count == 0 and not existed:
                 self._seed_default_data(conn)
 
     def _migrate_add_template_infrastructure(self, conn: sqlite3.Connection) -> None:
@@ -327,3 +390,22 @@ class Database:
                             "INSERT OR IGNORE INTO prompt_tags (prompt_id, tag_id) VALUES (?, ?)",
                             (prompt_id, actual_tag_id),
                         )
+
+
+class _BorrowedConnection:
+    """Delegate SQL while the Database.transaction owner controls lifetime."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def close(self):
+        pass

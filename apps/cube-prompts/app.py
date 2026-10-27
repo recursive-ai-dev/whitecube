@@ -9,6 +9,8 @@ side-by-side run of one prompt against up to three models.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
+from difflib import unified_diff
 import os
 from pathlib import Path
 import sys
@@ -25,10 +27,13 @@ from prompt_manager.core.keychain import CredentialStoreError, get_key_vault
 from prompt_manager.core.models import Folder, Prompt, PromptTemplate
 from prompt_manager.core.template_engine import check_syntax_errors, extract_variables, hydrate_template
 from prompt_manager.core.token_counter import calculate_metrics
-from prompt_manager.integrations.llm_providers import LLMClient, discover_ollama_models, list_models_by_provider
+from prompt_manager.integrations.llm_providers import LLMClient, discover_ollama_models, list_models_by_provider, get_model_info, validate_base_url
 from prompt_manager.storage import backup
 from prompt_manager.storage.database import Database
 from prompt_manager.storage.repository import PromptRepository
+from prompt_manager.storage.run_history import RunHistoryRepository
+from prompt_manager.storage.presets import PresetRepository
+from prompt_manager.core.run_exporter import export_run_json, export_run_markdown
 
 import gi
 gi.require_version('Gtk', '4.0')
@@ -157,10 +162,39 @@ def get_text(view):
 
 
 def short_time(value):
-    """2026-10-10T12:34:56.123 -> 2026-10-10 12:34; other text unchanged."""
+    """Display aware timestamps in local time; preserve legacy naive dates."""
     if isinstance(value, str) and len(value) >= 16 and value[10:11] in ('T', ' '):
+        try:
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is not None:
+                return parsed.astimezone().strftime('%Y-%m-%d %H:%M')
+        except ValueError:
+            pass
         return f'{value[:10]} {value[11:16]}'
     return value or ''
+
+
+def custom_model_ids():
+    """Ignore invalid saved IDs so a damaged preference cannot prevent startup."""
+    saved = config.get_setting('custom_models', [])
+    if not isinstance(saved, list):
+        return []
+    valid = []
+    for model_id in saved:
+        try:
+            model = get_model_info(model_id)
+            if isinstance(model_id, str) and ':' in model_id and model.id not in valid:
+                valid.append(model.id)
+        except ValueError:
+            continue
+    return valid
+
+
+def history_model(model_id):
+    try:
+        return get_model_info(model_id)
+    except ValueError:
+        return None
 
 
 def render_export(kind, prompt, hydrated):
@@ -180,8 +214,10 @@ def render_export(kind, prompt, hydrated):
 class PromptsWindow(Adw.ApplicationWindow):
     def __init__(self, app, repo):
         super().__init__(application=app, title='Cube Prompts')
-        self.set_default_size(1240, 820)
+        self.set_default_size(1380, 900)
         self.repo = repo
+        self.run_history = RunHistoryRepository(repo.db)
+        self.presets = PresetRepository(repo.db)
         self.vault = get_key_vault()
         self.prompts = []
         self.current = None          # the Prompt in the editor, as last saved
@@ -192,8 +228,17 @@ class PromptsWindow(Adw.ApplicationWindow):
         self.folders = []
         self.filters = []            # (kind, value) behind each filter entry
         self.models = [m for m in list_models_by_provider() if m.provider != 'ollama']
+        for model_id in custom_model_ids():
+            model = get_model_info(model_id)
+            if model and model.id not in [m.id for m in self.models]:
+                self.models.append(model)
         self.ollama_models = []
         self.running = False
+        self.cancel_event = None
+        self.run_context = None
+        self.closing = False
+        self.close_pending = False
+        self.var_signature = None
         self.revisions = []
         self.templates = []
 
@@ -203,7 +248,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         title = box(False, 8)
         title.append(label('Cube Prompts', 'title'))
-        title.append(label(f'Prompt library · {VERSION}', 'muted'))
+        title.append(chip(f'STUDIO {VERSION}'))
         header.set_title_widget(title)
         header.pack_start(button('New', self.new_prompt, css='flat', icon='list-add-symbolic', tooltip='New prompt (Ctrl N)'))
         self.save_button = button('Save', lambda: self.save(checkpoint=True), css='flat', icon='document-save-symbolic',
@@ -234,7 +279,8 @@ class PromptsWindow(Adw.ApplicationWindow):
         self.status.set_hexpand(True)
         self.status.set_ellipsize(Pango.EllipsizeMode.END)
         footer.append(self.status)
-        footer.append(label('Ctrl 1-6  pages  ·  Ctrl N  new  ·  Ctrl S  save  ·  Ctrl F  search  ·  Ctrl R  run', 'shortcut'))
+        shortcuts = label('Ctrl N  new  ·  Ctrl S  save  ·  Ctrl K  search  ·  Ctrl R  run', 'shortcut')
+        footer.append(shortcuts)
         layout.append(footer)
         self.toast_overlay.set_child(layout)
 
@@ -254,10 +300,10 @@ class PromptsWindow(Adw.ApplicationWindow):
     # --- layout ---------------------------------------------------------------
     def make_rail(self):
         rail = box(spacing=12, css='rail')
-        rail.set_size_request(230, -1)
+        rail.set_size_request(184, -1)
         rail.set_hexpand(False)
         rail.append(label('Cube Prompts', 'rail-name'))
-        rail.append(label('PROMPT LIBRARY', 'rail-caption'))
+        rail.append(label('WRITE / TEST / REFINE', 'rail-caption'))
         rail.append(box(spacing=8))
         self.rail_buttons = {}
         for index, (name, title, icon) in enumerate(PAGES, 1):
@@ -285,11 +331,17 @@ class PromptsWindow(Adw.ApplicationWindow):
         page.append(label(lede, 'lede', True))
 
     def make_library(self, page):
-        split = box(False, 18)
+        self.heading(page, 'WORKSPACE', 'A better prompt starts here',
+                     'Build your library, fill in variables, and take the same prompt to any model.')
+        split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        split.set_position(260)
+        split.set_shrink_start_child(False)
+        split.set_shrink_end_child(False)
         split.set_vexpand(True)
 
         listing = box(spacing=8)
-        listing.set_size_request(300, -1)
+        listing.set_size_request(220, -1)
+        listing.set_margin_end(18)
         listing.set_hexpand(False)
         self.search = Gtk.SearchEntry()
         self.search.set_property('placeholder-text', 'Search prompts')
@@ -305,12 +357,16 @@ class PromptsWindow(Adw.ApplicationWindow):
         listing.append(row)
         self.count_label = label('', 'muted')
         listing.append(self.count_label)
+        self.sort_drop = Gtk.DropDown.new_from_strings(['Recently edited', 'Title A–Z', 'Most used', 'Oldest first'])
+        self.sort_drop.set_tooltip_text('Sort the library')
+        self.sort_drop.connect('notify::selected', lambda *_: self.reload_list())
+        listing.append(self.sort_drop)
         self.prompt_list = Gtk.ListBox()
         self.prompt_list.add_css_class('boxed-list')
         self.prompt_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
         self.prompt_list.connect('row-activated', self.on_prompt_activated)
         listing.append(self.prompt_list)
-        split.append(listing)
+        split.set_start_child(listing)
 
         work = box(spacing=18)
         work.set_hexpand(True)
@@ -380,9 +436,18 @@ class PromptsWindow(Adw.ApplicationWindow):
         editor.append(actions)
         work.append(editor)
 
-        fill = box(False, 18)
-        fill.set_homogeneous(True)
+        fill = box(spacing=18)
         variables = card('Variables', None)
+        preset_row = box(False, 8)
+        self.preset_drop = Gtk.DropDown.new_from_strings(['Session values'])
+        self.preset_drop.set_hexpand(True)
+        self.preset_drop.connect('notify::selected', self.apply_preset)
+        preset_row.append(self.preset_drop)
+        preset_row.append(button('Save preset', self.ask_save_preset, icon='document-save-symbolic'))
+        self.delete_preset_button = button('', self.delete_preset, icon='user-trash-symbolic', tooltip='Delete selected preset')
+        self.delete_preset_button.set_sensitive(False)
+        preset_row.append(self.delete_preset_button)
+        variables.append(preset_row)
         self.var_box = box(spacing=10)
         variables.append(self.var_box)
         fill.append(variables)
@@ -395,13 +460,13 @@ class PromptsWindow(Adw.ApplicationWindow):
         preview.append(self.metrics)
         fill.append(preview)
         work.append(fill)
-        split.append(work)
+        split.set_end_child(work)
         page.append(split)
 
     def make_run(self, page):
         self.heading(page, 'RUN', 'Try it on real models',
                      'Sends the filled-in prompt to up to three models at once and compares answers, time, '
-                     'tokens and estimated cost. Pollinations needs no key; others use the keys in Settings.')
+                     'tokens and estimated cost. Completed comparisons are kept in History, including failures.')
         setup = box(False, 12, 'hero')
         self.run_drops = []
         for slot in range(3):
@@ -416,14 +481,25 @@ class PromptsWindow(Adw.ApplicationWindow):
         temp.append(label('TEMPERATURE', 'eyebrow'))
         self.temperature = Gtk.SpinButton.new_with_range(0, 2, 0.1)
         self.temperature.set_digits(1)
-        self.temperature.set_value(0.7)
+        self.temperature.set_value(config.get_setting('run_temperature', 0.7))
         temp.append(self.temperature)
         setup.append(temp)
         page.append(setup)
+        options = box(False, 12)
+        options.append(label('MAX OUTPUT TOKENS', 'meta-key'))
+        self.max_tokens = Gtk.SpinButton.new_with_range(64, 32768, 64)
+        self.max_tokens.set_value(config.get_setting('run_max_tokens', 2048))
+        self.max_tokens.set_tooltip_text('Output limit sent to each provider; model limits may be lower.')
+        options.append(self.max_tokens)
+        options.append(label('Cost estimates use the bundled catalog. Custom model pricing is unknown.', 'muted', True))
+        page.append(options)
         self.fill_run_models()
         actions = box(False, 12)
         self.run_button = button('Run prompt', self.run_prompt, css='primary', icon='media-playback-start-symbolic')
         actions.append(self.run_button)
+        self.cancel_button = button('Cancel', self.cancel_run, icon='process-stop-symbolic')
+        self.cancel_button.set_sensitive(False)
+        actions.append(self.cancel_button)
         actions.append(button('Find local Ollama models', self.discover_ollama, icon='view-refresh-symbolic'))
         self.run_hint = label('', 'muted', True)
         self.run_hint.set_valign(Gtk.Align.CENTER)
@@ -433,6 +509,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         self.results = box(False, 14)
         self.results.set_homogeneous(True)
         page.append(self.results)
+        self.results.append(card('Ready when you are', 'Choose your models above. Each answer appears as it finishes.'))
 
     def make_templates(self, page):
         self.heading(page, 'TEMPLATES', 'Start from a pattern',
@@ -453,8 +530,24 @@ class PromptsWindow(Adw.ApplicationWindow):
         page.append(split)
 
     def make_history(self, page):
-        self.heading(page, 'HISTORY', 'Revisions', 'Every Save (Ctrl S) keeps the version it replaces. Pick one to '
-                     'compare, then restore it into the editor.')
+        self.heading(page, 'HISTORY', 'Keep the work behind the answer',
+                     'Revisit model comparisons and compare saved revisions with your current draft.')
+        runs = card('Model comparisons', 'Snapshots keep the exact filled-in input, variables, answers, and errors on this computer.')
+        self.run_filter = Gtk.DropDown.new_from_strings(['All prompts', 'Current prompt'])
+        self.run_filter.connect('notify::selected', lambda *_: self.reload_runs())
+        runs.append(self.run_filter)
+        self.saved_run_list = Gtk.ListBox()
+        self.saved_run_list.add_css_class('boxed-list')
+        self.saved_run_list.connect('row-selected', self.on_saved_run_selected)
+        run_scroll = scroll(self.saved_run_list, min_height=150)
+        run_scroll.set_vexpand(False)
+        run_scroll.set_max_content_height(220)
+        run_scroll.set_propagate_natural_height(True)
+        runs.append(run_scroll)
+        self.saved_run_detail = box(spacing=12)
+        runs.append(self.saved_run_detail)
+        page.append(runs)
+        page.append(label('Prompt revisions', 'section-title'))
         split = box(False, 18)
         listing = box(spacing=8)
         listing.set_size_request(300, -1)
@@ -467,6 +560,10 @@ class PromptsWindow(Adw.ApplicationWindow):
         detail.set_hexpand(True)
         self.revision_title = label('Select a revision.', 'section-title')
         detail.append(self.revision_title)
+        self.revision_diff = Gtk.CheckButton(label='Show changes from this revision to the current draft')
+        self.revision_diff.set_active(True)
+        self.revision_diff.connect('toggled', lambda *_: self.show_revision())
+        detail.append(self.revision_diff)
         console = box(css='console')
         frame, self.revision_view = text_area(320, editable=False, css='preview')
         console.append(frame)
@@ -493,7 +590,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         console.append(frame)
         single.append(console)
         page.append(single)
-        whole = card('Whole library', 'JSON keeps prompts, folders, tags and templates. CSV and Markdown are for '
+        whole = card('Whole library', 'JSON keeps prompts, folders, tags, templates, revisions, variable presets, and comparisons. CSV and Markdown are for '
                      'spreadsheets and notes; Markdown cannot be imported back.')
         row = box(False, 10)
         row.append(button('Back up as JSON…', lambda: self.save_library('json'), css='primary', icon='document-save-symbolic'))
@@ -537,6 +634,21 @@ class PromptsWindow(Adw.ApplicationWindow):
         actions.append(button('Save settings', self.save_settings, css='primary', icon='document-save-symbolic'))
         actions.append(button('Reload', self.load_settings, icon='view-refresh-symbolic'))
         page.append(actions)
+        custom = card('Use any model ID',
+                      'Add a model from your provider account or local server using provider:model-id. '
+                      'For example, ollama:qwen3:8b or openrouter:vendor/model. Choose it on the Run page.')
+        custom_row = box(False, 10)
+        self.custom_model_entry = Gtk.Entry()
+        self.custom_model_entry.set_hexpand(True)
+        self.custom_model_entry.set_placeholder_text('openai:your-model-id')
+        self.custom_model_entry.connect('activate', lambda *_: self.add_custom_model())
+        custom_row.append(self.custom_model_entry)
+        custom_row.append(button('Add model', self.add_custom_model, icon='list-add-symbolic'))
+        custom.append(custom_row)
+        self.custom_model_list = box(spacing=8)
+        custom.append(self.custom_model_list)
+        page.append(custom)
+        self.refresh_custom_models()
         page.append(label(f'Library: {self.repo.db.db_path}', 'muted', selectable=True))
 
     # --- navigation and shortcuts ---------------------------------------------
@@ -551,6 +663,7 @@ class PromptsWindow(Adw.ApplicationWindow):
             self.reload_templates()
         elif name == 'history':
             self.reload_revisions()
+            self.reload_runs()
         elif name == 'export':
             self.refresh_export()
         elif name == 'settings':
@@ -586,7 +699,16 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     def on_close(self, *_):
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return True
+        if self.running:
+            self.close_pending = True
+            self.cancel_run()
+            self.set_status('Cancelling and saving the comparison before closing…')
+            return True
+        self.closing = True
+        if self.cancel_event:
+            self.cancel_event.set()
         return False
 
     def toast(self, text):
@@ -602,7 +724,11 @@ class PromptsWindow(Adw.ApplicationWindow):
                 result, error = work(), None
             except Exception as exc:          # reported in the UI, never swallowed
                 result, error = None, exc
-            GLib.idle_add(lambda: done(result, error) and False)
+            def complete():
+                if not self.closing:
+                    done(result, error)
+                return False
+            GLib.idle_add(complete)
         threading.Thread(target=run, daemon=True).start()
 
     # --- library --------------------------------------------------------------
@@ -634,6 +760,13 @@ class PromptsWindow(Adw.ApplicationWindow):
             tag_id=value if kind == 'tag' else None,
             favorite_only=kind == 'favorites',
             search_query=self.search.get_text().strip() or None)
+        sort = self.sort_drop.get_selected()
+        if sort == 1:
+            self.prompts.sort(key=lambda p: p.title.casefold())
+        elif sort == 2:
+            self.prompts.sort(key=lambda p: (-p.use_count, p.title.casefold()))
+        elif sort == 3:
+            self.prompts.sort(key=lambda p: p.created_at)
         clear(self.prompt_list)
         folder_names = {f.id: f.name for f in self.folders}
         selected_id = select_id or (self.current.id if self.current else None)
@@ -676,7 +809,8 @@ class PromptsWindow(Adw.ApplicationWindow):
         if not prompt_id or (self.current and prompt_id == self.current.id):
             return
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return
         prompt = self.repo.get_prompt_by_id(prompt_id)
         if prompt:
             self.open_prompt(prompt)
@@ -704,6 +838,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         self.loading = False
         self.set_dirty(False)
         self.rebuild_variables()
+        self.reload_presets()
         self.refresh_preview()
         for row in self._rows(self.prompt_list):
             if getattr(row, 'prompt_id', None) == prompt.id:
@@ -734,8 +869,9 @@ class PromptsWindow(Adw.ApplicationWindow):
         if self.loading:
             return
         self.set_dirty(True)
-        names = [s.name for s in extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view))]
-        if names != list(self.var_widgets):
+        specs = extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view))
+        signature = [(s.name, s.default_value, s.is_multiline, tuple(s.options)) for s in specs]
+        if signature != self.var_signature:
             self.rebuild_variables()
         self.refresh_preview()
 
@@ -763,7 +899,8 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     def new_prompt(self):
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return
         index = self.filter_drop.get_selected()
         kind, value = self.filters[index] if index < len(self.filters) else ('all', None)
         prompt = self.repo.save_prompt(Prompt(title='Untitled Prompt', folder_id=value if kind == 'folder' else None,
@@ -783,7 +920,8 @@ class PromptsWindow(Adw.ApplicationWindow):
                       template_content=source.template_content, system_instruction=source.system_instruction,
                       target_model=source.target_model, temperature=source.temperature, tags=source.tags)
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return
         saved = self.repo.save_prompt(copy)
         self.values[saved.id] = dict(self.values.get(source.id, {}))
         self.reload_list(select_id=saved.id)
@@ -798,6 +936,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         def confirmed(_value):
             self.repo.delete_prompt(self.current.id)
             self.values.pop(self.current.id, None)
+            self.set_dirty(False)
             self.current = None
             self.reload_filters()
             self.reload_list()
@@ -831,6 +970,7 @@ class PromptsWindow(Adw.ApplicationWindow):
             return
         values = self.values.setdefault(self.current.id, {})
         specs = extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view))
+        self.var_signature = [(s.name, s.default_value, s.is_multiline, tuple(s.options)) for s in specs]
         if not specs:
             self.var_box.append(label('No variables. Write {{name}} in the template to add a field.', 'muted', True))
             return
@@ -842,7 +982,7 @@ class PromptsWindow(Adw.ApplicationWindow):
                 if chosen in spec.options:
                     drop.set_selected(spec.options.index(chosen))
                 drop.connect('notify::selected', lambda d, *_ , n=spec.name, o=spec.options: self.set_value(n, o[d.get_selected()]))
-                values.setdefault(spec.name, spec.options[drop.get_selected()])
+                values[spec.name] = spec.options[drop.get_selected()]
                 widget = drop
             elif spec.is_multiline:
                 widget, view = text_area(80, mono=True)
@@ -862,6 +1002,51 @@ class PromptsWindow(Adw.ApplicationWindow):
         if self.current:
             self.values.setdefault(self.current.id, {})[name] = value
             self.refresh_preview()
+
+    def reload_presets(self):
+        self.loading_presets = True
+        self.saved_presets = self.presets.list_presets(self.current.id) if self.current else []
+        self.preset_drop.set_model(Gtk.StringList.new(['Session values'] + [p.name for p in self.saved_presets]))
+        self.preset_drop.set_selected(0)
+        self.delete_preset_button.set_sensitive(False)
+        self.loading_presets = False
+
+    def apply_preset(self, *_):
+        if getattr(self, 'loading_presets', True) or not self.current:
+            return
+        index = self.preset_drop.get_selected()
+        self.delete_preset_button.set_sensitive(0 < index <= len(self.saved_presets))
+        if 0 < index <= len(self.saved_presets):
+            self.values[self.current.id] = dict(self.saved_presets[index - 1].values)
+            self.rebuild_variables()
+            self.refresh_preview()
+            self.set_status(f'Loaded preset “{self.saved_presets[index - 1].name}”.')
+
+    def ask_save_preset(self):
+        if not self.current:
+            return
+        def save_preset(name):
+            values = dict(self.values.get(self.current.id, {}))
+            for spec in extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view)):
+                if not values.get(spec.name, '').strip() and spec.default_value:
+                    values[spec.name] = spec.default_value
+            try:
+                preset = self.presets.save_preset(self.current.id, name, values)
+            except ValueError as error:
+                self.toast(str(error))
+                return
+            self.reload_presets()
+            self.preset_drop.set_selected(next(i + 1 for i, p in enumerate(self.saved_presets) if p.id == preset.id))
+            self.toast(f'Preset “{preset.name}” saved.')
+        self.ask('Save variable preset', 'Keep these inputs for this prompt. Saving an existing name updates it.',
+                 'Save', save_preset, entry_text='')
+
+    def delete_preset(self):
+        index = self.preset_drop.get_selected()
+        if 0 < index <= len(self.saved_presets):
+            preset = self.saved_presets[index - 1]
+            self.ask(f'Delete preset “{preset.name}”?', 'The current session values are kept.', 'Delete',
+                     lambda _v: (self.presets.delete_preset(preset.id), self.reload_presets()), destructive=True)
 
     def hydrated(self):
         """(system, prompt) with variables filled; unfilled ones stay as {{name}}."""
@@ -885,7 +1070,7 @@ class PromptsWindow(Adw.ApplicationWindow):
         if missing:
             summary += '  ·  unfilled: ' + ', '.join(missing)
         self.metrics.set_text(summary)
-        errors = check_syntax_errors(get_text(self.template_view))
+        errors = check_syntax_errors(get_text(self.template_view)) + check_syntax_errors(get_text(self.system_view))
         self.syntax_label.set_text(' '.join(errors))
         self.syntax_label.set_visible(bool(errors))
 
@@ -961,7 +1146,8 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     def prompt_from_template(self, template):
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return
         prompt = self.repo.create_prompt_from_template(template.id)
         self.reload_list(select_id=prompt.id)
         self.open_prompt(prompt)
@@ -970,6 +1156,7 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     # --- history --------------------------------------------------------------
     def reload_revisions(self):
+        self.selected_revision = None
         clear(self.revision_list)
         self.revisions = self.repo.get_revisions(self.current.id) if self.current else []
         self.revision_view.get_buffer().set_text('')
@@ -993,14 +1180,30 @@ class PromptsWindow(Adw.ApplicationWindow):
         if not revision:
             return
         self.revision_title.set_text(f'Revision {revision.revision_number} · {revision.title}')
-        self.revision_view.get_buffer().set_text(
-            (f'[system]\n{revision.system_instruction}\n\n' if revision.system_instruction else '') + revision.template_content)
         self.restore_button.set_sensitive(True)
         self.selected_revision = revision
+        self.show_revision()
+
+    def show_revision(self):
+        revision = getattr(self, 'selected_revision', None)
+        if not revision:
+            return
+        before = f'Title: {revision.title}\n\n[system]\n{revision.system_instruction}\n\n[prompt]\n{revision.template_content}'
+        if self.revision_diff.get_active():
+            draft = self.editor_prompt()
+            after = f'Title: {draft.title}\n\n[system]\n{draft.system_instruction}\n\n[prompt]\n{draft.template_content}'
+            text = ''.join(unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
+                                        fromfile=f'Revision {revision.revision_number}', tofile='Current draft'))
+            text = text or 'No changes. This revision matches the current draft.'
+        else:
+            text = before
+        self.revision_view.get_buffer().set_text(text)
 
     def restore_revision(self):
         revision = getattr(self, 'selected_revision', None)
         if not revision:
+            return
+        if self.dirty and not self.save(checkpoint=True, quiet=True):
             return
         self.title_entry.set_text(revision.title)
         self.system_view.get_buffer().set_text(revision.system_instruction)
@@ -1008,9 +1211,70 @@ class PromptsWindow(Adw.ApplicationWindow):
         self.navigate('library')
         self.set_status(f'Restored revision {revision.revision_number} into the editor; Ctrl S keeps it.')
 
+    def reload_runs(self):
+        if not hasattr(self, 'saved_run_list'):
+            return
+        prompt_id = self.current.id if self.current and self.run_filter.get_selected() == 1 else None
+        saved = self.run_history.list_runs(prompt_id=prompt_id)
+        clear(self.saved_run_list)
+        clear(self.saved_run_detail)
+        if not saved:
+            self.saved_run_list.append(label('No comparisons yet. Run a prompt to start a history.', 'muted', True))
+            return
+        for run in saved:
+            row = Gtk.ListBoxRow()
+            row.saved_run = run
+            content = box(spacing=4, css='prompt-row')
+            content.append(label(run.title, 'prompt-title'))
+            ok = sum(r.is_success for r in run.responses)
+            content.append(label(f'{short_time(run.created_at)} · {ok}/{len(run.responses)} answered', 'muted'))
+            row.set_child(content)
+            self.saved_run_list.append(row)
+        self.saved_run_list.select_row(self.saved_run_list.get_row_at_index(0))
+
+    def on_saved_run_selected(self, _listbox, row):
+        clear(self.saved_run_detail)
+        run = getattr(row, 'saved_run', None) if row else None
+        if not run:
+            return
+        self.saved_run_detail.append(label(f'{run.title} · {short_time(run.created_at)}', 'section-title'))
+        actions = box(False, 8)
+        actions.append(button('Export Markdown…', lambda: self.choose_save('comparison.md',
+            lambda path: path.write_text(export_run_markdown(run), encoding='utf-8')), icon='document-save-as-symbolic'))
+        actions.append(button('Export JSON…', lambda: self.choose_save('comparison.json',
+            lambda path: path.write_text(export_run_json(run), encoding='utf-8')), icon='document-save-as-symbolic'))
+        actions.append(button('New prompt from inputs', lambda: self.prompt_from_run(run), icon='list-add-symbolic'))
+        actions.append(button('Delete', lambda: self.ask('Delete this comparison?',
+            'The prompt and its revisions are kept.', 'Delete',
+            lambda _v: (self.run_history.delete_run(run.id), self.reload_runs()), destructive=True),
+            css='secondary destructive', icon='user-trash-symbolic'))
+        self.saved_run_detail.append(actions)
+        expander = Gtk.Expander(label='Exact inputs sent to the models')
+        frame, view = text_area(160, editable=False)
+        view.get_buffer().set_text((f'[system]\n{run.system_instruction}\n\n' if run.system_instruction else '') + run.prompt)
+        expander.set_child(frame)
+        self.saved_run_detail.append(expander)
+        from prompt_manager.core.arena import ArenaResult
+        result = ArenaResult(prompt=run.prompt, system_instruction=run.system_instruction, responses=run.responses)
+        columns = box(False, 12)
+        columns.set_homogeneous(True)
+        self.render_results(columns, [history_model(r.model_id) for r in run.responses], result)
+        self.saved_run_detail.append(columns)
+
+    def prompt_from_run(self, run):
+        if self.dirty and not self.save(checkpoint=False, quiet=True):
+            return
+        prompt = self.repo.save_prompt(Prompt(title=f'{run.title} (run snapshot)',
+            template_content=run.prompt, system_instruction=run.system_instruction, temperature=run.temperature))
+        self.filter_drop.set_selected(0)
+        self.search.set_text('')
+        self.reload_list(select_id=prompt.id)
+        self.open_prompt(prompt)
+        self.navigate('library')
+
     # --- run ------------------------------------------------------------------
     def fill_run_models(self):
-        models = self.models + self.ollama_models
+        models = list({m.id: m for m in self.models + self.ollama_models}.values())
         names = [m.display_name for m in models]
         for slot, drop in enumerate(self.run_drops):
             previous = drop.get_selected_item().get_string() if drop.get_selected_item() else None
@@ -1067,8 +1331,33 @@ class PromptsWindow(Adw.ApplicationWindow):
         if not models:
             self.toast('Choose at least one model.')
             return
+        errors = check_syntax_errors(get_text(self.template_view)) + check_syntax_errors(get_text(self.system_view))
+        values = self.values.get(self.current.id, {}) if self.current else {}
+        missing = [s.name for s in extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view))
+                   if not values.get(s.name, '').strip() and not s.default_value]
+        if errors or missing:
+            self.toast('Fix template syntax before running.' if errors else 'Fill in variables: ' + ', '.join(missing))
+            self.navigate('library')
+            return
+        if self.dirty and not self.save(checkpoint=False, quiet=True):
+            return
+        temperature = round(self.temperature.get_value(), 2)
+        max_tokens = self.max_tokens.get_value_as_int()
+        specs = extract_variables(get_text(self.template_view) + '\n' + get_text(self.system_view))
+        resolved_values = {s.name: values.get(s.name, '').strip() and values[s.name] or s.default_value for s in specs}
+        try:
+            config.set_setting('run_temperature', temperature)
+            config.set_setting('run_max_tokens', max_tokens)
+            if self.current:
+                self.repo.increment_use_count(self.current.id)
+            client = LLMClient(key_vault=self.vault)
+        except Exception as error:
+            self.toast(f'Could not start the run: {error}')
+            return
         self.running = True
+        self.cancel_event = threading.Event()
         self.run_button.set_sensitive(False)
+        self.cancel_button.set_sensitive(True)
         self.spinner.start()
         clear(self.results)
         self.result_views = []
@@ -1080,29 +1369,71 @@ class PromptsWindow(Adw.ApplicationWindow):
         names = ', '.join(m.display_name for m in models)
         self.set_status(f'Running on {names}…')
         self.run_hint.set_text('Running…')
-        temperature = round(self.temperature.get_value(), 2)
-        client = LLMClient(key_vault=self.vault)
-        if self.current:
-            self.repo.increment_use_count(self.current.id)
+        self.run_context = (self.current.id if self.current else None,
+                            self.title_entry.get_text().strip() or 'Untitled Prompt', resolved_values, temperature, max_tokens)
+        self.run_completed = 0
+        event = self.cancel_event
+        def progress(index, response):
+            GLib.idle_add(self.run_progress, event, index, models, response)
         self.background(lambda: run_arena_comparison(body, [m.id for m in models], system_instruction=system,
-                                                     temperature=temperature, timeout=RUN_TIMEOUT, client=client),
+                                                     temperature=temperature, max_tokens=max_tokens,
+                                                     timeout=RUN_TIMEOUT, client=client, cancel_event=event,
+                                                     on_response=progress),
                         lambda result, error: self.run_finished(models, result, error))
+
+    def cancel_run(self):
+        if self.running and self.cancel_event:
+            self.cancel_event.set()
+            self.cancel_button.set_sensitive(False)
+            self.run_hint.set_text('Cancelling… requests already sent may still finish at the provider.')
+
+    def run_progress(self, event, index, models, response):
+        if self.closing or not self.running or event is not self.cancel_event:
+            return False
+        columns = list(self._rows(self.results))
+        if index < len(columns):
+            from prompt_manager.core.arena import ArenaResult
+            columns[index].remove_css_class('card')
+            self.render_results(columns[index], [models[index]], ArenaResult('', '', [response]), clear_first=True)
+        self.run_completed += 1
+        self.run_hint.set_text(f'{self.run_completed} of {len(models)} finished…')
+        return False
 
     def run_finished(self, models, result, error):
         self.running = False
         self.run_button.set_sensitive(True)
+        self.cancel_button.set_sensitive(False)
         self.spinner.stop()
         clear(self.results)
         if error:
             self.set_status(f'Run failed: {error}')
             self.results.append(card('Run failed', str(error)))
+            if self.close_pending:
+                self.close()
             return
+        try:
+            prompt_id, title, values, temperature, max_tokens = self.run_context
+            self.run_history.save(prompt_id, title, result, variables=values, temperature=temperature, max_tokens=max_tokens)
+        except Exception as save_error:
+            self.toast(f'Answers received, but history could not be saved: {save_error}')
+            self.close_pending = False
+        self.render_results(self.results, models, result)
+        ok = sum(1 for r in result.responses if r.is_success)
+        cancelled = self.cancel_event and self.cancel_event.is_set()
+        self.set_status(f'{ok} of {len(result.responses)} models answered.' + (' Run cancelled.' if cancelled else ''))
+        self.update_run_hint()
+        if self.close_pending:
+            self.close()
+
+    def render_results(self, container, models, result, clear_first=False):
+        if clear_first:
+            clear(container)
         fastest = result.fastest_response
         cheapest = result.cheapest_response
         for model, response in zip(models, result.responses):
             column = box(spacing=10, css='card')
             top = box(False, 8)
-            name = label(model.display_name, 'section-title')
+            name = label(model.display_name if model else response.model_id, 'section-title')
             name.set_hexpand(True)
             name.set_ellipsize(Pango.EllipsizeMode.END)
             top.append(name)
@@ -1116,7 +1447,12 @@ class PromptsWindow(Adw.ApplicationWindow):
             column.append(top)
             if response.is_success:
                 stats = f'{response.elapsed_seconds:.1f} s · {response.prompt_tokens} in · {response.completion_tokens} out'
-                stats += ' · free' if model.is_free else f' · ~${response.estimated_cost_usd:.4f}'
+                if model and model.is_free:
+                    stats += ' · free'
+                elif response.estimated_cost_usd:
+                    stats += f' · ~${response.estimated_cost_usd:.4f}'
+                else:
+                    stats += ' · cost unavailable'
             else:
                 stats = f'No answer after {response.elapsed_seconds:.1f} s'
             column.append(label(stats, 'muted'))
@@ -1128,10 +1464,7 @@ class PromptsWindow(Adw.ApplicationWindow):
             if response.is_success:
                 column.append(button('Copy answer', lambda t=response.content: (self.copy_text(t), self.toast('Answer copied.')),
                                      icon='edit-copy-symbolic'))
-            self.results.append(column)
-        ok = sum(1 for r in result.responses if r.is_success)
-        self.set_status(f'{ok} of {len(result.responses)} models answered.')
-        self.update_run_hint()
+            container.append(column)
 
     # --- export ---------------------------------------------------------------
     def export_kind(self):
@@ -1164,7 +1497,8 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     def save_library(self, kind):
         if self.dirty:
-            self.save(checkpoint=False, quiet=True)
+            if not self.save(checkpoint=False, quiet=True):
+                return
         writers = {'json': (backup.export_library_to_json, 'cube-prompts-library.json'),
                    'csv': (backup.export_library_to_csv, 'cube-prompts-library.csv'),
                    'zip': (backup.export_library_to_markdown_zip, 'cube-prompts-library.zip')}
@@ -1179,9 +1513,15 @@ class PromptsWindow(Adw.ApplicationWindow):
         read = backup.import_library_from_json if kind == 'json' else backup.import_library_from_csv
 
         def chosen(path):
+            if self.dirty and not self.save(checkpoint=False, quiet=True):
+                return
             count = read(self.repo, path)
             self.reload_filters()
             self.reload_list()
+            if self.current:
+                updated = self.repo.get_prompt_by_id(self.current.id)
+                if updated:
+                    self.open_prompt(updated)
             self.toast(f'Imported {count} prompts from {path.name}.')
         dialog = Gtk.FileDialog(title='Import a library')
         file_filter = Gtk.FileFilter()
@@ -1237,6 +1577,9 @@ class PromptsWindow(Adw.ApplicationWindow):
 
     def save_settings(self):
         try:
+            for entry in self.endpoint_entries.values():
+                if entry.get_text().strip():
+                    validate_base_url(entry.get_text().strip())
             for provider, entry in self.key_entries.items():
                 if entry.get_text().strip() != self.vault.get_api_key(provider):
                     self.vault.set_api_key(provider, entry.get_text())
@@ -1250,11 +1593,45 @@ class PromptsWindow(Adw.ApplicationWindow):
                     else:
                         cfg.pop('base_url', None)
                     self.vault.set_provider_config(provider, cfg)
-        except CredentialStoreError as error:
+        except (CredentialStoreError, ValueError) as error:
             self.toast(str(error))
             return
         self.load_settings()
         self.toast('Settings saved.')
+
+    def add_custom_model(self):
+        model_id = self.custom_model_entry.get_text().strip()
+        try:
+            model = get_model_info(model_id)
+            if not model or ':' not in model_id or model.provider not in {p[0] for p in PROVIDERS}:
+                raise ValueError('Use provider:model-id with a supported provider from the list above.')
+            saved = custom_model_ids()
+            if model_id not in saved and model_id not in [m.id for m in list_models_by_provider()]:
+                saved.append(model_id)
+                config.set_setting('custom_models', saved)
+                self.models.append(model)
+                self.fill_run_models()
+            self.custom_model_entry.set_text('')
+            self.refresh_custom_models()
+            self.toast(f'{model.display_name} is available on the Run page.')
+        except ValueError as error:
+            self.toast(str(error))
+
+    def refresh_custom_models(self):
+        clear(self.custom_model_list)
+        for model_id in custom_model_ids():
+            row = box(False, 8)
+            name = label(model_id, 'mono')
+            name.set_hexpand(True)
+            row.append(name)
+            row.append(button('Remove', lambda mid=model_id: self.remove_custom_model(mid), css='small'))
+            self.custom_model_list.append(row)
+
+    def remove_custom_model(self, model_id):
+        config.set_setting('custom_models', [mid for mid in custom_model_ids() if mid != model_id])
+        self.models = [m for m in self.models if m.id != model_id]
+        self.fill_run_models()
+        self.refresh_custom_models()
 
     # --- dialogs --------------------------------------------------------------
     def ask(self, heading, body, confirm, on_confirm, entry_text=None, destructive=False):
@@ -1274,7 +1651,10 @@ class PromptsWindow(Adw.ApplicationWindow):
 
         def respond(_dialog, response):
             if response == 'ok':
-                on_confirm(entry.get_text() if entry else None)
+                try:
+                    on_confirm(entry.get_text() if entry else None)
+                except Exception as error:
+                    self.toast(str(error))
         dialog.connect('response', respond)
         dialog.present(self)
 

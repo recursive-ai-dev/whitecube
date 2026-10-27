@@ -1,6 +1,7 @@
 """Application configuration and XDG path management for Prompt Manager."""
 
 import json
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -56,14 +57,38 @@ def _migrate_settings_credentials(data: dict) -> bool:
         ("github", "token", "github"),
         ("pollinations", "api_key", "pollinations"),
     ):
-        block = data.get(section, {})
+        block = _settings_block(data, section)
         if field in block:
             secret = block[field]
-            if secret and not get_key_vault().get_api_key(provider):
+            if isinstance(secret, str) and secret and not get_key_vault().get_api_key(provider):
                 get_key_vault().set_api_key(provider, secret)
             block.pop(field)
             changed = True
     return changed
+
+
+def _settings_block(data: dict, key: str) -> dict:
+    """Treat malformed section shapes as empty without rewriting on reads."""
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _typed_setting(value, default):
+    """Honor the caller's default type and reject non-finite JSON numbers."""
+    if default is None:
+        return value
+    if isinstance(default, bool):
+        valid = isinstance(value, bool)
+    elif isinstance(default, (int, float)):
+        valid = (type(value) is int if type(default) is int else type(value) in (int, float))
+        if valid:
+            try:
+                valid = math.isfinite(value)
+            except (ValueError, OverflowError):
+                valid = False
+    else:
+        valid = isinstance(value, type(default))
+    return value if valid else default
 
 
 def _read_settings() -> dict:
@@ -88,7 +113,7 @@ def _write_settings(data: dict) -> None:
     temp_path = Path(name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump(data, stream, indent=2)
+            json.dump(data, stream, indent=2, allow_nan=False)
         temp_path.replace(CONFIG_FILE_PATH)
     finally:
         temp_path.unlink(missing_ok=True)
@@ -96,7 +121,7 @@ def _write_settings(data: dict) -> None:
 
 def get_theme_id() -> str:
     """Return persisted theme id, or DEFAULT_THEME_ID."""
-    return _read_settings().get("theme", DEFAULT_THEME_ID)
+    return get_setting("theme", DEFAULT_THEME_ID)
 
 
 def set_theme_id(theme_id: str) -> None:
@@ -107,7 +132,7 @@ def set_theme_id(theme_id: str) -> None:
 
 
 def get_setting(key: str, default=None):
-    return _read_settings().get(key, default)
+    return _typed_setting(_read_settings().get(key, default), default)
 
 
 def set_setting(key: str, value) -> None:
@@ -121,7 +146,7 @@ def set_setting(key: str, value) -> None:
 def get_github_config() -> dict:
     """Return persisted GitHub config block (may be empty)."""
     data = _read_settings()
-    gh = data.get("github", {})
+    gh = _settings_block(data, "github")
     # Ensure defaults
     from prompt_manager.core.keychain import get_key_vault
     gh["token"] = get_key_vault().get_api_key("github")
@@ -141,7 +166,7 @@ def get_github_config() -> dict:
 def set_github_config(patch: dict) -> None:
     """Merge patch into github config block and persist."""
     data = _read_settings()
-    gh = data.get("github", {})
+    gh = _settings_block(data, "github")
     from prompt_manager.core.keychain import get_key_vault
     patch = dict(patch)
     if "token" in patch:
@@ -156,7 +181,7 @@ def clear_github_config() -> None:
     data = _read_settings()
     from prompt_manager.core.keychain import get_key_vault
     get_key_vault().delete_api_key("github")
-    gh = data.get("github", {})
+    gh = _settings_block(data, "github")
     for key in ["token", "token_type", "username", "avatar_url", "repo", "connected", "last_sync", "last_sync_sha"]:
         gh.pop(key, None)
     gh["connected"] = False
@@ -166,7 +191,7 @@ def clear_github_config() -> None:
 
 def is_github_connected() -> bool:
     gh = get_github_config()
-    return bool(gh.get("token") and gh.get("connected"))
+    return bool(gh.get("token") and gh.get("connected") is True)
 
 
 # ── Pollinations AI configuration ─────────────────────────────────────
@@ -186,7 +211,7 @@ POLLINATIONS_MODELS = [
 def get_pollinations_config() -> dict:
     """Return persisted Pollinations configuration."""
     data = _read_settings()
-    pol = data.get("pollinations", {})
+    pol = _settings_block(data, "pollinations")
     pol.setdefault("model", DEFAULT_POLLINATIONS_MODEL)
     from prompt_manager.core.keychain import get_key_vault
     pol["api_key"] = get_key_vault().get_api_key("pollinations")
@@ -198,7 +223,7 @@ def get_pollinations_config() -> dict:
 def set_pollinations_config(patch: dict) -> None:
     """Merge patch into pollinations configuration and persist."""
     data = _read_settings()
-    pol = data.get("pollinations", {})
+    pol = _settings_block(data, "pollinations")
     from prompt_manager.core.keychain import get_key_vault
     patch = dict(patch)
     if "api_key" in patch:

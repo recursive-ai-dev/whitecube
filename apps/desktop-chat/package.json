@@ -1,19 +1,20 @@
 {
   "name": "desktop-chat",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "license": "Apache-2.0",
-  "description": "Global-hotkey AI chat panel with filesystem tool access",
+  "description": "Desktop AI workspace with saved conversations, local models and file tools",
   "main": "main.js",
   "private": true,
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "deb": "bash packaging/build-deb.sh",
+    "verify:deb": "node packaging/verify-deb.js"
   },
-  "dependencies": {},
   "devDependencies": {
-    "electron": "^33.0.0"
+    "electron": "45.1.0"
   },
   "allowScripts": {
-    "electron@33.4.11": true
+    "electron@45.1.0": true
   }
 }

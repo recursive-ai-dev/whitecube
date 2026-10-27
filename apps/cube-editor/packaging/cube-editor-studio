@@ -1,0 +1,32 @@
+#!/usr/bin/python3 -I
+"""Launch the standalone or source copy without importing GTK for CLI commands."""
+import os
+from pathlib import Path
+import sys
+
+
+def main():
+    launcher = Path(__file__).resolve()
+    locations = [launcher.parent.parent, launcher.parent.parent / 'lib/cube-editor']
+    directory = next((path for path in locations if (path / 'app.py').is_file()
+                      and (path / 'engine.py').is_file()), None)
+    if directory is None:
+        print('cube-editor: application files are missing; reinstall cube-editor', file=sys.stderr)
+        return 1
+    arguments = sys.argv[1:]
+    if arguments == ['--version']:
+        version_files = [directory / 'VERSION', directory / 'packaging/VERSION']
+        version = next((path.read_text().strip() for path in version_files if path.is_file()), 'unknown')
+        print(f'cube-editor {version}')
+        return 0
+    cli = Path(sys.argv[0]).name == 'cube-editor-cli'
+    if arguments and arguments[0] == '--cli':
+        cli = True
+        arguments = arguments[1:]
+    os.environ['CUBE_EDITOR_STANDALONE'] = '1'
+    program = directory / ('engine.py' if cli else 'app.py')
+    os.execv('/usr/bin/python3', ['python3', '-I', str(program), *arguments])
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

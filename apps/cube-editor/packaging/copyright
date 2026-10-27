@@ -1,0 +1,23 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: cube-editor
+Source: https://github.com/recursive-ai-dev/whitecube
+
+Files: *
+Copyright: 2026 recursive-ai-dev and Whitecube contributors
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ https://www.apache.org/licenses/LICENSE-2.0
+ .
+ On Debian systems the complete license is available at
+ /usr/share/common-licenses/Apache-2.0.
+ .
+ A complete copy is also installed as /usr/share/doc/cube-editor/COPYING.
+
+Files: packaging/org.whitecube.CubeEditor.Standalone.metainfo.xml
+Copyright: 2026 Whitecube contributors
+License: CC0-1.0
+ To the extent possible under law, the authors waive all copyright and
+ related or neighboring rights to this metadata under CC0 1.0.
+ See https://creativecommons.org/publicdomain/zero/1.0/.

@@ -13,16 +13,10 @@ from tensegrity_lm import TensegrityConfig, TensegrityLM, prepare_data, load_che
 from tensegrity_nb_lib import run_training, training_precision
 from prepare_folder import prepare_folder
 from model_presets import MODEL_PRESETS
+from training_options import add_model_size_flags
 from files import atomic_json
 
 ROOT = Path(__file__).resolve().parent
-
-
-def add_model_size_flags(parser):
-    group = parser.add_mutually_exclusive_group()
-    for size, preset in MODEL_PRESETS.items():
-        group.add_argument(f"--{size}", dest="model_size", action="store_const", const=size,
-                           help=f"{preset['parameters']:,} parameters (default: 1m; resume uses saved size)")
 
 
 def local_config(model_size="1m"):

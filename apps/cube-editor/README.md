@@ -8,13 +8,35 @@ its old Python runtime and GTK wizard are not runtime dependencies.
 
 ## Run and install
 
-From the Whitecube repository:
+Build and install the standalone **Cube Editor 0.5.0** package from this directory:
+
+```sh
+bash packaging/build-deb.sh
+sudo apt install ./packaging/out/cube-editor_0.5.0_all.deb
+cube-editor-studio
+```
+
+The package adds Cube Editor to the application menu, installs its runtime in
+`/usr/lib/cube-editor`, and includes `cube-editor-cli` for scripts. It needs
+GTK 4 and libadwaita 1.5 or newer; APT resolves the image tools and Python
+dependencies. QEMU and OVMF are recommended for VM tests. The package contains
+portable Python code (`Architecture: all`); customizing and boot-testing images
+still depends on the host architecture and installed external tools.
+
+The standalone launchers and desktop entry coexist with `whitecube-desktop`,
+which already owns the `cube-editor` command. Building runs editor checks,
+including GTK tests on a private display when `gtk4-broadwayd` is available.
+It requires no root and does not install anything or restart the desktop.
+The adjacent `.deb.sha256` file records the package checksum.
+
+From the Whitecube repository, the existing checkout launcher also works:
 
 ```sh
 ./bin/cube-editor
 ```
 
-Build the updated desktop package and install the specific resulting file:
+To include the editor in the entire Whitecube desktop instead, run these commands
+from the repository root:
 
 ```sh
 bash packaging/build-deb.sh
@@ -65,10 +87,15 @@ initramfs; the live ISO retains its boot tools. Original installer configuration
 are backed up in the project. The additional image increases output size and
 storage needs. Custom installer mappings require explicit adaptation.
 
-Extract, customize, terminal, and build operations open a Foot terminal and use
+Extract, customize, terminal, and build operations open a supported terminal and use
 `sudo` authentication for filesystem work. Close the guest shell normally to
 finish a manual editing session. Follow the operation log if extraction or
 package installation fails; an incomplete operation is not a successful build.
+Foot is preferred in a Wayland session. QTerminal, GNOME Terminal, Konsole,
+Xfce Terminal and xterm support other desktops, including LXQt on X11.
+Set `CUBE_EDITOR_TERMINAL=qterminal` (or another supported executable) to choose
+explicitly. Arguments are passed directly without a shell, and a closed terminal
+cannot count as a successful operation without the worker's completion event.
 
 Use only trusted images, packages, payloads and recipes. Guest executables,
 package maintainer scripts and terminal commands run with **host root
@@ -85,7 +112,25 @@ is made that every third-party installer or distribution supports customization.
 
 ## Editing, recovery and release tools
 
-The workbench now includes these sixteen workflow improvements:
+Version 0.5.0 adds a project overview with the next suggested action, a studio
+menu, keyboard command selection, smaller-window navigation, and system/light/dark
+appearance. Window geometry and the last studio page are saved in
+`$XDG_CONFIG_HOME/cube-editor/preferences.json` (default `~/.config`). Use
+**Ctrl K** for commands, **Ctrl ,** for appearance, and **F1** for shortcuts.
+
+**System diagnostics** checks workflow tools, Python bindings, project inputs,
+recovery state, storage, VM acceleration and UEFI firmware. It is also available
+without GTK through `cube-editor-cli doctor [PROJECT]`; failed required checks
+return exit status 1 and optional VM features appear as warnings.
+
+**Export release report** on Test & release writes a self-contained HTML document
+with a freshly computed ISO SHA256, sidecar and saved build digest comparisons,
+the release's original recipe, source provenance, and manually recorded boot
+results. Checks for different ISO contents remain historical. Reports require a
+new `.html` filename and never replace an existing file. Report generation
+does not mark boot tests passed or authenticate recorded source hashes.
+
+The existing workbench includes these sixteen workflow improvements:
 
 1. **Storage preflight.** Source and Build pages offer conservative estimates.
    Workers check free space before extraction, compression and restore copies.
@@ -187,7 +232,20 @@ a saved point or repair the original file and journal explicitly before building
 
 ## Developer commands
 
-The process/project API can run without starting the desktop interface:
+The installed CLI can run without starting the desktop interface:
+
+```sh
+cube-editor-cli --version
+cube-editor-cli doctor
+cube-editor-cli doctor /path/to/project
+cube-editor-cli report /path/to/project /path/to/release-report.html
+cube-editor-cli report /path/to/project /path/to/older-report.html --release /path/to/older.iso
+```
+
+`doctor` and `report` print structured JSON. A report with missing or mismatched
+integrity evidence is still exported for review, and the CLI returns status 1.
+
+From the repository root, the process/project API also runs directly:
 
 ```sh
 python3 apps/cube-editor/engine.py dependencies
@@ -215,7 +273,20 @@ command without changing an image. `run` opens the authenticated worker in Foot.
 The project JSON records package lists, custom commands, payload mappings, and
 output settings; retain its schema and use absolute paths for local files.
 
-Run the focused editor tests and then the required repository build:
+From this app directory, run all editor tests on an isolated GTK display with
+the distribution Python:
+
+```sh
+/usr/bin/python3 -I tools/check.py
+```
+
+Install `libgtk-4-bin` if `gtk4-broadwayd` is missing. The runner uses a temporary
+home, private D-Bus session, and local-only GIO; it does not use desktop settings.
+Tests cover synthetic ISO/SquashFS exports, worker lifecycle, terminal selection,
+GTK workflows, diagnostics, release reports and extracted-package launchers.
+They do not run sudo or certify a real installer or guest boot.
+
+From the repository root, run the focused tests and the full desktop build:
 
 ```sh
 python3 -m unittest discover -s apps/cube-editor/tests -v
@@ -223,7 +294,7 @@ python3 -m unittest discover -s apps/cube-editor/tests -v
 ```
 
 The core external tools are `xorriso`, `unsquashfs`, `mksquashfs`, `sudo`,
-`unshare`, `mount`, `chroot`, and `foot`. The UI uses Python GI bindings for GTK 4
+`unshare`, `mount`, `chroot`, and a supported terminal. The UI uses Python GI bindings for GTK 4
 and libadwaita 1.5 or newer. Layered Calamares integration uses `python3-yaml` to preserve and
 validate configuration structure. Privileged mount operations use a private
 mount namespace.

@@ -1,0 +1,11 @@
+#!/usr/bin/python3 -I
+"""Launch the standalone package using only trusted system Python modules."""
+import os
+from pathlib import Path
+import sys
+
+application = Path(__file__).resolve().parent.parent / 'lib/cube-prompts/app.py'
+if not application.is_file():
+    print('cube-prompts-studio: application files are missing; reinstall cube-prompts', file=sys.stderr)
+    raise SystemExit(1)
+os.execv('/usr/bin/python3', ['/usr/bin/python3', '-I', '-B', str(application), *sys.argv[1:]])

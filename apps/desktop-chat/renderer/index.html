@@ -10,9 +10,11 @@
 <body>
   <div id="app">
     <div id="titlebar">
-      <span id="title">Desktop Chat</span>
+      <div id="brand"><span class="cube-mark" aria-hidden="true">▧</span><span id="title">DESKTOP CHAT</span><span class="version-label">WHITE CUBE</span></div>
       <div id="titlebar-actions">
+        <button id="btn-sidebar" title="Toggle conversation sidebar (Ctrl+B)" aria-label="Toggle conversation sidebar" aria-expanded="true">☰</button>
         <button id="btn-find" title="Find in chat (Ctrl+F)" aria-label="Find in chat">Find</button>
+        <button id="btn-export" title="Export chat as Markdown" aria-label="Export conversation as Markdown">Export</button>
         <button id="btn-copy-chat" title="Copy conversation (Ctrl+Shift+C)" aria-label="Copy conversation as Markdown">Copy chat</button>
         <button id="btn-new" title="New chat (Ctrl+N)" aria-label="New chat">＋</button>
         <button id="btn-settings" title="Settings (Ctrl+,)" aria-label="Settings">⚙</button>
@@ -20,6 +22,17 @@
       </div>
     </div>
 
+    <div id="workspace">
+      <aside id="sidebar" aria-label="Saved conversations">
+        <div class="sidebar-heading"><span>YOUR WORKSPACE</span><span class="local-badge">LOCAL HISTORY</span></div>
+        <button id="btn-sidebar-new" class="new-chat-button">＋ New conversation <kbd>Ctrl N</kbd></button>
+        <label class="search-label" for="chat-search">Search conversations</label>
+        <input id="chat-search" type="search" placeholder="Search your chats…" autocomplete="off" />
+        <div id="chat-list" role="list" aria-label="Conversations"></div>
+        <div class="sidebar-footer"><span class="status-dot"></span> Saved on this device<br><span>API keys stay in your settings.</span></div>
+      </aside>
+      <main id="conversation">
+        <div id="conversation-heading"><div><p class="eyebrow">CONVERSATION</p><h1 id="chat-title">New conversation</h1></div><div class="conversation-actions"><button id="btn-chat-rename" title="Rename conversation" aria-label="Rename conversation">Rename</button><button id="btn-chat-delete" title="Delete conversation" aria-label="Delete conversation">Delete</button></div></div>
     <div id="model-bar">
       <div id="model-controls">
         <label for="model-picker">Talk to</label>
@@ -36,15 +49,30 @@
       <button id="find-next" aria-label="Next matching message">↓</button>
       <button id="find-close" aria-label="Close search">×</button>
     </div>
+    <div id="empty-state">
+      <div class="empty-mark" aria-hidden="true">▧</div>
+      <p class="eyebrow">A LITTLE SPACE TO THINK</p>
+      <h2>What are we working on?</h2>
+      <p>Talk to your model. Work with your files.<br>Keep your conversations close.</p>
+      <div class="starter-grid">
+        <button class="starter" data-prompt="Help me turn an idea into an actionable plan. Ask me what I want to build."><span>01 / THINK IT THROUGH</span>Make a plan <span aria-hidden="true">↗</span></button>
+        <button class="starter" data-prompt="Help me understand a piece of code. Ask me to paste it or share its file path."><span>02 / UNDERSTAND THE DETAILS</span>Explain some code <span aria-hidden="true">↗</span></button>
+        <button class="starter" data-prompt="Help me improve a draft. Ask me to paste the text and describe the audience."><span>03 / FIND THE RIGHT WORDS</span>Shape a draft <span aria-hidden="true">↗</span></button>
+        <button class="starter" data-prompt="Help me explore a directory on my computer. Ask for its path, then use read_file to inspect it."><span>04 / GET THINGS DONE</span>Explore my files <span aria-hidden="true">↗</span></button>
+      </div>
+      <button id="btn-setup" class="text-button">Configure your connection →</button>
+    </div>
     <div id="messages" role="log" aria-label="Chat messages" aria-busy="false" tabindex="0"></div>
     <div id="chat-status"><span id="activity" role="status" aria-live="polite">Ready</span><button id="btn-latest" class="hidden">Jump to latest</button></div>
 
     <div id="composer">
-      <textarea id="input" aria-label="Message" aria-describedby="composer-hint" maxlength="100000" rows="2" placeholder="Message… (Enter to send, Shift+Enter for newline)"></textarea>
+      <textarea id="input" aria-label="Message" aria-describedby="composer-hint" maxlength="100000" rows="2" placeholder="Ask, explore, or make something…"></textarea>
       <button id="btn-send">Send</button>
       <button id="btn-stop" class="hidden">Stop</button>
     </div>
-    <p id="composer-hint">Enter to send · Shift+Enter for a new line · <span id="draft-count">0</span> characters</p>
+    <p id="composer-hint">Enter to send · Shift+Enter for a new line · <span id="draft-count">0</span> characters <span class="hint-end">Alt+↑ reuse last message</span></p>
+      </main>
+    </div>
   </div>
 
   <div id="settings-overlay" class="hidden">
@@ -60,6 +88,13 @@
       <label>API Key
         <input id="s-apikey" type="password" placeholder="sk-…" />
       </label>
+      <div class="settings-section">GENERATION</div>
+      <div class="settings-grid"><label>Temperature
+        <input id="s-temperature" type="number" min="0" max="2" step="0.1" value="0.7" />
+      </label><label>Maximum reply tokens
+        <input id="s-max-tokens" type="number" min="1" max="32768" step="1" value="8192" />
+      </label></div>
+      <label class="checkbox-row"><input id="s-tools" type="checkbox" checked /> Enable filesystem tools for API models</label>
       <label class="checkbox-row">
         <input id="s-confirm" type="checkbox" />
         Confirm before write_file / edit_file / move_file
@@ -91,6 +126,17 @@
         <button id="rename-cancel" type="button">Cancel</button>
         <button id="rename-save" type="submit" class="primary">Save name</button>
       </div>
+    </form>
+  </div>
+
+  <div id="chat-dialog-overlay" class="hidden">
+    <form id="chat-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-dialog-title">
+      <h3 id="chat-dialog-title">Rename conversation</h3>
+      <p id="chat-dialog-description" class="hint"></p>
+      <label id="chat-name-label" for="chat-name">Conversation name</label>
+      <input id="chat-name" type="text" maxlength="120" autocomplete="off" />
+      <p id="chat-dialog-error" role="status" aria-live="polite"></p>
+      <div class="settings-actions"><button id="chat-dialog-cancel" type="button">Cancel</button><button id="chat-dialog-save" type="submit" class="primary">Save</button></div>
     </form>
   </div>
 

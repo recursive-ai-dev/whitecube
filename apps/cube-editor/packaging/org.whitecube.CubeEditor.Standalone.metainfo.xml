@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.whitecube.CubeEditor.Standalone</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <name>Cube Editor Studio</name>
+  <summary>Customize, rebuild and test Linux live images</summary>
+  <description>
+    <p>Create persistent projects from Debian and Ubuntu live ISO images. Edit
+    package recipes and payloads, save restore points, rebuild bootable images,
+    verify release checksums and test your images with QEMU.</p>
+    <p>The standalone package works on GTK desktops, independently of the
+    Whitecube desktop session. Guest editing uses authenticated privileged
+    workers; only use images and recipes you trust.</p>
+  </description>
+  <launchable type="desktop-id">org.whitecube.CubeEditor.Standalone.desktop</launchable>
+  <url type="homepage">https://github.com/recursive-ai-dev/whitecube</url>
+  <url type="bugtracker">https://github.com/recursive-ai-dev/whitecube/issues</url>
+  <developer id="org.whitecube"><name>Whitecube contributors</name></developer>
+  <provides><binary>cube-editor-studio</binary><binary>cube-editor-cli</binary></provides>
+  <content_rating type="oars-1.1"/>
+  <releases><release version="0.5.0" date="2026-10-27"/></releases>
+</component>

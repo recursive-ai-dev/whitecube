@@ -1,0 +1,16 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Whitecube Desktop Chat
+Source: https://github.com/recursive-ai-dev/whitecube
+
+Files: usr/lib/whitecube-desktop-chat/app/*
+Copyright: Whitecube contributors
+License: Apache-2.0
+ See /usr/share/doc/whitecube-desktop-chat/LICENSE and NOTICE.
+
+Files: usr/lib/whitecube-desktop-chat/runtime/*
+Copyright: Electron contributors and Chromium authors
+License: MIT and BSD and other licenses
+ Electron's license is shipped at
+ /usr/lib/whitecube-desktop-chat/runtime/LICENSE.
+ Bundled Chromium third-party notices and license terms are shipped at
+ /usr/lib/whitecube-desktop-chat/runtime/LICENSES.chromium.html.

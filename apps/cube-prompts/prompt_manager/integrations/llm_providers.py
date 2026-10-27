@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
+import re
 import time
 from typing import Any, Dict, List, Optional
 import urllib.error
@@ -181,16 +183,52 @@ MODEL_CATALOG: List[ModelInfo] = [
 ]
 
 
-def get_model_info(model_id: str) -> Optional[ModelInfo]:
-    """Find ModelInfo by full ID (e.g. 'openai:gpt-4o') or short name."""
-    for m in MODEL_CATALOG:
-        if m.id == model_id or m.id.split(":", 1)[-1] == model_id:
-            return m
-    # Return dynamic fallback
-    if ":" in model_id:
-        prov, name = model_id.split(":", 1)
-        return ModelInfo(id=model_id, display_name=f"{prov.title()}: {name}", provider=prov)
-    return ModelInfo(id=f"openai:{model_id}", display_name=model_id, provider="openai")
+SUPPORTED_PROVIDERS = {"pollinations", "openai", "anthropic", "gemini", "ollama", "openrouter"}
+
+
+def get_model_info(model_id: str) -> ModelInfo:
+    """Resolve a built-in model or a custom ``provider:model`` identifier.
+
+    Custom IDs retain slashes and additional colons (for example Ollama tags).
+    Their pricing is unknown; zero is an estimate, not a promise of free use.
+    """
+    if not isinstance(model_id, str) or not model_id.strip():
+        raise ValueError("Choose a model or enter provider:model.")
+    model_id = model_id.strip()
+    if len(model_id) > 512 or any(char.isspace() or ord(char) < 32 for char in model_id):
+        raise ValueError("Model IDs must be at most 512 characters without whitespace.")
+    for model in MODEL_CATALOG:
+        if model.id == model_id or model.id.split(":", 1)[-1] == model_id:
+            return model
+    provider, name = model_id.split(":", 1) if ":" in model_id else ("openai", model_id)
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ValueError("Unsupported provider. Use openai, anthropic, gemini, ollama, openrouter or pollinations.")
+    if not name:
+        raise ValueError("Enter a model name after the provider and colon.")
+    return ModelInfo(id=f"{provider}:{name}", display_name=f"{provider.title()}: {name}",
+                     provider=provider, is_free=provider == "ollama")
+
+
+def validate_base_url(base_url: str) -> str:
+    """Validate an explicitly configured HTTP endpoint without disclosing it.
+
+    Keep path prefixes for reverse proxies, but reject credentials and queries:
+    authentication belongs in the API key field rather than the URL.
+    """
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ValueError("Enter an HTTP or HTTPS endpoint.")
+    base_url = base_url.strip().rstrip("/")
+    try:
+        parsed = urllib.parse.urlsplit(base_url)
+        _ = parsed.port  # Validate malformed ports as well as hostnames.
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment
+                or any(char.isspace() or ord(char) < 32 for char in base_url)):
+            raise ValueError
+    except ValueError:
+        raise ValueError("Use an HTTP or HTTPS endpoint without credentials, query parameters or a fragment.") from None
+    return base_url
 
 
 def list_models_by_provider(provider: Optional[str] = None) -> List[ModelInfo]:
@@ -202,10 +240,10 @@ def list_models_by_provider(provider: Optional[str] = None) -> List[ModelInfo]:
 
 def discover_ollama_models(base_url: str = "http://localhost:11434") -> List[ModelInfo]:
     """Query local Ollama instance for installed models."""
-    url = f"{base_url.rstrip('/')}/api/tags"
-    req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
     discovered = []
     try:
+        url = f"{validate_base_url(base_url)}/api/tags"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"}, method="GET")
         with urllib.request.urlopen(req, timeout=3) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             for item in data.get("models", []):
@@ -270,16 +308,26 @@ class LLMClient:
 
     def execute(self, request: LLMRequest) -> LLMResponse:
         """Execute request against target provider with automatic cost and token calculation."""
-        start_time = time.time()
-        model_info = get_model_info(request.model_id)
-        provider = model_info.provider if model_info else "pollinations"
-        raw_model_name = request.model_id.split(":", 1)[-1] if ":" in request.model_id else request.model_id
-
-        # Calculate input tokens
-        input_text = f"{request.system_instruction}\n{request.prompt}"
-        prompt_tokens = count_bpe_tokens(input_text)
-
+        start_time = time.monotonic()
+        provider = ""
+        prompt_tokens = 0
         try:
+            model_info = get_model_info(request.model_id)
+            provider = model_info.provider
+            raw_model_name = model_info.id.split(":", 1)[-1]
+            if not isinstance(request.prompt, str) or not request.prompt.strip():
+                raise ValueError("Prompt cannot be empty.")
+            if (not isinstance(request.timeout, (int, float)) or isinstance(request.timeout, bool)
+                    or not math.isfinite(request.timeout) or not 0 < request.timeout <= 600):
+                raise ValueError("Request timeout must be between 0 and 600 seconds.")
+            if (not isinstance(request.temperature, (int, float)) or not math.isfinite(request.temperature)
+                    or not 0 <= request.temperature <= 2):
+                raise ValueError("Temperature must be between 0 and 2.")
+            if request.max_tokens is not None and (type(request.max_tokens) is not int
+                    or not 0 < request.max_tokens <= 1000000):
+                raise ValueError("Maximum output tokens must be a positive integer up to 1000000.")
+            input_text = f"{request.system_instruction}\n{request.prompt}"
+            prompt_tokens = count_bpe_tokens(input_text)
             if provider == "pollinations":
                 content = self._call_pollinations(request, raw_model_name)
             elif provider == "openai":
@@ -295,7 +343,9 @@ class LLMClient:
             else:
                 raise ValueError(f"Unsupported provider '{provider}'")
 
-            elapsed = time.time() - start_time
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("The provider returned an empty response. Check its model and output limits.")
+            elapsed = time.monotonic() - start_time
             completion_tokens = count_bpe_tokens(content)
             total_tokens = prompt_tokens + completion_tokens
 
@@ -317,11 +367,11 @@ class LLMClient:
                 error=None,
             )
         except urllib.error.HTTPError as e:
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             err_msg = f"HTTP {e.code}: {e.reason}"
             try:
                 if e.fp:
-                    raw_body = e.read().decode("utf-8", errors="replace")
+                    raw_body = self._safe_error(e.read(8192).decode("utf-8", errors="replace"), provider)
                     try:
                         parsed = json.loads(raw_body)
                         if isinstance(parsed, dict):
@@ -348,10 +398,10 @@ class LLMClient:
                 completion_tokens=0,
                 total_tokens=prompt_tokens,
                 estimated_cost_usd=0.0,
-                error=err_msg,
+                error=self._safe_error(err_msg, provider),
             )
         except Exception as e:
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
             return LLMResponse(
                 content="",
                 elapsed_seconds=elapsed,
@@ -361,8 +411,21 @@ class LLMClient:
                 completion_tokens=0,
                 total_tokens=prompt_tokens,
                 estimated_cost_usd=0.0,
-                error=str(e),
+                error=self._safe_error(str(e), provider),
             )
+
+    def _safe_error(self, message: str, provider: str) -> str:
+        """Keep useful provider diagnostics while removing credentials."""
+        try:
+            secret = self.vault.get_api_key(provider) if provider else ""
+        except Exception:
+            secret = ""
+        if secret:
+            for encoded in {secret, urllib.parse.quote(secret, safe=""), urllib.parse.quote_plus(secret)}:
+                message = message.replace(encoded, "[redacted]")
+        message = re.sub(r"(?i)([?&](?:key|api_key|token|access_token)=)[^&\s]+", r"\1[redacted]", message)
+        message = re.sub(r"(?i)(Bearer\s+)[^\s\"']+", r"\1[redacted]", message)
+        return message[:600]
 
     # ── Provider-specific HTTP implementations ──────────────────────────
 
@@ -378,12 +441,11 @@ class LLMClient:
         )
 
     def _call_openai(self, req: LLMRequest, model_name: str) -> str:
-        api_key = self.vault.get_api_key("openai")
-        if not api_key:
-            raise ValueError("OpenAI API key not configured. Please set your API key in Settings (Ctrl+,).")
-
         cfg = self.vault.get_provider_config("openai")
-        base_url = cfg.get("base_url", "https://api.openai.com/v1").rstrip("/")
+        base_url = validate_base_url(cfg.get("base_url") or "https://api.openai.com/v1")
+        api_key = self.vault.get_api_key("openai")
+        if not api_key and urllib.parse.urlsplit(base_url).hostname == "api.openai.com":
+            raise ValueError("OpenAI API key not configured. Please set your API key in Settings (Ctrl+,).")
 
         messages = []
         if req.system_instruction.strip():
@@ -401,9 +463,10 @@ class LLMClient:
         url = f"{base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
             "User-Agent": "CubePrompts/1.0.0",
         }
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         data = json.dumps(payload).encode("utf-8")
         http_req = urllib.request.Request(url, data=data, headers=headers, method="POST")
 
@@ -487,7 +550,7 @@ class LLMClient:
 
     def _call_ollama(self, req: LLMRequest, model_name: str) -> str:
         cfg = self.vault.get_provider_config("ollama")
-        base_url = cfg.get("base_url", "http://localhost:11434").rstrip("/")
+        base_url = validate_base_url(cfg.get("base_url") or "http://localhost:11434")
 
         messages = []
         if req.system_instruction.strip():
@@ -503,6 +566,9 @@ class LLMClient:
             },
         }
 
+        if req.max_tokens:
+            payload["options"]["num_predict"] = req.max_tokens
+
         url = f"{base_url}/api/chat"
         headers = {"Content-Type": "application/json"}
         data = json.dumps(payload).encode("utf-8")
@@ -514,7 +580,7 @@ class LLMClient:
                 return body.get("message", {}).get("content", "").strip()
         except urllib.error.URLError as e:
             raise ConnectionError(
-                f"Cannot connect to Ollama at {base_url}. Ensure Ollama is running (`ollama serve`). Error: {e}"
+                "Cannot connect to Ollama. Check the endpoint in Settings and ensure Ollama is running (`ollama serve`)."
             ) from e
 
     def _call_openrouter(self, req: LLMRequest, model_name: str) -> str:

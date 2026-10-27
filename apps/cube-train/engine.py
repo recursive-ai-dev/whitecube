@@ -1,5 +1,6 @@
 """Native trainer's process and run management (stdlib only; no torch in GTK)."""
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -529,7 +530,8 @@ class Trainer:
 
     def resume_command(self, run_id, steps):
         run = self.find_run(run_id)
-        return shlex.join(['whitecube-train', '--resume', run['directory'], '--steps', str(int(steps))])
+        command = os.environ.get('WHITECUBE_TRAIN_COMMAND') or 'whitecube-train'
+        return shlex.join([command, '--resume', run['directory'], '--steps', str(int(steps))])
 
     def trash(self, run_id, kind='run'):
         run = self.find_run(run_id)
@@ -817,6 +819,82 @@ class Trainer:
                 'notes': run['notes'], 'previews': self.previews(run_id), 'benchmarks': self.benchmarks(run_id),
                 'disk_bytes': directory_size(directory), 'metrics': read_metrics(directory)}
 
+    def compare_runs(self, run_ids=None):
+        """Compare saved metrics without loading weights or scanning corpus data.
+
+        Fingerprints describe recorded integrity metadata, not a fresh integrity
+        check. Training and benchmarking verify the actual artifacts separately.
+        Only matching recorded corpora and evaluation plans receive a ranking.
+        """
+        available = {run['id']: run for run in self.list_runs()}
+        if run_ids is None:
+            selected = [run['id'] for run in sorted(available.values(),
+                        key=lambda run: (run['created'], run['id']), reverse=True)[:20]]
+        else:
+            if (not isinstance(run_ids, (list, tuple)) or len(run_ids) > 20
+                    or any(not isinstance(value, str) for value in run_ids)):
+                raise ValueError('Choose up to 20 run IDs to compare.')
+            selected = list(dict.fromkeys(run_ids))
+            missing = [value for value in selected if value not in available]
+            if missing:
+                raise ValueError('Unavailable run IDs: ' + ', '.join(missing))
+        rows, warnings = [], []
+        for run_id in selected:
+            run = available[run_id]
+            directory = Path(run['directory'])
+            progress = read_json(directory / 'progress.json')
+            result = read_json(directory / 'result.json')
+            config = read_json(directory / 'local_config.json')
+            meta = run['meta']
+            corpus = read_json(directory / 'data/corpus.json', max_bytes=16 * 1024 * 1024)
+            fingerprint = recorded_corpus_fingerprint(corpus)
+            # Newer progress records can supply Best before the first result.
+            loss = next((value for value in (run['val_loss'], progress.get('best_val_loss'))
+                         if finite_number(value) and value >= 0 and finite_number(bits_per_byte(value))), None)
+            rate = progress.get('tokens_per_second')
+            seconds = run['training_seconds']
+            if not finite_number(seconds) or seconds < 0:
+                seconds = None
+            context = config.get('block_size', corpus.get('block_size'))
+            budget = next((value for value in (result.get('eval_iters'), progress.get('eval_iters'), meta.get('eval_iters'))
+                           if nonnegative_int(value) > 0), None)
+            precision = run['dtype']
+            # Evaluation fixes its sampling seed to 2026 and batch size to 8.
+            plan = {'eval_iters': int(budget) if budget is not None else None,
+                    'block_size': int(context) if nonnegative_int(context) > 0 else None,
+                    'seed': 2026, 'batch_size': 8, 'dtype': precision}
+            rows.append({'id': run_id, 'name': run['name'], 'model_size': run['size'],
+                         'device': meta.get('device') if meta.get('device') in ('cpu', 'cuda') else None,
+                         'status': run['phase'], 'step': run['completed_steps'], 'parameters': run['parameters'],
+                         'val_loss': loss, 'bits_per_byte': bits_per_byte(loss),
+                         'tokens_per_second': rate if finite_number(rate) and rate >= 0 else None,
+                         'training_seconds': seconds, 'corpus_fingerprint': fingerprint,
+                         'evaluation': plan})
+        if len(rows) < 2:
+            warnings.append('Select at least two runs to compare validation losses.')
+        if any(row['corpus_fingerprint'] is None for row in rows):
+            warnings.append('Some runs lack recorded corpus checksums; matching validation data cannot be established.')
+        elif len({row['corpus_fingerprint'] for row in rows}) > 1:
+            warnings.append('These runs use different prepared corpora; validation losses are not directly comparable.')
+        if any(any(value is None for value in row['evaluation'].values()) for row in rows):
+            warnings.append('Some runs lack a complete evaluation plan or actual precision; use checkpoint benchmarks for a controlled comparison.')
+        elif len({json.dumps(row['evaluation'], sort_keys=True) for row in rows}) > 1:
+            warnings.append('Validation budgets, contexts or compute precisions differ; use matching checkpoint benchmarks before ranking.')
+        if any(row['val_loss'] is None for row in rows):
+            warnings.append('Some runs have no finite saved validation loss yet.')
+        comparable = len(rows) >= 2 and not warnings
+        best = min(rows, key=lambda row: row['val_loss']) if comparable else None
+        if any(row['tokens_per_second'] is not None for row in rows):
+            # This is informational and does not invalidate the loss comparison.
+            throughput_note = 'Throughput is the last reported training rate; device, batching and runtime affect it.'
+        else:
+            throughput_note = 'Training throughput has not been recorded.'
+        return {'schema_version': 1, 'kind': 'whitecube_run_comparison', 'created_at': now(),
+                'runs': rows, 'comparable': comparable, 'warnings': warnings,
+                'best_run_id': best['id'] if best else None,
+                'notes': ['Corpus fingerprints use recorded checksums; this view does not rehash data.',
+                          'Loss and bits per byte include special token targets, as on the training chart.', throughput_note]}
+
     def summary(self):
         """Plain-text run table for the command line."""
         lines = []
@@ -841,6 +919,25 @@ class Trainer:
         if finite_number(progress.get('eta_seconds')):
             text += f' · about {int(progress["eta_seconds"]) // 60} min remaining'
         return text + f'\nRun folder: {job["run"]}\nLog: {job["log"]}'
+
+
+def recorded_corpus_fingerprint(corpus):
+    """Ignore locations and source metadata so independently reused data matches."""
+    artifacts = corpus.get('artifacts')
+    if not isinstance(artifacts, dict):
+        return None
+    selected = {}
+    for name in ('train.bin', 'val.bin'):
+        record = artifacts.get(name)
+        if (not isinstance(record, dict) or not isinstance(record.get('sha256'), str)
+                or not re.fullmatch('[0-9a-f]{64}', record['sha256'])
+                or nonnegative_int(record.get('bytes'), -1) < 0):
+            return None
+        selected[name] = {'sha256': record['sha256'], 'bytes': record['bytes']}
+    payload = {'artifacts': selected, 'tokenizer': corpus.get('tokenizer'),
+               'token_dtype': corpus.get('token_dtype', 'uint16'),
+               'byte_order': corpus.get('byte_order', sys.byteorder), 'token_bytes': corpus.get('token_bytes', 2)}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
 def valid_recent(value):
