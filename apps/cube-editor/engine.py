@@ -1038,7 +1038,13 @@ def main(argv=None):
         else:
             engine = Engine(Project.load(args.project), lambda e: print(json.dumps(e), flush=True) if args.command == "run" else None)
             if args.command == "plan":
-                value = {**engine.detailed_plan(args.action), 'launch': engine.worker_command(args.action)}
+                value = engine.detailed_plan(args.action)
+                # Planning is useful from SSH and headless build hosts too.
+                # Report missing GUI authentication separately from the image plan.
+                try:
+                    value['launch'] = engine.worker_command(args.action)
+                except CubeError as error:
+                    value.update(launch=None, launch_error=str(error))
             elif args.command == "verify":
                 value = engine.verify_release(record=True)
             elif args.command == 'verify-source':

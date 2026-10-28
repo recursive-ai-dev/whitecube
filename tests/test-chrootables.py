@@ -119,6 +119,11 @@ def make_store(path):
 
 
 class BackendRules(unittest.TestCase):
+    def test_installed_manager_is_the_private_bundled_helper(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True), patch.object(backend, 'HERE', Path('/usr/share/whitecube/chrootables')):
+            self.assertEqual(backend.manager_path(), Path('/usr/libexec/whitecube/chrootable-manager'))
+
     def test_names_sizes_and_descriptions_follow_the_manager(self):
         for good in ('a', 'build-lab', 'A.1_x', 'x' * 64):
             self.assertTrue(backend.valid_name(good), good)

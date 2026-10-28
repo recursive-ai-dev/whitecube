@@ -1596,7 +1596,7 @@ run_demo() (
     else ui_init && main_menu; fi
 )
 
-usage() {
+usage_text() {
     printf '%s\n' "Chrootable Manager $APP_VERSION - Debian environment workbench" '
 Usage: chrootable-manager [COMMAND]
 No command opens the terminal dashboard (root required).
@@ -1669,13 +1669,19 @@ Configuration
 These are host-root development environments, not security sandboxes.
 Ephemeral sessions discard filesystem writes but still expose host devices.'
 }
+usage() {
+    local command=${0##*/} text
+    [[ $0 != /usr/libexec/whitecube/* ]] || command=whitecube-chrootable-manager
+    text=$(usage_text)
+    printf '%s\n' "${text//chrootable-manager/$command}"
+}
 # Points at the command's own usage line, not only at --help.
 usage_error() {
     local line
     fail "Invalid arguments. Run $0 --help for usage." || true
     if [[ ${1:-} == --* ]]; then
         while IFS= read -r line; do
-            if [[ $line == "  $1 "* ]]; then printf 'Usage: chrootable-manager %s\n' "${line#  }" >&2; fi
+            if [[ $line == "  $1 "* ]]; then printf 'Usage: %s %s\n' "$0" "${line#  }" >&2; fi
         done < <(usage)
     fi
     return 2

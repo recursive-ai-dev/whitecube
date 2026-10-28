@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Cube Browser
+Name=Whitecube Browser
 GenericName=Web Browser
 Comment=Native interactive-web browser preview for Whitecube
-Exec=/usr/bin/cube-browser %u
-TryExec=/usr/bin/cube-browser
-Icon=cube-browser
+Exec=/usr/bin/whitecube-browser -- %u
+TryExec=/usr/bin/whitecube-browser
+Icon=whitecube-browser
 Terminal=false
 Categories=Network;WebBrowser;
 MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

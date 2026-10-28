@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Chrootables
+Name=Whitecube Chrootables
 GenericName=Debian Workspaces
 Comment=Create, enter, snapshot and share Debian chroot workspaces
 Exec=/usr/bin/chrootables

@@ -269,7 +269,9 @@ python3 apps/cube-editor/engine.py releases /path/to/project
 ```
 
 `inspect` reads the ISO. `plan` prints argument arrays and the worker launch
-command without changing an image. `run` opens the authenticated worker in Foot.
+command without changing an image. It also works without a graphical terminal;
+in that case its JSON contains `launch: null` and an explanatory `launch_error`.
+`run` opens the authenticated worker in the selected supported terminal.
 The project JSON records package lists, custom commands, payload mappings, and
 output settings; retain its schema and use absolute paths for local files.
 

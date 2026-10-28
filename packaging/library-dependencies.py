@@ -1,5 +1,12 @@
 #!/usr/bin/python3 -I
-"""Map every unbundled native shared library to its Debian package, or fail."""
+"""Map direct ELF dependencies to their Debian owners, validating full resolution.
+
+Dependencies of distribution libraries are managed by those libraries' packages.
+Pinning their entire ldd closure unnecessarily ties a release to the builder's
+distribution (for example GTK's JPEG provider differs between Debian and Ubuntu).
+Every shipped ELF, including private shared libraries, contributes its own
+DT_NEEDED entries; complete ldd closures still detect missing and X11 libraries.
+"""
 import argparse
 import os
 from pathlib import Path
@@ -7,11 +14,9 @@ import re
 import subprocess
 import sys
 
-NATIVE = ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
-          'usr/libexec/whitecube/cube-browser/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-renderd',
-          'usr/libexec/whitecube/cube-browser/cube-netd')
-# cube-player is not listed: libmpv (Depends: libmpv2) reaches X11 and is not on the build host.
 RESOLVED = re.compile(r'^\s*(\S+)\s+=>\s+(\S+)\s+\(', re.MULTILINE)
+ABSOLUTE_RESOLVED = re.compile(r'^\s*(/\S+)\s+\(', re.MULTILINE)
+NEEDED = re.compile(r'\(NEEDED\).*\[([^]]+)\]')
 DIVERTED_FROM = re.compile(r'^diversion by .+ from: (.+)$', re.MULTILINE)
 
 
@@ -54,20 +59,56 @@ def owner_for_library(path, query=package_query):
     raise RuntimeError(f'no Debian package owns required shared library: {path}')
 
 
+def elf_files(stage, include_chat):
+    runtime = stage / 'usr/lib/whitecube/desktop-chat-runtime'
+    for path in sorted((stage / 'usr').rglob('*')):
+        if path.is_symlink() or not path.is_file() or (not include_chat and path.is_relative_to(runtime)):
+            continue
+        with path.open('rb') as stream:
+            if stream.read(4) == b'\x7fELF':
+                yield path
+
+
+def needed_libraries(binary):
+    result = subprocess.run(['readelf', '--dynamic', '--wide', str(binary)], capture_output=True, text=True,
+                            env=dict(os.environ, LC_ALL='C'))
+    if result.returncode:
+        raise RuntimeError(f'{binary.name}: cannot inspect ELF dependencies: {result.stderr.strip()}')
+    return set(NEEDED.findall(result.stdout))
+
+
 def discover(stage, include_chat=False):
-    private = (stage / 'usr/lib/whitecube').resolve()
-    binaries = [stage / name for name in NATIVE]
-    libraries = [p for p in private.glob('*.so*') if p.is_file() and not p.is_symlink()]
-    paths = set()
+    stage = stage.resolve()
+    private = stage / 'usr/lib/whitecube'
     runtime = private / 'desktop-chat-runtime'
-    chat_paths = [runtime / 'electron', *runtime.glob('*.so')] if include_chat else []
-    for binary in binaries + libraries + chat_paths:
-        search = str(runtime) if binary in chat_paths else str(private)
+    paths = set()
+    binaries = list(elf_files(stage, include_chat))
+    if not binaries:
+        raise RuntimeError('package contains no ELF executables or shared libraries')
+    for binary in binaries:
+        needed = needed_libraries(binary)
+        if not needed:  # Static executables have no runtime library dependencies.
+            continue
+        chat = binary.is_relative_to(runtime)
+        search = str(runtime) if chat else str(private)
         result = subprocess.run(['ldd', str(binary)], capture_output=True, text=True,
                                 env=dict(os.environ, LD_LIBRARY_PATH=search, LC_ALL='C'))
         if result.returncode or re.search(r'=>\s+not found(?:\s|$)', result.stdout):
             raise RuntimeError(f'{binary.name}: unresolved shared library: {result.stdout.strip()} {result.stderr.strip()}')
-        for _, path in RESOLVED.findall(result.stdout):
+        resolved = dict(RESOLVED.findall(result.stdout))
+        # The dynamic loader can itself be a DT_NEEDED library (Chromium's
+        # crashpad helper does this). ldd prints its absolute path without =>.
+        for path in ABSOLUTE_RESOLVED.findall(result.stdout):
+            resolved.setdefault(Path(path).name, path)
+            resolved.setdefault(path, path)
+        if not chat and binary.relative_to(stage).as_posix() != 'usr/bin/cube-player':
+            for name in resolved:
+                if name.startswith(('libX11', 'libxcb')):
+                    raise RuntimeError(f'{binary.name}: X11 library reaches a native executable: {name}')
+        for name in needed:
+            path = resolved.get(name)
+            if path is None:
+                raise RuntimeError(f'{binary.name}: direct dependency did not resolve: {name}')
             if not Path(path).resolve().is_relative_to(private):
                 paths.add(path)
     packages = {owner_for_library(path) for path in sorted(paths)}
@@ -84,7 +125,7 @@ def main():
     try:
         for package in discover(args.stage.resolve(), args.chat_runtime):
             print(package)
-    except RuntimeError as error:
+    except (OSError, RuntimeError) as error:
         print(f'library-dependencies: {error}', file=sys.stderr)
         return 1
     return 0

@@ -62,6 +62,12 @@ int main(void) {
     // A cycle skips only its own branch; repeated valid entries remain intentional.
     g_file_set_contents(list,"./list.m3u\na ' strange; name.mp4\na ' strange; name.mp4\n",-1,NULL);
     g_assert_cmpint(add_media(&a,list,0),==,2);g_assert_cmpuint(a.queue->len,==,7);
+    // VLC-style XSPF locations use URI escaping and share cycle/nesting bounds.
+    char *xspf=g_build_filename(root,"list.xspf",NULL);
+    g_file_set_contents(xspf,"<playlist xmlns=\"http://xspf.org/ns/0/\"><trackList><track><location>a%20%27%20strange%3B%20name.mp4</location></track><track><location>list.xspf</location></track></trackList></playlist>",-1,NULL);
+    g_assert_cmpint(add_media(&a,xspf,0),==,1);g_assert_cmpuint(a.queue->len,==,8);
+    g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,7))->path,==,media);
+    g_remove(xspf);g_free(xspf);
     g_remove(config);g_remove(access);g_rmdir(dir);g_remove(media);g_remove(list);g_rmdir(root);
     g_free(config);g_free(access);g_free(dir);g_free(media);g_free(list);g_free(root);
     state_free(&a.state);g_ptr_array_free(a.queue,TRUE);g_ptr_array_free(a.entries,TRUE);g_array_free(a.player.tracks,TRUE);g_array_free(a.player.chapters,TRUE);g_free(a.folder);

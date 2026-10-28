@@ -132,8 +132,33 @@ The default package build runs the core C and Python tests, desktop application
 unit and rendering checks, Chat's Node.js suite, and the native browser/player
 Meson suites with their `integration` suite excluded. The finished archive is
 checked for ownership, permissions, conffiles, symlinks, checksums and ABI
-requirements, then unpacked with dpkg into a disposable installation root.
+requirements, then unpacked with dpkg into a disposable installation root
+containing standalone Chrootables and Cube Browser fixture packages. Their
+original command/launcher/icon contents and dpkg ownership must survive.
 This unpack test does not configure the desktop or start its session.
+
+The build checks staged files against its installed dpkg database. The normal
+isolated runner also checks the finished archive against the real host's file
+ownership database. To perform that read-only host check separately:
+
+```sh
+python3 -I packaging/check-installed-conflicts.py packaging/out/whitecube-desktop_0.8.1_amd64.deb
+```
+
+This catches file ownership collisions that an apt dependency simulation cannot
+detect. Whitecube 0.8.1 namespaces its bundled browser and workspace manager so
+the corresponding standalone applications can remain installed.
+
+The eight native executables also enable PIE, stack protection, fortified
+functions and full RELRO. The final verifier inspects ELF headers in the archive
+to require amd64, PIE, full RELRO and non-executable stacks; the manifest lists
+the verified executables. Cached Meson builds explicitly refresh compiler and
+linker options before recompilation.
+
+After building, run the [installed runtime smoke test](INSTALLED-SMOKE.md) on
+the host to launch the delivered archive with its installed absolute paths in
+a disposable Debian root. It retains a report and window captures without
+changing the host installation or cached builder.
 
 To run Cube Player's optional real Wayland playback checks after a successful
 build:
@@ -154,6 +179,14 @@ verified archive hash, dependency list and file counts. The checksum file uses
 just the artifact filename, so check it from `packaging/out/` with
 `sha256sum --check <package>.deb.sha256`. `SOURCE_DATE_EPOCH` controls normalized
 archive timestamps; by default it comes from the last source commit.
+
+Dependencies name the direct library providers of shipped ELF files, with ABI
+minimum versions from Debian's symbol metadata. Transitive distribution library
+packages are left to apt; this avoids pinning Debian-specific implementations of
+libraries used internally by GTK or mpv. The bundled display-info ABI does not
+require its obsolete system package. Building on Debian 13 remains the supported
+release baseline; dependency resolution on another distribution is a separate
+check and does not replace testing that desktop on its hardware.
 
 ## Install the artifact
 

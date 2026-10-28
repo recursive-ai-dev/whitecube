@@ -31,7 +31,7 @@ GUEST_PATH_FRAGMENTS = {
         b'for example /etc/skel/.config or /usr/local/bin. Overlays are applied with the recipe.',),
     'usr/share/whitecube/cube-editor/worker.py': (
         b'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',),
-    'usr/bin/chrootable-manager': (
+    'usr/libexec/whitecube/chrootable-manager': (
         b'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',),
 }
 # Owned-looking paths that name files inside a target system being built, not host files:
@@ -142,7 +142,7 @@ def main():
                 'usr/bin/cube-editor', 'usr/share/whitecube/cube-editor/app.py',
                 'usr/share/whitecube/cube-editor/worker.py', 'usr/share/applications/cube-editor.desktop',
                 'usr/share/icons/hicolor/scalable/apps/cube-editor.svg',
-                'usr/bin/chrootables', 'usr/bin/chrootable-manager', 'usr/share/whitecube/chrootables/app.py',
+                'usr/bin/chrootables', 'usr/bin/whitecube-chrootable-manager', 'usr/libexec/whitecube/chrootable-manager', 'usr/share/whitecube/chrootables/app.py',
                 'usr/share/whitecube/chrootables/backend.py', 'usr/share/whitecube/chrootables/broker.py', 'usr/share/applications/chrootables.desktop',
                 'usr/share/icons/hicolor/scalable/apps/chrootables.svg',
                 'usr/bin/cube-strap', 'usr/share/whitecube/cube-strap/app.py', 'usr/share/whitecube/cube-strap/strap.py',
@@ -151,9 +151,9 @@ def main():
                 'usr/bin/cube-prompts', 'usr/share/whitecube/cube-prompts/app.py',
                 'usr/share/whitecube/cube-prompts/prompt_manager/storage/repository.py',
                 'usr/share/applications/cube-prompts.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-prompts.svg',
-                'usr/bin/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-browser',
+                'usr/bin/whitecube-browser', 'usr/libexec/whitecube/cube-browser/cube-browser',
                 'usr/libexec/whitecube/cube-browser/cube-renderd', 'usr/libexec/whitecube/cube-browser/cube-netd',
-                'usr/share/applications/cube-browser.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-browser.svg',
+                'usr/share/applications/whitecube-browser.desktop', 'usr/share/icons/hicolor/scalable/apps/whitecube-browser.svg',
                 'usr/bin/cube-player', 'usr/share/applications/cube-player.desktop',
                 'usr/share/icons/hicolor/scalable/apps/cube-player.svg',
                 'usr/bin/wc-help', 'usr/bin/wc-doctor', 'usr/lib/wc-suite/wc_suite.py',

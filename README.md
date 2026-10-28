@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.8.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.8.1_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -50,6 +50,11 @@ tests a real `dpkg --unpack` in a disposable directory, and writes matching
 `.deb.sha256` and `.deb.json` release files. The dependency list includes ABI
 version requirements from the shipped binaries. The package targets amd64;
 building in Debian 13 provides the supported release baseline.
+
+Version 0.8.1 coexists with the standalone `chrootables` and `cube-browser`
+packages. The bundled browser uses `whitecube-browser`; the bundled workspace
+CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
+launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
 
 ## Desktop and package improvements in 0.8.0
 
@@ -77,8 +82,14 @@ settings absent from the profile. See [settings profiles](docs/SETTINGS-PROFILES
 
 Cube Player now expands PLS playlists in numeric track order, handles M3U files
 with a UTF-8 BOM and relative paths, preserves HLS streaming manifests, and bounds
-recursive playlist imports. Debian upgrades also preserve the shipped skeleton
+recursive playlist imports. VLC-style XSPF playlists support relative and alternative
+media locations. Debian upgrades also preserve the shipped skeleton
 configuration files as conffiles.
+
+The eight native executables use PIE, stack protection, fortified functions and
+full RELRO. Final archive verification checks their actual amd64 headers and
+hardening. An [installed runtime smoke test](docs/INSTALLED-SMOKE.md) exercises
+the package's desktop, settings, browser, player and Chat in a disposable root.
 
 ## Network switch
 
@@ -155,7 +166,7 @@ set `NODE` to a Node executable when it is outside PATH. See `docs/PANEL-CHAT-IM
 `chrootables` manages Debian chroot workspaces: debootstrap images with profiles, persistent or disposable
 sessions, snapshots, clones, exports and imports. The window runs as you and reaches root through sudo (a
 password typed into it goes to `sudo -S -v` once and is never stored); shells open in `whitecube-terminal`.
-The same engine is the `chrootable-manager` command, with its own menu and JSON output. See
+The same engine is the `whitecube-chrootable-manager` command, with its own menu and JSON output. See
 [the app notes](apps/chrootables/README.md).
 
 `cube-prompts` is the prompt library: folders, tags, favorites and full-text search over a local SQLite

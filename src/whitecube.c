@@ -185,7 +185,7 @@ static void config_defaults(void) {
 	snprintf(g_chat_cmd, sizeof(g_chat_cmd), "%s", "foot -a cube-chat -T cube-chat /usr/bin/cube-chat");
 	snprintf(g_scripts_app_id, sizeof(g_scripts_app_id), "%s", "cube-scripts");
 	snprintf(g_scripts_cmd, sizeof(g_scripts_cmd), "%s", "/usr/bin/whitecube-terminal -a cube-scripts -T Scripts /usr/bin/cube-scripts");
-	snprintf(g_browser_cmd, sizeof(g_browser_cmd), "%s", "/usr/bin/whitecube-web open");
+	snprintf(g_browser_cmd, sizeof(g_browser_cmd), "%s", "/usr/bin/whitecube-browser");
 	snprintf(g_help_cmd, sizeof(g_help_cmd), "%s", "/usr/bin/whitecube-terminal -T keys -e less /usr/share/whitecube/keys.txt");
 	snprintf(g_settings_cmd, sizeof(g_settings_cmd), "%s", "cube-settings");
 	g_xkb_model[0] = g_xkb_layout[0] = g_xkb_variant[0] = g_xkb_options[0] = 0;

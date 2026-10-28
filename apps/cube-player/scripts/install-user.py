@@ -32,7 +32,7 @@ def entries(home):
         'Exec=' + desktop_quote(launcher) + ' %U', 'Icon=cube-player',
         'Terminal=false', 'StartupNotify=true', 'StartupWMClass=cube-player',
         'Categories=AudioVideo;Player;Audio;Video;', 'Keywords=Whitecube;mpv;film;music;media;',
-        'MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/ogg;audio/mpeg;audio/flac;audio/x-flac;audio/ogg;audio/opus;audio/mp4;audio/x-wav;audio/wav;audio/aac;audio/x-mpegurl;application/x-mpegurl;application/vnd.apple.mpegurl;', '',
+        'MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/ogg;audio/mpeg;audio/flac;audio/x-flac;audio/ogg;audio/opus;audio/mp4;audio/x-wav;audio/wav;audio/aac;audio/x-mpegurl;audio/x-scpls;application/x-mpegurl;application/vnd.apple.mpegurl;application/xspf+xml;', '',
     ])
     return [(launcher, wrapper.encode(), 0o755), (icon, (ROOT / 'assets/cube-player.svg').read_bytes(), 0o644), (desktop, entry.encode(), 0o644)]
 

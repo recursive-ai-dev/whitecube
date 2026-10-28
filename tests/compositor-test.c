@@ -52,7 +52,7 @@ static void test_reload_defaults(void) {
 	assert(!strcmp(g_chat_cmd, "foot -a cube-chat -T cube-chat /usr/bin/cube-chat"));
 	assert(!strcmp(g_scripts_app_id, "cube-scripts"));
 	assert(!strcmp(g_scripts_cmd, "/usr/bin/whitecube-terminal -a cube-scripts -T Scripts /usr/bin/cube-scripts"));
-	assert(!strcmp(g_browser_cmd, "/usr/bin/whitecube-web open"));
+	assert(!strcmp(g_browser_cmd, "/usr/bin/whitecube-browser"));
 	assert(!strcmp(g_help_cmd, "/usr/bin/whitecube-terminal -T keys -e less /usr/share/whitecube/keys.txt"));
 	assert(!strcmp(g_settings_cmd, "cube-settings"));
 	assert(!g_xkb_model[0] && !g_xkb_layout[0] && !g_xkb_variant[0] && !g_xkb_options[0]);

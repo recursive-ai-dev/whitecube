@@ -39,7 +39,7 @@ install -m 0755 build/whitecube "$bin/whitecube-compositor"
 # Cube Browser and Cube Player (meson, built by apps/build-native-apps.sh). The browser starts its
 # renderer and network workers from its own directory, so the three stay together in libexec.
 cp -a build/native-apps-root/usr/. "$dest/usr/"
-ln -s ../libexec/whitecube/cube-browser/cube-browser "$bin/cube-browser"
+ln -s ../libexec/whitecube/cube-browser/cube-browser "$bin/whitecube-browser"
 
 # --- commands (scripts)
 for f in bin/*; do
@@ -108,11 +108,12 @@ while IFS= read -r -d '' source; do
   fi
 done < <(find apps/cube-editor -mindepth 1 \( -type d \( -name upstream -o -name tests -o -name packaging -o -name __pycache__ \) -prune \) -o \( -type d -o -type f \) -print0)
 rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/desktop-chat/dist" "$share/desktop-chat/packaging" "$share/cube-apps/tests" "$share/cube-apps/shot.sh" "$share/cube-train/tests"
-# Chrootables: the window runs from /usr/share; its manager is a command of its own (CLI and menu),
-# which the window finds as /usr/bin/chrootable-manager.
+# Keep the bundled manager separate from the standalone chrootables package.
+# The window uses the private root helper; the public alias is namespaced.
 install -d -m 0755 "$share/chrootables"
 for f in app.py backend.py broker.py style.css README.md MANAGER.md; do install -m 0644 "apps/chrootables/$f" "$share/chrootables/$f"; done
-install -m 0755 apps/chrootables/chrootable-manager "$bin/chrootable-manager"
+install -m 0755 apps/chrootables/chrootable-manager "$lib/chrootable-manager"
+ln -s ../libexec/whitecube/chrootable-manager "$bin/whitecube-chrootable-manager"
 # Cube Strap: the window runs from /usr/share and imports cube-apps and chrootables beside it;
 # its one privileged step, cube-strap-build, lives with the other root helpers.
 install -d -m 0755 "$share/cube-strap"
@@ -153,7 +154,7 @@ install -m 0644 data/icons/chrootables.svg "$dest/usr/share/icons/hicolor/scalab
 install -m 0644 data/icons/cube-train.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-train.svg"
 install -m 0644 data/icons/cube-strap.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-strap.svg"
 install -m 0644 data/icons/cube-prompts.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-prompts.svg"
-install -m 0644 data/icons/cube-browser.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-browser.svg"
+install -m 0644 data/icons/whitecube-browser.svg "$dest/usr/share/icons/hicolor/scalable/apps/whitecube-browser.svg"
 install -m 0644 data/icons/cube-player.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-player.svg"
 env -u LD_LIBRARY_PATH python3 -I apps/cube-apps/install.py --destdir "$dest" > /dev/null   # GTK helpers use distro Cairo
 env -u LD_LIBRARY_PATH python3 -I packaging/install-wc-suite.py "$dest" > /dev/null          # wc-* commands, /usr/lib/wc-suite, completions

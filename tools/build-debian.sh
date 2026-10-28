@@ -150,7 +150,7 @@ case $mode in
   command) [[ $# -gt 0 ]] || { echo 'build-debian.sh: -- requires a command' >&2; exit 2; }; arguments=("$@") ;;
   build) arguments=(/bin/bash -euc '[[ -x "$ELECTRON_DIST/electron" ]] || npm --prefix apps/desktop-chat ci; bash tools/prepare-native-deps.sh; source build/native-deps/environment.sh; bash packaging/build-deb.sh') ;;
 esac
-exec bwrap --unsetenv LD_LIBRARY_PATH --unsetenv PKG_CONFIG_PATH --unsetenv GI_TYPELIB_PATH \
+bwrap --unsetenv LD_LIBRARY_PATH --unsetenv PKG_CONFIG_PATH --unsetenv GI_TYPELIB_PATH \
   --unsetenv PYTHONPATH --unsetenv PYTHONHOME --unsetenv NODE_PATH --unsetenv TMPDIR \
   --unsetenv XDG_RUNTIME_DIR --unsetenv WAYLAND_DISPLAY --unsetenv DISPLAY --unsetenv DBUS_SESSION_BUS_ADDRESS \
   --unsetenv XDG_CONFIG_HOME --unsetenv XDG_DATA_HOME --unsetenv XDG_STATE_HOME --unsetenv XDG_CACHE_HOME \
@@ -158,3 +158,9 @@ exec bwrap --unsetenv LD_LIBRARY_PATH --unsetenv PKG_CONFIG_PATH --unsetenv GI_T
   --unshare-user --uid "$(id -u)" --gid "$(id -g)" --chdir "$root" --setenv HOME /tmp/whitecube-build-home \
   --setenv PATH /opt/whitecube-node/bin:/usr/sbin:/usr/bin:/sbin:/bin --setenv NODE /opt/whitecube-node/bin/node --setenv LANG C.UTF-8 \
   --setenv ELECTRON_DIST "$electron_dist" "${extra_binds[@]}" "${arguments[@]}"
+if [[ $mode == build ]]; then
+  version=$(tr -d '[:space:]' < "$root/packaging/VERSION")
+  # The builder's dpkg database cannot reveal file collisions on the host.
+  # Check the delivered archive against that host too, without changing it.
+  python3 -I "$root/packaging/check-installed-conflicts.py" "$root/packaging/out/whitecube-desktop_${version}_amd64.deb"
+fi

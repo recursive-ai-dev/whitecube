@@ -21,7 +21,7 @@ import threading
 import time
 
 HERE = Path(__file__).resolve().parent
-INSTALLED_MANAGER = Path('/usr/bin/chrootable-manager')
+INSTALLED_MANAGER = Path('/usr/libexec/whitecube/chrootable-manager')
 DEFAULT_STORE = Path('/var/lib/chrootable-manager')
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
 SIZE = re.compile(r'[1-9][0-9]{0,6}\Z')

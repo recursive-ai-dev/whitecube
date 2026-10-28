@@ -14,8 +14,10 @@ and imports).
   the window closes, on Lock, or after the idle time set in Preferences. This is
   what makes one password enough on this desktop, where sudoers sets
   `timestamp_timeout=0` and sudo remembers nothing between commands.
-- `chrootable-manager`: the manager (installed as `/usr/bin/chrootable-manager`,
-  with its own whiptail menu and command line); `MANAGER.md` is its manual.
+- `chrootable-manager`: the private manager at `/usr/libexec/whitecube/chrootable-manager`,
+  exposed as `whitecube-chrootable-manager` for its whiptail menu and command line.
+  This leaves the standalone Chrootables package's public command alone;
+  `MANAGER.md` is the engine manual (use `whitecube-chrootable-manager` when installed).
 - `tests/integration.sh`: the manager's opt-in root test (downloads Debian).
 
 Window features: queued operations with a live console and Cancel, a Run

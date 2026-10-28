@@ -51,10 +51,54 @@ static void test_playlists(const char *root) {
     g_remove(list); g_remove(pls); g_free(list); g_free(pls); g_free(expected);
 }
 
+static void test_xspf(const char *root) {
+    char *list = g_build_filename(root, "list.xspf", NULL);
+    char *expected = g_build_filename(root, "sub", "film é.mp4", NULL);
+    char *uri = g_filename_to_uri(expected, NULL, NULL);
+    bool stream = true; GError *error = NULL;
+    g_assert_true(media_supported("Playlist.XSPF"));
+    g_assert_true(media_playlist_path(list));
+    const char *xml = "<?xml version=\"1.0\"?><playlist xmlns=\"http://xspf.org/ns/0/\" version=\"1\">"
+        "<title>Not a media URL</title><trackList xml:base=\"sub/\">"
+        "<track><location>film%20%C3%A9.mp4</location><location>ignored.mp4</location></track>"
+        "<track><location>spotify:unsupported</location><location>https://example.com/radio?a=1&amp;b=2</location></track>"
+        "<track><location><![CDATA[https://example.com/another.mp3?x=1&y=2]]></location></track>"
+        "<track><extension><location>ignored.mp4</location></extension></track>"
+        "</trackList></playlist>";
+    g_assert_true(g_file_set_contents(list, xml, -1, NULL));
+    GPtrArray *items = media_playlist_read(list, &stream, &error);
+    g_assert_no_error(error); g_assert_false(stream); g_assert_cmpuint(items->len, ==, 3);
+    g_assert_cmpstr(g_ptr_array_index(items, 0), ==, uri);
+    g_assert_cmpstr(g_ptr_array_index(items, 1), ==, "https://example.com/radio?a=1&b=2");
+    g_assert_cmpstr(g_ptr_array_index(items, 2), ==, "https://example.com/another.mp3?x=1&y=2");
+    g_ptr_array_free(items, TRUE);
+    const char *invalid[] = {"<html/>", "<playlist><trackList>",
+        "<playlist><trackList><track><location>bad<extra/>value</location></track></trackList></playlist>",
+        "<!DOCTYPE playlist [<!ENTITY remote SYSTEM 'file:///etc/passwd'>]><playlist><trackList><track><location>&remote;</location></track></trackList></playlist>"};
+    for (guint i = 0; i < G_N_ELEMENTS(invalid); i++) {
+        g_file_set_contents(list, invalid[i], -1, NULL);
+        items = media_playlist_read(list, &stream, &error);
+        g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    }
+    GString *many = g_string_new("<playlist><trackList>");
+    for (int i = 0; i < 2049; i++) g_string_append(many, "<track><location>film.mp4</location></track>");
+    g_string_append(many, "</trackList></playlist>");
+    g_file_set_contents(list, many->str, many->len, NULL); g_string_free(many, TRUE);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    many = g_string_new("<playlist>");
+    for (int i = 0; i < 65; i++) g_string_append(many, "<extension>");
+    g_file_set_contents(list, many->str, many->len, NULL); g_string_free(many, TRUE);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    g_remove(list); g_free(list); g_free(expected); g_free(uri);
+}
+
 int main(void) {
     GError *error=NULL;char *root=g_dir_make_tmp("cube-player-state-XXXXXX",&error);g_assert_no_error(error);
     g_setenv("XDG_CONFIG_HOME",root,TRUE);g_setenv("XDG_STATE_HOME",root,TRUE);
     test_playlists(root);
+    test_xspf(root);
     State s;state_init(&s);g_assert_cmpfloat(s.volume,==,70);g_assert_true(s.resume);
     char *file=g_build_filename(root,"a film ' $ (é).mp4",NULL);g_assert_true(g_file_set_contents(file,"fixture",-1,NULL));
     char *path=media_path(file,&error);g_assert_no_error(error);g_assert_cmpstr(path,==,file);g_free(path);
@@ -76,5 +120,5 @@ int main(void) {
     g_assert_true(state_save(&s));
     char time[32];format_time(3661,time);g_assert_cmpstr(time,==,"1:01:01");format_time(NAN,time);g_assert_cmpstr(time,==,"00:00");
     g_remove(file);g_remove(s.config_path);g_remove(s.history_path);char *dir=g_path_get_dirname(s.config_path);g_rmdir(dir);g_free(dir);g_rmdir(root);
-    state_free(&s);g_free(file);g_free(root);g_print("State, resume, URI handling, privacy, bounded M3U/PLS parsing, and history bounds passed.\n");return 0;
+    state_free(&s);g_free(file);g_free(root);g_print("State, resume, URI handling, privacy, bounded M3U/PLS/XSPF parsing, and history bounds passed.\n");return 0;
 }

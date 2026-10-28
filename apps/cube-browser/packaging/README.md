@@ -43,11 +43,11 @@ all bundled dependency licenses are installed under `/usr/share/doc/cube-browser
 Replace the private Cairo with an ABI-compatible shared build if desired; its
 corresponding unmodified upstream source is identified in `copyright`.
 
-The standalone archive shares `/usr/bin/cube-browser` and the browser icon with
-the combined `whitecube-desktop` package. Coinstallation is unsupported until
-that distribution moves the browser into a separate package. This archive
-declares neither `Conflicts` nor `Replaces`; dpkg will reject existing owned-file
-collisions instead of automatically removing or overwriting a packaged desktop.
+Whitecube Desktop 0.8.1 and later use `whitecube-browser` for their bundled
+browser command, desktop entry and icon, allowing both packages to coexist.
+Whitecube Desktop 0.8.0 and earlier share these public paths and cannot be
+coinstalled. This standalone archive declares neither `Conflicts` nor `Replaces`;
+dpkg rejects owned-file collisions instead of removing or overwriting a desktop.
 
 Existing user profiles are retained. Remove the app using `sudo apt remove
 cube-browser`; this retains settings, history and downloads. User data is in the

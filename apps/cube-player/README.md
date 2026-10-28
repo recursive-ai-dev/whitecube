@@ -21,9 +21,11 @@ them to the queue. Files begin playing immediately when the player is idle.
 
 The queue supports selecting/removing items, clearing, shuffle, repeat queue,
 repeat one, and automatic advance. Opening a folder adds its supported files in
-name order; it does not recursively scan subfolders. Local UTF-8 M3U and PLS playlists are
+name order; it does not recursively scan subfolders. Local UTF-8 M3U, PLS and XSPF playlists are
 expanded in queue order, including BOM-prefixed M3U files and paths relative to
-the playlist. PLS files follow their numeric `FileN` order. HLS manifests stay
+the playlist. PLS files follow their numeric `FileN` order. XSPF locations support
+URI escaping, XML entities, CDATA and `xml:base`; the first supported location in
+each track is used. HLS manifests stay
 intact for streaming playback. Imports skip cyclic references, limit nesting and
 total work, and reject malformed or oversized playlists (2 MiB, 2,048 items). The Recent tab reopens previously played media.
 

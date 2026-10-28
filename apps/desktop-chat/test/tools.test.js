@@ -48,6 +48,7 @@ test('reads reject binary files, special files and invalid offsets', async t => 
 test('edits preserve literal replacement characters, mode and symlinks', async t => {
   const directory = await fixture(t), file = path.join(directory, 'text');
   await fs.writeFile(file, 'before old after', { mode: 0o640 });
+  await fs.chmod(file, 0o640); // Establish the fixture even with a restrictive umask.
   const link = path.join(directory, 'link');
   await fs.symlink(file, link);
   await execute('edit_file', { path: link, old_string: 'old', new_string: '$& $` $\'' });

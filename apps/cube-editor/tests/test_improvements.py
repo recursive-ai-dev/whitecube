@@ -80,6 +80,18 @@ class ImprovementsTests(ProjectFixture):
                 if arguments[0] == 'plan':
                     self.assertTrue(value['dry_run']); self.assertIn('storage', value)
 
+    def test_cli_plan_remains_available_without_an_authentication_terminal(self):
+        output = io.StringIO()
+        with mock.patch('engine.terminal_command', side_effect=engine.CubeError('No graphical authentication terminal')), \
+                contextlib.redirect_stdout(output):
+            result = engine.main(['plan', str(self.project.directory), 'build'])
+        self.assertEqual(result, 0)
+        value = json.loads(output.getvalue())
+        self.assertTrue(value['dry_run'])
+        self.assertTrue(value['commands'])
+        self.assertIsNone(value['launch'])
+        self.assertEqual(value['launch_error'], 'No graphical authentication terminal')
+
     def test_multiline_recipe_keeps_loops_and_heredoc_intact(self):
         script = "for item in a b; do\n  echo \"$item\"\ndone\ncat <<'END'\nhello\nEND\n"
         self.project.save(recipe={'commands': [script]})
@@ -288,8 +300,10 @@ class ImprovementsTests(ProjectFixture):
         with contextlib.redirect_stdout(io.StringIO()):
             self.worker('build').compress_tree(output)
         unpacked = self.path / 'metadata-unpacked'
+        # An unprivileged extractor masks modes using its process umask.
+        # Keep that fixture behavior independent of the caller's private umask.
         subprocess.run(['unsquashfs', '-user-xattrs', '-no-progress', '-processors', '1',
-                        '-d', str(unpacked), str(output)], check=True, capture_output=True)
+                        '-d', str(unpacked), str(output)], check=True, capture_output=True, umask=0o022)
         self.assertEqual(os.getxattr(unpacked / 'config', 'user.cube-editor-test'), b'guest metadata')
         self.assertEqual((unpacked / 'config').stat().st_mode & 0o777, 0o751)
         self.assertEqual(os.readlink(unpacked / 'config-link'), 'config')

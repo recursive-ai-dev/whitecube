@@ -311,12 +311,15 @@ def completion_choices(name):
     return list(dict.fromkeys(choices))
 
 
-APP_TOOLS = {"browser": "cube-browser", "chat": "desktop-chat", "settings": "cube-settings", "lab": "command-center"}
+APP_TOOLS = {"browser": "whitecube-browser", "chat": "desktop-chat", "settings": "cube-settings", "lab": "command-center"}
 
 
 def app(args):
     tool = APP_TOOLS[args.name]
     local = BIN / tool
+    if args.name == 'browser' and not (local.is_file() or shutil.which(tool)):
+        tool = 'cube-browser'
+        local = BIN / tool
     detach([local if local.is_file() and os.access(local, os.X_OK) else tool] + rest(args), args.name)
 
 
@@ -883,7 +886,7 @@ def check(args):
 
 
 DOCTOR_TOOLS = {
-    "Applications": ("foot", "whitecube-terminal", "fuzzel", "cube-browser", "desktop-chat", "cube-settings", "command-center", "binsys", "xdg-open", "gparted"),
+    "Applications": ("foot", "whitecube-terminal", "fuzzel", "whitecube-browser", "desktop-chat", "cube-settings", "command-center", "binsys", "xdg-open", "gparted"),
     "Desktop": ("swaylock", "whitecube-next-wallpaper", "grim", "slurp", "wl-copy", "wl-paste", "wlr-randr", "brightnessctl"),
     "Audio (alternatives)": ("amixer", "wpctl", "cube-audio"),
     "Network": ("ip", "ping", "cube-net", "iw", "rfkill", "bluetoothctl"),

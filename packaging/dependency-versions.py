@@ -22,7 +22,7 @@ def elf_files(stage):
                 yield path
 
 
-def discover(stage):
+def discover(stage, excluded_packages=()):
     stage = stage.resolve()
     binaries = list(elf_files(stage))
     if not binaries:
@@ -39,6 +39,7 @@ def discover(stage):
             'dpkg-shlibdeps', '-O', '--ignore-missing-info', '--warnings=0',
             '-xwhitecube-desktop', '-S' + str(stage), '-l' + str(private),
             '-l' + str(private / 'desktop-chat-runtime'),
+            *('-x' + package for package in excluded_packages),
             *('-e' + str(path) for path in binaries),
         ], cwd=tmp, text=True, capture_output=True)
     if result.returncode:
@@ -53,9 +54,11 @@ def discover(stage):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('stage', type=Path)
+    parser.add_argument('--exclude-package', action='append', default=[],
+                        help='omit a library provider whose ABI is shipped privately')
     args = parser.parse_args()
     try:
-        for dependency in discover(args.stage):
+        for dependency in discover(args.stage, args.exclude_package):
             print(dependency)
     except (OSError, RuntimeError) as error:
         print(f'dependency-versions: {error}', file=sys.stderr)

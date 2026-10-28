@@ -20,7 +20,10 @@ build_app() {
     '-Dc_args=-fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security'
     '-Dc_link_args=-Wl,-z,relro,-z,now')
   if [[ -f $dir/build.ninja ]]; then
-    meson setup --reconfigure "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube "${hardening[@]}" > "$dir.setup.log"
+    # Explicitly update cached compiler options: older Meson releases can
+    # retain their previous c_args during setup --reconfigure.
+    meson configure "$dir" -Dprefix=/usr "-Dbindir=$bindir" -Dprivate_libdir=/usr/lib/whitecube "${hardening[@]}" > "$dir.setup.log"
+    meson setup --reconfigure "$dir" "$src" >> "$dir.setup.log"
   else
     meson setup "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube "${hardening[@]}" > "$dir.setup.log"
   fi

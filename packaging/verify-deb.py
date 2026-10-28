@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -21,6 +22,56 @@ import tempfile
 
 PACKAGE = 'whitecube-desktop'
 SANDBOX = 'usr/lib/whitecube/desktop-chat-runtime/chrome-sandbox'
+HARDENED = {
+    'usr/bin/' + name for name in
+    ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-player')
+} | {
+    'usr/libexec/whitecube/cube-browser/' + name for name in
+    ('cube-browser', 'cube-renderd', 'cube-netd')
+}
+STANDALONE_FILES = {
+    'chrootables': {
+        '/usr/bin/chrootable-manager': b'#!/bin/sh\nprintf "standalone chrootables fixture\\n"\n',
+    },
+    'cube-browser': {
+        '/usr/bin/cube-browser': b'#!/bin/sh\nprintf "standalone browser fixture\\n"\n',
+        '/usr/share/applications/cube-browser.desktop': b'[Desktop Entry]\nType=Application\nName=Standalone Browser Fixture\nExec=cube-browser\nIcon=cube-browser\n',
+        '/usr/share/icons/hicolor/scalable/apps/cube-browser.svg': b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M0 0h16v16H0z"/></svg>\n',
+    },
+}
+
+
+def check_hardening(data, name, problems):
+    """Inspect ELF64 program/dynamic headers without executing the binary."""
+    if int.from_bytes(data[16:18], 'little') != 3:  # ET_DYN (PIE)
+        problems.append(f'native executable is not PIE: {name}')
+    offset = int.from_bytes(data[32:40], 'little')
+    size = int.from_bytes(data[54:56], 'little')
+    count = int.from_bytes(data[56:58], 'little')
+    if size < 56 or not count or offset + size * count > len(data):
+        problems.append(f'invalid ELF program headers: {name}')
+        return
+    relro, bind_now, nonexec_stack = False, False, False
+    for index in range(count):
+        kind, flags, start, _, _, length, _, _ = struct.unpack_from('<IIQQQQQQ', data, offset + index * size)
+        if kind == 0x6474e552 and length:  # PT_GNU_RELRO
+            relro = True
+        if kind == 0x6474e551:  # PT_GNU_STACK
+            nonexec_stack = not flags & 1
+        if kind == 2:  # PT_DYNAMIC
+            if start + length > len(data) or length % 16:
+                problems.append(f'invalid ELF dynamic table: {name}')
+                continue
+            for position in range(start, start + length, 16):
+                tag, value = struct.unpack_from('<QQ', data, position)
+                if not tag:
+                    break
+                if tag == 24 or (tag == 30 and value & 8) or (tag == 0x6ffffffb and value & 1):
+                    bind_now = True
+    if not relro or not bind_now:
+        problems.append(f'native executable lacks full RELRO: {name}')
+    if not nonexec_stack:
+        problems.append(f'native executable lacks a non-executable stack: {name}')
 
 
 def payload_digest(stream, name, problems):
@@ -32,6 +83,12 @@ def payload_digest(stream, name, problems):
         if (len(header) < 64 or header[4:7] != b'\x02\x01\x01'
                 or int.from_bytes(header[18:20], 'little') != 62):
             problems.append(f'ELF file is not amd64: {name}')
+        elif name in HARDENED:
+            data = header + stream.read()
+            check_hardening(data, name, problems)
+            return hashlib.md5(data).hexdigest()
+    elif name in HARDENED:
+        problems.append(f'native executable is not ELF: {name}')
     digest = hashlib.md5(header)
     return hashlib.file_digest(stream, lambda: digest).hexdigest()
 
@@ -199,17 +256,85 @@ def check(package):
         'size_bytes': package.stat().st_size,
         'sha256': sha256,
         'payload_files': len(checksums), 'dependencies': dependencies,
+        'hardened_executables': sorted(HARDENED & checksums.keys()),
         'conffiles': sorted(conffiles), 'verification': 'passed' if not problems else 'failed',
     }
     return problems, summary
 
 
+def standalone_fixtures(directory):
+    """Build valid tiny packages owning names used by independently shipped apps."""
+    archives = []
+    for name, files in STANDALONE_FILES.items():
+        stage = directory / name
+        metadata = stage / 'DEBIAN'
+        metadata.mkdir(parents=True)
+        (metadata / 'control').write_text(
+            f'Package: {name}\nVersion: 1.0.0\nArchitecture: all\n'
+            'Maintainer: Whitecube <whitecube@localhost>\n'
+            'Description: standalone application coexistence test fixture\n')
+        hashes = []
+        for absolute, content in files.items():
+            relative = absolute.lstrip('/')
+            target = stage / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            target.chmod(0o755 if absolute.startswith('/usr/bin/') else 0o644)
+            hashes.append(hashlib.md5(content).hexdigest() + '  ' + relative)
+        (metadata / 'md5sums').write_text('\n'.join(hashes) + '\n')
+        for target in stage.rglob('*'):
+            if target.is_dir():
+                target.chmod(0o755)
+        stage.chmod(0o755)
+        for target in metadata.iterdir():
+            target.chmod(0o644)
+        archive = directory / (name + '_1.0.0_all.deb')
+        result = subprocess.run(['dpkg-deb', '--root-owner-group', '-Znone', '--build',
+                                 str(stage), str(archive)], text=True, capture_output=True)
+        if result.returncode:
+            raise RuntimeError('could not build standalone coexistence fixture: ' + result.stderr.strip())
+        archives.append(archive)
+    return archives
+
+
+def package_status(path):
+    """Read dpkg's paragraph-based database, rather than just its first record."""
+    records = {}
+    for paragraph in re.split(r'\n\s*\n', path.read_text().strip()):
+        fields = Parser().parsestr(paragraph)
+        name = fields.get('Package')
+        if not name or name in records:
+            raise RuntimeError('invalid or duplicate package record in disposable dpkg database')
+        records[name] = fields
+    return records
+
+
+def verify_standalones(root):
+    """Check both bytes and dpkg ownership, even if Replaces permitted a takeover."""
+    records = package_status(root / 'var/lib/dpkg/status')
+    for name, files in STANDALONE_FILES.items():
+        if name not in records or records[name].get('Status') != 'install ok unpacked':
+            raise RuntimeError(f'standalone fixture lost its package registration: {name}')
+        for absolute, content in files.items():
+            installed = root / absolute.lstrip('/')
+            if not installed.is_file() or installed.is_symlink() or installed.read_bytes() != content:
+                raise RuntimeError(f'dpkg unpack replaced standalone fixture content: {absolute}')
+            query = subprocess.run(['dpkg-query', '--admindir=' + str(root / 'var/lib/dpkg'),
+                                    '--search', absolute], text=True, capture_output=True)
+            expected = f'{name}: {absolute}'
+            if query.returncode or query.stdout.strip() != expected:
+                raise RuntimeError(f'dpkg unpack changed standalone ownership of {absolute}: '
+                                   + (query.stdout + query.stderr).strip())
+
+
 def smoke_unpack(package):
     """Use dpkg's real unpack/database path in a disposable root, with no scripts.
 
-    This is an unpack test. Configuring and launching the Wayland session still
-    require an installed system. Refuse archives with a preinst, since dpkg
-    would execute that script even for --unpack.
+    Seed independently installed chrootables and cube-browser packages before
+    unpacking Whitecube, then check their contents and dpkg ownership survive.
+    Configuring and launching the Wayland session still require an installed
+    system. Refuse archives with a preinst, since dpkg would execute that script
+    even for --unpack.
     """
     with archive_members(package, '--ctrl-tarfile') as archive:
         for member in archive:
@@ -219,7 +344,7 @@ def smoke_unpack(package):
         root = Path(tmp) / 'root'
         command = [
             'dpkg', '--root=' + str(root), '--log=' + str(Path(tmp) / 'dpkg.log'),
-            '--force-not-root', '--no-triggers', '--unpack', str(package.resolve()),
+            '--force-not-root', '--no-triggers', '--unpack',
         ]
         # dpkg 1.22 still attempts chown(0) under --force-not-root. That uid is
         # deliberately unmapped in the builder's ordinary-user namespace.
@@ -228,13 +353,19 @@ def smoke_unpack(package):
             if fakeroot is None:
                 raise RuntimeError('fakeroot is required for the rootless dpkg unpack smoke test')
             command.insert(0, fakeroot)
-        result = subprocess.run(command, text=True, capture_output=True,
-                                env=dict(os.environ, FAKEROOTDONTTRYCHOWN='1'))
-        if result.returncode:
-            raise RuntimeError('dpkg unpack smoke test failed: ' + result.stderr.strip())
+        def unpack(archives):
+            result = subprocess.run([*command, *map(str, archives)], text=True, capture_output=True,
+                                    env=dict(os.environ, FAKEROOTDONTTRYCHOWN='1'))
+            if result.returncode:
+                raise RuntimeError('dpkg unpack smoke test failed: ' + result.stderr.strip())
+
+        unpack(standalone_fixtures(Path(tmp)))
+        verify_standalones(root)
+        unpack([package.resolve()])
+        verify_standalones(root)
         info = root / 'var/lib/dpkg/info'
-        fields = Parser().parsestr((root / 'var/lib/dpkg/status').read_text())
-        if fields.get('Package') != PACKAGE or fields.get('Status') != 'install ok unpacked':
+        records = package_status(root / 'var/lib/dpkg/status')
+        if PACKAGE not in records or records[PACKAGE].get('Status') != 'install ok unpacked':
             raise RuntimeError('dpkg did not register the unpacked package')
         config = set((info / (PACKAGE + '.conffiles')).read_text().splitlines())
         for line in (info / (PACKAGE + '.md5sums')).read_text().splitlines():
@@ -247,6 +378,13 @@ def smoke_unpack(package):
             with installed.open('rb') as stream:
                 if hashlib.file_digest(stream, 'md5').hexdigest() != checksum:
                     raise RuntimeError(f'dpkg unpacked inconsistent data for {name}')
+    return {
+        'unpack_smoke': 'passed',
+        'coexistence_smoke': {
+            'verification': 'passed', 'packages': sorted(STANDALONE_FILES),
+            'preserved_paths': sorted(path for files in STANDALONE_FILES.values() for path in files),
+        },
+    }
 
 
 def main():
@@ -265,16 +403,16 @@ def main():
         return 1
     if args.unpack:
         try:
-            smoke_unpack(args.package)
+            summary.update(smoke_unpack(args.package))
         except (OSError, RuntimeError, tarfile.TarError, ValueError) as error:
             print(f'verify-deb: {error}', file=sys.stderr)
             return 1
-        summary['unpack_smoke'] = 'passed'
     if args.json:
         args.json.write_text(json.dumps(summary, indent=2) + '\n')
-    print(f'verify-deb: passed ({summary["payload_files"]} payload files; ownership, modes, conffiles and checksums)')
+    print(f'verify-deb: passed ({summary["payload_files"]} payload files; ownership, modes, conffiles, amd64 ELF and checksums; '
+          f'{len(summary["hardened_executables"])} native executables checked for PIE, full RELRO and non-executable stack)')
     if args.unpack:
-        print('verify-deb: dpkg unpack and installed package database/checksums passed in a disposable root')
+        print('verify-deb: dpkg unpack, installed package database/checksums and standalone chrootables/browser coexistence passed in a disposable root')
     return 0
 
 

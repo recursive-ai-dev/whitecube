@@ -26,19 +26,34 @@ settings and playlist handling, and strengthens Debian release verification.
   invalid types, out-of-range values and unsupported profile versions.
 - Expand local PLS and M3U playlists with numeric track ordering, BOM/CRLF and
   relative-path handling. Preserve HLS manifests and limit recursive work.
+- Import VLC-style XSPF playlists with XML entities, relative locations and
+  alternative media locations; reject external entities and bound track/nesting counts.
+- Keep the session crash guard armed across immediate login-manager retries and
+  report failed library inspections instead of treating them as healthy.
+- Preview Cube Editor build plans from a headless terminal even when no graphical
+  authentication terminal is available; actual image operations retain authentication.
 
 ## Debian releases
 
 - Release version 0.8.0; preserve all shipped /etc defaults with conffiles.
 - Add runtime dependencies for the settings writer and derive ABI version
   requirements from the actual shipped ELF binaries and private runtimes.
+- Declare the Help pager, process inspection and system-control commands as
+  runtime dependencies rather than relying on a preconfigured desktop host.
 - Bundle wlroots' display-info ABI privately with sibling library lookup, so
   newer distributions can install without an obsolete system library package.
+- Keep apt dependencies to direct shipped-library requirements and their ABI
+  minima; allow the target distribution to resolve its own transitive libraries.
 - Verify archive ownership, modes, symlinks, conffiles and complete checksums.
+- Harden the eight native executables with PIE, stack protection, fortified
+  functions and full RELRO. Independently verify amd64 ELF headers, PIE, RELRO
+  and non-executable stacks in the final archive.
 - Test dpkg unpacking and its package database in a disposable installation root.
 - Emit a portable SHA256 file and JSON manifest alongside the verified archive.
 - Normalize archive timestamps using SOURCE_DATE_EPOCH and correct fresh-build
   ordering so package tests see the complete native app staging tree.
+- Add an [installed runtime smoke test](INSTALLED-SMOKE.md) for the delivered
+  archive, using installed absolute paths in a private, read-only Debian root.
 
 The build never installs Whitecube on the host. Installation starts no desktop,
 network service or firewall change. Select Whitecube at login after installing

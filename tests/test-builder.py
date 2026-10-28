@@ -26,7 +26,15 @@ class CachedBuilder(unittest.TestCase):
         node.parent.mkdir(parents=True)
         node.write_text('#!/bin/sh\nprintf "v22.23.4\\n"\n')
         node.chmod(0o755)
-        self.env = dict(os.environ, WHITECUBE_BUILDER_DIR=str(self.work))
+        # A cached --prepare-only must never enter a namespace. Keep the
+        # dependency probe independent of whether this test host has bwrap.
+        commands = Path(self.tmp.name) / 'commands'
+        commands.mkdir()
+        bwrap = commands / 'bwrap'
+        bwrap.write_text('#!/bin/sh\necho "unexpected namespace launch" >&2\nexit 97\n')
+        bwrap.chmod(0o755)
+        self.env = dict(os.environ, WHITECUBE_BUILDER_DIR=str(self.work),
+                        PATH=str(commands) + os.pathsep + os.environ['PATH'])
         self.env.pop('ELECTRON_DIST', None)
 
     def run_builder(self, *args, **extra_env):

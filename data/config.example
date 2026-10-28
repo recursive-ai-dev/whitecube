@@ -13,7 +13,7 @@ chat_app_id=cube-chat
 chat_cmd=foot -a cube-chat -T cube-chat /usr/bin/cube-chat
 scripts_app_id=cube-scripts
 scripts_cmd=/usr/bin/whitecube-terminal -c "$HOME/.config/whitecube/scripts-foot.ini" -a cube-scripts -T Scripts /usr/bin/cube-scripts
-browser_cmd=/usr/bin/whitecube-web open
+browser_cmd=/usr/bin/whitecube-browser
 help_cmd=foot -T keys -e less /usr/share/whitecube/keys.txt
 
 # Privacy controls (Settings > Privacy). Defaults retain existing preferences.

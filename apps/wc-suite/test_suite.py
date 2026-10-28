@@ -131,6 +131,14 @@ class SuiteTests(unittest.TestCase):
             self.assertEqual(wc.main(["browser", "--", "--help"]), 0)
             self.assertEqual(detached.call_args.args[0][1:], ["--help"])
 
+    def test_browser_prefers_bundled_command_and_falls_back_to_standalone(self):
+        with patch.object(wc, 'detach') as detached, patch.object(wc.shutil, 'which', return_value='/usr/bin/whitecube-browser'):
+            self.assertEqual(wc.main(['browser']), 0)
+            self.assertEqual(detached.call_args.args[0], ['whitecube-browser'])
+        with patch.object(wc, 'detach') as detached, patch.object(wc.shutil, 'which', return_value=None):
+            self.assertEqual(wc.main(['browser']), 0)
+            self.assertEqual(detached.call_args.args[0], ['cube-browser'])
+
     def test_editor_with_arguments_without_shell_evaluation(self):
         self.file(wc.CONFIG, "audio=alsa\n")
         with patch.dict(os.environ, {"VISUAL": "", "EDITOR": "editor --wait 'a b'"}), patch.object(wc, "exec_tool") as execute:

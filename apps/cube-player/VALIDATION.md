@@ -20,7 +20,9 @@ artifacts are `build/live-session.png`, `build/live-session.ini`, and
 - 48 combinations of panel, viewport size, and interface scaling, from 640 × 400
   to 1920 × 1080, including assertions that controls stay inside the viewport.
 - Live Whitecube palette, strong contrast, and interface scale integration.
-- M3U relative paths and recursive-playlist bounds.
+- M3U/PLS relative paths, numeric PLS ordering, XSPF URI escaping and XML bases,
+  XML entities/CDATA, malformed XML and external entities, track/depth limits,
+  and recursive-playlist bounds.
 - Per-user installation, desktop entry validation, launcher execution, backups,
   rollback, and refusal to overwrite user changes during rollback.
 - Real native Wayland window creation, configure acknowledgement, frame

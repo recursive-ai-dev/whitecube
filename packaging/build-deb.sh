@@ -74,7 +74,8 @@ bundle_library "$wlroots"
 display_info=$(ldd "$wlroots" | awk '$1 ~ /^libdisplay-info\.so\./ {print $3}')
 [[ -f $display_info ]] || { echo 'build-deb.sh: cannot resolve wlroots display-info library' >&2; exit 1; }
 bundle_library "$display_info"
-install -m 0644 /usr/share/doc/"$(dpkg-query -S "$(realpath "$display_info")" | head -1 | cut -d: -f1)"/copyright \
+display_info_package=$(dpkg-query -S "$(realpath "$display_info")" | head -1 | cut -d: -f1)
+install -m 0644 "/usr/share/doc/$display_info_package/copyright" \
   "$stage/usr/share/doc/whitecube-desktop/libdisplay-info-copyright"
 cairo_stage=build-cairo/stage/usr/local/lib/x86_64-linux-gnu
 cairo=$(ldd build/cube-settings | awk '$1 == "libcairo.so.2" {print $3}')
@@ -111,7 +112,7 @@ fi
 # though Chat is launched with Ozone Wayland. Native desktop binaries stay X-free.
 chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-runtime)
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
-runtime=(foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
+runtime=(apt less procps systemd foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
   gdisk parted dosfstools xz-utils
   dhcpcd-base iproute2 nftables seatd
@@ -124,7 +125,7 @@ pkgs['gir1.2-adw-1 (>= 1.5)']=1
 pkgs['libadwaita-1-0 (>= 1.5)']=1
 # Record ABI minima for the actual native programs, bundled libraries and Chat
 # runtime. Ownership alone does not prevent installation on an older libc.
-abi_dependencies=$(python3 -I packaging/dependency-versions.py "$stage")
+abi_dependencies=$(python3 -I packaging/dependency-versions.py "$stage" --exclude-package "$display_info_package")
 while IFS= read -r dependency; do
   [[ -n $dependency ]] || continue
   package=${dependency%% *}
@@ -145,6 +146,7 @@ find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 python3 -I packaging/check-tree.py "$stage" --sources src
+python3 -I packaging/check-installed-conflicts.py "$stage"
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"
 temporary_deb=$out/.whitecube-desktop_${version}_amd64.deb
@@ -154,6 +156,7 @@ python3 -I packaging/verify-deb.py "$temporary_deb" --unpack --json "$temporary_
 mv -f -- "$temporary_deb" "$deb"
 mv -f -- "$temporary_deb.json" "$deb.json"
 ( cd "$out" && sha256sum "$(basename "$deb")" > "$(basename "$deb").sha256" )
+chmod 0644 "$deb" "$deb.json" "$deb.sha256"
 rm -rf -- "$out/stage"
 mv -- "$stage" "$out/stage"
 echo

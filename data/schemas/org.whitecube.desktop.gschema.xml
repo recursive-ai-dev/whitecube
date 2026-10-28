@@ -55,7 +55,7 @@
       <description>Shell command launched by Alt+D. Maximum 127 bytes.</description>
     </key>
     <key name="browser-cmd" type="s">
-      <default>'/usr/bin/whitecube-web open'</default>
+      <default>'/usr/bin/whitecube-browser'</default>
       <summary>Browser command</summary>
       <description>Shell command launched by Alt+W.</description>
     </key>

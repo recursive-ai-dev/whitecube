@@ -5,10 +5,12 @@ import importlib.util
 import importlib.machinery
 import json
 import hashlib
+import io
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -46,7 +48,7 @@ class Tree(unittest.TestCase):
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
-                     'chrootables', 'chrootable-manager', 'cube-strap', 'net-off', 'net-on'):
+                     'chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
@@ -119,11 +121,26 @@ class Tree(unittest.TestCase):
             self.assertTrue(os.access(app / name, os.R_OK), name)
         # The window must run the root-owned command, never a copy beside it.
         self.assertFalse((app / 'chrootable-manager').exists())
-        self.assertTrue((self.stage / 'usr/bin/chrootable-manager').read_text().startswith('#!/usr/bin/env bash'))
+        helper = self.stage / 'usr/libexec/whitecube/chrootable-manager'
+        self.assertTrue(helper.read_text().startswith('#!/usr/bin/env bash'))
+        self.assertEqual((self.stage / 'usr/bin/whitecube-chrootable-manager').resolve(), helper.resolve())
+        self.assertIn("Path('/usr/libexec/whitecube/chrootable-manager')", (app / 'backend.py').read_text())
+        self.assertFalse((self.stage / 'usr/bin/chrootable-manager').exists())
         entry = (self.stage / 'usr/share/applications/chrootables.desktop').read_text()
         self.assertIn('Exec=/usr/bin/chrootables', entry)
         self.assertIn('Icon=chrootables', entry)
         self.assertTrue((self.stage / 'usr/share/icons/hicolor/scalable/apps/chrootables.svg').is_file())
+
+    def test_bundled_browser_leaves_standalone_package_files_unowned(self):
+        for name in ('usr/bin/cube-browser', 'usr/share/applications/cube-browser.desktop',
+                     'usr/share/icons/hicolor/scalable/apps/cube-browser.svg'):
+            self.assertFalse((self.stage / name).exists(), name)
+        launcher = self.stage / 'usr/bin/whitecube-browser'
+        self.assertEqual(launcher.resolve(), (self.stage / 'usr/libexec/whitecube/cube-browser/cube-browser').resolve())
+        entry = (self.stage / 'usr/share/applications/whitecube-browser.desktop').read_text()
+        self.assertIn('Exec=/usr/bin/whitecube-browser -- %u', entry)
+        self.assertIn('Icon=whitecube-browser', entry)
+        self.assertTrue((self.stage / 'usr/share/icons/hicolor/scalable/apps/whitecube-browser.svg').is_file())
 
     def test_wc_command_suite_is_shipped_system_wide_and_runs_from_the_tree(self):
         sys.path.insert(0, str(ROOT / 'apps/wc-suite'))
@@ -315,6 +332,88 @@ class DependencyOwnership(unittest.TestCase):
         self.assertEqual(self.scanner.owner_for_library('/lib/x86_64-linux-gnu/libEGL.so.1'), 'libegl1')
         self.assertEqual(self.scanner.owner_for_library('/lib/x86_64-linux-gnu/libGLESv2.so.2'), 'libgles2')
 
+    def compile_dependency_fixture(self):
+        compiler = shutil.which('cc')
+        if compiler is None:
+            self.skipTest('a C compiler is required for ELF dependency fixtures')
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        stage = root / 'stage'
+        destination = stage / 'usr/bin'
+        destination.mkdir(parents=True)
+        distro = root / 'distribution-libraries'
+        distro.mkdir()
+        library = distro / 'libbridge.so.1'
+        subprocess.run([compiler, '-shared', '-fPIC', '-Wl,-soname,libbridge.so.1',
+                        '-x', 'c', '-o', str(library), '-', '-lm'],
+                       input='#include <math.h>\ndouble bridge(double x) { return cos(x); }\n',
+                       text=True, capture_output=True, check=True)
+        subprocess.run([compiler, '-x', 'c', '-o', str(destination / 'example'), '-',
+                        '-L' + str(distro), '-Wl,-rpath,' + str(distro), '-l:libbridge.so.1'],
+                       input='extern double bridge(double); int main(void) { return (int)bridge(1.23); }\n',
+                       text=True, capture_output=True, check=True)
+        return stage, library
+
+    @staticmethod
+    def fixture_owner(path):
+        name = Path(path).name
+        return ('libbridge-provider' if name.startswith('libbridge') else
+                'libm-transitive-provider' if name.startswith('libm.so') else 'libc6')
+
+    def test_distribution_library_transitive_implementation_is_not_pinned(self):
+        stage, _ = self.compile_dependency_fixture()
+        with patch.object(self.scanner, 'owner_for_library', side_effect=self.fixture_owner):
+            dependencies = self.scanner.discover(stage)
+        self.assertEqual(dependencies, ['libbridge-provider', 'libc6'])
+
+    def test_shipped_private_library_contributes_its_own_direct_dependencies(self):
+        stage, library = self.compile_dependency_fixture()
+        private = stage / 'usr/lib/whitecube'
+        private.mkdir(parents=True)
+        shutil.copyfile(library, private / library.name)
+        with patch.object(self.scanner, 'owner_for_library', side_effect=self.fixture_owner):
+            dependencies = self.scanner.discover(stage)
+        self.assertEqual(dependencies, ['libc6', 'libm-transitive-provider'])
+
+    def test_missing_transitive_distribution_library_still_fails_validation(self):
+        stage, _ = self.compile_dependency_fixture()
+        execute = subprocess.run
+        def missing(command, **kwargs):
+            result = execute(command, **kwargs)
+            if command[0] == 'ldd':
+                result.stdout += '\n libimplementation.so.1 => not found\n'
+            return result
+        with patch.object(self.scanner.subprocess, 'run', side_effect=missing):
+            with self.assertRaisesRegex(RuntimeError, 'unresolved shared library'):
+                self.scanner.discover(stage)
+
+    def test_x11_in_transitive_closure_still_fails_native_validation(self):
+        stage, _ = self.compile_dependency_fixture()
+        execute = subprocess.run
+        def x11(command, **kwargs):
+            result = execute(command, **kwargs)
+            if command[0] == 'ldd':
+                result.stdout += '\n libX11.so.6 => /usr/lib/libX11.so.6 (0x1234)\n'
+            return result
+        with patch.object(self.scanner.subprocess, 'run', side_effect=x11):
+            with self.assertRaisesRegex(RuntimeError, 'X11 library reaches a native executable'):
+                self.scanner.discover(stage)
+
+    def test_direct_dynamic_loader_dependency_resolves_without_an_arrow(self):
+        compiler = shutil.which('cc')
+        if compiler is None:
+            self.skipTest('a C compiler is required for ELF dependency fixtures')
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            binary = stage / 'usr/bin/loader-user'
+            binary.parent.mkdir(parents=True)
+            subprocess.run([compiler, '-x', 'c', '-o', str(binary), '-', '-Wl,--no-as-needed',
+                            '-x', 'none', '/lib64/ld-linux-x86-64.so.2'], input='int main(void) { return 0; }\n',
+                           text=True, capture_output=True, check=True)
+            self.assertIn('ld-linux-x86-64.so.2', self.scanner.needed_libraries(binary))
+            self.assertIn('libc6', self.scanner.discover(stage))
+
 
 class ArchiveVerification(unittest.TestCase):
     """Exercise the final archive checker on real deb files, independent of a desktop build."""
@@ -332,7 +431,7 @@ class ArchiveVerification(unittest.TestCase):
         metadata.mkdir(parents=True)
         self.control = metadata / 'control'
         self.control.write_text(
-            'Package: whitecube-desktop\nVersion: 0.8.0\nArchitecture: amd64\n'
+            'Package: whitecube-desktop\nVersion: 0.8.1\nArchitecture: amd64\n'
             'Maintainer: Whitecube <whitecube@localhost>\nSection: x11\nPriority: optional\n'
             'Installed-Size: 1\nDepends: libc6 (>= 2.34), python3\nDescription: test fixture\n')
         for name in ('postinst', 'postrm'):
@@ -352,7 +451,7 @@ class ArchiveVerification(unittest.TestCase):
             if path.is_dir():
                 path.chmod(0o755)
         self.write_checksums()
-        self.package = Path(self.tmp.name) / 'whitecube-desktop_0.8.0_amd64.deb'
+        self.package = Path(self.tmp.name) / 'whitecube-desktop_0.8.1_amd64.deb'
 
     def write_checksums(self):
         hashes = []
@@ -369,6 +468,29 @@ class ArchiveVerification(unittest.TestCase):
                                  str(self.stage), str(self.package)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return self.checker.check(self.package)
+
+    def rewrite_archive(self, flag, mutate):
+        """Alter a tar member to exercise checks dpkg-deb's builder precludes."""
+        self.verify()
+        parts = []
+        for current, name in (('--ctrl-tarfile', 'control.tar'), ('--fsys-tarfile', 'data.tar')):
+            raw = subprocess.check_output(['dpkg-deb', current, str(self.package)])
+            if current == flag:
+                output = io.BytesIO()
+                with tarfile.open(fileobj=io.BytesIO(raw)) as source, tarfile.open(fileobj=output, mode='w') as destination:
+                    for member in source:
+                        content = source.extractfile(member).read() if member.isfile() else None
+                        destination.addfile(member, io.BytesIO(content) if content is not None else None)
+                    mutate(destination)
+                raw = output.getvalue()
+            parts.append((name, raw))
+        archive = bytearray(b'!<arch>\n')
+        for name, data in [('debian-binary', b'2.0\n'), *parts]:
+            archive.extend(f'{name:<16}{0:<12}{0:<6}{0:<6}{0o100644:<8o}{len(data):<10}`\n'.encode())
+            archive.extend(data)
+            if len(data) % 2:
+                archive.extend(b'\n')
+        self.package.write_bytes(archive)
 
     def test_complete_archive_passes_and_reports_a_verifiable_manifest(self):
         problems, summary = self.verify()
@@ -421,6 +543,62 @@ class ArchiveVerification(unittest.TestCase):
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'unsafe archive path'):
                 self.checker.payload_path(name)
 
+    def test_wrong_architecture_elf_is_rejected_even_with_amd64_control(self):
+        binary = self.stage / 'usr/bin/example'
+        binary.parent.mkdir(parents=True)
+        header = bytearray(64)
+        header[:7] = b'\x7fELF\x02\x01\x01'
+        header[18:20] = (183).to_bytes(2, 'little')  # EM_AARCH64
+        binary.write_bytes(header)
+        self.write_checksums()
+        problems, _ = self.verify()
+        self.assertIn('ELF file is not amd64: usr/bin/example', problems)
+
+    def test_duplicate_control_entries_are_rejected(self):
+        def duplicate(archive):
+            member = tarfile.TarInfo('./postinst')
+            member.mode = 0o755
+            script = b'#!/bin/sh\nexit 0\n'
+            member.size = len(script)
+            archive.addfile(member, io.BytesIO(script))
+        self.rewrite_archive('--ctrl-tarfile', duplicate)
+        problems, _ = self.checker.check(self.package)
+        self.assertIn('duplicate control path: postinst', problems)
+
+    def test_payload_cannot_traverse_a_symlink_parent(self):
+        (self.stage / 'etc/whitecube/alias').symlink_to('config')
+        def append_child(archive):
+            member = tarfile.TarInfo('./etc/whitecube/alias/child')
+            member.mode = 0o644
+            archive.addfile(member, io.BytesIO())
+        self.rewrite_archive('--fsys-tarfile', append_child)
+        problems, _ = self.checker.check(self.package)
+        self.assertIn('payload parent is not a directory: etc/whitecube/alias/child through etc/whitecube/alias', problems)
+
+    def compile_core(self, flags):
+        compiler = shutil.which('cc')
+        if compiler is None:
+            self.skipTest('a C compiler is required for ELF hardening fixtures')
+        binary = self.stage / 'usr/bin/whitecube-compositor'
+        binary.parent.mkdir(parents=True)
+        subprocess.run([compiler, '-x', 'c', '-o', str(binary), *flags, '-'],
+                       input='int main(void) { return 0; }\n', text=True, capture_output=True, check=True)
+        binary.chmod(0o755)
+        self.write_checksums()
+
+    def test_hardened_native_executable_passes_and_is_in_the_manifest(self):
+        self.compile_core(['-fPIE', '-pie', '-Wl,-z,relro,-z,now,-z,noexecstack'])
+        problems, summary = self.verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(summary['hardened_executables'], ['usr/bin/whitecube-compositor'])
+
+    def test_unhardened_native_executable_is_rejected(self):
+        self.compile_core(['-fno-pie', '-no-pie', '-Wl,-z,norelro,-z,lazy,-z,execstack'])
+        problems, _ = self.verify()
+        self.assertIn('native executable is not PIE: usr/bin/whitecube-compositor', problems)
+        self.assertIn('native executable lacks full RELRO: usr/bin/whitecube-compositor', problems)
+        self.assertIn('native executable lacks a non-executable stack: usr/bin/whitecube-compositor', problems)
+
     def test_external_symlink_cannot_escape_installed_root(self):
         (self.config.parent / 'bad').symlink_to('../../../outside')
         problems, _ = self.verify()
@@ -441,9 +619,60 @@ class ArchiveVerification(unittest.TestCase):
         problems, _ = self.verify()
         self.assertIn('cyclic symlink: etc/whitecube/cycle-a', problems)
 
-    def test_real_dpkg_unpack_registers_payload_and_configuration(self):
-        self.verify()
-        self.checker.smoke_unpack(self.package)
+    def test_real_dpkg_unpack_preserves_standalone_packages_and_registers_own_payload(self):
+        problems, _ = self.verify()
+        self.assertEqual(problems, [])
+        result = self.checker.smoke_unpack(self.package)
+        self.assertEqual(result['unpack_smoke'], 'passed')
+        self.assertEqual(result['coexistence_smoke'], {
+            'verification': 'passed', 'packages': ['chrootables', 'cube-browser'],
+            'preserved_paths': [
+                '/usr/bin/chrootable-manager', '/usr/bin/cube-browser',
+                '/usr/share/applications/cube-browser.desktop',
+                '/usr/share/icons/hicolor/scalable/apps/cube-browser.svg',
+            ],
+        })
+
+    def test_real_dpkg_rejects_each_legacy_shared_application_path(self):
+        for relative in ('usr/bin/chrootable-manager', 'usr/bin/cube-browser',
+                         'usr/share/applications/cube-browser.desktop',
+                         'usr/share/icons/hicolor/scalable/apps/cube-browser.svg'):
+            with self.subTest(path=relative):
+                target = self.stage / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b'conflicting Whitecube payload\n')
+                target.chmod(0o644)
+                self.write_checksums()
+                problems, _ = self.verify()
+                self.assertEqual(problems, [])
+                with self.assertRaisesRegex(RuntimeError, 'trying to overwrite'):
+                    self.checker.smoke_unpack(self.package)
+                target.unlink()
+        self.write_checksums()
+
+    def test_coexistence_check_rejects_takeover_even_if_replaces_permits_unpack(self):
+        target = self.stage / 'usr/bin/cube-browser'
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b'#!/bin/sh\nexit 0\n')
+        target.chmod(0o755)
+        self.control.write_text(self.control.read_text() + 'Replaces: cube-browser\n')
+        self.write_checksums()
+        problems, _ = self.verify()
+        self.assertEqual(problems, [])
+        with self.assertRaisesRegex(RuntimeError, 'replaced standalone fixture content: /usr/bin/cube-browser'):
+            self.checker.smoke_unpack(self.package)
+
+    def test_coexistence_check_verifies_dpkg_owner_even_when_original_bytes_are_identical(self):
+        target = self.stage / 'usr/bin/cube-browser'
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.checker.STANDALONE_FILES['cube-browser']['/usr/bin/cube-browser'])
+        target.chmod(0o755)
+        self.control.write_text(self.control.read_text() + 'Replaces: cube-browser\n')
+        self.write_checksums()
+        problems, _ = self.verify()
+        self.assertEqual(problems, [])
+        with self.assertRaisesRegex(RuntimeError, 'changed standalone ownership of /usr/bin/cube-browser'):
+            self.checker.smoke_unpack(self.package)
 
     def test_rootless_unpack_refuses_packages_that_would_execute_a_preinst(self):
         script = self.stage / 'DEBIAN/preinst'
@@ -469,6 +698,31 @@ class ABIDependencies(unittest.TestCase):
             (destination / 'example').unlink()
             with self.assertRaisesRegex(RuntimeError, 'no ELF'):
                 scanner.discover(stage)
+
+    def test_excluded_private_provider_is_removed_without_losing_libc_minimum(self):
+        spec = importlib.util.spec_from_file_location('whitecube_excluded_dependency_versions', ROOT / 'packaging/dependency-versions.py')
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        compiler = shutil.which('cc')
+        if compiler is None:
+            self.skipTest('a C compiler is required for the private-provider fixture')
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            binary = stage / 'usr/bin/example'
+            binary.parent.mkdir(parents=True)
+            subprocess.run([compiler, '-x', 'c', '-o', str(binary), '-', '-lz'],
+                           input='extern const char *zlibVersion(void); int main(void) { return zlibVersion()[0] == 0; }\n',
+                           text=True, capture_output=True, check=True)
+            output = subprocess.check_output(['ldd', str(binary)], text=True)
+            source = next(line.split()[2] for line in output.splitlines() if line.strip().startswith('libz.so.1 =>'))
+            private = stage / 'usr/lib/whitecube'
+            private.mkdir(parents=True)
+            shutil.copyfile(source, private / 'libz.so.1')
+            original = scanner.discover(stage)
+            self.assertTrue(any(value.startswith('zlib1g') for value in original), original)
+            excluded = scanner.discover(stage, excluded_packages=('zlib1g',))
+            self.assertFalse(any(value.startswith('zlib1g') for value in excluded), excluded)
+            self.assertTrue(any(value.startswith('libc6 (>= ') for value in excluded), excluded)
 
 
 class OptionalSettingsTools(unittest.TestCase):

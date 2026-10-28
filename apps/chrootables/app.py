@@ -12,6 +12,7 @@ import argparse
 import json
 import math
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -1238,7 +1239,7 @@ class ChrootablesWindow(Adw.ApplicationWindow):
         run = button('Run command', lambda: (self.navigate('run'), self.select_run_target(name), self.run_command.grab_focus()),
                      icon='media-playback-start-symbolic')
         sessions.append(run)
-        copy = button('', lambda: self.copy_text(f'sudo chrootable-manager --enter {name}', 'Shell command copied.'),
+        copy = button('', lambda: self.copy_text(shlex.join(['sudo', '--', str(backend.manager_path()), '--enter', name]), 'Shell command copied.'),
                       css='flat', icon='edit-copy-symbolic', tooltip='Copy the terminal command for this workspace')
         sessions.append(copy)
         self.detail.append(sessions)
