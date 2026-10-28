@@ -26,3 +26,9 @@ The Debian package additionally bundles, under their own licenses:
 - the Electron runtime of Desktop Chat (MIT, with the Chromium component
   licenses listed in LICENSES.chromium.html in
   /usr/lib/whitecube/desktop-chat-runtime).
+
+- Trainer's private PyArrow 26.0.0 decoder (Apache-2.0, with bundled third-party
+  components), in /usr/lib/whitecube/trainer-parquet-runtime. Complete license
+  text and notices are retained in pyarrow-26.0.0.dist-info/licenses/ there.
+  The standalone Trainer includes the same runtime beside its pipeline under
+  /usr/lib/whitecube-trainer/cube-train/parquet-runtime.

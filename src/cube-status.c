@@ -604,6 +604,14 @@ static void load_apps(void) {
     g_strfreev(dirs);
     scan_apps("/var/lib/flatpak/exports/share/applications", "", 0);
     scan_apps("/var/lib/snapd/desktop/applications", "", 0);
+    // The integrated and standalone packages expose the same Trainer under
+    // established desktop IDs. Resolve XDG overrides/visibility first, then
+    // prefer the integrated release only when its entry remains visible.
+    bool bundled_trainer = false;
+    for (int i = 0; i < napps; i++)
+        if (apps[i].name[0] && !strcmp(apps[i].id, "cube-train.desktop")) bundled_trainer = true;
+    if (bundled_trainer) for (int i = 0; i < napps; i++)
+        if (!strcmp(apps[i].id, "whitecube-trainer.desktop")) apps[i].name[0] = 0;
     int keep = 0;
     for (int i = 0; i < napps; i++) if (apps[i].name[0]) apps[keep++] = apps[i];
     napps = keep;

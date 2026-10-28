@@ -31,13 +31,18 @@ def collect(stage, root=ROOT):
     if source['dirty']:
         diff = output(['git', 'diff', 'HEAD', '--binary'], root) or ''
         source['changes_sha256'] = hashlib.sha256((changes + '\n' + diff).encode()).hexdigest()
-    paths = (*inputs.BUILDER_RECIPES, *inputs.ELECTRON_RECIPES, 'BUILD.sh', 'meson.build')
+    paths = (*inputs.BUILDER_RECIPES, *inputs.ELECTRON_RECIPES, 'BUILD.sh', 'meson.build',
+             'apps/cube-train/packaging/parquet-runtime.py', 'apps/cube-train/packaging/parquet-runtime.json')
     hashes = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in paths}
     runtime = {'electron': inputs.validate_electron(stage / 'usr/lib/whitecube/desktop-chat-runtime', inputs.electron_version(root)),
                'node': output([os.environ.get('NODE', 'node'), '--version'], root),
                'python': sys.version.split()[0],
                'compiler': output(shlex.split(os.environ.get('CC', 'cc')) + ['--version'], root),
                'meson': output(['meson', '--version'], root)}
+    parquet = json.loads((stage / 'usr/lib/whitecube/trainer-parquet-runtime/runtime.json').read_text())
+    runtime['pyarrow'] = parquet['pyarrow_version']
+    runtime['parquet_abi'] = parquet['abi']
+    runtime['parquet_wheel_sha256'] = parquet['wheel']['sha256']
     if runtime['compiler']:
         runtime['compiler'] = runtime['compiler'].splitlines()[0]
     packages = output(['dpkg-query', '-W', '-f=${binary:Package}=${Version}\n',

@@ -1,0 +1,13 @@
+{
+  "format": "org.whitecube.trainer.parquet-runtime",
+  "version": 1,
+  "python": "/usr/bin/python3.13",
+  "python_version": "3.13",
+  "abi": "cp313",
+  "pyarrow_version": "26.0.0",
+  "wheel": {
+    "filename": "pyarrow-26.0.0-cp313-cp313-manylinux_2_28_x86_64.whl",
+    "url": "https://files.pythonhosted.org/packages/4f/d6/e95834b29360092376fe4da9956ba41bb7b021869efe6ee9d4172d05cb15/pyarrow-26.0.0-cp313-cp313-manylinux_2_28_x86_64.whl",
+    "sha256": "240bd18a7487f8767616a948a69dd4e740a8bc36a1c9da49e4dc9a32c5c2faed"
+  }
+}

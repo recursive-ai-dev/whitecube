@@ -91,6 +91,8 @@ for f in apps/cube-train/*.py apps/cube-train/*.md; do
   install -m 0644 "$f" "$share/cube-train/$(basename "$f")"
 done
 cp -a apps/cube-train/pipeline "$share/cube-train/pipeline"
+python3 -I apps/cube-train/packaging/parquet-runtime.py stage "$dest/usr/lib/whitecube/trainer-parquet-runtime" >/dev/null
+ln -s ../../../lib/whitecube/trainer-parquet-runtime "$share/cube-train/parquet-runtime"
 find "$share/cube-train/pipeline" -name __pycache__ -prune -exec rm -rf {} +
 # Upstream modules carry executable bits despite having no shebang. Keep real
 # command scripts executable; imported Python modules are ordinary shared data.

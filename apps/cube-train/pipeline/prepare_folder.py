@@ -6,11 +6,7 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except ImportError:
-    pa = pq = None
+from parquet_io import pa, pq
 
 from prepare_parquet import (corpus_integrity, field_type, parquet_values, pick_column,
                              plain_html, TEXT_FIELDS)
@@ -35,7 +31,7 @@ def texts(path, column=None, *, batch_rows=32, stop_requested=None, stats=None):
             selected = pick_column(pf.schema_arrow, column)
             stats['column'] = selected
             print(f"Reading {path.name}: {selected}, {pf.metadata.num_rows:,} rows", flush=True)
-            for text in parquet_values(pf, selected, batch_rows):
+            for text in parquet_values(pf, selected, batch_rows, stop_requested):
                 check_cancelled(stop_requested)
                 stats['rows_scanned'] += 1
                 if text is not None:

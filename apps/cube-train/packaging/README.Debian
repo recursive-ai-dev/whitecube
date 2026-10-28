@@ -2,7 +2,8 @@ Whitecube Trainer standalone package
 ===================================
 
 The upstream NOTICE covers the full Whitecube repository. This standalone
-package contains Trainer, its pipeline, the GTK theme and trainer icon only.
+package contains Trainer, its pipeline, a pinned private Parquet decoder, the
+GTK theme and trainer icon.
 It does not bundle the compositor, Electron, wlroots, cairo or other apps.
 
 Launch Whitecube Trainer from your applications menu or run:
@@ -18,11 +19,19 @@ your current Wayland or X11 desktop and honors GDK_BACKEND when explicitly set.
 
 Training runtime
 ----------------
+Inspect needs neither Torch nor NumPy in the selected training environment.
+Prepare-only uses system Python and its required NumPy package without Torch.
+Normal training uses the selected Torch environment; Parquet decoding can use
+the separate system/private decoder in each workflow.
+
 The desktop never imports PyTorch. Select a Python interpreter in Train, then
-use Check runtime. The recommended python3-torch and python3-numpy packages
-provide a system CPU runtime. Existing CUDA virtual environments can be selected
-instead. PyArrow is optional for Parquet, safetensors for weights export and
-Jupyter/ipykernel for notebook execution. Nothing is downloaded by package
+use Check runtime. NumPy is a required dependency for corpus preparation; the
+recommended python3-torch package provides a system CPU training runtime. Existing CUDA virtual environments can be selected
+instead. Parquet decoding is independent of the selected training environment:
+Debian 13 uses the included CPython 3.13 PyArrow runtime; systems providing
+python3-pyarrow use their system Python decoder. The dependency alternative is
+python3.13 | python3-pyarrow. safetensors remains optional for weights export,
+and Jupyter/ipykernel for notebook execution. Nothing is downloaded by package
 maintainer scripts; this package has no maintainer scripts.
 
 GTK >= 4.12 and libadwaita >= 1.5 are required. Older distributions must upgrade
@@ -41,8 +50,13 @@ From apps/cube-train:
 
     ./packaging/build-deb.sh
 
-Output goes to dist/whitecube-trainer_<version>_all.deb with a SHA256 sidecar.
+Output goes to dist/whitecube-trainer_<version>_amd64.deb with a SHA256 sidecar.
 --output-dir, --version and --epoch are supported. SOURCE_DATE_EPOCH or the
 repository's latest commit timestamp makes identical source builds reproducible.
-The build requires Python 3, git, dpkg and dpkg-deb; it performs no installation,
-network access, compilation or privileged actions.
+The build requires Python 3, git, dpkg, dpkg-deb, dpkg-shlibdeps, readelf and ldd.
+It downloads the exact PyArrow wheel recorded in packaging/parquet-runtime.json
+when absent from the local cache and verifies its SHA256 before extraction.
+The wheel is never installed into host Python. No compilation, host package
+installation or privileged action is performed. The amd64 architecture and
+interpreter dependency reflect the bundled native extension ABI. All upstream
+licenses and notices remain in parquet-runtime/pyarrow-26.0.0.dist-info/licenses/.

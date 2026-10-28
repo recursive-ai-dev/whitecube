@@ -20,6 +20,7 @@ jobs:
         run: |
           python3 -I tests/test-builder.py
           python3 -I tests/test-build-tools.py
+          python3 -I tests/test-parquet-runtime.py
           python3 -I tests/test-lifecycle.py
           python3 -I tests/test-packaging.py ArchiveVerification
       - name: Session and privileged-write regression tests

@@ -143,14 +143,14 @@ def probe_runtime(executable):
     executable = Path(executable).expanduser()
     if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
         raise ValueError('Choose an absolute path to a Python executable with PyTorch and NumPy installed.')
-    code = ("import json,torch,numpy,importlib.util; c=torch.cuda.is_available(); "
+    code = ("import json,torch,numpy; from parquet_io import support; p=support(); c=torch.cuda.is_available(); "
             "print(json.dumps({'torch':torch.__version__,'cuda':c,'gpu':torch.cuda.get_device_name(0) if c else None,"
-            "'parquet':importlib.util.find_spec('pyarrow') is not None,'memory':list(torch.cuda.mem_get_info(0)) if c else None,"
+            "'parquet':p['available'],'parquet_provider':p['provider'],'parquet_error':p['error'],'memory':list(torch.cuda.mem_get_info(0)) if c else None,"
             "'bf16':bool(c and torch.cuda.is_bf16_supported()),'numpy':numpy.__version__,'cpus':torch.get_num_threads(),"
             "'training_error':step()}))")
     # One CPU optimizer step: imports that only load during training (for
     # example sympy through torch.fx) fail here instead of in the first run.
-    code = ("def step():\n try:\n  import torch\n  m=torch.nn.Linear(2,2); o=torch.optim.AdamW(m.parameters())\n"
+    code = (f"import sys;sys.path.insert(0, {str(PIPELINE)!r})\n" + "def step():\n try:\n  import torch\n  m=torch.nn.Linear(2,2); o=torch.optim.AdamW(m.parameters())\n"
             "  m(torch.ones(1,2)).sum().backward(); o.step(); return None\n"
             " except Exception as e:\n  return (type(e).__name__+': '+str(e))[:400]\n" + code)
     try:
@@ -774,7 +774,7 @@ class Trainer:
 
     def command(self, values, run, *, resume_id=None, prepare_only=False):
         """Supervisor arguments for validated values."""
-        command = [values['python'], '-u', str(PIPELINE / 'train_supervisor.py')]
+        command = ['/usr/bin/python3' if prepare_only else values['python'], '-u', str(PIPELINE / 'train_supervisor.py')]
         if resume_id:
             command += ['--resume', str(run)]
         else:
@@ -1060,10 +1060,9 @@ for name in sys.argv[2:]:
     fields, auto, error = [], None, None
     try:
         if name.lower().endswith('.parquet'):
-            import pyarrow.parquet as pq
-            from prepare_parquet import field_type, pick_column
-            import pyarrow as pa
-            schema = pq.ParquetFile(name).schema_arrow
+            from parquet_io import pa, pq, pick_column
+            with pq.ParquetFile(name) as source:
+                schema = source.schema_arrow
             def walk(prefix, typ):
                 if pa.types.is_dictionary(typ): typ = typ.value_type
                 if pa.types.is_string(typ) or pa.types.is_large_string(typ): fields.append(prefix)

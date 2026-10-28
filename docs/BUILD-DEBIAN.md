@@ -109,6 +109,16 @@ and require neither Node.js nor npm. Electron 42 and newer require the explicit
 local installer after `npm ci`; npm no longer downloads the binary through a
 postinstall script.
 
+Trainer's private Parquet reader is prepared during the build. Its PyArrow wheel
+URL, version, Python ABI and SHA256 are pinned in
+`apps/cube-train/packaging/parquet-runtime.json`; downloads are cached under that
+app's `.deps/` directory and checked before extraction. Runtime payload checksums
+and upstream licenses remain in the package, and the release manifest records
+the wheel identity. The decoder uses Python 3.13 on Debian 13; a distribution
+PyArrow package can satisfy the alternative dependency on newer Python systems.
+NumPy is required for corpus preparation, while PyTorch remains in the selected
+training environment.
+
 `tools/prepare-native-deps.sh` does not install system packages. It verifies the
 browser's pinned Cairo, SQLite, JPEG, QuickJS and Mbed TLS downloads, rebuilds
 generated objects and Meson state for the selected distribution, extracts
@@ -148,7 +158,7 @@ isolated runner also checks the finished archive against the real host's file
 ownership database. To perform that read-only host check separately:
 
 ```sh
-python3 -I packaging/check-installed-conflicts.py packaging/out/whitecube-desktop_0.9.0_amd64.deb
+python3 -I packaging/check-installed-conflicts.py packaging/out/whitecube-desktop_0.9.1_amd64.deb
 ```
 
 This catches file ownership collisions that an apt dependency simulation cannot

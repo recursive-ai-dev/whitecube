@@ -52,15 +52,15 @@ class DiagnosticsTests(unittest.TestCase):
             report = diagnostics.collect_diagnostics(self.trainer, values=self.values)
         self.assertIn('whitecube-trainer-cli --doctor', self.by_id(report, 'runtime')['remedy'])
 
-    def test_successful_runtime_cpu_and_optional_parquet(self):
+    def test_missing_parquet_decoder_is_a_required_runtime_failure(self):
         with patch.object(engine, 'probe_runtime', return_value=self.runtime) as probe:
             report = diagnostics.collect_diagnostics(self.trainer, check_runtime=True, values=self.values)
         probe.assert_called_once_with(sys.executable)
-        self.assertTrue(report['ok'])
+        self.assertFalse(report['ok'])
         self.assertTrue(report['runtime_checked'])
         self.assertEqual(self.by_id(report, 'runtime')['status'], 'ok')
         self.assertEqual(self.by_id(report, 'device')['detail'], 'CPU')
-        self.assertEqual(self.by_id(report, 'parquet')['status'], 'warning')
+        self.assertEqual(self.by_id(report, 'parquet')['status'], 'error')
         self.assertIn('PyArrow', self.by_id(report, 'parquet')['detail'])
 
     def test_cuda_unavailable_and_incompatible_precision_have_actionable_errors(self):

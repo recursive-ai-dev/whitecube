@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import engine
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 SCHEMA_VERSION = 1
 MIN_FREE_BYTES = 1024**3
 DESKTOP_PYTHON = '/usr/bin/python3'
@@ -27,10 +27,10 @@ def runtime_setup_hint():
     """Offer an isolated environment rather than modifying system Python."""
     environment = '~/.local/share/whitecube-train/venv'
     return (f'python3 -m venv {environment}\n'
-            f'{environment}/bin/python -m pip install torch numpy pyarrow\n'
+            f'{environment}/bin/python -m pip install torch numpy\n'
             f'Select {environment}/bin/python in the training Python field. '
             'If venv is unavailable, install python3-venv first. '
-            'PyArrow is needed only for Parquet; install a CUDA-compatible PyTorch build for GPU training.')
+            'The installed package supplies its Parquet decoder separately. Install a CUDA-compatible PyTorch build for GPU training.')
 
 
 def _check(identifier, title, status, detail, remedy=None, **extra):
@@ -170,9 +170,10 @@ def collect_diagnostics(trainer, *, check_runtime=False, values=None):
                 checks.append(_check('precision', 'Training precision', 'error',
                                      'The selected CUDA device does not support bfloat16.',
                                      'Select automatic, float32 or float16 precision.'))
-            checks.append(_check('parquet', 'Parquet support', 'ok' if runtime.get('parquet') else 'warning',
-                                 'PyArrow is available.' if runtime.get('parquet') else 'PyArrow is absent; TXT, Markdown and JSONL remain available.',
-                                 None if runtime.get('parquet') else f'{shlex.quote(str(executable))} -m pip install pyarrow'))
+            checks.append(_check('parquet', 'Parquet support', 'ok' if runtime.get('parquet') else 'error',
+                                 'PyArrow is available through ' + str(runtime.get('parquet_provider') or 'the selected Python') + '.' if runtime.get('parquet') else
+                                 runtime.get('parquet_error') or 'No usable PyArrow decoder is available.',
+                                 None if runtime.get('parquet') else 'Reinstall Whitecube Trainer and its declared Parquet/Python dependencies.'))
         except (ValueError, OSError) as error:
             checks.append(_check('runtime', 'CPU optimizer test', 'error', str(error), runtime_setup_hint()))
     else:

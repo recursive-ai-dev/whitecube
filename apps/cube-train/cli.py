@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import engine
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 COMPARISON_FIELDS = ('id', 'name', 'model_size', 'device', 'status', 'step', 'parameters',
                      'val_loss', 'bits_per_byte', 'tokens_per_second', 'training_seconds', 'corpus_fingerprint')
 
@@ -114,7 +114,8 @@ def main(argv=None):
               'Training options (uses the Python selected in the desktop):\n')
         build_parser(prog=program).print_help()
         return 0
-    _execute(trainer.preferences()['python'], 'train_supervisor.py', args, isolated=False)
+    _execute('/usr/bin/python3' if '--prepare-only' in args else trainer.preferences()['python'],
+             'train_supervisor.py', args, isolated=False)
     return 0
 
 

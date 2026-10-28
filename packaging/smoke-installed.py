@@ -57,6 +57,57 @@ def check_png(path):
         raise RuntimeError(f'invalid or empty PNG capture: {path.name}')
 
 
+TRAINER_PARQUET_SMOKE = r'''
+import importlib.util
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+app = Path('/usr/share/whitecube/cube-train')
+runtime = app / 'parquet-runtime'
+manifest = json.loads((runtime / 'runtime.json').read_text())
+source = Path('/tmp/trainer-smoke.parquet')
+output = Path('/tmp/trainer-smoke-corpus')
+assert importlib.util.find_spec('pyarrow') is None, 'smoke must exercise the packaged fallback'
+docs = [f'Document {index}: café ' + chr(65 + index) * 700 for index in range(20)]
+fixture = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import pyarrow as pa
+import pyarrow.parquet as pq
+docs = json.loads(sys.stdin.read())
+pq.write_table(pa.table({'text': list(range(len(docs))), 'content': docs}), sys.argv[2])
+"""
+subprocess.run([manifest['python'], '-I', '-B', '-c', fixture, str(runtime.resolve()), str(source)],
+               input=json.dumps(docs), text=True, check=True, timeout=30)
+sys.path.insert(0, str(app))
+import engine
+from parquet_io import support
+from prepare_folder import prepare_folder
+import numpy as np
+reader = support()
+assert reader['available'], reader
+fields = engine.probe_fields([source], '/usr/bin/python3')
+assert fields[str(source)]['auto'] == 'content', fields
+assert not fields[str(source)]['error'], fields
+corpus = prepare_folder(source, output, max_tokens=20000, block_size=8, batch_rows=3)
+assert corpus['train_tokens'] > 8 and corpus['val_tokens'] > 8, corpus
+stored = []
+for split in ('train', 'val'):
+    tokens = np.fromfile(output / (split + '.bin'), dtype=np.uint16)
+    ends = list(np.where(tokens == 257)[0] + 1)
+    assert ends and ends[-1] == len(tokens)
+    starts = [0] + ends[:-1]
+    stored.extend(bytes(tokens[start:end - 1].astype(np.uint8)).decode('utf-8')
+                  for start, end in zip(starts, ends))
+assert sorted(stored) == sorted(docs), 'Parquet text did not survive corpus preparation'
+print(json.dumps({'verification': 'passed', 'reader': reader,
+                  'selected_field': fields[str(source)]['auto'], 'documents': len(stored),
+                  'train_tokens': corpus['train_tokens'], 'val_tokens': corpus['val_tokens']}))
+'''
+
+
 def inside():
     output = Path('/report')
     home, runtime = Path.home(), Path(os.environ['XDG_RUNTIME_DIR'])
@@ -95,6 +146,12 @@ def inside():
         doctor = run(['/usr/bin/whitecube-doctor', '--json', '--strict', '--check', 'package', '--check', 'libraries'])
         (output / 'doctor.json').write_text(doctor.stdout)
         checks.append('installed package paths and runtime library checks')
+
+        parquet = run(['/usr/bin/python3', '-I', '-c', TRAINER_PARQUET_SMOKE], timeout=90)
+        (output / 'trainer-parquet.log').write_text(parquet.stdout)
+        parquet_report = json.loads(parquet.stdout.splitlines()[-1])
+        (output / 'trainer-parquet.json').write_text(json.dumps(parquet_report, indent=2) + '\n')
+        checks.append('installed Trainer Parquet inspection and lossless corpus preparation without PyArrow in the training Python')
 
         profile = {'format': 'org.whitecube.preferences', 'version': 1,
                    'settings': {'tab-w': 252, 'clock-format': '12h', 'clock-seconds': True}}

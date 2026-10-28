@@ -39,6 +39,11 @@ STANDALONE_FILES = {
         '/usr/share/applications/cube-browser.desktop': b'[Desktop Entry]\nType=Application\nName=Standalone Browser Fixture\nExec=cube-browser\nIcon=cube-browser\n',
         '/usr/share/icons/hicolor/scalable/apps/cube-browser.svg': b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M0 0h16v16H0z"/></svg>\n',
     },
+    'whitecube-trainer': {
+        '/usr/bin/whitecube-trainer': b'#!/bin/sh\nprintf "standalone trainer fixture\\n"\n',
+        '/usr/share/applications/whitecube-trainer.desktop': b'[Desktop Entry]\nType=Application\nName=Whitecube Trainer\nExec=whitecube-trainer\nTryExec=whitecube-trainer\nIcon=whitecube-trainer\nStartupWMClass=org.whitecube.Trainer\n',
+        '/usr/share/icons/hicolor/scalable/apps/whitecube-trainer.svg': b'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><path d="M0 0h16v16H0z"/></svg>\n',
+    },
 }
 
 
@@ -367,7 +372,7 @@ def verify_standalones(root):
 def smoke_unpack(package):
     """Use dpkg's real unpack/database path in a disposable root, with no scripts.
 
-    Seed independently installed chrootables and cube-browser packages before
+    Seed independently installed Chrootables, Browser and Trainer packages before
     unpacking Whitecube, then check their contents and dpkg ownership survive.
     Configuring and launching the Wayland session still require an installed
     system. Refuse archives with a preinst, since dpkg would execute that script
@@ -449,7 +454,7 @@ def main():
     print(f'verify-deb: passed ({summary["payload_files"]} payload files; ownership, modes, conffiles, amd64 ELF and checksums; '
           f'{len(summary["hardened_executables"])} native executables checked for PIE, full RELRO and non-executable stack)')
     if args.unpack:
-        print('verify-deb: dpkg unpack, installed package database/checksums and standalone chrootables/browser coexistence passed in a disposable root')
+        print('verify-deb: dpkg unpack, installed package database/checksums and standalone Chrootables/Browser/Trainer coexistence passed in a disposable root')
     return 0
 
 

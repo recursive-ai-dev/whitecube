@@ -87,19 +87,11 @@ def read_file_to_bytes(filepath: str) -> bytes:
     """
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".parquet":
-        try:
-            import pandas as pd
-            df = pd.read_parquet(filepath)
-            str_cols = [c for c in df.columns if pd.api.types.is_string_dtype(df[c]) or df[c].dtype == object]
-            lines = []
-            for col in str_cols:
-                lines.extend(df[col].dropna().astype(str).tolist())
-            content = "\n\n".join(lines)
-            return content.encode("utf-8", errors="replace")
-        except Exception as e:
-            print(f"[warning] Failed to parse parquet {filepath}: {e}, falling back to raw read")
-            with open(filepath, "rb") as fh:
-                return fh.read()
+        from parquet_io import pq, pick_column
+        from prepare_parquet import parquet_values
+        with pq.ParquetFile(filepath) as source:
+            column = pick_column(source.schema_arrow)
+            return '\n\n'.join(text for text in parquet_values(source, column) if text is not None).encode('utf-8')
     elif ext == ".jsonl":
         lines = []
         try:

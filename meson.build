@@ -76,7 +76,8 @@ foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'te
                 ['native-preference-validation', 'test-preferences.py'],
                 ['settings-transactions', 'test-settings-transactions.py'],
                 ['suspend-lock', 'test-suspend.py'], ['build-tools', 'test-build-tools.py'],
-                ['builder-cache', 'test-builder.py'], ['package-lifecycle', 'test-lifecycle.py']]
+                ['builder-cache', 'test-builder.py'], ['package-lifecycle', 'test-lifecycle.py'],
+                ['parquet-runtime-integrity', 'test-parquet-runtime.py']]
   test(item[0], python, args: ['-I', meson.current_source_dir() / 'tests' / item[1]],
     depends: compiled_schema, env: schema_env, timeout: 120, suite: 'python')
 endforeach

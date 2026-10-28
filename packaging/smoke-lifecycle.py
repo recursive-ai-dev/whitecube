@@ -105,7 +105,7 @@ def inside():
 
     for fixture in sorted(Path('/repo/fixtures').glob('*.deb')):
         command('dpkg', '--install', str(fixture))
-    record('standalone Browser and Chrootables coexistence fixtures installed')
+    record('standalone Browser, Chrootables and Trainer coexistence fixtures installed')
 
     install(package)
     verify_installed()

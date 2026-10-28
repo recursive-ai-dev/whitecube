@@ -76,3 +76,15 @@ License: MIT
  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  THE SOFTWARE.
+
+Files: usr/lib/whitecube/trainer-parquet-runtime/*
+Copyright: 2016-2026 The Apache Software Foundation and contributors
+License: Apache-2.0 and bundled-third-party
+Comment: The pinned PyPI wheel includes additional bundled third-party software.
+ Complete upstream license texts and third-party notices are retained in
+ /usr/lib/whitecube/trainer-parquet-runtime/pyarrow-26.0.0.dist-info/licenses/
+ as LICENSE.txt and NOTICE.txt.
+
+License: bundled-third-party
+ The complete licenses for the wheel's bundled components are reproduced in
+ the upstream LICENSE.txt and NOTICE.txt files at the path above.

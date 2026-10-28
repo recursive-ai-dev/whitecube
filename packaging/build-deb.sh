@@ -112,12 +112,15 @@ fi
 # though Chat is launched with Ozone Wayland. Native desktop binaries stay X-free.
 chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-runtime)
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
-runtime=(apt less procps systemd foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
+runtime=(python3-numpy apt less procps systemd foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
   gdisk parted dosfstools xz-utils
   dhcpcd-base iproute2 nftables seatd
   libmpv2 libwayland-egl1)   # cube-player: libmpv is not bundled (it reaches X11 and gets security updates from Debian)
 for p in "${runtime[@]}"; do pkgs[$p]=1; done
+# Debian13 uses the private CP313 decoder; newer Python distros can provide
+# their own PyArrow without requiring an unavailable older interpreter.
+pkgs['python3.13 | python3-pyarrow']=1
 # Cube Editor uses Adw.Dialog (introduced in libadwaita 1.5). Constrain both
 # the typelib and its runtime, replacing any unconstrained scanner entries.
 unset 'pkgs[gir1.2-adw-1]' 'pkgs[libadwaita-1-0]'
@@ -152,6 +155,7 @@ python3 -I packaging/check-tree.py "$stage" --sources src
 python3 -I packaging/check-installed-conflicts.py "$stage"
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"
+python3 -I apps/cube-train/packaging/parquet-runtime.py check "$stage/usr/lib/whitecube/trainer-parquet-runtime"
 temporary_deb=$out/.whitecube-desktop_${version}_amd64.deb
 trap 'rm -rf -- "$stage"; rm -f -- "$temporary_deb" "$temporary_deb.json"' EXIT
 dpkg-deb --root-owner-group --threads-max="${DPKG_DEB_THREADS_MAX:-2}" -Zxz -z"${DPKG_DEB_COMPRESSION_LEVEL:-3}" --build "$stage" "$temporary_deb" > /dev/null

@@ -6,7 +6,7 @@ host (Bubblewrap and the cached Debian builder are required):
 ```sh
 python3 -I packaging/smoke-installed.py \
   --rootfs build/debian-builder/rootfs \
-  --deb packaging/out/whitecube-desktop_0.9.0_amd64.deb \
+  --deb packaging/out/whitecube-desktop_0.9.1_amd64.deb \
   --output build/installed-smoke
 ```
 
@@ -32,6 +32,11 @@ Logs, PNG captures, player diagnostics and `report.json` remain in the requested
 output directory. Success requires every check; failure reports the error and
 retains completed checks and logs for diagnosis.
 
+Trainer's Parquet check runs with no PyArrow module in the training interpreter.
+It discovers the text column through the packaged reader, prepares training and
+validation corpora, and compares every decoded document with the original Unicode
+fixture. The report records the reader provider and resulting token counts.
+
 The test uses a headless Pixman output and does not validate physical display,
 GPU, input or sound hardware. Extracting rootlessly cannot provide the sandbox
 helper's real root ownership, so Chat receives `--no-sandbox` inside this already
@@ -48,10 +53,10 @@ upgrade, removal and purge in a new Debian runtime root:
 
 ```sh
 python3 -I tools/verify-release.py \
-  --deb packaging/out/whitecube-desktop_0.9.0_amd64.deb \
+  --deb packaging/out/whitecube-desktop_0.9.1_amd64.deb \
   --previous-deb packaging/out/whitecube-desktop_0.8.1_amd64.deb \
   --rootfs build/debian-builder/rootfs \
-  --output build/release-0.9.0
+  --output build/release-0.9.1
 ```
 
 Supplying the previous archive enables `packaging/smoke-lifecycle.py` and makes
@@ -63,7 +68,7 @@ are authenticated; only the generated local test repository is explicitly truste
 This step needs network access to obtain runtime packages.
 
 The lifecycle checks preserve modified conffiles and user dotfiles across
-upgrade/removal, and keep standalone Browser/Chrootables fixture paths and dpkg
+upgrade/removal, and keep standalone Browser/Chrootables/Trainer fixture paths and dpkg
 ownership intact. Maintainer scripts execute in private user/PID/network namespaces;
 service starts are blocked. Logs, package inventory, reports and the resulting
 runtime root remain under the output directory for diagnosis.

@@ -369,12 +369,12 @@ def _pick_text_column(names: Sequence[str], string_cols: Sequence[str], requeste
 
 
 def _iter_parquet_records(path: str, spec: _RecordSpec, rej: _Rejects) -> Iterator[Record]:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as e:  # pragma: no cover - environment dependent
-        raise ImportError("reading .parquet needs `pip install pyarrow`") from e
-    pf = pq.ParquetFile(path)
+    from parquet_io import pa, pq
+    with pq.ParquetFile(path) as pf:
+        yield from _iter_parquet_rows(pf, pa, path, spec, rej)
+
+
+def _iter_parquet_rows(pf, pa, path, spec, rej):
     schema = pf.schema_arrow
     names = list(schema.names)
     string_cols = [f.name for f in schema if pa.types.is_string(f.type) or pa.types.is_large_string(f.type)]

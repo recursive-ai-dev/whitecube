@@ -63,7 +63,10 @@ class StandalonePackageTests(unittest.TestCase):
     def test_standalone_package_dependencies_and_no_desktop_collision(self):
         fields = subprocess.check_output(['dpkg-deb', '--field', str(self.deb)], text=True)
         self.assertIn('Package: whitecube-trainer\n', fields)
-        self.assertIn('Architecture: all\n', fields)
+        self.assertIn('Architecture: amd64\n', fields)
+        self.assertIn('python3.13 | python3-pyarrow', fields)
+        self.assertIn('python3-numpy', fields)
+        self.assertIn('libstdc++6', fields)
         self.assertIn('gir1.2-adw-1 (>= 1.5)', fields)
         self.assertNotIn('whitecube-desktop', fields)
         self.assertEqual(sorted(p.name for p in self.binaries.iterdir()), ['whitecube-trainer', 'whitecube-trainer-cli'])
@@ -79,6 +82,9 @@ class StandalonePackageTests(unittest.TestCase):
                          'pipeline/tensegrity/train.py'):
             self.assertTrue((application / filename).is_file(), filename)
         self.assertTrue((application.parent / 'cube-apps/cube_theme.py').is_file())
+        self.assertTrue((application / 'parquet-runtime/runtime.json').is_file())
+        self.assertTrue((application / 'parquet-runtime/pyarrow/libparquet.so.2600').is_file())
+        self.assertTrue((application / 'parquet-runtime/pyarrow-26.0.0.dist-info/licenses/LICENSE.txt').is_file())
         names = {p.name for p in self.stage.rglob('*')}
         self.assertFalse(names.intersection({'__pycache__', '.pytest_cache', 'tests', '.git', 'train-out'}))
 

@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.1_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -56,7 +56,7 @@ packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
 
-## Improvements in 0.9.0
+## Improvements in 0.9.1
 
 Suspend from Settings or the panel first waits for the screen locker to confirm
 that the compositor has locked the session. Failed application launches and
@@ -72,12 +72,15 @@ Each file replacement is atomic; multiple files are not one filesystem transacti
 
 Chat searches conversation history in a worker, caches its index, debounces
 typing and pages the sidebar. Trainer refreshes run/job metadata in the background
-without overlapping scans. Editor offers Save, Discard edits and Keep editing
+without overlapping scans. The packaged Trainer includes a private Parquet reader,
+so dataset inspection and preparation also work when the selected training Python
+does not have PyArrow. The Whitecube launcher shows one Trainer entry when both
+the bundled and standalone packages are installed. Editor offers Save, Discard edits and Keep editing
 when leaving a modified project, including invalid or unwritable drafts.
 
 The native build definitions are shared through Meson, dependency caches follow
 their recipes and lockfiles, and packages record source/build provenance.
-The [release guide](docs/RELEASE-0.9.0.md) describes the changes and verification;
+The [release guide](docs/RELEASE-0.9.1.md) describes the changes and verification;
 the [maintenance guide](docs/MAINTENANCE.md) documents the release checks.
 
 Download the Debian amd64 binary package and its checksum from
@@ -85,8 +88,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.0_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.0_amd64.deb
+sha256sum --check whitecube-desktop_0.9.1_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.1_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

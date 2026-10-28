@@ -40,10 +40,10 @@ After building, run the complete verification outside the builder:
 
 ```sh
 python3 -I tools/verify-release.py \
-  --deb packaging/out/whitecube-desktop_0.9.0_amd64.deb \
+  --deb packaging/out/whitecube-desktop_0.9.1_amd64.deb \
   --rootfs build/debian-builder/rootfs \
   --previous-deb packaging/out/whitecube-desktop_0.8.1_amd64.deb \
-  --output build/release-0.9.0
+  --output build/release-0.9.1
 ```
 
 The output directory must be absent or empty. Add `--list` to inspect commands.
@@ -58,7 +58,9 @@ The lifecycle test executes real apt/dpkg installation, maintainer scripts,
 standalone-package coexistence, conffile-preserving upgrade, removal and purge.
 It operates in a disposable user/PID/network namespace with service starts
 blocked. The graphical smoke exercises installed paths, bundled libraries,
-settings import/export, Browser, Player and Chat. See
+settings import/export, Browser, Player and Chat. It also verifies Trainer's
+Parquet inspection and exact corpus round-trip with no PyArrow in the training
+interpreter. See
 [installed runtime scope](INSTALLED-SMOKE.md).
 
 These checks do not replace physical GPU, display, input, audio and resume tests
@@ -77,7 +79,7 @@ Never replace an already published version with different binaries.
 
 ```sh
 cd packaging/out
-sha256sum --check whitecube-desktop_0.9.0_amd64.deb.sha256
+sha256sum --check whitecube-desktop_0.9.1_amd64.deb.sha256
 ```
 
 Keep the previous archive for upgrade testing and rollback. Installing never

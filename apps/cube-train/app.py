@@ -24,7 +24,7 @@ import cli
 from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 from gi.repository import Pango
 
-VERSION = '1.1.0'
+VERSION = '1.1.1'
 PLAN_PRESETS = (('Custom', None), ('Smoke test · 20 steps', 20), ('Short · 1,000 steps', 1000),
                 ('Standard · 5,000 steps', 5000), ('Long · 20,000 steps', 20_000))
 RUN_SORTS = ('Newest first', 'Oldest first', 'Name', 'Best validation loss', 'Model size')
@@ -1312,7 +1312,7 @@ class TrainerWindow(Adw.ApplicationWindow):
                     details.append(f'GPU memory {format_bytes(free)} free of {format_bytes(total)}')
                 if info.get('cuda'):
                     details.append('bf16 supported' if info.get('bf16') else 'fp16 mixed precision')
-                details.append(f'Parquet {"available" if info["parquet"] else "needs pyarrow"}')
+                details.append(f'Parquet {"available" if info["parquet"] else "decoder missing; reinstall Trainer dependencies"}')
                 if info.get('training_error'):
                     hint = engine.repair_hint(info['training_error'], executable)
                     details.append(f'\nTraining check failed: {info["training_error"]}. This environment cannot run an optimizer step'

@@ -68,6 +68,11 @@ class Tree(unittest.TestCase):
         self.assertIn('Terminal=false', desktop)
         self.assertIn('X-Wayland-Native=true', desktop)
         self.assertFalse((trainer / 'tests').exists())
+        runtime = trainer / 'parquet-runtime'
+        self.assertTrue(runtime.is_symlink())
+        self.assertEqual(runtime.resolve(), (self.stage / 'usr/lib/whitecube/trainer-parquet-runtime').resolve())
+        self.assertTrue((runtime / 'runtime.json').is_file())
+        self.assertTrue((runtime / 'pyarrow/libparquet.so.2600').is_file())
         self.assertFalse(any(trainer.rglob('*.pt')))
         for module in (trainer / 'pipeline').rglob('*.py'):
             if not module.read_bytes().startswith(b'#!'):
@@ -655,18 +660,23 @@ class ArchiveVerification(unittest.TestCase):
         result = self.checker.smoke_unpack(self.package)
         self.assertEqual(result['unpack_smoke'], 'passed')
         self.assertEqual(result['coexistence_smoke'], {
-            'verification': 'passed', 'packages': ['chrootables', 'cube-browser'],
+            'verification': 'passed', 'packages': ['chrootables', 'cube-browser', 'whitecube-trainer'],
             'preserved_paths': [
                 '/usr/bin/chrootable-manager', '/usr/bin/cube-browser',
+                '/usr/bin/whitecube-trainer',
                 '/usr/share/applications/cube-browser.desktop',
+                '/usr/share/applications/whitecube-trainer.desktop',
                 '/usr/share/icons/hicolor/scalable/apps/cube-browser.svg',
+                '/usr/share/icons/hicolor/scalable/apps/whitecube-trainer.svg',
             ],
         })
 
     def test_real_dpkg_rejects_each_legacy_shared_application_path(self):
-        for relative in ('usr/bin/chrootable-manager', 'usr/bin/cube-browser',
+        for relative in ('usr/bin/chrootable-manager', 'usr/bin/cube-browser', 'usr/bin/whitecube-trainer',
                          'usr/share/applications/cube-browser.desktop',
-                         'usr/share/icons/hicolor/scalable/apps/cube-browser.svg'):
+                         'usr/share/applications/whitecube-trainer.desktop',
+                         'usr/share/icons/hicolor/scalable/apps/cube-browser.svg',
+                         'usr/share/icons/hicolor/scalable/apps/whitecube-trainer.svg'):
             with self.subTest(path=relative):
                 target = self.stage / relative
                 target.parent.mkdir(parents=True, exist_ok=True)

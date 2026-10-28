@@ -10,10 +10,9 @@ import subprocess
 import sys
 import time
 import traceback
-import torch
 
 from prepare_folder import prepare_folder
-from train_local import train, MODEL_PRESETS
+from model_presets import MODEL_PRESETS
 from files import atomic_json
 from train_supervisor import cpu_temperature
 from pacing import TrainingPacer
@@ -238,8 +237,12 @@ def main():
             subprocess.run(['ionice', '-c', '3', '-p', str(os.getpid())], capture_output=True, check=True, timeout=5)
         except (OSError, subprocess.SubprocessError) as error:
             print(f'Idle disk priority unavailable: {error}', file=sys.stderr)
-    torch.set_num_threads(args.cpu_threads)
-    torch.set_num_interop_threads(1)
+    if not args.prepare_only:
+        global torch
+        import torch
+        from train_local import train
+        torch.set_num_threads(args.cpu_threads)
+        torch.set_num_interop_threads(1)
     # This lock is shared with desktop launch/trash and existing CLI installs.
     state = home / '.local' / 'state' / 'tensegrity'
     state.mkdir(parents=True, exist_ok=True)

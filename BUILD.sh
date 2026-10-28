@@ -132,6 +132,8 @@ else
   cp "$core/cube-space.ppm" "$out/cube-space.ppm"
   cp "$core"/{bar,menu,menu-search}.png "$out/"
 fi
+# Stage the pinned private Parquet decoder without modifying system Python.
+python3 -I apps/cube-train/packaging/parquet-runtime.py prepare
 # Package tests inspect the complete tree, including these native apps.
 [[ -n $sysroot || -n ${SANITIZE:-} ]] || bash apps/build-native-apps.sh "$native_dir/$out"
 # Network controller (cube-net, DHCP hook, unit, helper): pure Python, needs no root, radio or network.
@@ -143,6 +145,7 @@ python3 -I tests/test-doctor.py
 python3 -I tests/test-session.py
 python3 -I tests/test-builder.py
 python3 -I tests/test-build-tools.py
+python3 -I tests/test-parquet-runtime.py
 python3 -I tests/test-lifecycle.py
 python3 -I tests/test-settings-transactions.py
 python3 -I tests/test-suspend.py
@@ -162,6 +165,7 @@ python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_engine*.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_app.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_worker_descendants.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_snapshots.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_parquet_runtime.py' -v
 if [[ -n ${TRAINING_PYTHON:-} ]]; then
   "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_pipeline.py' -v
   "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_corpus_improvements.py' -v

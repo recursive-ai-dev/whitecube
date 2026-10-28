@@ -14,11 +14,7 @@ from files import atomic_json, file_sha256, publish_directory
 from corpus_index import DocumentIndex
 
 import numpy as np
-try:
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-except ImportError:
-    pa = pq = None
+from parquet_io import pa, pq, field_type, pick_column, read_batches, TEXT_FIELDS
 
 
 class PlainHTML(HTMLParser):
@@ -64,38 +60,10 @@ def plain_html(text):
     return "\n".join(line for line in lines if line)
 
 
-TEXT_FIELDS = ('text', 'content', 'story', 'body', 'document.html')
-
-
-def field_type(schema, name):
-    parts = [name] if name in schema.names else name.split('.')
-    typ = schema.field(parts[0]).type
-    for part in parts[1:]:
-        if pa.types.is_dictionary(typ):
-            typ = typ.value_type
-        if not pa.types.is_struct(typ):
-            raise KeyError(name)
-        typ = typ.field(part).type
-    return typ.value_type if pa.types.is_dictionary(typ) else typ
-
-
-def pick_column(schema, requested=None):
-    if requested is not None and (not isinstance(requested, str) or not requested.strip()):
-        raise ValueError('Text column must be a nonempty string')
-    for name in [requested] if requested is not None else TEXT_FIELDS:
-        try:
-            typ = field_type(schema, name)
-            if pa.types.is_string(typ) or pa.types.is_large_string(typ):
-                return name
-        except (KeyError, AttributeError, IndexError):
-            pass
-    raise ValueError(f'No recognized text column. Available fields: {schema.names}; use --column')
-
-
-def parquet_values(parquet, selected, batch_rows=32):
+def parquet_values(parquet, selected, batch_rows=32, stop_requested=None):
     """Keep projected struct scalars intact so parent nulls remain visible."""
     parts = [selected] if selected in parquet.schema_arrow.names else selected.split('.')
-    for batch in parquet.iter_batches(batch_size=batch_rows, columns=[selected], use_threads=False):
+    for batch in read_batches(parquet, batch_size=batch_rows, columns=[selected], stop_requested=stop_requested):
         for scalar in batch.column(0):
             value = scalar.as_py()
             for component in parts[1:]:
@@ -151,7 +119,7 @@ def prepare(source, output, *, column=None, max_tokens=2_000_000,
         total = rows_scanned = documents = truncated = skipped = 0
         eos = np.array([257], dtype=np.uint16).tobytes()
         with combined.open("wb") as stream:
-            for text in parquet_values(parquet, column, batch_rows):
+            for text in parquet_values(parquet, column, batch_rows, stop_requested):
                 check_cancelled(stop_requested)
                 rows_scanned += 1
                 if strip_html and text:

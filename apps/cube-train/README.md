@@ -1,8 +1,10 @@
-# Whitecube Trainer 1.1.0
+# Whitecube Trainer 1.1.1
 
 Native GTK4 controls and a local small-language-model training pipeline. The
-desktop process uses the system Python and never imports PyTorch. Preparation,
-training and CPU previews run in the Python environment selected in the app.
+desktop process uses the system Python and never imports PyTorch. Training and
+CPU previews use the Python environment selected in the app. Inspect and
+prepare-only work independently of that environment: inspection needs neither
+Torch nor NumPy there, and preparation uses the packaged system NumPy dependency.
 
 ## Install the standalone Debian package
 
@@ -10,22 +12,25 @@ Build from this directory, without root or the Whitecube compositor:
 
 ```sh
 ./packaging/build-deb.sh
-sudo apt install ./dist/whitecube-trainer_1.1.0_all.deb
+sudo apt install ./dist/whitecube-trainer_1.1.1_amd64.deb
 whitecube-trainer
 ```
 
-The package runs on an existing Wayland or X11 desktop. It requires Python 3.10+,
-GTK 4.12+ and libadwaita 1.5+ (for example Ubuntu 24.04 or newer). It installs an
+The amd64 package runs on an existing Wayland or X11 desktop. It requires
+GTK 4.12+, libadwaita 1.5+ and either CPython 3.13 (Debian 13) or a distribution
+providing python3-pyarrow for its system Python. It installs an
 application menu entry, icon, desktop actions and the complete local pipeline.
 The standalone commands are `whitecube-trainer` and `whitecube-trainer-cli`, so
 it can coexist with `whitecube-desktop`. The checkout and full desktop keep
 their `cube-train` and `whitecube-train` commands. All CLI examples below work
 with `whitecube-trainer-cli` in a standalone installation.
 
-APT recommends system PyTorch and NumPy for CPU training. If you already have a
+NumPy is required for corpus preparation; APT recommends system PyTorch for CPU training. If you already have a
 training environment, use `sudo apt install --no-install-recommends
-./dist/whitecube-trainer_1.1.0_all.deb`, then select that environment's Python in
-Train. PyArrow is optional for Parquet input. The package does not bundle a GPU
+./dist/whitecube-trainer_1.1.1_amd64.deb`, then select that environment's Python in
+Train. A private pinned Parquet decoder handles input when the selected training
+environment lacks PyArrow. Newer Python distributions can use their packaged
+python3-pyarrow provider. The package does not bundle a GPU
 runtime or download dependencies from installation scripts. Removing it preserves
 your runs and preferences.
 
@@ -37,7 +42,7 @@ repository commit timestamp) for reproducible archives. See
 
 **System** in the navigation rail (`Ctrl+4`) checks the current training draft:
 desktop libraries, selected interpreter, a CPU optimizer step, CUDA access,
-requested precision, optional Parquet support, corpus path accessibility and
+requested precision, Parquet decoder availability, corpus path accessibility and
 free/writable output, state and preferences storage. Checks run in the background;
 repair instructions and JSON copy/export make failures easier to diagnose.
 This checks access to the corpus; use **Inspect** and preparation for contents

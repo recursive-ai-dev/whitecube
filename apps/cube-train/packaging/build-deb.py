@@ -7,6 +7,7 @@ import ast
 import fcntl
 import gzip
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -18,6 +19,9 @@ import time
 APP = Path(__file__).resolve().parent.parent
 REPO = APP.parent.parent
 PACKAGE = 'whitecube-trainer'
+spec = importlib.util.spec_from_file_location('trainer_parquet_runtime', APP / 'packaging/parquet-runtime.py')
+parquet_runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(parquet_runtime)
 
 
 def version():
@@ -67,6 +71,8 @@ def stage_tree(stage, release, epoch):
     for source in sorted((APP / 'pipeline').rglob('*')):
         if source.is_file() and source.suffix in {'.py', '.txt'} and '__pycache__' not in source.parts:
             copy_file(source, application / 'pipeline' / source.relative_to(APP / 'pipeline'))
+    parquet_runtime.stage(application / 'parquet-runtime')
+    native_dependencies = parquet_runtime.abi_dependencies(application / 'parquet-runtime')
     copy_file(APP.parent / 'cube-apps/cube_theme.py', stage / 'usr/lib/whitecube-trainer/cube-apps/cube_theme.py')
     write_file(stage / 'usr/bin/whitecube-trainer', launcher('app'), 0o755)
     write_file(stage / 'usr/bin/whitecube-trainer-cli', launcher('cli'), 0o755)
@@ -91,14 +97,14 @@ def stage_tree(stage, release, epoch):
     installed_size = (sum(p.stat().st_size for p in stage.rglob('*') if p.is_file()) + 1023) // 1024
     control = f'''Package: {PACKAGE}
 Version: {release}
-Architecture: all
+Architecture: amd64
 Section: science
 Priority: optional
 Maintainer: Whitecube contributors <whitecube@localhost>
 Installed-Size: {installed_size}
-Depends: python3 (>= 3.10), python3-gi, python3-cairo, python3-gi-cairo, gir1.2-gtk-4.0 (>= 4.12), gir1.2-adw-1 (>= 1.5), libadwaita-1-0 (>= 1.5)
-Recommends: python3-numpy, python3-torch, python3-venv, fonts-dejavu-core
-Suggests: python3-pyarrow, python3-safetensors, python3-ipykernel, jupyter-notebook
+Depends: {native_dependencies}, python3.13 | python3-pyarrow, python3-numpy, python3 (>= 3.10), python3-gi, python3-cairo, python3-gi-cairo, gir1.2-gtk-4.0 (>= 4.12), gir1.2-adw-1 (>= 1.5), libadwaita-1-0 (>= 1.5)
+Recommends: python3-torch, python3-venv, fonts-dejavu-core
+Suggests: python3-safetensors, python3-ipykernel, jupyter-notebook
 Description: native workshop for training small local language models
  A GTK4 and libadwaita desktop application with reproducible corpus preparation,
  resumable CPU or CUDA training, live metrics, checkpoint comparison, previews,
@@ -148,7 +154,7 @@ def main(argv=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             parser.error('another package build is using this output directory')
-        filename = f'{PACKAGE}_{options.version}_all.deb'
+        filename = f'{PACKAGE}_{options.version}_amd64.deb'
         with tempfile.TemporaryDirectory(prefix='.package-', dir=output) as temporary:
             temporary = Path(temporary)
             stage = temporary / 'root'

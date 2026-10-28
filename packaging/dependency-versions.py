@@ -39,6 +39,7 @@ def discover(stage, excluded_packages=()):
             'dpkg-shlibdeps', '-O', '--ignore-missing-info', '--warnings=0',
             '-xwhitecube-desktop', '-S' + str(stage), '-l' + str(private),
             '-l' + str(private / 'desktop-chat-runtime'),
+            '-l' + str(private / 'trainer-parquet-runtime/pyarrow'),
             *('-x' + package for package in excluded_packages),
             *('-e' + str(path) for path in binaries),
         ], cwd=tmp, text=True, capture_output=True)
