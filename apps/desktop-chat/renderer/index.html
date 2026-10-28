@@ -28,7 +28,7 @@
         <button id="btn-sidebar-new" class="new-chat-button">＋ New conversation <kbd>Ctrl N</kbd></button>
         <label class="search-label" for="chat-search">Search conversations</label>
         <input id="chat-search" type="search" placeholder="Search your chats…" autocomplete="off" />
-        <div id="chat-list" role="list" aria-label="Conversations"></div>
+        <nav id="chat-list" aria-label="Conversations"></nav>
         <div class="sidebar-footer"><span class="status-dot"></span> Saved on this device<br><span>API keys stay in your settings.</span></div>
       </aside>
       <main id="conversation">
@@ -97,7 +97,7 @@
       <label class="checkbox-row"><input id="s-tools" type="checkbox" checked /> Enable filesystem tools for API models</label>
       <label class="checkbox-row">
         <input id="s-confirm" type="checkbox" />
-        Confirm before write_file / edit_file / move_file
+        Ask before creating, editing, or moving files
       </label>
       <label>Global hotkey
         <input id="s-hotkey" type="text" placeholder="CommandOrControl+Shift+T" />

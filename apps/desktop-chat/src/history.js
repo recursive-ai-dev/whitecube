@@ -4,6 +4,37 @@ const { randomUUID } = require('node:crypto');
 
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function timestamp(value) {
+  if (typeof value !== 'string' || value.length !== 24) return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
+}
+function toolCall(value) {
+  return object(value) && typeof value.id === 'string' && value.id.length > 0 && value.id.length <= 512 &&
+    value.type === 'function' && object(value.function) && typeof value.function.name === 'string' &&
+    value.function.name.length > 0 && value.function.name.length <= 256 && typeof value.function.arguments === 'string';
+}
+function contextMessage(value) {
+  if (!object(value)) return false;
+  if (value.role === 'user') return typeof value.content === 'string';
+  if (value.role === 'tool') return typeof value.content === 'string' && typeof value.tool_call_id === 'string' && value.tool_call_id.length > 0;
+  if (value.role !== 'assistant' || !(typeof value.content === 'string' || value.content === null)) return false;
+  return value.tool_calls === undefined || Array.isArray(value.tool_calls) && value.tool_calls.length > 0 && value.tool_calls.length <= 64 && value.tool_calls.every(toolCall);
+}
+function displayMessage(value) {
+  return object(value) && ['user', 'assistant', 'tool', 'notice', 'error'].includes(value.role) && typeof value.content === 'string';
+}
+function validChat(chat, id) {
+  return object(chat) && chat.id === id && typeof chat.title === 'string' && chat.title.trim().length > 0 &&
+    chat.title.length <= 120 && !/[\x00-\x1f\x7f]/.test(chat.title) &&
+    timestamp(chat.createdAt) && timestamp(chat.updatedAt) &&
+    (chat.customTitle === undefined || typeof chat.customTitle === 'boolean') &&
+    Array.isArray(chat.messages) && chat.messages.every(displayMessage) &&
+    Array.isArray(chat.context) && chat.context.every(contextMessage) &&
+    object(chat.source) && ['api', 'local'].includes(chat.source.chatSource) &&
+    ['endpoint', 'model', 'checkpointId'].every(key => typeof chat.source[key] === 'string');
+}
 function sourceOf(settings = {}) {
   return { chatSource: settings.chatSource === 'local' ? 'local' : 'api',
     checkpointId: typeof settings.checkpointId === 'string' ? settings.checkpointId : '',
@@ -32,7 +63,7 @@ class History {
     const filename = this.filename(id);
     if (fs.statSync(filename).size > MAX_FILE_BYTES) throw new Error('This conversation is too large to open.');
     const chat = JSON.parse(fs.readFileSync(filename, 'utf8'));
-    if (chat.id !== id || typeof chat.title !== 'string' || !Array.isArray(chat.messages) || !Array.isArray(chat.context)) {
+    if (!validChat(chat, id)) {
       throw new Error('Conversation data is damaged. The original file has been preserved.');
     }
     return { ...chat, source: sourceOf(chat.source) };

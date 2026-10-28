@@ -1,6 +1,8 @@
 #ifndef CB_ENGINE_INTERNAL_H
 #define CB_ENGINE_INTERNAL_H
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 #include "engine.h"
 #include "image.h"
 #include "forms.h"

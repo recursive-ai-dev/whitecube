@@ -12,7 +12,31 @@ static void drain(int socket){
         if(m.fd>=0)close(m.fd);
     }
 }
+static void fragments(void){
+    const char *html="<body><div id=out>original</div><script>"
+        "const out=document.getElementById('out');"
+        "out.innerHTML='<p id=first>A &amp; B</p><input id=field value=ready>';"
+        "if(out.firstChild.textContent!=='A & B'||document.getElementById('field').value!=='ready')throw Error('fragment parse');"
+        "if(!out.innerHTML.includes('A &amp; B'))throw Error('fragment serialize');"
+        "const old=out.firstChild;out.innerHTML='<span id=next>next</span>';"
+        "if(old.isConnected||old.textContent!=='A & B')throw Error('fragment lifetime');"
+        "out.firstChild.insertAdjacentHTML('afterend','<b>after</b>');"
+        "if(out.lastChild.tagName!=='B')throw Error('adjacent');"
+        "const detached=document.createElement('p');detached.className='test';"
+        "if(!detached.matches('.test')||detached.closest('p')!==detached)throw Error('detached matches');"
+        "let blocked=0;try{out.innerHTML='<div>'.repeat(130)}catch(e){blocked++}"
+        "if(!blocked||out.textContent!=='nextafter')throw Error('atomic depth quota');"
+        "out.textContent='FRAGMENTS_OK';"
+        "</script></body>";
+    int sockets[2];assert(!socketpair(AF_UNIX,SOCK_SEQPACKET,0,sockets));
+    struct cb_page *page=cb_page_parse(html,strlen(html),"https://example.org/");assert(page);
+    struct cb_dom *dom=cb_dom_new(page,sockets[0],"[{},{}]",1);assert(dom);drain(sockets[1]);
+    cb_dom_tick(dom);drain(sockets[1]);cb_page_layout(page,640,1);
+    char *text=cb_page_text(page);assert(strstr(text,"FRAGMENTS_OK"));free(text);
+    cb_dom_free(dom);cb_page_free(page);close(sockets[0]);close(sockets[1]);
+}
 int main(void){
+    fragments();
     const char *html="<body><input id=field><button id=button>Run</button><p id=out>initial</p><script>"
         "const out=document.getElementById('out');"
         "for(let i=0;i<120;i++){let a=document.createElement('div'),b=document.createTextNode('detached '+i);a.append(b);out.append(a);out.removeChild(a);out.append(a);a.textContent='replacement';a.remove();}"

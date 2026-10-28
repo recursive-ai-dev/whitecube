@@ -34,4 +34,19 @@ int cb_history_visit(const char *url, const char *title);
 char *cb_history_html(void);
 int cb_history_clear(void);
 
+/* Bookmarks are independent of browsing history, bounded to 1,000 URLs.
+ * Private windows may read bookmarks but mutations explicitly fail. */
+struct cb_bookmark {
+    char url[4096];
+    char title[4096];
+};
+int cb_bookmark_add(const char *url, const char *title, bool private_mode);
+int cb_bookmark_remove(const char *url, bool private_mode);
+/* 1 saved, 0 absent, -1 storage/validation error. Reads never create files. */
+int cb_bookmark_contains(const char *url);
+/* Caller frees *items; an empty/missing database succeeds with NULL and zero. */
+int cb_bookmark_list(struct cb_bookmark **items, size_t *count);
+/* Caller frees the escaped complete HTML document; NULL on storage error. */
+char *cb_bookmarks_html(void);
+
 #endif

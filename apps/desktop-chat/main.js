@@ -3,7 +3,7 @@ const path = require('path');
 const fs = require('node:fs');
 const { History, sourceOf, exportMarkdown } = require('./src/history');
 const config = require('./src/config');
-const { runAgentTurn } = require('./src/llm');
+const { runAgentTurn, repairToolCalls } = require('./src/llm');
 const { needsApiKey, validateSettings } = require('./src/endpoint');
 const { LocalModels } = require('./src/local-models');
 const localModels = new LocalModels();
@@ -56,18 +56,35 @@ function getHistory() {
   if (!history) history = new History(path.join(app.getPath('userData'), 'conversations'));
   return history;
 }
-function ensureChat() {
-  if (!activeChat) {
-    activeChat = getHistory().current() || getHistory().create(config.load());
-    conversation = [{ role: 'system', content: SYSTEM_PROMPT }, ...activeChat.context];
+function activateChat(chat) {
+  const current = config.load();
+  if (chat.source.chatSource === 'local') {
+    config.save({ chatSource: 'local', checkpointId: chat.source.checkpointId });
+  } else {
+    config.save({ chatSource: 'api', ...(current.endpoint === chat.source.endpoint ? { model: chat.source.model } : {}) });
   }
+  getHistory().activate(chat);
+  activeChat = chat;
+  conversation = [{ role: 'system', content: SYSTEM_PROMPT }, ...chat.context];
+  repairToolCalls?.(conversation);
+  transcriptAssistant = null;
+  return chat;
+}
+function ensureChat() {
+  if (!activeChat) activateChat(getHistory().current() || getHistory().create(config.load()));
   return activeChat;
 }
 function notifyChats() { if (windowReady) win.webContents.send('chats:changed'); }
 function saveConversation() {
   clearTimeout(historyTimer); historyTimer = null;
   if (!activeChat) return;
+  // The engine commits a streamed answer only when it finishes. Snapshot the
+  // visible partial answer as well so an unexpected exit does not lose context.
   activeChat.context = conversation.filter(m => m.role !== 'system');
+  if (transcriptAssistant?.content && conversation.at(-1)?.content !== transcriptAssistant.content) {
+    activeChat.context.push({ role: 'assistant', content: transcriptAssistant.content });
+  }
+  repairToolCalls?.(activeChat.context);
   activeChat.updatedAt = new Date().toISOString();
   getHistory().save(activeChat);
 }
@@ -263,6 +280,7 @@ if (!gotLock) {
     else if (!firstArgs.hide) showWindow(false);
   });
 
+  app.on('before-quit', () => { isQuitting = true; currentAbort?.abort(); });
   app.on('window-all-closed', () => {});
 
   app.on('will-quit', () => {
@@ -274,6 +292,25 @@ if (!gotLock) {
 }
 
 // ---- IPC ----
+function trustedSender(event) {
+  return Boolean(win && event?.sender === win.webContents &&
+    (!event.senderFrame || event.senderFrame === win.webContents.mainFrame));
+}
+function handle(channel, callback) {
+  ipcMain.handle(channel, (event, ...args) => {
+    if (!trustedSender(event)) throw new Error('Request did not originate from the chat window.');
+    return callback(event, ...args);
+  });
+}
+function listen(channel, callback) {
+  ipcMain.on(channel, (event, ...args) => {
+    if (trustedSender(event)) callback(event, ...args);
+  });
+}
+function sendToRenderer(sender, channel, payload) {
+  if (!sender.isDestroyed?.()) sender.send(channel, payload);
+}
+
 
 function publicSettings(s) {
   return {
@@ -285,7 +322,7 @@ function publicSettings(s) {
   };
 }
 
-ipcMain.handle('settings:get', () => publicSettings(config.load()));
+handle('settings:get', () => publicSettings(config.load()));
 
 function modelList() {
   const s = config.load();
@@ -308,8 +345,8 @@ function requestCheckpoint(id) {
     else console.error('Checkpoint could not be selected:', err.message);
   }
 }
-ipcMain.handle('models:list', modelList);
-ipcMain.handle('models:select', (evt, id) => {
+handle('models:list', modelList);
+handle('models:select', (evt, id) => {
   if (currentAbort) throw new Error('Stop the reply before switching models.');
   if (id !== 'api') localModels.find(id);
   config.save(id === 'api' ? { chatSource: 'api' } : { chatSource: 'local', checkpointId: id });
@@ -317,7 +354,7 @@ ipcMain.handle('models:select', (evt, id) => {
   evt.sender.send('chat:cleared');
   return modelList();
 });
-ipcMain.handle('models:rename', (evt, { id, name } = {}) => {
+handle('models:rename', (evt, { id, name } = {}) => {
   localModels.find(id);
   if (typeof name !== 'string' || name.trim().length > 80 || /[\x00-\x1f\x7f]/.test(name)) {
     throw new Error('Use a name of up to 80 characters without line breaks.');
@@ -328,7 +365,7 @@ ipcMain.handle('models:rename', (evt, { id, name } = {}) => {
   return modelList();
 });
 
-ipcMain.handle('settings:save', (evt, payload) => {
+handle('settings:save', (evt, payload) => {
   if (currentAbort) throw new Error('Stop the reply before saving settings.');
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Settings must be an object.');
   if (payload && typeof payload.hotkey === 'string') {
@@ -342,7 +379,7 @@ ipcMain.handle('settings:save', (evt, payload) => {
   return publicSettings(saved);
 });
 
-ipcMain.handle('settings:test', async (evt, payload) => {
+handle('settings:test', async (evt, payload) => {
   const s = validateSettings({ ...config.load(), ...(payload || {}) });
   if (needsApiKey(s.endpoint) && !s.apiKey) throw new Error('No API key set.');
   let base = (s.endpoint || '').trim().replace(/\/+$/, '');
@@ -366,21 +403,23 @@ ipcMain.handle('settings:test', async (evt, payload) => {
   }
 });
 
-ipcMain.handle('settings:clear-key', () => {
+handle('settings:clear-key', () => {
   const saved = config.save({ apiKey: '' });
   return { ok: true, keyStorage: saved.keyStorage };
 });
 
-ipcMain.handle('chat:new', () => {
+handle('chat:new', () => {
   return freshConversation();
 });
 
-ipcMain.handle('chat:cancel', () => {
+handle('chat:cancel', () => {
   if (currentAbort) currentAbort.abort();
   return true;
 });
 
-ipcMain.on('chat:confirm-response', (evt, { requestId, approved }) => {
+listen('chat:confirm-response', (evt, payload) => {
+  if (!payload || typeof payload.requestId !== 'string' || typeof payload.approved !== 'boolean') return;
+  const { requestId, approved } = payload;
   const resolver = pendingConfirms.get(requestId);
   if (resolver) {
     resolver(approved);
@@ -388,7 +427,7 @@ ipcMain.on('chat:confirm-response', (evt, { requestId, approved }) => {
   }
 });
 
-ipcMain.handle('chat:send', async (evt, userText) => {
+handle('chat:send', async (evt, userText) => {
   if (currentAbort) throw new Error('A reply is already in progress.');
   currentAbort = new AbortController();
   const controller = currentAbort;
@@ -396,25 +435,33 @@ ipcMain.handle('chat:send', async (evt, userText) => {
   controller.signal.addEventListener('abort', () => {
     for (const resolve of pendingConfirms.values()) resolve(false);
     pendingConfirms.clear();
-    evt.sender.send('chat:confirm-cancelled');
+    sendToRenderer(evt.sender, 'chat:confirm-cancelled');
   }, { once: true });
 
   const confirmTool = (toolCall) =>
     new Promise((resolve) => {
       const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       pendingConfirms.set(requestId, resolve);
-      evt.sender.send('chat:confirm-request', { requestId, ...toolCall });
+      sendToRenderer(evt.sender, 'chat:confirm-request', { requestId, ...toolCall });
     });
 
   const onEvent = (event) => {
     recordEvent(event);
-    evt.sender.send('chat:event', event);
+    sendToRenderer(evt.sender, 'chat:event', event);
   };
 
   try {
-    let settings = validateSettings(config.load());
     if (typeof userText !== 'string' || !userText.trim()) throw new Error('Enter a message.');
     if (userText.length > 100000) throw new Error('Message exceeds 100,000 characters. Split it into smaller messages.');
+    ensureChat();
+    let settings = validateSettings(config.load());
+    const profile = sourceOf(settings);
+    if (activeChat.messages.some(message => message.role === 'user')) {
+      const original = activeChat.source;
+      const changed = original.chatSource !== profile.chatSource || (profile.chatSource === 'local' ?
+        original.checkpointId !== profile.checkpointId : original.endpoint !== profile.endpoint || original.model !== profile.model);
+      if (changed) throw new Error('This saved conversation uses a different endpoint or model. Start a new chat to use the new settings.');
+    }
     if (settings.chatSource === 'local') {
       const checkpoint = localModels.find(settings.checkpointId, settings.modelAliases);
       onEvent({ type: 'notice', text: `Using ${checkpoint.name}. Loading the local checkpoint…` });
@@ -425,18 +472,12 @@ ipcMain.handle('chat:send', async (evt, userText) => {
     if (needsApiKey(settings.endpoint) && !settings.apiKey) {
       throw new Error('No API key set. Open Settings and configure your endpoint, model, and key. A localhost server needs no key.');
     }
-    ensureChat();
-    const profile = sourceOf(config.load());
-    if (activeChat.messages.length && activeChat.source.chatSource === 'api' &&
-        (activeChat.source.endpoint !== profile.endpoint || activeChat.source.model !== profile.model)) {
-      throw new Error('The API endpoint or model has changed since this chat was saved. Start a new chat to use the new settings.');
-    }
     activeChat.source = profile;
     const message = { role: 'user', content: userText.trim() };
     transcriptAssistant = null;
     activeChat.messages.push({ ...message });
     if (!activeChat.customTitle && activeChat.messages.filter(m => m.role === 'user').length === 1) {
-      activeChat.title = userText.trim().replace(/\s+/g, ' ').slice(0, 80);
+      activeChat.title = userText.trim().replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').slice(0, 80);
     }
     conversation.push(message);
     saveConversation();
@@ -460,56 +501,46 @@ ipcMain.handle('chat:send', async (evt, userText) => {
     pendingConfirms.clear();
     try { saveConversation(); } catch (err) {
       failure = `Could not save conversation: ${err.message}`;
-      evt.sender.send('chat:event', { type: 'error', message: failure });
+      sendToRenderer(evt.sender, 'chat:event', { type: 'error', message: failure });
     }
     transcriptAssistant = null;
     currentAbort = null;
     notifyChats();
-    evt.sender.send('chat:done');
+    sendToRenderer(evt.sender, 'chat:done');
   }
 
   return failure ? { ok: false, error: failure } : { ok: true };
 });
 
-ipcMain.on('clipboard:write', (evt, text) => {
+listen('clipboard:write', (evt, text) => {
   if (typeof text === 'string') clipboard.writeText(text.slice(0, 1_000_000));
 });
 
-ipcMain.on('panel:hide', () => {
+listen('panel:hide', () => {
   hideWindow();
 });
 
-ipcMain.on('panel:show', () => {
+listen('panel:show', () => {
   showWindow(false);
 });
 
 // Saved conversations use opaque IDs; renderer input never becomes a file path.
-ipcMain.handle('chats:list', (_evt, query = '') => getHistory().list(query));
-ipcMain.handle('chats:current', () => ensureChat());
-ipcMain.handle('chats:get', (_evt, id) => getHistory().get(id));
-ipcMain.handle('chats:select', (_evt, id) => {
+handle('chats:list', (_evt, query = '') => getHistory().list(query));
+handle('chats:current', () => ensureChat());
+handle('chats:get', (_evt, id) => getHistory().get(id));
+handle('chats:select', (_evt, id) => {
   if (currentAbort) throw new Error('Stop the reply before switching conversations.');
   const chat = getHistory().get(id);
-  const current = config.load();
-  if (chat.source.chatSource === 'local') {
-    config.save({ chatSource: 'local', checkpointId: chat.source.checkpointId });
-  } else {
-    config.save({ chatSource: 'api', ...(current.endpoint === chat.source.endpoint ? { model: chat.source.model } : {}) });
-  }
-  getHistory().activate(chat);
-  activeChat = chat;
-  conversation = [{ role: 'system', content: SYSTEM_PROMPT }, ...chat.context];
-  transcriptAssistant = null;
-  return chat;
+  return activateChat(chat);
 });
-ipcMain.handle('chats:rename', (_evt, id, title) => {
+handle('chats:rename', (_evt, id, title) => {
   if (currentAbort) throw new Error('Stop the reply before renaming conversations.');
   const chat = getHistory().rename(id, title);
-  if (activeChat?.id === id) activeChat.title = chat.title, activeChat.customTitle = true;
+  if (activeChat?.id === id) { activeChat.title = chat.title; activeChat.customTitle = true; }
   notifyChats();
   return chat;
 });
-ipcMain.handle('chats:delete', (_evt, id) => {
+handle('chats:delete', (_evt, id) => {
   if (currentAbort) throw new Error('Stop the reply before deleting conversations.');
   getHistory().delete(id);
   if (activeChat?.id === id) {
@@ -520,7 +551,7 @@ ipcMain.handle('chats:delete', (_evt, id) => {
   notifyChats();
   return { activeChat: ensureChat() };
 });
-ipcMain.handle('chats:export', async (_evt, id, format = 'markdown') => {
+handle('chats:export', async (_evt, id, format = 'markdown') => {
   if (!['markdown', 'json'].includes(format)) throw new Error('Choose Markdown or JSON export.');
   const chat = getHistory().get(id);
   const ext = format === 'json' ? 'json' : 'md';

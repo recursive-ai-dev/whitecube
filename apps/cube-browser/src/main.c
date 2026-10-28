@@ -10,6 +10,9 @@
 #include "broker.h"
 #include "dom.h"
 #include "download.h"
+#include "net.h"
+#include <linux/landlock.h>
+#include <sys/syscall.h>
 #include <cairo.h>
 #include <pango/pangocairo.h>
 #include <glib.h>
@@ -43,7 +46,7 @@ struct web_request {struct worker worker;unsigned state,id,credentials;char url[
 struct browser {
     struct cb_session *session;
     struct web_request web[32];
-    bool print_console,scripts_enabled,script_loading,script_busy;double script_settle;
+    bool print_console,scripts_enabled,script_loading,script_busy,bookmarked;double script_settle;
     char console[128][2048];unsigned console_count;
     char network_log[128][1024];unsigned network_count;
     unsigned panel,panel_selected,panel_scroll;bool network_panel;
@@ -246,6 +249,7 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
     if(b->ready&&!b->error&&(strcmp(url,b->url)||(from_page&&strchr(url,'#')))&&cb_url_same_document(b->url,url)){
         blur_page(b);snprintf(b->url,sizeof(b->url),"%s",url);snprintf(b->address,sizeof(b->address),"%s",url);
         b->address_focus=b->find_focus=b->find_visible=false;b->notice[0]=0;
+        b->bookmarked=cb_bookmark_contains(url)==1;
         if(history)remember_trail(b,url);
         b->anchor_needed=true;page_status(b);dirty(b);return;
     }
@@ -259,9 +263,11 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
     snprintf(b->status,sizeof(b->status),"Opening %.500s",url);snprintf(b->title,sizeof(b->title),"Loading…");
     if(history)remember_trail(b,url);
     int fd=-1;
-    if(!strcmp(url,"cube:home"))fd=cb_document_fd(cb_home,strlen(cb_home));
+    b->bookmarked=cb_bookmark_contains(url)==1;
+    if(!strcmp(url,"cube:home"))fd=cb_document_fd(b->private_mode?cb_private_home:cb_home,strlen(b->private_mode?cb_private_home:cb_home));
     else if(!strcmp(url,"cube:about"))fd=cb_document_fd(cb_about,strlen(cb_about));
-    else if(!strcmp(url,"cube:history")){char*h=cb_history_html();if(h){fd=cb_document_fd(h,strlen(h));free(h);}}
+    else if(!strcmp(url,"cube:bookmarks")){char*h=cb_bookmarks_html();if(h){fd=cb_document_fd(h,strlen(h));free(h);}}
+    else if(!strcmp(url,"cube:history")){char*h=b->private_mode?strdup(cb_private_history):cb_history_html();if(h){fd=cb_document_fd(h,strlen(h));free(h);}}
     else if(g_str_has_prefix(url,"file:///")){
         char *path=g_filename_from_uri(url,NULL,NULL);int file=path?open(path,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK):-1;g_free(path);
         char *html=NULL;size_t size=0;
@@ -279,12 +285,22 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
 }
 static void navigate(struct browser*b,const char*input,bool history,bool from_page){navigate_request(b,input,history,from_page,NULL,false);}
 static void go(struct browser*b,int direction){int i=b->trail_at+direction;if(i<0||i>=b->trail_count)return;b->trail_at=i;char url[4096];snprintf(url,sizeof(url),"%s",b->trail[i]);navigate(b,url,false,false);}
-static void new_tab(struct browser*b){
+static void new_window(struct browser*b,bool private_mode){
     pid_t p=fork();if(p==0){if(fork()!=0)_exit(0);setsid();close_range(3,~0U,0);
-        if(b->private_mode)execl(b->executable,"cube-browser","--private","cube:home",(char*)NULL);
+        if(private_mode)execl(b->executable,"cube-browser","--private","cube:home",(char*)NULL);
         else execl(b->executable,"cube-browser","cube:home",(char*)NULL);
         _exit(127);}
     if(p>0)while(waitpid(p,NULL,0)<0&&errno==EINTR){}
+}
+static void new_tab(struct browser*b){new_window(b,b->private_mode);}
+static void bookmark_toggle(struct browser *b){
+    if(b->private_mode){notice(b,"Bookmarks are read-only in a private window.");return;}
+    if(!cb_url_remote(b->url)&&!g_str_has_prefix(b->url,"file:///")){notice(b,"Open a website or local document to bookmark it.");return;}
+    int exists=cb_bookmark_contains(b->url);
+    if(exists<0){notice(b,"Could not read bookmarks.");return;}
+    int result=exists?cb_bookmark_remove(b->url,false):cb_bookmark_add(b->url,b->title,false);
+    if(result){notice(b,"Could not save bookmark.");return;}
+    b->bookmarked=!exists;notice(b,exists?"Bookmark removed":"Page bookmarked · Ctrl+Shift+B opens bookmarks");
 }
 static void find_next(struct browser*b){if(!*b->find||!b->ready||b->render.socket<0)return;
     struct cb_message m={.type=CB_FIND,.fd=-1,.a=(uint32_t)fmax(0,b->find_y+1)};snprintf(m.text,sizeof(m.text),"%s",b->find);cb_send(b->render.socket,&m);}
@@ -294,6 +310,7 @@ static bool worker_readable(const struct worker *w){
 }
 static void page_navigate(struct browser *b,const char *url){
     if(!strcmp(url,"cube:history-clear")&&!strcmp(b->url,"cube:history")){
+        if(b->private_mode){notice(b,"Private windows never access saved history.");return;}
         if(cb_history_clear())notice(b,"Could not clear history.");else navigate(b,"cube:history",false,false);
     }else navigate(b,url,true,true);
 }
@@ -472,6 +489,9 @@ static void panel_activate(struct browser *b){
     else if(action==7){b->panel=0;navigate(b,"cube:history",true,false);}
     else if(action==8)panel_open(b,3);
     else if(action==9)panel_open(b,2);
+    else if(action==10)navigate(b,"cube:bookmarks",true,false);
+    else if(action==11)bookmark_toggle(b);
+    else if(action==12)new_window(b,true);
     else b->panel=0;
     dirty(b);
 }
@@ -494,6 +514,7 @@ static void check_worker(struct browser*b,bool network){
             b->http_status=m.a;
             if(m.b){char *text=NULL;size_t size;if(cb_read_document(m.fd,&text,&size)==0){char *escaped=cb_html_escape(text);char *html=g_strdup_printf("<html><body><pre>%s</pre></body></html>",escaped);free(text);free(escaped);close(m.fd);m.fd=cb_document_fd(html,strlen(html));g_free(html);}}
             snprintf(b->url,sizeof(b->url),"%.4095s",m.text);
+            b->bookmarked=cb_bookmark_contains(b->url)==1;
             if(!b->address_focus)snprintf(b->address,sizeof(b->address),"%s",b->url);
             if(b->trail_at>=0){free(b->trail[b->trail_at]);b->trail[b->trail_at]=strdup(b->url);}
             int fd=m.fd;m.fd=-1;if(fd<0||document(b,fd,b->url))fail_page(b,"Could not send the response to the renderer.");
@@ -587,9 +608,9 @@ static void draw_panel(struct browser *b,cairo_t *c){
     if(b->panel==1){
         char script[96],site[128],zoom[64];snprintf(script,sizeof script,"JavaScript by default: %s",b->config.javascript?"On":"Off");
         snprintf(site,sizeof site,"JavaScript for this site: %s",cb_site_scripts(b->session,b->url,b->config.javascript)?"On":"Off");snprintf(zoom,sizeof zoom,"Reset zoom (currently %.0f%%)",b->zoom*100);
-        const char *labels[]={script,site,"Use this page as home","Zoom out","Zoom in",zoom,b->private_mode?"Clear this private window's data":"Clear history, cookies and site data","History","Downloads","Console and network","Close settings"};
+        const char *labels[]={script,site,"Use this page as home","Zoom out","Zoom in",zoom,b->private_mode?"Clear this private window's data":"Clear history, cookies and site data","History","Downloads","Console and network","Bookmarks",b->bookmarked?"Remove this bookmark":"Bookmark this page","New private window","Close settings"};
         unsigned visible=(unsigned)fmax(1,floor((h-94*s)/(28*s))),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;
-        for(unsigned i=start;i<11&&i<start+visible;i++){double row=y+50*s+(i-start)*28*s;if(i==b->panel_selected)box(c,x+10*s,row,w-20*s,27*s,0xc9c9c9);text(c,x+18*s,row+6*s,labels[i],12*s,0x111111,w-36*s,false);}
+        for(unsigned i=start;i<14&&i<start+visible;i++){double row=y+50*s+(i-start)*28*s;if(i==b->panel_selected)box(c,x+10*s,row,w-20*s,27*s,0xc9c9c9);text(c,x+18*s,row+6*s,labels[i],12*s,0x111111,w-36*s,false);}
         text(c,x+18*s,y+h-26*s,"↑ ↓ choose · Enter apply · Esc close",11*s,0x4a4a4a,w-36*s,false);
     }else if(b->panel==2){
         unsigned count=b->network_panel?b->network_count:b->console_count,rows=(unsigned)fmax(1,floor((h-100*s)/(27*s))),available=count<128?count:128;
@@ -605,12 +626,12 @@ static void draw_panel(struct browser *b,cairo_t *c){
 }
 static void draw(void*data,cairo_t*c,int w,int h){struct browser*b=data;bool changed=b->w!=w||b->h!=h;geometry(b,w,h);if(changed)request_layout(b);
     double s=b->scale;unsigned bg=b->acc.strong_contrast?0xffffff:0xf5f5f5,ink=0x111111,line=b->acc.strong_contrast?0x111111:0x111111;
-    box(c,0,0,w,h,bg);box(c,0,0,w,32*s,0x111111);cube(c,14*s,8*s,16*s,0xf2f2f2);
-    text(c,40*s,8*s,"cube / browser",12*s,0xf2f2f2,w-200*s,true);
+    box(c,0,0,w,h,bg);box(c,0,0,w,32*s,b->private_mode?0x302640:0x111111);cube(c,14*s,8*s,16*s,0xf2f2f2);
+    text(c,40*s,8*s,b->private_mode?"cube / private":"cube / browser",12*s,0xf2f2f2,w-200*s,true);
     text(c,w-106*s,6*s,"−",16*s,0xf2f2f2,25*s,false);text(c,w-70*s,6*s,"□",15*s,0xf2f2f2,25*s,false);text(c,w-34*s,5*s,"×",18*s,0xf2f2f2,25*s,false);
     text(c,17*s,46*s,"‹",27*s,b->trail_at>0?ink:0x9a9a9a,25*s,false);text(c,52*s,46*s,"›",27*s,b->trail_at+1<b->trail_count?ink:0x9a9a9a,25*s,false);
     text(c,90*s,50*s,loading(b)?"×":"↻",22*s,ink,30*s,false);text(c,130*s,52*s,"⌂",20*s,ink,30*s,false);
-    double ax=172*s,ay=42*s,aw=w-286*s,ah=36*s;box(c,ax,ay,aw,ah,b->address_focus?0xffffff:0xefefef);
+    double ax=172*s,ay=42*s,aw=w-322*s,ah=36*s;box(c,ax,ay,aw,ah,b->address_focus?0xffffff:0xefefef);
     if(b->address_focus){color(c,0x111111);cairo_set_line_width(c,1.5);cairo_rectangle(c,ax+.5,ay+.5,aw-1,ah-1);cairo_stroke(c);}
     const char*address=b->address;double tx=ax+12*s;
     if(b->select_all&&b->address_focus)box(c,tx,ay+7*s,aw-24*s,22*s,0xc8c8c8);
@@ -626,6 +647,7 @@ static void draw(void*data,cairo_t*c,int w,int h){struct browser*b=data;bool cha
         box(c,tx+cx-offset,ay+9*s,1.2,18*s,0x111111);cairo_restore(c);
         pango_font_description_free(font);g_object_unref(layout);
     }else text(c,tx,ay+10*s,address,13*s,ink,aw-24*s,false);
+    text(c,w-142*s,52*s,b->bookmarked?"★":"☆",19*s,b->bookmarked?0x256357:ink,30*s,false);
     text(c,w-96*s,52*s,"+",20*s,ink,25*s,false);text(c,w-60*s,54*s,"Menu",11*s,ink,52*s,false);
     box(c,0,b->view_y-1,w,1,line);
     cairo_save(c);cairo_rectangle(c,0,b->view_y,w,b->view_h);cairo_clip(c);
@@ -643,7 +665,7 @@ static void click(void*data,double x,double y,uint32_t button){struct browser*b=
     if(button==BTN_SIDE){go(b,-1);return;}if(button==BTN_EXTRA){go(b,1);return;}
     if(button!=BTN_LEFT)return;
     if(b->panel){double px,py,pw,ph;panel_geometry(b,&px,&py,&pw,&ph);if(x>=px&&x<px+pw&&y>=py&&y<py+ph){
-            if(b->panel==1&&y>=py+50*s&&y<py+ph-40*s){unsigned visible=(unsigned)fmax(1,floor((ph-94*s)/(28*s))),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;b->panel_selected=start+(unsigned)((y-py-50*s)/(28*s));if(b->panel_selected<11)panel_activate(b);}
+            if(b->panel==1&&y>=py+50*s&&y<py+ph-40*s){unsigned visible=(unsigned)fmax(1,floor((ph-94*s)/(28*s))),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;b->panel_selected=start+(unsigned)((y-py-50*s)/(28*s));if(b->panel_selected<14)panel_activate(b);}
             else if(b->panel==3&&b->download_state==1&&y>=py+140*s&&y<py+190*s)download_cancel(b);
             return;}
         b->panel=0;dirty(b);return;
@@ -653,7 +675,8 @@ static void click(void*data,double x,double y,uint32_t button){struct browser*b=
     if(y<b->view_y){
         if(x<42*s)go(b,-1);else if(x<78*s)go(b,1);else if(x<120*s){if(loading(b)){reset_resources(b);stop_worker(&b->net);stop_worker(&b->render);b->busy=false;b->ready=false;b->layout_pending=false;snprintf(b->status,sizeof(b->status),"Loading stopped");}else navigate(b,b->url,false,false);}
         else if(x<166*s)navigate(b,b->config.homepage,true,false);
-        else if(x<b->w-114*s){blur_page(b);b->address_focus=true;b->find_focus=false;b->select_all=true;b->cursor=strlen(b->address);}
+        else if(x<b->w-150*s){blur_page(b);b->address_focus=true;b->find_focus=false;b->select_all=true;b->cursor=strlen(b->address);}
+        else if(x<b->w-114*s)bookmark_toggle(b);
         else if(x<b->w-70*s)new_tab(b);else panel_open(b,1);
         dirty(b);return;
     }
@@ -675,13 +698,16 @@ static void insert(struct browser*b,const char*utf8){
 static void paste(void*data,const char*t){struct browser*b=data;if(b->address_focus||b->find_focus)insert(b,t);else interact(b,CB_INTERACT_TEXT,0,0,t);}
 static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,bool alt){struct browser*b=data;
     xkb_keysym_t lower=xkb_keysym_to_lower(sym);
+    if(ctrl&&shift&&lower==XKB_KEY_p){new_window(b,true);return;}
+    if(ctrl&&shift&&lower==XKB_KEY_b){navigate(b,"cube:bookmarks",true,false);return;}
+    if(ctrl&&lower==XKB_KEY_d){bookmark_toggle(b);return;}
     if(ctrl&&sym==XKB_KEY_comma){panel_open(b,1);return;}
     if(sym==XKB_KEY_F12||(ctrl&&shift&&lower==XKB_KEY_j)){panel_open(b,2);return;}
     if(ctrl&&lower==XKB_KEY_j){panel_open(b,3);return;}
     if(ctrl&&lower==XKB_KEY_s){download_start(b);return;}
     if(b->panel&&!(ctrl&&(lower==XKB_KEY_l||lower==XKB_KEY_w||lower==XKB_KEY_r))){
         if(sym==XKB_KEY_Escape){if(b->panel==3&&b->download_state==1)download_cancel(b);else b->panel=0;}
-        else if(b->panel==1){if(sym==XKB_KEY_Down||sym==XKB_KEY_Tab)b->panel_selected=(b->panel_selected+1)%11;else if(sym==XKB_KEY_Up)b->panel_selected=(b->panel_selected+10)%11;else if(sym==XKB_KEY_Return||sym==XKB_KEY_KP_Enter)panel_activate(b);}
+        else if(b->panel==1){if(sym==XKB_KEY_Down||sym==XKB_KEY_Tab)b->panel_selected=(b->panel_selected+1)%14;else if(sym==XKB_KEY_Up)b->panel_selected=(b->panel_selected+13)%14;else if(sym==XKB_KEY_Return||sym==XKB_KEY_KP_Enter)panel_activate(b);}
         else if(b->panel==2){if(sym==XKB_KEY_Tab){b->network_panel=!b->network_panel;b->panel_scroll=0;}else if(sym==XKB_KEY_Down)b->panel_scroll=(unsigned)fmin(127,b->panel_scroll+1);else if(sym==XKB_KEY_Up&&b->panel_scroll)b->panel_scroll--;}
         else if(b->panel==3&&ctrl&&lower==XKB_KEY_c&&*b->download_path)cb_window_copy(b->window,b->download_path);
         dirty(b);return;
@@ -739,23 +765,57 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     dirty(b);
 }
 static void cleanup(struct browser*b){stop_worker(&b->download);cb_session_close(b->session);reset_resources(b);stop_worker(&b->net);stop_worker(&b->render);free_frame(b);for(int i=0;i<b->trail_count;i++)free(b->trail[i]);cb_window_free(b->window);}
-static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [URL | HTML-file]\n       cube-browser --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser --dump URL\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L address, Ctrl+T desktop tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
+static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [--] [URL | HTML-file]\n       cube-browser --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser --dump URL\n       cube-browser --check\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L address, Ctrl+T desktop tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+D bookmark, Ctrl+Shift+B bookmarks, Ctrl+Shift+P private window.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
+static int health_check(const char *directory){
+    int failures=0;char path[PATH_MAX];struct stat st;
+    puts("Cube Browser " CB_VERSION " · installation check");
+    const char *workers[]={"cube-renderd","cube-netd"};
+    for(unsigned i=0;i<2;i++){
+        int n=snprintf(path,sizeof path,"%s/%s",directory,workers[i]);
+        bool ok=n>0&&(size_t)n<sizeof path&&!stat(path,&st)&&S_ISREG(st.st_mode)&&!access(path,X_OK);
+        printf("%s: %s\n",workers[i],ok?"OK":"MISSING or not executable");failures+=!ok;
+    }
+    bool ca=!stat(CB_CA_BUNDLE,&st)&&S_ISREG(st.st_mode)&&st.st_size>0&&!access(CB_CA_BUNDLE,R_OK);
+    printf("HTTPS certificates: %s\n",ca?"OK":"MISSING (install ca-certificates)");failures+=!ca;
+    int abi=(int)syscall(SYS_landlock_create_ruleset,NULL,0,LANDLOCK_CREATE_RULESET_VERSION);
+    printf("Worker filesystem sandbox: Landlock ABI %d%s\n",abi,abi>=3?" (OK)":" (requires ABI 3 or newer)");failures+=abi<3;
+    const char *display=getenv("WAYLAND_DISPLAY"),*runtime=getenv("XDG_RUNTIME_DIR"),*socket=getenv("WAYLAND_SOCKET");
+    bool wayland=socket&&*socket;
+    if(display&&*display){
+        int n=display[0]=='/'?snprintf(path,sizeof path,"%s",display):snprintf(path,sizeof path,"%s/%s",runtime?runtime:"",display);
+        wayland=n>0&&(size_t)n<sizeof path&&!stat(path,&st)&&S_ISSOCK(st.st_mode);
+    }
+    printf("Desktop: %s\n",wayland?"Wayland socket available":"No Wayland socket · use a Wayland session for windows; --render/--dump work headlessly");
+    puts("This checks installation prerequisites; run --dump cube:home to exercise the worker sandboxes.");
+    return failures?1:0;
+}
 int main(int argc,char**argv){
     unsetenv("DISPLAY");signal(SIGPIPE,SIG_IGN);umask(077);
     struct browser b={.download={.socket=-1},.scripts_enabled=true,.net={.socket=-1},.render={.socket=-1},.trail_at=-1,.w=1120,.h=800};
     ssize_t n=readlink("/proc/self/exe",b.executable,sizeof(b.executable)-1);if(n<0)return 1;b.executable[n]=0;snprintf(b.directory,sizeof(b.directory),"%s",b.executable);char*slash=strrchr(b.directory,'/');if(!slash)return 1;*slash=0;
+    if(argc==2&&(!strcmp(argv[1],"--help")||!strcmp(argv[1],"-h"))){usage();return 0;}
+    if(argc==2&&!strcmp(argv[1],"--version")){puts("cube-browser " CB_VERSION " (interactive-web preview)");return 0;}
+    if(argc==2&&!strcmp(argv[1],"--check"))return health_check(b.directory);
     char error[256];cb_config_defaults(&b.config);if(cb_config_load(&b.config,error,sizeof(error)))fprintf(stderr,"cube-browser: %s\n",error);
     cb_accessibility_load(&b.acc);b.scale=b.acc.ui_scale;b.zoom=fmax(.5,fmin(2,b.config.zoom));
-    const char *url=b.config.homepage,*output=NULL;bool dump=false;double seconds=0;int width=1120,height=800;
+    const char *url=b.config.homepage,*output=NULL;bool dump=false,positional=false,explicit_url=false;double seconds=0;int width=1120,height=800;
     for(int i=1;i<argc;i++){
+        if(positional){if(explicit_url){usage();return 2;}url=argv[i];explicit_url=true;continue;}
+        if(!strcmp(argv[i],"--")){positional=true;continue;}
         if(!strcmp(argv[i],"--help")||!strcmp(argv[i],"-h")){usage();return 0;}
         else if(!strcmp(argv[i],"--version")){puts("cube-browser " CB_VERSION " (interactive-web preview)");return 0;}
         else if(!strcmp(argv[i],"--console"))b.print_console=true;
         else if(!strcmp(argv[i],"--private"))b.private_mode=true;
-        else if(!strcmp(argv[i],"--render")&&i+2<argc){url=argv[++i];output=argv[++i];b.private_mode=true;if(i+1<argc&&argv[i+1][0]!='-'){char tail;if(sscanf(argv[++i],"%dx%d%c",&width,&height,&tail)!=2){usage();return 2;}}}
-        else if(!strcmp(argv[i],"--dump")&&i+1<argc){url=argv[++i];dump=true;b.private_mode=true;}
+        else if(!strcmp(argv[i],"--render")&&i+2<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];output=argv[++i];b.private_mode=true;if(i+1<argc&&argv[i+1][0]!='-'){char tail;if(sscanf(argv[++i],"%dx%d%c",&width,&height,&tail)!=2){usage();return 2;}}}
+        else if(!strcmp(argv[i],"--dump")&&i+1<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];dump=true;b.private_mode=true;}
         else if(!strcmp(argv[i],"--quit-after")&&i+1<argc){char*end;seconds=strtod(argv[++i],&end);if(*end||!isfinite(seconds)||seconds<=0||seconds>3600)return 2;}
-        else if(argv[i][0]=='-'){usage();return 2;}else url=argv[i];
+        else if(argv[i][0]=='-'){usage();return 2;}else {if(explicit_url){usage();return 2;}url=argv[i];explicit_url=true;}
+    }
+    char local_url[4096];
+    if(explicit_url&&url[0]!='/'&&!strchr(url,':')&&!access(url,F_OK)){
+        char *path=g_canonicalize_filename(url,NULL);
+        if(strlen(path)>=sizeof local_url){g_free(path);return 2;}
+        snprintf(local_url,sizeof local_url,"%s",path);g_free(path);url=local_url;
     }
     if(width<640||height<400||width>4096||height>4096){fprintf(stderr,"Render size must be 640x400 through 4096x4096.\n");return 2;}
     geometry(&b,width,height);
@@ -775,6 +835,6 @@ int main(int argc,char**argv){
         cleanup(&b);return result;
     }
     b.window=cb_window_new((struct cb_callbacks){draw,key,click,scroll,tick,paste},&b);
-    if(!b.window){fprintf(stderr,"cube-browser: cannot connect to Wayland; run inside Whitecube or use --render/--dump.\n");return 1;}
+    if(!b.window){fprintf(stderr,"cube-browser: cannot connect to Wayland; run inside a Wayland desktop (including Whitecube), or use --render/--dump. Run --check for installation diagnostics.\n");return 1;}
     navigate(&b,url,true,false);int result=cb_window_run(b.window,seconds);cleanup(&b);return result;
 }

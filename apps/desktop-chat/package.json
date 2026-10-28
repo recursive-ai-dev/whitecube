@@ -16,5 +16,8 @@
   },
   "allowScripts": {
     "electron@45.1.0": true
+  },
+  "engines": {
+    "node": ">=22.12.0"
   }
 }

@@ -1,15 +1,43 @@
 # Cube Browser
 
-Cube Browser **0.9.0** is a native Wayland interactive-web preview for Whitecube.
+Cube Browser **0.10.0** is a native Wayland interactive-web preview for Whitecube.
 It has its own HTML/CSS engine, Pango/Cairo software rendering, mbedTLS and a
 bounded QuickJS interpreter behind the replaceable `cube-js` interface. It uses
 no Chromium, Firefox, WebKit, Electron, GTK, X11, XWayland or D-Bus.
 
-This release completes the [eight-phase sprint](SPRINT.md). It supports a documented
+This release builds on the [eight-phase sprint](SPRINT.md). It supports a documented
 subset of the web; complex applications can still fail. The full design in
 [spec.md](spec.md), including the complete M0 milestone, remains a longer-term target.
 See [compatibility](COMPATIBILITY.md), [validation](VALIDATION.md) and
 [release/rollback notes](RELEASE.md).
+
+## Install a standalone Debian package
+
+The built archive is `dist/cube-browser_0.10.0_amd64.deb`:
+
+```sh
+sudo apt install ./dist/cube-browser_0.10.0_amd64.deb
+cube-browser --check
+cube-browser
+```
+
+Launch **Cube Browser** from your desktop menu; its **New Private Window** action
+starts an isolated window. This build targets Ubuntu 26.04 amd64. Its actual
+shared-library version requirements are recorded in the package. A native Wayland
+session and Linux Landlock ABI 3 or newer are required for windows; headless text
+and PNG exports work without a compositor. The package includes its workers and
+private X-free Cairo and does not need this checkout or Whitecube installed.
+It registers HTTP/HTTPS/HTML handlers without changing your default browser.
+
+Build and verify another package after bootstrapping the dependencies below:
+
+```sh
+python3 packaging/build-deb.py
+python3 tests/test_package.py dist/cube-browser_0.10.0_amd64.deb
+```
+
+See [packaging details](packaging/README.md) for dependencies, repeatable builds,
+installation paths and removal. Building and testing do not install system files.
 
 ## Build and run
 
@@ -31,7 +59,9 @@ dpkg-deb, wayland-scanner, and development files for wayland-client/cursor,
 wayland-protocols, xkbcommon, Pango, GLib, pixman, FreeType, Fontconfig, libpng,
 Expat and zlib. Workers require Linux Landlock ABI 3 or later and seccomp filters;
 they fail closed if restrictions cannot be installed. Native integration tests
-also require the adjacent Whitecube build described in `scripts/e2e.py`.
+use the adjacent Whitecube build described in `scripts/e2e.py`, or an extracted
+Weston installation via `--weston-dir PATH`. Packaging also needs `dpkg-dev`
+and `desktop-file-utils`.
 
 Bootstraps write only to `.deps/`. Private Cairo is selected by the executables'
 runtime search path. The build checks the complete dependency closure for missing
@@ -55,14 +85,16 @@ also intended for this machine, rather than as a portable binary distribution.
 ## What works
 
 - Native windows, address/search bar, clipboard, desktop tabs, back/forward,
-  reload/stop, keyboard navigation, scrolling, zoom, find, anchors and local history.
+  reload/stop, keyboard navigation, scrolling, zoom, find, anchors, local history
+  and persistent bookmarks.
 - Bounded HTML recovery, selectors, cascade, CSS variables, responsive media,
   block/inline/flex, equal-column grids, tables, positioned blocks and clipping.
 - External CSS and PNG/JPEG/static SVG images, loaded through isolated workers.
 - GET/POST forms, editable masked passwords, cookie sessions, origin storage,
   conditional HTTP cache, private windows and data clearing.
 - Classic/deferred scripts, DOM text/tree/attribute changes, events and cancelled
-  defaults, promises, timers, text/JSON fetch and localStorage/sessionStorage.
+  defaults, bounded HTML fragment insertion, promises, timers, text/JSON fetch
+  and localStorage/sessionStorage.
 - Native settings, persistent per-site script choices, console/network diagnostics
   and downloads with progress and cancellation.
 - Whitecube scaling, strong contrast and reduced-motion preferences; headless PNG
@@ -81,7 +113,9 @@ Fetch implements a small CORS subset and refuses redirects that change origin.
 | Ctrl+T / Ctrl+W | New desktop tab / close window |
 | Alt+Left / Alt+Right | Back / forward |
 | Ctrl+R or F5 | Reload |
-| Ctrl+H | Local history |
+| Ctrl+H | Local history (private windows show only the private history notice) |
+| Ctrl+D / Ctrl+Shift+B | Add/remove current bookmark / open bookmarks |
+| Ctrl+Shift+P | New private window |
 | Ctrl+F, then Enter; F3 | Find and advance |
 | Ctrl+plus / Ctrl+minus / Ctrl+0 | Zoom in / out / reset |
 | Ctrl+comma | Settings; arrows and Enter choose an action |
@@ -119,9 +153,15 @@ script choices override the default. Settings and SQLite files are owner-only.
 
 History has 90-day retention in `$XDG_DATA_HOME/cube-browser/history.sqlite3`.
 Cookies, local storage and site script choices use `sites.sqlite3` in that folder.
+Bookmarks use a separate `bookmarks.sqlite3`, with at most 1,000 saved URLs.
+Ctrl+D or the address-bar star adds/removes a page; `cube:bookmarks` lists saved
+pages. Private windows may read bookmarks and never change them. Clearing browsing
+data preserves bookmarks.
+
 Session cookies, sessionStorage and the HTTP cache belong to the current window.
-Private windows use independent in-memory site state and do not write history or
-settings. They do not provide network anonymity. Clear browsing data resets site
+Private windows use independent in-memory site state. They never read or write
+saved history, and they never save settings. The private start page explains what remains
+on disk. They do not provide network anonymity. Clear browsing data resets site
 state, site choices and the window's back/forward trail; normal clearing also
 clears persistent history.
 
@@ -132,10 +172,15 @@ output-scale protocols and input-method composition remain unsupported.
 ## Exports and limits
 
 ```sh
+build/cube-browser --check
 build/cube-browser --render cube:home build/home.png 1120x800
 build/cube-browser --render https://example.com build/example.png
 build/cube-browser --console --dump https://example.com
 ```
+
+Relative HTML paths and `file:///` URLs are supported on the command line. `--`
+ends option parsing for desktop URL handlers. `--help`, `--version` and `--check`
+do not create profile files.
 
 Exports use a private profile, wait for initial scripts/resources and allow up
 to one second of async settling. `--console` prints bounded page output to stderr.
@@ -149,10 +194,11 @@ and a two-second cumulative execution budget. Local files cannot fetch external
 resources or use origin storage. Remote pages cannot navigate to local files or
 browser pages. Symlink local documents are refused.
 
-Full HTML/CSS/SVG conformance, modules, dynamic scripts, innerHTML, iframes, Shadow
+Full HTML/CSS/SVG conformance, modules, dynamic scripts, iframes, Shadow
 DOM, file uploads, streaming fetch, service workers, IndexedDB, audio/video, WebGL,
-extensions, HTTP/2/3 and IPv6 remain outside this release. Detailed grammar,
-quotas and failure behavior are in [COMPATIBILITY.md](COMPATIBILITY.md).
+extensions, HTTP/2/3 and IPv6 remain outside this release. HTML fragments support
+`innerHTML`, `outerHTML` reads and `insertAdjacentHTML`; scripts, stylesheets and
+resource URLs introduced by fragments stay inert. Detailed grammar, quotas and failure behavior are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Process boundaries and verification
 
@@ -174,8 +220,10 @@ not undergone an independent security audit.
 ```sh
 ./BUILD.sh
 scripts/check-sanitizers.sh
-python3 scripts/corpus.py --output build/sprint-0.9/release
-python3 scripts/e2e.py --artifacts build/e2e-0.9
+# If host policy prevents LeakSanitizer thread attachment:
+# CUBE_SANITIZER_LEAKS=0 scripts/check-sanitizers.sh
+python3 scripts/corpus.py --output build/release-0.10/corpus
+python3 scripts/e2e.py --artifacts build/release-0.10/wayland
 ```
 
 Tests use local deterministic servers, temporary HOME/XDG profiles and an isolated

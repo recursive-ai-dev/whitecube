@@ -62,7 +62,7 @@
   }
   function query(root, selector) {
     selector = String(selector); if (!selector.trim() || selector.length > 1024) throw new SyntaxError('Invalid selector');
-    return list([...new Set(selector.split(',').flatMap(s => call(1, id(root), s.trim(), 'selector')))].map(wrap));
+    return list(call(1, id(root), selector, 'selector').map(wrap));
   }
   class Node extends EventTarget {
     constructor() { super(); throw new TypeError('Use document.createElement or createTextNode'); }
@@ -98,6 +98,8 @@
     get children() { return list(this.childNodes.filter(n => n.nodeType === 1)); }
     get firstElementChild() { return this.children[0] ?? null; }
     get lastElementChild() { return this.children.at(-1) ?? null; }
+    get nextElementSibling() { let n = this.nextSibling; while (n && n.nodeType !== 1) n = n.nextSibling; return n; }
+    get previousElementSibling() { let n = this.previousSibling; while (n && n.nodeType !== 1) n = n.previousSibling; return n; }
     get childElementCount() { return this.children.length; }
     getAttribute(name) { return call(4, id(this), 'get', name); }
     hasAttribute(name) { return call(4, id(this), 'has', name); }
@@ -106,11 +108,29 @@
     toggleAttribute(name, force) { const set = force === undefined ? !this.hasAttribute(name) : !!force; if (set) this.setAttribute(name, ''); else this.removeAttribute(name); return set; }
     querySelector(selector) { return query(this, selector)[0] ?? null; }
     querySelectorAll(selector) { return query(this, selector); }
-    matches(selector) { const parent = this.parentNode; return parent ? query(parent, selector).includes(this) : false; }
+    matches(selector) { selector = String(selector); if (!selector.trim() || selector.length > 1024) throw new SyntaxError('Invalid selector'); return call(13, id(this), selector); }
     closest(selector) { for (let n = this; n; n = n.parentElement) if (n.matches(selector)) return n; return null; }
+    getElementsByTagName(tag) { return this.querySelectorAll(String(tag)); }
+    getElementsByClassName(name) { return this.querySelectorAll('.'+String(name).trim().split(/\s+/).join('.')); }
     get innerText() { return this.textContent; } set innerText(v) { this.textContent = v; }
-    get innerHTML() { throw new TypeError('innerHTML is not supported; use textContent or child methods'); }
-    set innerHTML(v) { throw new TypeError('innerHTML is not supported; use textContent or child methods'); }
+    get innerHTML() { return call(2, id(this), 'innerHTML'); }
+    set innerHTML(v) { call(12, id(this), 'replace', v ?? ''); }
+    get outerHTML() { return call(2, id(this), 'outerHTML'); }
+    insertAdjacentHTML(position, html) {
+      position = String(position).toLowerCase();
+      if (!['beforebegin','afterbegin','beforeend','afterend'].includes(position)) throw new SyntaxError('Invalid insertion position');
+      call(12, id(this), position, String(html));
+    }
+    insertAdjacentElement(position, element) {
+      if (!(element instanceof Element)) throw new TypeError('Expected an element');
+      position = String(position).toLowerCase();
+      if (position === 'beforebegin') { if (!this.parentNode) return null; this.parentNode.insertBefore(element,this); }
+      else if (position === 'afterend') { if (!this.parentNode) return null; this.parentNode.insertBefore(element,this.nextSibling); }
+      else if (position === 'afterbegin') this.insertBefore(element,this.firstChild);
+      else if (position === 'beforeend') this.appendChild(element);
+      else throw new SyntaxError('Invalid insertion position');
+      return element;
+    }
     get classList() {
       const element = this, values = () => element.className.split(/\s+/).filter(Boolean), save = a => { element.className = [...new Set(a)].join(' '); };
       return {contains: s => values().includes(String(s)), add: (...s) => save([...values(), ...s]), remove: (...s) => save(values().filter(x => !s.includes(x))),

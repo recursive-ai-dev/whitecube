@@ -20,6 +20,8 @@ int main(void){
     unsigned char malformed[]={0,0,0,1,0x80};assert(send(f[0],malformed,sizeof(malformed),0)==sizeof(malformed));assert(cb_recv(f[1],&got)<0&&errno==EPROTO);
     close(f[0]);assert(cb_recv(f[1],&got)==0);close(f[1]);
     char url[4096];const char *search="https://duckduckgo.com/html/?q=%s";
+    assert(!cb_url_input("cube:start",search,url,sizeof(url))&&!strcmp(url,"cube:home"));
+    assert(!cb_url_input("cube:bookmarks",search,url,sizeof(url))&&!strcmp(url,"cube:bookmarks"));
     assert(!cb_url_input("example.com",search,url,sizeof(url))&&!strcmp(url,"https://example.com"));
     assert(!cb_url_input(" localhost:8123/a ",search,url,sizeof(url))&&!strcmp(url,"http://localhost:8123/a"));
     assert(!cb_url_input("hello & world",search,url,sizeof(url))&&!strcmp(url,"https://duckduckgo.com/html/?q=hello%20%26%20world"));

@@ -70,6 +70,7 @@ function load() {
 
 function save(settings) {
   if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw new Error('Settings must be an object.');
+  if (settings.apiKey !== undefined && typeof settings.apiKey !== 'string') throw new Error('API key must be text.');
   let existingRaw = {};
   try {
     existingRaw = JSON.parse(fs.readFileSync(configPath(), 'utf8') || '{}');

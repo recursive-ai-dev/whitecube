@@ -66,6 +66,19 @@ static int profile_path(char *path, size_t size, bool config, const char *file)
     return count < 0 || (size_t)count >= size - used ? -1 : 0;
 }
 
+/* Read-only profile access: 1 absent, 0 found, -1 invalid; never mkdir/chmod. */
+static int profile_read_path(char *path, size_t size, bool config, const char *file)
+{
+    if (xdg_path(path, size, config ? "XDG_CONFIG_HOME" : "XDG_DATA_HOME",
+                 config ? ".config" : ".local/share", "cube-browser")) return -1;
+    struct stat st;
+    if (lstat(path, &st)) return errno == ENOENT ? 1 : -1;
+    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid()) return -1;
+    size_t used = strlen(path);
+    int count = snprintf(path + used, size - used, "/%s", file);
+    return count < 0 || (size_t)count >= size - used ? -1 : 0;
+}
+
 static int read_private(const char *path, char *buffer, size_t size)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
@@ -94,9 +107,9 @@ static int read_private(const char *path, char *buffer, size_t size)
 void cb_config_defaults(struct cb_config *config)
 {
     memset(config, 0, sizeof(*config));
-    snprintf(config->homepage, sizeof(config->homepage), "cube:start");
+    snprintf(config->homepage, sizeof(config->homepage), "cube:home");
     snprintf(config->search_engine, sizeof(config->search_engine),
-             "https://duckduckgo.com/?q=%%s");
+             "https://duckduckgo.com/html/?q=%%s");
     config->zoom = 1.0;config->javascript=true;
 }
 
@@ -136,7 +149,9 @@ int cb_config_load(struct cb_config *config, char *error, size_t error_size)
     cb_config_defaults(config);
     if (error && error_size) error[0] = '\0';
     char path[CB_PATH_MAX], data[16384];
-    if (profile_path(path, sizeof(path), true, "config"))
+    int path_result = profile_read_path(path, sizeof(path), true, "config");
+    if (path_result == 1) return 0;
+    if (path_result)
         return errorf(error, error_size, "Cannot access the private config directory");
     int result = read_private(path, data, sizeof(data));
     if (result == 1) return 0;
@@ -448,7 +463,8 @@ char *cb_history_html(void)
     sqlite3_stmt *statement = NULL;
     int result = append(&buffer, "<!doctype html><html><head><title>History — cube-browser</title></head>"
         "<body><h1>History</h1><p>Recent visits, retained for 90 days. Showing up to 500 pages.</p>"
-        "<p><a href=\"cube:history-clear\">Clear browsing history</a> · <a href=\"cube:start\">Start page</a></p>");
+        "<p><a href=\"cube:history-clear\">Clear browsing history</a> · <a href=\"cube:home\">Home</a> · "
+        "<a href=\"cube:bookmarks\">Bookmarks</a></p>");
     if (result || sqlite3_prepare_v2(db, "SELECT url,title,visited_at FROM history "
                                    "ORDER BY visited_at DESC,url ASC LIMIT 500", -1, &statement, NULL) != SQLITE_OK) goto failure;
     size_t count = 0;
@@ -486,4 +502,217 @@ int cb_history_clear(void)
     int result = sqlite3_exec(db, "DELETE FROM history; VACUUM;", NULL, NULL, NULL);
     sqlite3_close(db);
     return result == SQLITE_OK ? 0 : -1;
+}
+
+#define CB_BOOKMARK_LIMIT 1000
+
+/* Unlike profile_path(), this path check never creates or chmods directories.
+ * Reading saved pages in a private window must leave the profile untouched. */
+static sqlite3 *bookmarks_open(bool writable, bool *missing)
+{
+    *missing = false;
+    sqlite3 *db = NULL;
+    if (writable) {
+        db = cb_storage_open("bookmarks.sqlite3");
+        if (!db) return NULL;
+        if (sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS bookmarks("
+                "url TEXT PRIMARY KEY,title TEXT NOT NULL,added_at INTEGER NOT NULL)",
+                NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_close(db);
+            return NULL;
+        }
+        return db;
+    }
+    char path[CB_PATH_MAX];
+    int path_result = profile_read_path(path, sizeof(path), false, "bookmarks.sqlite3");
+    if (path_result) { *missing = path_result == 1; return NULL; }
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0) { *missing = errno == ENOENT; return NULL; }
+    bool valid = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_uid == getuid();
+    close(fd);
+    if (!valid) return NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 1000);
+    sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 1024 * 1024);
+    sqlite3_exec(db, "PRAGMA trusted_schema=OFF", NULL, NULL, NULL);
+    return db;
+}
+
+/* Strict UTF-8 validation without a locale or an extra storage dependency. */
+static bool bookmark_text(const char *text)
+{
+    if (!text || !clean_text(text, 4096)) return false;
+    const unsigned char *p = (const unsigned char *)text;
+    while (*p) {
+        uint32_t code = *p++;
+        if (code < 0x80) continue;
+        unsigned count;
+        uint32_t minimum;
+        if (code >= 0xc2 && code <= 0xdf) { count = 1; minimum = 0x80; code &= 0x1f; }
+        else if (code >= 0xe0 && code <= 0xef) { count = 2; minimum = 0x800; code &= 0x0f; }
+        else if (code >= 0xf0 && code <= 0xf4) { count = 3; minimum = 0x10000; code &= 0x07; }
+        else return false;
+        for (unsigned i = 0; i < count; i++) {
+            if ((*p & 0xc0) != 0x80) return false;
+            code = (code << 6) | (*p++ & 0x3f);
+        }
+        if (code < minimum || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return false;
+    }
+    return true;
+}
+
+static bool bookmark_url(const char *url)
+{
+    if (!bookmark_text(url) || !history_url(url) || strchr(url, '\\')) return false;
+    if (!strncmp(url, "file:///", 8)) return true;
+    if (!strncmp(url, "file:", 5)) return false;
+    const char *authority = strstr(url, "://") + 3;
+    size_t size = strcspn(authority, "/?#");
+    if (!size) return false;
+    for (size_t i = 0; i < size; i++)
+        if (authority[i] == '@' || authority[i] == '%' || (unsigned char)authority[i] <= 32) return false;
+    return true;
+}
+
+int cb_bookmark_add(const char *url, const char *title, bool private_mode)
+{
+    if (private_mode || !bookmark_url(url)) return -1;
+    if (!title || !*title) title = url;
+    if (!bookmark_text(title)) return -1;
+    bool missing;
+    sqlite3 *db = bookmarks_open(true, &missing);
+    if (!db) return -1;
+    sqlite3_stmt *statement = NULL;
+    int result = -1;
+    /* A single SQLite statement makes the capacity check and upsert atomic. */
+    const char *query = "INSERT INTO bookmarks(url,title,added_at) SELECT ?,?,? "
+        "WHERE (SELECT count(*) FROM bookmarks) < 1000 OR EXISTS(SELECT 1 FROM bookmarks WHERE url=?) "
+        "ON CONFLICT(url) DO UPDATE SET title=excluded.title,added_at=excluded.added_at";
+    if (sqlite3_prepare_v2(db, query, -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 2, title, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_int64(statement, 3, (sqlite3_int64)time(NULL)) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 4, url, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_DONE && sqlite3_changes(db) == 1) result = 0;
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return result;
+}
+
+int cb_bookmark_remove(const char *url, bool private_mode)
+{
+    if (private_mode || !bookmark_url(url)) return -1;
+    bool missing;
+    /* Avoid creating an empty database when the user removes an absent URL. */
+    sqlite3 *db = bookmarks_open(false, &missing);
+    if (!db) return missing ? 0 : -1;
+    sqlite3_close(db);
+    db = bookmarks_open(true, &missing);
+    if (!db) return -1;
+    sqlite3_stmt *statement = NULL;
+    int result = -1;
+    if (sqlite3_prepare_v2(db, "DELETE FROM bookmarks WHERE url=?", -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_step(statement) == SQLITE_DONE) result = 0;
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return result;
+}
+
+int cb_bookmark_contains(const char *url)
+{
+    if (!bookmark_url(url)) return -1;
+    bool missing;
+    sqlite3 *db = bookmarks_open(false, &missing);
+    if (!db) return missing ? 0 : -1;
+    sqlite3_stmt *statement = NULL;
+    int result = -1;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM bookmarks WHERE url=?", -1, &statement, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(statement, 1, url, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+        int step = sqlite3_step(statement);
+        if (step == SQLITE_ROW) result = 1;
+        else if (step == SQLITE_DONE) result = 0;
+    }
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return result;
+}
+
+int cb_bookmark_list(struct cb_bookmark **items, size_t *count)
+{
+    if (!items || !count) return -1;
+    *items = NULL; *count = 0;
+    bool missing;
+    sqlite3 *db = bookmarks_open(false, &missing);
+    if (!db) return missing ? 0 : -1;
+    sqlite3_stmt *statement = NULL;
+    struct cb_bookmark *list = NULL;
+    size_t used = 0, capacity = 0;
+    if (sqlite3_prepare_v2(db, "SELECT url,title FROM bookmarks ORDER BY added_at DESC,url ASC LIMIT 1000",
+                          -1, &statement, NULL) != SQLITE_OK) goto failure;
+    int step;
+    while ((step = sqlite3_step(statement)) == SQLITE_ROW) {
+        const char *url = (const char *)sqlite3_column_text(statement, 0);
+        const char *title = (const char *)sqlite3_column_text(statement, 1);
+        if (!bookmark_url(url) || !bookmark_text(title)) continue;
+        if (used == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            if (capacity > CB_BOOKMARK_LIMIT) capacity = CB_BOOKMARK_LIMIT;
+            struct cb_bookmark *next = realloc(list, capacity * sizeof(*list));
+            if (!next) goto failure;
+            list = next;
+        }
+        strcpy(list[used].url, url);
+        strcpy(list[used].title, title);
+        used++;
+    }
+    if (step != SQLITE_DONE) goto failure;
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    *items = list; *count = used;
+    return 0;
+failure:
+    free(list);
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return -1;
+}
+
+char *cb_bookmarks_html(void)
+{
+    struct cb_bookmark *items = NULL;
+    size_t count = 0;
+    if (cb_bookmark_list(&items, &count)) return NULL;
+    struct html_buffer buffer = {0};
+    if (append(&buffer, "<!doctype html><html><head><title>Bookmarks — Cube Browser</title>"
+            "<style>body{font-family:sans-serif;max-width:900px;margin:40px auto;padding:24px;}"
+            "h1{font-size:36px;}article{padding:16px 0;border-bottom:1px solid #ddd;}"
+            "a{color:#111;}p{color:#555;}</style></head><body>"
+            "<p>CUBE / LIBRARY</p><h1>Bookmarks</h1>"
+            "<p>Your saved pages. Press Ctrl+D on a page to add or remove it. "
+            "Private windows can read your bookmarks.</p>"
+            "<p><a href=\"cube:home\">Home</a> · <a href=\"cube:history\">History</a></p>")) goto failure;
+    for (size_t i = 0; i < count; i++) {
+        /* Leave room for the largest fully escaped row and the document footer. */
+        if (buffer.used > 2 * 1024 * 1024 - 80000) {
+            if (append(&buffer, "<p>More bookmarks are saved. Remove older pages to show additional entries.</p>")) goto failure;
+            break;
+        }
+        if (append(&buffer, "<article><a href=\"") || escape(&buffer, items[i].url) ||
+            append(&buffer, "\">") || escape(&buffer, items[i].title) ||
+            append(&buffer, "</a><p>") || escape(&buffer, items[i].url) ||
+            append(&buffer, "</p></article>")) goto failure;
+    }
+    if ((!count && append(&buffer, "<p>No bookmarks yet. Open a page and press Ctrl+D to save it.</p>")) ||
+        append(&buffer, "</body></html>")) goto failure;
+    free(items);
+    return buffer.data;
+failure:
+    free(items);
+    free(buffer.data);
+    return NULL;
 }

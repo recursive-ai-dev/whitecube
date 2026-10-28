@@ -29,8 +29,15 @@ def check(stage):
         if result.returncode or 'not found' in result.stdout:
             problems.append('unresolved Electron shared libraries')
     launcher = stage / 'usr/bin/desktop-chat'
-    if not launcher.is_file() or '--ozone-platform=wayland' not in launcher.read_text():
-        problems.append('Wayland chat launcher is missing')
+    if not launcher.is_file():
+        problems.append('chat launcher is missing')
+    else:
+        source = launcher.read_text()
+        supports_wayland = '--ozone-platform=wayland' in source or all(
+            marker in source for marker in ('WAYLAND_DISPLAY', 'platform=wayland',
+                                            '--ozone-platform=$platform'))
+        if not supports_wayland:
+            problems.append('Wayland chat launcher support is missing')
     return problems
 
 

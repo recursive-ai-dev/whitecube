@@ -96,7 +96,7 @@ while IFS= read -r -d '' source; do
     install -m 0644 "$source" "$share/cube-editor/$relative"
   fi
 done < <(find apps/cube-editor -mindepth 1 \( -type d \( -name upstream -o -name tests -o -name packaging -o -name __pycache__ \) -prune \) -o \( -type d -o -type f \) -print0)
-rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/cube-apps/tests" "$share/cube-apps/shot.sh" "$share/cube-train/tests"
+rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/desktop-chat/dist" "$share/desktop-chat/packaging" "$share/cube-apps/tests" "$share/cube-apps/shot.sh" "$share/cube-train/tests"
 # Chrootables: the window runs from /usr/share; its manager is a command of its own (CLI and menu),
 # which the window finds as /usr/bin/chrootable-manager.
 install -d -m 0755 "$share/chrootables"

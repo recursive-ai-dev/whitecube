@@ -34,6 +34,9 @@ function verifyDeb(filename) {
     assert.equal(runtime.architecture, architecture); assert.equal(runtime.appVersion, version);
     assert.equal(fs.readFileSync(path.join(install, 'runtime/version'), 'utf8').trim().replace(/^v/, ''), runtime.electron);
     assert.ok(fs.statSync(path.join(install, 'runtime/electron')).mode & 0o111);
+    const executable = fs.readFileSync(path.join(install, 'runtime/electron'));
+    assert.equal(executable.toString('hex', 0, 4), '7f454c46');
+    assert.equal(({ 62: 'amd64', 183: 'arm64' })[executable.readUInt16LE(18)], architecture);
     for (const line of fs.readFileSync(path.join(control, 'md5sums'), 'utf8').trim().split('\n')) {
       const match = line.match(/^([a-f\d]{32})  (usr\/.+)$/); assert.ok(match, 'Invalid md5sums entry');
       const file = path.resolve(directory, match[2]); assert.ok(file.startsWith(directory + path.sep));

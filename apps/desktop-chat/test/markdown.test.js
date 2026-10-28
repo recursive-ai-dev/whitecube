@@ -75,3 +75,19 @@ test('empty and non-string input do not throw', () => {
   assert.strictEqual(render(''), '');
   assert.strictEqual(render(undefined), '<p>undefined</p>');
 });
+
+test('Markdown tables escape content and format inline code', () => {
+  const html = render('| Name | Value |\n| --- | :---: |\n| `<b>` | **safe** |\n| <img onerror=x> | a \\| b |');
+  assert.ok(html.includes('<th>Name</th><th>Value</th>'));
+  assert.ok(html.includes('<td><code>&lt;b&gt;</code></td><td><strong>safe</strong></td>'));
+  assert.ok(html.includes('<td>&lt;img onerror=x&gt;</td><td>a | b</td>'));
+  assert.ok(!html.includes('<img'));
+  assert.ok(render('a | b\nwords | words').startsWith('<p>'));
+});
+
+test('blockquotes keep hostile markup inert and do not recurse on nested markers', () => {
+  const html = render('> **quoted**\n> <script>alert(1)</script>\n\nAfter');
+  assert.ok(html.includes('<blockquote><p><strong>quoted</strong><br>&lt;script&gt;alert(1)&lt;/script&gt;</p></blockquote>'));
+  assert.ok(html.endsWith('<p>After</p>'));
+  assert.doesNotThrow(() => render('>'.repeat(50000)));
+});

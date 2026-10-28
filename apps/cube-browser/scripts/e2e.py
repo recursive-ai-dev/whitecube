@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import select
 import signal
+import sqlite3
 import socket
 import struct
 import subprocess
@@ -54,11 +55,15 @@ def wait_for(check, description, timeout=8):
 
 class WaylandProxy:
     """Observe buffers and feed keyboard events without changing application code."""
-    def __init__(self, endpoint: Path, upstream: Path):
+    def __init__(self, endpoint: Path, upstream: Path, test_seat=False):
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(str(endpoint))
         self.listener.listen(1)
         self.upstream = upstream
+        self.test_seat = test_seat
+        self.test_seat_global = 0xfffffff0
+        self.forward_fds = []
+        self.server_forward_fds = []
         self.stop = threading.Event()
         self.lock = threading.RLock()
         self.send_lock = threading.Lock()
@@ -115,12 +120,22 @@ class WaylandProxy:
                         return
                     try:
                         if source is self.client:
-                            self.inspect_client(data, fds)
-                            self.forward(self.server, data, fds)
+                            self.forward_fds.extend(os.dup(fd) for fd in fds)
+                            forwarded = self.inspect_client(data, fds)
+                            if forwarded:
+                                self.forward(self.server, forwarded, self.forward_fds)
+                                for fd in self.forward_fds:
+                                    os.close(fd)
+                                self.forward_fds.clear()
                         else:
-                            self.inspect_server(data)
-                            with self.send_lock:
-                                self.forward(self.client, data, fds)
+                            self.server_forward_fds.extend(os.dup(fd) for fd in fds)
+                            forwarded = self.inspect_server(data)
+                            if forwarded:
+                                with self.send_lock:
+                                    self.forward(self.client, forwarded, self.server_forward_fds)
+                                for fd in self.server_forward_fds:
+                                    os.close(fd)
+                                self.server_forward_fds.clear()
                     finally:
                         for fd in fds:
                             os.close(fd)
@@ -132,6 +147,7 @@ class WaylandProxy:
                 self.error = error
 
     def inspect_client(self, data, fds):
+        forwarded = bytearray()
         with self.lock:
             self.fds.extend(os.dup(fd) for fd in fds)
             self.client_bytes += data
@@ -141,14 +157,41 @@ class WaylandProxy:
                 assert size >= 8
                 if len(self.client_bytes) < size:
                     break
+                raw = self.client_bytes[:size]
                 body, self.client_bytes = self.client_bytes[8:size], self.client_bytes[size:]
                 kind = self.objects.get(obj)
+                suppress = kind in ("test_seat", "test_keyboard", "test_data_device")
                 if kind == "wl_display" and opcode == 1:
-                    self.objects[struct.unpack_from("=I", body)[0]] = "wl_registry"
+                    registry, = struct.unpack_from("=I", body)
+                    self.objects[registry] = "wl_registry"
+                    if self.test_seat:
+                        # Weston headless has no physical input seat. Expose one
+                        # only to this isolated test client; presentation still
+                        # traverses the real compositor unchanged.
+                        interface = b"wl_seat\0"
+                        payload = u32(self.test_seat_global, len(interface)) + interface + b"\0" * (-len(interface) % 4) + u32(5)
+                        self.send_events([message(registry, 0, payload)])
                 elif kind == "wl_registry" and opcode == 0:
                     interface, end = string_at(body, 4)
                     _, new_id = struct.unpack_from("=II", body, end)
                     self.objects[new_id] = interface
+                    global_name, = struct.unpack_from("=I", body)
+                    if self.test_seat and global_name == self.test_seat_global:
+                        suppress = False
+                        raw = message(1, 1, u32(new_id))  # reserve the client id upstream
+                        self.objects[new_id] = "test_seat"
+                        self.send_events([message(new_id, 0, u32(2))])  # keyboard capability
+                elif kind == "test_seat" and opcode == 1:
+                    self.keyboard, = struct.unpack_from("=I", body)
+                    self.objects[self.keyboard] = "test_keyboard"
+                    suppress = False
+                    raw = message(1, 1, u32(self.keyboard))
+                elif kind == "wl_data_device_manager" and opcode == 1 and self.test_seat:
+                    device, seat = struct.unpack_from("=II", body)
+                    if self.objects.get(seat) == "test_seat":
+                        suppress = False
+                        raw = message(1, 1, u32(device))
+                        self.objects[device] = "test_data_device"
                 elif kind == "wl_compositor" and opcode == 0:
                     self.objects[struct.unpack_from("=I", body)[0]] = "wl_surface"
                 elif kind == "wl_seat" and opcode == 1:
@@ -190,8 +233,12 @@ class WaylandProxy:
                     self.title, _ = string_at(body)
                 elif kind == "xdg_toplevel" and opcode == 3:
                     self.app_id, _ = string_at(body)
+                if not suppress:
+                    forwarded.extend(raw)
+        return bytes(forwarded)
 
     def inspect_server(self, data):
+        forwarded = bytearray()
         with self.lock:
             self.server_bytes += data
             while len(self.server_bytes) >= 8:
@@ -200,14 +247,19 @@ class WaylandProxy:
                 assert size >= 8
                 if len(self.server_bytes) < size:
                     break
+                raw = self.server_bytes[:size]
                 body, self.server_bytes = self.server_bytes[8:size], self.server_bytes[size:]
                 kind = self.objects.get(obj)
+                if kind in ("test_seat", "test_keyboard", "test_data_device"):
+                    continue
+                forwarded.extend(raw)
                 if obj == 1 and opcode == 0:
                     raise AssertionError(f"Wayland protocol error: {body!r}")
                 if kind == "xdg_surface" and opcode == 0:
                     self.configures += 1
                 if kind == "wl_buffer" and opcode == 0:
                     self.releases += 1
+        return bytes(forwarded)
 
     def send_events(self, events, fd=None):
         if self.error:
@@ -311,6 +363,10 @@ class WaylandProxy:
         for fd in self.pools.values():
             os.close(fd)
         for fd in self.fds:
+            os.close(fd)
+        for fd in self.forward_fds:
+            os.close(fd)
+        for fd in self.server_forward_fds:
             os.close(fd)
 
 
@@ -482,9 +538,9 @@ def exercise_scripts(proxy, origin, requests, async_started, async_release):
     proxy.key(38, proxy.control); proxy.type(origin + '/async-cancel'); proxy.key(28)
     wait_for(async_started.is_set, 'asynchronous fetch started')
     proxy.key(38, proxy.control); proxy.type('cube:home'); proxy.key(28)
-    wait_for(lambda: proxy.title == 'Start here — Cube Browser', 'navigation cancelled JavaScript fetch')
+    wait_for(lambda: proxy.title == 'Private browsing — Cube Browser', 'navigation cancelled JavaScript fetch')
     async_release.set(); time.sleep(.1)
-    assert proxy.title == 'Start here — Cube Browser', 'old async callback modified the new document'
+    assert proxy.title == 'Private browsing — Cube Browser', 'old async callback modified the new document'
 
 
 def exercise_workflows(proxy, origin, requests, root, download_started, cancel_started, artifacts):
@@ -598,9 +654,98 @@ def exercise_responsive(proxy, origin, requests, artifacts, state_directory, res
              'table-cell link activated through page keyboard traversal')
 
 
+def exercise_bookmarks(browser, browser_env, upstream, root, origin, log, artifacts, test_seat):
+    """Exercise Ctrl+D persistence, the library shortcut, and private nonwriting."""
+    database = root / "data/cube-browser/bookmarks.sqlite3"
+    saved_url = origin + "/bookmarks-fixture"
+
+    def saved():
+        if not database.exists():
+            return False
+        try:
+            with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as db:
+                return db.execute("SELECT count(*) FROM bookmarks WHERE url=?", (saved_url,)).fetchone()[0] == 1
+        except sqlite3.OperationalError:
+            return False
+
+    def launch(name, arguments, title):
+        proxy = WaylandProxy(root / "runtime" / name, upstream, test_seat=test_seat)
+        try:
+            process = subprocess.Popen([str(browser), "--quit-after", "25", *arguments],
+                env=dict(browser_env, WAYLAND_DISPLAY=name), stdout=log, stderr=log, start_new_session=True)
+            wait_for(lambda: proxy.title == title and proxy.commits >= 2, name + " frame")
+            proxy.keyboard_ready()
+            return process, proxy
+        except BaseException:
+            if "process" in locals():
+                stop_process(process)
+            proxy.close()
+            raise
+
+    def close(process, proxy):
+        try:
+            proxy.key(17, proxy.control)
+            assert process.wait(timeout=5) == 0, "bookmark window failed to close"
+            assert proxy.error is None, f"bookmark protocol proxy failed: {proxy.error}"
+        finally:
+            stop_process(process)
+            proxy.close()
+
+    process, proxy = launch("bookmarks-save", [saved_url], "Cube E2E navigation")
+    try:
+        proxy.key(32, proxy.control)  # Ctrl+D.
+        wait_for(saved, "bookmark saved to the normal profile")
+        proxy.key(48, proxy.control | proxy.shift)  # Ctrl+Shift+B.
+        wait_for(lambda: proxy.title == "Bookmarks — Cube Browser", "bookmark library shortcut")
+        save_frame(proxy, artifacts, "wayland-bookmarks.png")
+    finally:
+        close(process, proxy)
+    assert saved(), "bookmark was lost when the normal window closed"
+    before = (database.read_bytes(), database.stat().st_mtime_ns)
+
+    process, proxy = launch("bookmarks-private", ["--private", "cube:bookmarks"], "Bookmarks — Cube Browser")
+    try:
+        save_frame(proxy, artifacts, "wayland-private-bookmarks.png")
+        for url in (saved_url, origin + "/private-bookmark"):
+            proxy.key(38, proxy.control); proxy.type(url); proxy.key(28)
+            wait_for(lambda: proxy.title == "Cube E2E navigation", "private page before bookmark mutation")
+            commits = proxy.commits
+            proxy.key(32, proxy.control)
+            wait_for(lambda: proxy.commits > commits, "private bookmark action status")
+            assert (database.read_bytes(), database.stat().st_mtime_ns) == before, "private bookmark action changed saved pages"
+        assert saved(), "private window removed a normal bookmark"
+    finally:
+        close(process, proxy)
+    assert (database.read_bytes(), database.stat().st_mtime_ns) == before
+
+    process, proxy = launch("bookmarks-remove", [saved_url], "Cube E2E navigation")
+    try:
+        proxy.key(32, proxy.control)
+        wait_for(lambda: not saved(), "Ctrl+D removed a bookmark saved by an earlier window")
+    finally:
+        close(process, proxy)
+    print("e2e: Ctrl+D bookmark persistence/removal, Ctrl+Shift+B library, private read and nonwrite passed")
+
+
 def run(options):
     browser = options.browser.resolve()
     compositor = options.compositor.resolve()
+    compositor_args = []
+    compositor_env = {}
+    if options.weston_dir:
+        weston = options.weston_dir.resolve()
+        compositor = weston / "usr/bin/weston"
+        backends = list(weston.glob("usr/lib/*/libweston-*/headless-backend.so"))
+        assert len(backends) == 1, f"expected one Weston headless backend beneath {weston}"
+        backend = backends[0]
+        lib = backend.parent.parent
+        shell = lib / "weston/kiosk-shell.so"
+        assert shell.is_file(), f"Weston kiosk shell missing: {shell}"
+        compositor_env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None,
+            (str(lib), str(lib / "weston"), os.environ.get("LD_LIBRARY_PATH"))))
+        compositor_env["WESTON_MODULE_MAP"] = f"headless-backend.so={backend};kiosk-shell.so={shell}"
+        compositor_args = ["--backend=headless", f"--shell={shell}", "--renderer=pixman",
+                           "--no-config", "--socket=wayland-0", "--width=1280", "--height=960", "--idle-time=0"]
     assert browser.is_file(), f"browser binary missing: {browser}"
     if not compositor.is_file():
         print(f"SKIP: headless compositor unavailable: {compositor}")
@@ -754,16 +899,16 @@ def run(options):
         compositor_process = browser_process = proxy = None
         with (root / "compositor.log").open("w+") as compositor_log, (root / "browser.log").open("w+") as browser_log:
             try:
-                compositor_process = subprocess.Popen([str(compositor)], env=env, stdout=compositor_log,
+                compositor_process = subprocess.Popen([str(compositor), *compositor_args], env=dict(env, **compositor_env), stdout=compositor_log,
                                                        stderr=compositor_log, start_new_session=True)
                 upstream = root / "runtime" / "wayland-0"
                 wait_for(lambda: upstream.exists() or compositor_process.poll() is not None, "headless Wayland socket")
                 assert compositor_process.poll() is None, "headless compositor exited"
-                proxy = WaylandProxy(root / "runtime" / "cube-test", upstream)
+                proxy = WaylandProxy(root / "runtime" / "cube-test", upstream, test_seat=bool(options.weston_dir))
                 browser_env = dict(env, WAYLAND_DISPLAY="cube-test")
                 browser_process = subprocess.Popen([str(browser), "--private", "--quit-after", "55", "cube:home"],
                     env=browser_env, stdout=browser_log, stderr=browser_log, start_new_session=True)
-                wait_for(lambda: proxy.title == "Start here — Cube Browser" and proxy.commits >= 2, "home frame and title")
+                wait_for(lambda: proxy.title == "Private browsing — Cube Browser" and proxy.commits >= 2, "home frame and title")
                 assert proxy.app_id == "cube-browser", "missing native app id"
                 assert proxy.configures and proxy.acks, "xdg configure was not acknowledged"
                 wait_for(lambda: proxy.releases > 0, "real compositor buffer release")
@@ -790,7 +935,7 @@ def run(options):
                 proxy.key(19, proxy.control)  # Ctrl+R
                 wait_for(lambda: len(requests) > count and proxy.has_color(0xa1b2c3), "reload returned to document top")
                 proxy.key(105, proxy.alt)  # Alt+Left
-                wait_for(lambda: proxy.title == "Start here — Cube Browser", "back navigation")
+                wait_for(lambda: proxy.title == "Private browsing — Cube Browser", "back navigation")
                 count = len(requests)
                 proxy.key(106, proxy.alt)  # Alt+Right
                 wait_for(lambda: len(requests) > count and proxy.title == "Cube E2E navigation", "forward navigation")
@@ -801,7 +946,7 @@ def run(options):
                 proxy.key(38, proxy.control)
                 proxy.type('cube:home')
                 proxy.key(28)
-                wait_for(lambda: proxy.title == 'Start here — Cube Browser', "navigation cancels pending resources")
+                wait_for(lambda: proxy.title == 'Private browsing — Cube Browser', "navigation cancels pending resources")
                 slow_release.set()
                 def no_network_children():
                     children = Path(f'/proc/{browser_process.pid}/task/{browser_process.pid}/children').read_text().split()
@@ -814,7 +959,7 @@ def run(options):
                     return True
                 wait_for(no_network_children, "no resource workers survived cancelled navigation")
                 time.sleep(.08)
-                assert proxy.title == 'Start here — Cube Browser' and not proxy.has_color(0xff00ff), 'old resource modified new page'
+                assert proxy.title == 'Private browsing — Cube Browser' and not proxy.has_color(0xff00ff), 'old resource modified new page'
                 exercise_interactions(proxy, f'http://127.0.0.1:{server.server_port}', requests, options.artifacts)
                 exercise_sessions(proxy, f'http://127.0.0.1:{server.server_port}', requests, observations)
                 exercise_scripts(proxy, f'http://127.0.0.1:{server.server_port}', requests, async_started, async_release)
@@ -842,7 +987,9 @@ def run(options):
                       "external CSS/PNG, Ctrl+L HTTP navigation, zoom, find, reload, back/forward, pending-resource cancellation, "
                       "Tab/Shift+Tab page focus, immediate input typing, exact GET submission, blocked PUT, POST login/logout, cookies, conditional cache, scripted events/storage/cancellation, settings, downloads/cancel, diagnostics, private clearing, anchors without refetch, "
                       "responsive zoom, live reduced-motion CSS, SVG, table links/edited inputs, renderer crash recovery, private history and Ctrl+W passed")
-                print("Input source: isolated standard wl_keyboard events; real Whitecube headless compositor handled all presentation.")
+                print("Input source: isolated standard wl_keyboard events; real headless Wayland compositor handled all presentation.")
+                exercise_bookmarks(browser, browser_env, upstream, root, f'http://127.0.0.1:{server.server_port}',
+                                   browser_log, options.artifacts, bool(options.weston_dir))
                 return 0
             except BaseException:
                 for name, log in (("compositor", compositor_log), ("browser", browser_log)):
@@ -873,5 +1020,6 @@ if __name__ == "__main__":
     if not compositor.exists():
         compositor = base.parent / "whitecube" / "build" / "whitecube"
     parser.add_argument("--compositor", type=Path, default=compositor)
+    parser.add_argument("--weston-dir", type=Path, help="extracted Weston package root; use its headless compositor and an isolated test input seat")
     parser.add_argument("--artifacts", type=Path, help="save actual submitted Wayland buffers as PNG files")
     raise SystemExit(run(parser.parse_args()))

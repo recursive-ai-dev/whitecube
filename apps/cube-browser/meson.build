@@ -76,23 +76,26 @@ test('workers', python, args: [files('tests/test_workers.py'), renderer, net])
 test('interactions', python, args: [files('tests/test_interactions.py'), renderer])
 test('cli-and-installer', python, args: [files('tests/test_app.py'), browser])
 test('subresources', python, args: [files('tests/test_subresources.py'), browser], timeout: 60)
-test('wayland-e2e', python, args: [files('scripts/e2e.py'), '--browser', browser.full_path()], timeout: 60, suite: 'integration')
+test('wayland-e2e', python, args: [files('scripts/e2e.py'), '--browser', browser.full_path()], timeout: 60, suite: 'integration', is_parallel: false)
 
 session_test = executable('test-session', 'tests/test_session.c', link_with: [session, storage, policy, ipc], include_directories: inc, dependencies: [sqlite, glib, math])
 test('sessions', session_test)
 
 js_test_args = get_option('b_sanitize') == 'address,undefined' ? ['-DCB_COMPONENT_SANITIZER'] : []
 js_test = executable('test-js', 'tests/test_js.c', link_with: [js, ipc], include_directories: inc, dependencies: [quickjs, math], c_args: js_test_args)
-test('javascript-runtime', js_test)
+# These exercise the production 100 ms wall-clock JS turn limit. Running them
+# beside render/fuzz suites can consume that deadline through CPU contention;
+# keep the real limits and reserve the test runner for each scripted suite.
+test('javascript-runtime', js_test, is_parallel: false)
 
-test('web-apis', python, args: [files('tests/test_web.py')], timeout: 60)
+test('web-apis', python, args: [files('tests/test_web.py')], timeout: 60, is_parallel: false)
 
 download_test = executable('test-download', ['tests/test_download.c','src/download.c'], link_with: ipc, include_directories: inc)
 test('downloads', download_test)
 
 dom_test = executable('test-dom', 'tests/test_dom.c', link_with: [dom, js, engine, image, forms, media, policy, ipc], include_directories: inc,
     dependencies: [quickjs, cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
-test('dom-lifecycle', dom_test)
+test('dom-lifecycle', dom_test, is_parallel: false)
 fuzz_test = executable('test-fuzz', 'tests/test_fuzz.c', link_with: [engine, image, forms, media, policy, ipc], include_directories: inc,
     dependencies: [cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
 test('mutation-smoke', fuzz_test, timeout: 120)

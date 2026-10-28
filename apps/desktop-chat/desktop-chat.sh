@@ -16,7 +16,7 @@ Open the Desktop Chat workspace. Repeated launches control the running app.
   --settings, --configure     Open settings
   --checkpoint RUN/FILE.pt    Select a trained local checkpoint
   --quit                     Quit the running app
-  --version                  Print application and bundled runtime versions
+  --version                  Print application version
   --help                     Show this help
 
 Configure an OpenAI-compatible endpoint in Settings. A localhost server needs

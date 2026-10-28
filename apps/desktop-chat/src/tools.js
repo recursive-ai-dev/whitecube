@@ -105,6 +105,7 @@ async function atomicWrite(target, content) {
   const temporary = `${target}.desktop-chat-${require('crypto').randomUUID()}`;
   try {
     await fsp.writeFile(temporary, content, { encoding: 'utf8', flag: 'wx', mode: permissions });
+    await fsp.chmod(temporary, permissions);
     await fsp.rename(temporary, target);
   } finally { await fsp.unlink(temporary).catch(() => {}); }
 }
@@ -123,6 +124,7 @@ async function edit_file({ path: rawPath, old_string, new_string, replace_all })
   if (replace_all !== undefined && typeof replace_all !== 'boolean') throw new Error('replace_all must be true or false.');
   if ((await fsp.stat(target)).size > MAX_EDIT_BYTES) throw new Error('File exceeds the 8 MB editing limit.');
   const original = await fsp.readFile(target, 'utf8');
+  if (original.includes('\0')) throw new Error('This appears to be a binary file. Only text files can be edited.');
 
   if (old_string === '') {
     throw new Error('old_string must not be empty');
@@ -140,7 +142,7 @@ async function edit_file({ path: rawPath, old_string, new_string, replace_all })
 
   const updated = replace_all
     ? original.split(old_string).join(new_string ?? '')
-    : original.replace(old_string, new_string ?? '');
+    : original.replace(old_string, () => new_string);
 
   textArgument(updated, 'Updated file');
   await atomicWrite(target, updated);
@@ -180,8 +182,8 @@ const TOOL_DEFS = [
         properties: {
           path: { type: 'string', description: 'Absolute path, or ~-relative path' },
           offset: { type: 'integer', description: '1-based line number to start reading from (default 1)' },
-          limit: { type: 'integer', description: 'Max number of lines to return (default ~800, capped by a byte budget too)' }
-          ,byte_offset: { type: 'integer', description: 'Optional 0-based byte offset for reading very long lines or large files; use the continuation offset from a previous result.' }
+          limit: { type: 'integer', description: 'Max number of lines to return (default ~800, capped by a byte budget too)' },
+          byte_offset: { type: 'integer', description: 'Optional 0-based byte offset for reading very long lines or large files; use the continuation offset from a previous result.' }
         },
         required: ['path']
       }

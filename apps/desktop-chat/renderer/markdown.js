@@ -18,6 +18,10 @@
       .join('');
   }
 
+  function tableRow(line) {
+    return line.trim().replace(/^\|/, '').replace(/\|$/, '').split(/(?<!\\)\|/).map(cell => cell.trim().replace(/\\\|/g, '|'));
+  }
+
   function render(text) {
     const lines = String(text).replace(/\r\n?/g, '\n').split('\n');
     const out = [];
@@ -55,6 +59,27 @@
           `<div class="code-block"><div class="code-head"><span>${esc(fence[1] || 'text')}</span>` +
             `<button class="copy-btn" type="button">Copy</button></div><pre><code>${esc(code.join('\n'))}</code></pre></div>`
         );
+        continue;
+      }
+      // Only a full delimiter row starts a table; ordinary pipes stay prose.
+      const columns = line.includes('|') ? tableRow(line) : [];
+      const delimiter = i + 1 < lines.length && columns.length ? tableRow(lines[i + 1]) : [];
+      if (columns.length > 1 && delimiter.length === columns.length && delimiter.every(cell => /^:?-{3,}:?$/.test(cell))) {
+        flushPara(); flushList();
+        const rows = []; i += 2;
+        while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+          const cells = tableRow(lines[i++]);
+          rows.push(`<tr>${columns.map((_, index) => `<td>${inline(cells[index] || '')}</td>`).join('')}</tr>`);
+        }
+        out.push(`<div class="table-scroll"><table><thead><tr>${columns.map(cell => `<th>${inline(cell)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`);
+        continue;
+      }
+      const quote = /^\s*>\s?(.*)$/.exec(line);
+      if (quote) {
+        flushPara(); flushList();
+        const quoted = [quote[1]]; i++;
+        while (i < lines.length && /^\s*>/.test(lines[i])) quoted.push(lines[i++].replace(/^\s*>\s?/, ''));
+        out.push(`<blockquote><p>${quoted.map(inline).join('<br>')}</p></blockquote>`);
         continue;
       }
       const heading = /^(#{1,3})\s+(.+)$/.exec(line);

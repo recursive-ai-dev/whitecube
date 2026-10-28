@@ -42,7 +42,14 @@ async function start(args, overrides = {}) {
   const ipcMain = new EventEmitter();
   const handlers = new Map();
   const settings = { endpoint: 'https://example.com/v1', model: 'test-model', hotkey: 'Control+Shift+T', apiKey: '', chatSource: 'api', checkpointId: '', modelAliases: {}, ...overrides.settings };
-  ipcMain.handle = (name, callback) => handlers.set(name, callback);
+  const rawHandlers = new Map();
+  ipcMain.handle = (name, callback) => {
+    rawHandlers.set(name, callback);
+    handlers.set(name, (event = {}, ...args) => {
+      if (event.sender) windows[0].webContents.send = event.sender.send;
+      return callback({ ...event, sender: windows[0].webContents }, ...args);
+    });
+  };
   const electron = {
     app, BrowserWindow: Window, Tray, ipcMain, clipboard: {},
     Menu: { buildFromTemplate: (value) => value },
@@ -76,7 +83,7 @@ async function start(args, overrides = {}) {
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'main.js'), 'utf8'), context);
   await new Promise((resolve) => setImmediate(resolve));
-  return { app, win: windows[0], handlers };
+  return { app, win: windows[0], handlers, rawHandlers, ipcMain, directory };
 }
 
 test('first-launch settings wait for renderer listeners', async () => {
@@ -216,4 +223,81 @@ test('Stop cancels local startup and model changes are blocked during a reply', 
   handlers.get('chat:cancel')(); await pending;
   assert.ok(events.some(([name, data]) => name === 'chat:event' && data.message === 'Cancelled.'));
   assert.equal(events.at(-1)[0], 'chat:done');
+});
+
+test('deleting an API chat restores the local source before sending the fallback transcript', async () => {
+  const endpoints = [];
+  const { handlers } = await start(['--hide'], {
+    settings: { chatSource: 'local', checkpointId: 'run/ckpt_best.pt', apiKey: 'external-key' },
+    localModels: { ensure: async () => 'http://127.0.0.1:43210/v1' },
+    runAgentTurn: async ({ settings }) => endpoints.push(settings.endpoint)
+  });
+  const sender = { send() {} };
+  await handlers.get('chat:send')({ sender }, 'private local conversation');
+  const local = handlers.get('chats:current')();
+  handlers.get('models:select')({ sender }, 'api');
+  const api = handlers.get('chats:current')();
+  const result = handlers.get('chats:delete')({}, api.id);
+  assert.equal(result.activeChat.id, local.id);
+  assert.equal(handlers.get('settings:get')().chatSource, 'local');
+  await handlers.get('chat:send')({ sender }, 'continue locally');
+  assert.deepEqual(endpoints, ['http://127.0.0.1:43210/v1', 'http://127.0.0.1:43210/v1']);
+});
+
+test('changing the API endpoint cannot transfer an existing chat to the new provider', async () => {
+  let calls = 0;
+  const { handlers } = await start(['--hide'], {
+    settings: { endpoint: 'http://localhost:11434/v1' },
+    runAgentTurn: async () => { calls++; }
+  });
+  const sender = { send() {} };
+  await handlers.get('chat:send')({ sender }, 'private conversation');
+  handlers.get('settings:save')({}, { endpoint: 'http://localhost:8888/v1' });
+  const result = await handlers.get('chat:send')({ sender }, 'keep talking');
+  assert.equal(result.ok, false); assert.match(result.error, /different endpoint or model/);
+  assert.equal(calls, 1);
+});
+
+test('quit snapshots visible partial text into model context before the engine completes', async () => {
+  const partial = 'The reply in progress';
+  const { app, handlers, directory } = await start(['--hide'], {
+    settings: { endpoint: 'http://localhost:11434/v1' },
+    async runAgentTurn({ messages, onEvent, signal }) {
+      onEvent({ type: 'text-delta', text: partial });
+      await new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }));
+      messages.push({ role: 'assistant', content: partial });
+      signal.throwIfAborted();
+    }
+  });
+  const pending = handlers.get('chat:send')({ sender: { send() {} } }, 'start a reply');
+  const chat = handlers.get('chats:current')();
+  app.emit('will-quit');
+  const saved = JSON.parse(fs.readFileSync(path.join(directory, 'conversations', `${chat.id}.json`), 'utf8'));
+  assert.equal(saved.context.at(-1).content, partial);
+  assert.equal(saved.messages.at(-1).content, partial);
+  await pending;
+});
+
+test('IPC refuses other windows and subframes before reading secrets or changing state', async () => {
+  const { rawHandlers, win } = await start(['--hide']);
+  assert.throws(() => rawHandlers.get('settings:get')({ sender: { send() {} } }), /chat window/);
+  assert.throws(() => rawHandlers.get('settings:get')({ sender: win.webContents, senderFrame: {} }), /chat window/);
+  assert.equal(rawHandlers.get('settings:get')({ sender: win.webContents }).model, 'test-model');
+});
+
+test('destructive approval requires a boolean response from the chat window', async () => {
+  let approved;
+  const { handlers, ipcMain, win } = await start(['--hide'], {
+    settings: { endpoint: 'http://localhost:11434/v1' },
+    async runAgentTurn({ confirmTool }) { approved = await confirmTool({ name: 'write_file', args: {} }); }
+  });
+  const events = [];
+  const pending = handlers.get('chat:send')({ sender: { send: (channel, payload) => events.push([channel, payload]) } }, 'write something');
+  const requestId = events.find(([channel]) => channel === 'chat:confirm-request')[1].requestId;
+  ipcMain.emit('chat:confirm-response', { sender: win.webContents }, { requestId, approved: 'true' });
+  await Promise.resolve();
+  assert.equal(approved, undefined);
+  ipcMain.emit('chat:confirm-response', { sender: win.webContents }, { requestId, approved: false });
+  await pending;
+  assert.equal(approved, false);
 });

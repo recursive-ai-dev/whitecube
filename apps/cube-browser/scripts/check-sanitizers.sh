@@ -4,6 +4,13 @@
 set -euo pipefail
 browser_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$browser_root"
+# Some kernels/desktop policies deny LeakSanitizer's thread-attach operation.
+# Keep leak checks on by default; allow an explicit documented address/UB-only run.
+leak_checks=${CUBE_SANITIZER_LEAKS:-1}
+if [[ "$leak_checks" != 0 && "$leak_checks" != 1 ]]; then
+    echo 'CUBE_SANITIZER_LEAKS must be 0 or 1' >&2
+    exit 2
+fi
 export PKG_CONFIG_PATH="$browser_root/.deps/prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 quickjs_source="$browser_root/.deps/src/quickjs-2026-06-04"
 quickjs_objects=()
@@ -22,7 +29,7 @@ meson compile -C build/sanitize test-engine test-layout test-image test-storage 
 # Fontconfig/Pango keep global caches. Address/UB checks remain enabled for all
 # components; leak checks are retained for components that do not initialize fonts.
 for suite in storage ipc-and-address web-policy forms media sessions downloads images javascript-runtime; do
-    ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+    ASAN_OPTIONS=detect_leaks="$leak_checks":abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
         meson test -C build/sanitize --no-rebuild --print-errorlogs "$suite"
 done
 ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \

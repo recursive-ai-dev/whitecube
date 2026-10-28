@@ -131,10 +131,30 @@ attributes, text and child mutation, classList/dataset/inline style, input value
 checked state, and document title. EventTarget supports listeners, capture/bubble,
 once/passive and default cancellation. Native clicks and keyboard input dispatch
 click/key/input/submit/focus events; cancelled submission stays in the document.
-DOMContentLoaded follows the ordered classic/deferred script queue. Scripts run
-after HTML parsing; parser-blocking `document.write`, modules, dynamic script
-insertion, innerHTML, live collections, iframes, Shadow DOM and full CSSOM remain
-unsupported. Async script attributes use the deferred queue in this preview.
+Element `matches`/`closest` work on detached nodes. Selector lists return unique
+nodes in document order and retain commas inside quoted attributes. Element
+sibling traversal and descendant tag/class collections return snapshots. DOM
+`textContent` includes hidden descendants and is bounded by the 1 MiB host result
+limit, rather than the smaller form-value bound.
+
+`innerHTML` reads and replaces an element's children; `outerHTML` is read-only.
+`insertAdjacentHTML` and `insertAdjacentElement` support all four positions.
+HTML insertion uses the browser's bounded recovery parser, without the complete
+HTML context rules for tables, templates or foreign content. A fragment is limited
+to 60,000 UTF-8 bytes. Source, node, depth and control quotas are checked before
+changing the live tree; rejected fragments leave existing children intact.
+The document retains its 16,000-node, depth-128 and 128-control lifetime limits,
+including detached nodes, and a cumulative 4 MiB mutation-source budget. HTML
+serialization escapes text/attributes, preserves relative attribute URLs, emits
+attribute names in sorted order and rejects output over 128 KiB.
+
+Fragment scripts are inert. Styles/title declarations and external resource
+catalogs from fragments are discarded; inserted images do not fetch new resources.
+Inline style attributes still use the normal cascade and CSP checks. Inline event
+attributes are not evaluated. DOMContentLoaded follows the ordered classic/deferred
+script queue. Scripts run after HTML parsing; parser-blocking `document.write`,
+modules, dynamic script execution, live collections, iframes, Shadow DOM and full
+CSSOM remain unsupported. Async script attributes use the deferred queue.
 
 Promises and function-only timers run within interpreter budgets (64 active timers,
 16 timer callbacks per turn). Fetch supports GET with omit/same-origin credentials,

@@ -1,5 +1,5 @@
 [Desktop Entry]
-Name=Desktop Chat
+Name=Desktop Chat (Standalone)
 Comment=AI workspace with saved chats, local models and file tools
 Exec=whitecube-chat --show
 Icon=org.whitecube.DesktopChat.Standalone

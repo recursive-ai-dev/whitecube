@@ -32,7 +32,7 @@ function syncModals() {
 function updateModelControls() {
   modelPicker.disabled = sending || changingModel || switchingChat;
   refreshModelsBtn.disabled = sending || changingModel || switchingChat;
-  renameModelBtn.disabled = sending || changingModel || !modelData?.items.some(item => item.id === modelPicker.value);
+  renameModelBtn.disabled = sending || changingModel || switchingChat || !modelData?.items.some(item => item.id === modelPicker.value);
 }
 
 function renderModels(data) {
@@ -60,7 +60,7 @@ function renderModels(data) {
   } else if (selected !== 'api') {
     modelDetail.textContent = 'Refresh or choose another checkpoint. Switching models starts a new chat.';
   } else {
-    modelDetail.textContent = `${data.items.length} local checkpoints in ${data.directory}. Switching models starts a new chat.`;
+    modelDetail.textContent = data.items.length ? `${data.items.length} local checkpoints available. Switching models starts a new conversation.` : 'Configure your API connection and filesystem tools in Settings.';
   }
   updateModelControls();
 }
@@ -112,7 +112,14 @@ const activityEl = document.getElementById('activity');
 const latestBtn = document.getElementById('btn-latest');
 function draftKey() { return `desktop-chat-draft:${currentChat?.id || 'unsaved'}`; }
 function loadDraft() {
-  try { inputEl.value = localStorage.getItem(draftKey()) || ''; } catch { inputEl.value = ''; }
+  try {
+    let draft = localStorage.getItem(draftKey());
+    if (draft === null && !(currentChat?.messages?.length)) {
+      draft = localStorage.getItem('desktop-chat-draft');
+      if (draft !== null) { localStorage.setItem(draftKey(), draft); localStorage.removeItem('desktop-chat-draft'); }
+    }
+    inputEl.value = draft || '';
+  } catch { inputEl.value = ''; }
   updateComposer();
 }
 function updateComposer() {
@@ -388,7 +395,8 @@ const confirmBody = document.getElementById('confirm-body');
 
 window.api.onConfirmRequest(({ requestId, name, args, preview }) => {
   activeConfirm = requestId;
-  confirmTitle.textContent = `Allow ${name}?`;
+  const labels = { write_file: 'write this file', edit_file: 'edit this file', move_file: 'move this file' };
+  confirmTitle.textContent = `Allow ${labels[name] || name}?`;
   confirmBody.textContent = preview || JSON.stringify(args, null, 2);
   confirmOverlay.classList.remove('hidden');
   syncModals();
@@ -545,6 +553,8 @@ function updateChatControls() {
   document.getElementById('btn-chat-delete').disabled = blocked || !currentChat;
   document.getElementById('btn-export').disabled = blocked || !currentChat;
   for (const button of chatList.querySelectorAll('button')) button.disabled = blocked;
+  updateModelControls();
+  updateComposer();
 }
 function showHistoryError(err) { activityEl.textContent = err.message || String(err); }
 function chatDate(value) {
@@ -567,7 +577,7 @@ async function refreshChats() {
       const button = document.createElement('button'); button.className = 'chat-item';
       const active = chat.id === currentChat?.id;
       button.classList.toggle('active', active); button.setAttribute('aria-current', active ? 'true' : 'false');
-      button.setAttribute('role', 'listitem'); button.title = chat.title || 'New conversation';
+      button.title = chat.title || 'New conversation';
       for (const [cls, text] of [['chat-item-title', chat.title || 'New conversation'], ['chat-item-preview', chat.preview || 'Start with a message'], ['chat-item-meta', `${chatDate(chat.updatedAt)} · ${chat.messageCount || 0} messages`]]) {
         const el = document.createElement('span'); el.className = cls; el.textContent = text; button.appendChild(el);
       }
@@ -626,6 +636,8 @@ function openChatDialog(action) {
   chatDialogOverlay.classList.remove('hidden'); syncModals();
   if (removing) document.getElementById('chat-dialog-cancel').focus(); else { name.focus(); name.select(); }
 }
+const compactLayout = window.matchMedia('(max-width: 660px)');
+compactLayout.addEventListener('change', event => { if (event.matches) toggleSidebar(false); });
 document.getElementById('btn-sidebar').addEventListener('click', () => toggleSidebar());
 document.getElementById('btn-sidebar-new').addEventListener('click', () => newBtn.click());
 document.getElementById('chat-search').addEventListener('input', refreshChats);
@@ -641,6 +653,7 @@ document.getElementById('chat-dialog').addEventListener('submit', async e => {
       const result = await window.api.deleteChat(currentChat.id);
       try { localStorage.removeItem(`desktop-chat-draft:${oldId}`); } catch {}
       renderChat(result.activeChat || await window.api.getCurrentChat());
+      await refreshModels();
     } else {
       const title = document.getElementById('chat-name').value.trim();
       if (!title) throw new Error('Enter a conversation name.');

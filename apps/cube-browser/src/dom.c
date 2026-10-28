@@ -30,6 +30,71 @@ static int attached(struct node *n){unsigned depth=0;while(n&&n->parent&&depth++
 static void detach(struct node *n){struct node *p=n->parent;if(!p)return;struct node **at=&p->first,*previous=NULL;while(*at&&*at!=n){previous=*at;at=&(*at)->next;}if(*at){*at=n->next;if(p->last==n)p->last=previous;}n->next=NULL;n->parent=NULL;}
 static void append(struct node *parent,struct node *child,struct node *before){detach(child);child->parent=parent;struct node **at=&parent->first;while(*at&&*at!=before)at=&(*at)->next;child->next=*at;*at=child;if(!child->next)parent->last=child;}
 static unsigned subtree_depth(struct node *n){unsigned max=0;for(struct node *c=n->first;c;c=c->next){unsigned v=subtree_depth(c);if(v>max)max=v;}return max+1;}
+/* Fragment parsing is transactional. The temporary parser owns every allocation
+ * until all document quotas are checked. Its scripts, styles and resource catalog
+ * are deliberately discarded: DOM markup never grants a new network request or
+ * an additional script execution path. */
+static int insert_html(struct cb_dom *d,struct node *target,const char *position,const char *html){
+    struct cb_page *p=d->page;struct node *parent=target,*before=NULL;
+    int replace=!strcmp(position,"replace");
+    if(!replace&&strcmp(position,"beforeend")&&strcmp(position,"afterbegin")){
+        parent=target->parent;if(!parent||parent==p->root)return -1;
+        if(!strcmp(position,"beforebegin"))before=target;
+        else if(!strcmp(position,"afterend"))before=target->next;
+        else return -1;
+    }else if(!strcmp(position,"afterbegin"))before=target->first;
+    if(parent->tag[0]=='#'||cb_engine_is_void(parent->tag)||strlen(html)>60000||!g_utf8_validate(html,-1,NULL))return -1;
+    size_t bytes=strlen(html);if(bytes>4*TEXT_LIMIT-d->text_bytes)return -1;
+    struct cb_page *fragment=cb_page_parse(html,bytes,p->base);if(!fragment)return -1;
+    unsigned depth=0;for(struct node *at=parent;at;at=at->parent)depth++;
+    if(fragment->parse_incomplete||fragment->node_count-1>NODE_LIMIT-p->node_count||
+       depth+subtree_depth(fragment->root)-1>DEPTH_LIMIT||
+       fragment->control_count>CONTROL_LIMIT-p->control_count||fragment->control_overflow){cb_page_free(fragment);return -1;}
+    if(replace)while(target->first)detach(target->first);
+    for(guint i=1;i<fragment->nodes->len;i++){
+        struct node *child=g_ptr_array_index(fragment->nodes,i);
+        child->page=p;child->uid=(unsigned)++p->node_count;child->control=NULL;child->resource=SIZE_MAX;
+        g_ptr_array_add(p->nodes,child);
+    }
+    while(fragment->root->first)append(parent,fragment->root->first,before);
+    g_ptr_array_set_size(fragment->nodes,1);cb_page_free(fragment);
+    d->text_bytes+=bytes;d->dirty=1;return 0;
+}
+/* Bounded HTML serialization uses attributes rather than resolved URL fields,
+ * preserving relative references and preventing double entity decoding. */
+#define SERIALIZE_LIMIT (128u*1024u)
+static int html_append(GString *out,const char *value){size_t length=strlen(value);if(length>SERIALIZE_LIMIT-out->len)return -1;g_string_append(out,value);return 0;}
+static int html_escape(GString *out,const char *value,int attribute){
+    for(const char *s=value;*s;s++){
+        const char *entity=*s=='&'?"&amp;":*s=='<'?"&lt;":*s=='>'?"&gt;":attribute&&*s=='\"'?"&quot;":NULL;
+        if(entity){if(html_append(out,entity))return -1;}else{if(out->len>=SERIALIZE_LIMIT)return -1;g_string_append_c(out,*s);}
+    }return 0;
+}
+static int serialize_html(const struct node *n,GString *out){
+    if(n->text)return n->parent&&cb_engine_in_words("script style",n->parent->tag)?html_append(out,n->text):html_escape(out,n->text,0);
+    if(html_append(out,"<")||html_append(out,n->tag))return -1;
+    GList *keys=n->attrs?g_hash_table_get_keys(n->attrs):NULL;keys=g_list_sort(keys,(GCompareFunc)strcmp);
+    int failed=0;for(GList *at=keys;at&&!failed;at=at->next){const char *key=at->data;
+        failed=html_append(out," ")||html_append(out,key)||html_append(out,"=\"")||html_escape(out,g_hash_table_lookup(n->attrs,key),1)||html_append(out,"\"");}
+    g_list_free(keys);if(failed||html_append(out,">"))return -1;
+    if(cb_engine_is_void(n->tag))return 0;
+    for(const struct node *c=n->first;c;c=c->next)if(serialize_html(c,out))return -1;
+    return html_append(out,"</")||html_append(out,n->tag)||html_append(out,">");
+}
+/* A selector list is matched during one tree walk, so results remain unique and
+ * in document order. Quoted attribute commas and :not() commas are not split. */
+static int matches_list(const struct node *n,const char *selector){
+    char copy[1025];if(strlen(selector)>=sizeof copy)return 0;strcpy(copy,selector);
+    char *start=copy,quote=0;unsigned nesting=0;int match=0;
+    for(char *at=copy;;at++){
+        char ch=*at;if(ch=='\\'&&at[1]){at++;continue;}
+        if(quote){if(ch==quote)quote=0;}
+        else if(ch=='\"'||ch=='\'')quote=ch;
+        else if(ch=='['||ch=='(')nesting++;
+        else if((ch==']'||ch==')')&&nesting)nesting--;
+        if(!ch||(ch==','&&!quote&&!nesting)){*at=0;char *part=g_strstrip(start);if(*part&&cb_engine_selector_matches(n,part))match=1;if(!ch)break;start=at+1;}
+    }return match;
+}
 static void emit(struct cb_dom *d,unsigned type,unsigned a,unsigned b,const char *text,int fd){struct cb_message m={.type=type,.fd=fd,.a=a,.b=b};if(text)snprintf(m.text,sizeof m.text,"%.8191s",text);cb_send(d->socket,&m);if(fd>=0)close(fd);}
 static void log_message(void *opaque,unsigned level,const char *text){emit(opaque,CB_CONSOLE,level,0,text,-1);}
 static void refresh_controls(struct cb_dom *d){
@@ -57,8 +122,16 @@ static int set_attr(struct cb_dom *d,struct node *n,const char *name,const char 
     g_free(key);d->dirty=1;return 0;
 }
 static void query_nodes(struct node *root,const char *selector,int id,int include,GString *out,unsigned *count){
-    if(include&&root->tag[0]!='#'&&((id&&root->id&&!strcmp(root->id,selector))||(!id&&cb_engine_selector_matches(root,selector)))){if((*count)++)g_string_append_c(out,',');g_string_append_printf(out,"%u",root->uid);}
+    if(include&&root->tag[0]!='#'&&((id&&root->id&&!strcmp(root->id,selector))||(!id&&matches_list(root,selector)))){if((*count)++)g_string_append_c(out,',');g_string_append_printf(out,"%u",root->uid);}
     for(struct node *c=root->first;c;c=c->next)query_nodes(c,selector,id,1,out,count);
+}
+/* Form label extraction intentionally truncates at VALUE_LIMIT and omits hidden
+ * nodes. DOM textContent includes hidden text and has the larger host-result
+ * budget; sharing that helper silently truncated normal page data at 4095 bytes. */
+static int dom_text(const struct node *n,GString *out){
+    if(n->text){size_t size=strlen(n->text);if(size>TEXT_LIMIT-out->len)return -1;g_string_append_len(out,n->text,size);}
+    for(const struct node *c=n->first;c;c=c->next)if(dom_text(c,out))return -1;
+    return 0;
 }
 static char *get(struct cb_dom *d,struct node *n,const char *key){
     if(!strcmp(key,"nodeType"))return number(n==d->page->root?9:n->text?3:1);
@@ -66,7 +139,7 @@ static char *get(struct cb_dom *d,struct node *n,const char *key){
     if(!strcmp(key,"parentNode"))return number(n->parent?n->parent->uid:0);
     if(!strcmp(key,"nextSibling"))return number(n->next?n->next->uid:0);
     if(!strcmp(key,"childNodes")){GString *out=g_string_new("[");for(struct node *c=n->first;c;c=c->next)g_string_append_printf(out,"%s%u",c==n->first?"":",",c->uid);g_string_append_c(out,']');return g_string_free(out,FALSE);}
-    if(!strcmp(key,"textContent")||!strcmp(key,"data")){GString *out=g_string_new(NULL);cb_engine_raw_node_text(n,out);char *text=quote(out->str);g_string_free(out,TRUE);return text;}
+    if(!strcmp(key,"textContent")||!strcmp(key,"data")){GString *out=g_string_new(NULL);char *text=dom_text(n,out)?NULL:quote(out->str);g_string_free(out,TRUE);if(text&&strlen(text)>TEXT_LIMIT){g_free(text);text=NULL;}return text;}
     if(!strcmp(key,"value"))return quote(n->control?n->control->kind==C_SELECT&&n->control->selected>=0?n->control->options[n->control->selected].value:n->control->value:n->value?n->value:"");
     if(!strcmp(key,"checked"))return boolean(n->control?n->control->checked:n->checked);
     if(!strcmp(key,"disabled"))return boolean(n->disabled);
@@ -74,6 +147,12 @@ static char *get(struct cb_dom *d,struct node *n,const char *key){
     if(!strcmp(key,"title")&&n==d->page->root)return quote(d->page->title);
     if(!strcmp(key,"href"))return quote(n->href?n->href:"");
     if(!strcmp(key,"isConnected"))return boolean(attached(n));
+    if((!strcmp(key,"innerHTML")||!strcmp(key,"outerHTML"))&&n->tag[0]!='#'){
+        GString *out=g_string_new(NULL);int failed=0;
+        if(!strcmp(key,"outerHTML"))failed=serialize_html(n,out);
+        else for(struct node *c=n->first;c&&!failed;c=c->next)failed=serialize_html(c,out);
+        char *result=failed?NULL:quote(out->str);g_string_free(out,TRUE);return result;
+    }
     if(!strcmp(key,"activeElement"))return number(d->page->focus?d->page->focus->uid:0);
     return NULL;
 }
@@ -86,7 +165,7 @@ static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
         if(!strcmp(key,"textContent")||!strcmp(key,"data")){
             if(length>TEXT_LIMIT||d->text_bytes+length>4*TEXT_LIMIT)return NULL;
             d->text_bytes+=length;
-            if(n->text){g_free(n->text);n->text=g_strdup(value);}else{while(n->first)detach(n->first);if(length){struct node *c=cb_engine_new_node(p,n,"#text");if(!c)return NULL;c->text=g_strdup(value);}}
+            if(n->text){g_free(n->text);n->text=g_strdup(value);}else{struct node *c=length?cb_engine_new_node(p,NULL,"#text"):NULL;if(length&&!c)return NULL;while(n->first)detach(n->first);if(c){c->text=g_strdup(value);append(n,c,NULL);}}
             if(n->control&&(n->control->kind==C_BUTTON||n->control->kind==C_SUBMIT)){g_free(n->control->label);n->control->label=g_strdup(value);}
         }else if(!strcmp(key,"value")&&n->control){if(length>VALUE_LIMIT)return NULL;struct control *c=n->control;
             if(c->kind==C_SELECT){for(unsigned i=0;i<c->option_count;i++)if(!strcmp(c->options[i].value,value))c->selected=(int)i;}
@@ -130,6 +209,8 @@ static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
         if(strlen(argv[2])>=sizeof write->key||strlen(argv[3])>=sizeof write->value){g_free(write);return NULL;}strcpy(write->key,argv[2]);strcpy(write->value,argv[3]);
         int fd=cb_document_fd((const char *)write,sizeof *write);g_free(write);if(fd<0)return NULL;emit(d,CB_STORAGE_WRITE,0,0,NULL,fd);return boolean(1);
     }
+    if(op==12&&argc==3&&n){if(insert_html(d,n,argv[1],argv[2]))return NULL;refresh_controls(d);if(p->focus&&!attached(p->focus))p->focus=NULL;return boolean(1);}
+    if(op==13&&argc==2&&n&&n->tag[0]!='#')return boolean(matches_list(n,argv[1]));
     return NULL;
 }
 static int dispatch(struct cb_dom *d,struct node *n,const char *type,const char *key){

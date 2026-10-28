@@ -1,0 +1,61 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: cube-browser
+Source: https://github.com/recursive-ai-dev/whitecube
+
+Files: *
+Copyright: 2026 recursive-ai-dev and Whitecube contributors
+License: Apache-2.0
+Comment: A complete copy is installed as COPYING in this directory.
+
+Files: usr/lib/cube-browser/lib/libcairo*
+Copyright: The Cairo contributors
+License: LGPL-2.1 or MPL-1.1
+Comment: Cairo is a private unmodified shared library, dynamically linked so
+ it can be replaced with a compatible build. Upstream notices and COPYING
+ files are in licenses/. Source: https://cairographics.org/releases/,
+ cairo-1.18.4.tar.xz. Choose LGPL-2.1 for this distribution.
+
+Files: usr/lib/cube-browser/cube-netd
+Copyright: 2026 recursive-ai-dev and the Mbed TLS contributors
+License: Apache-2.0
+Comment: Statically includes Mbed TLS 3.6.7. Complete upstream license in
+ licenses/mbedtls-LICENSE.
+
+Files: usr/lib/cube-browser/cube-renderd
+Copyright: 2026 recursive-ai-dev and the QuickJS, libjpeg-turbo and NanoSVG contributors
+License: Apache-2.0 and MIT and BSD-3-Clause and IJG and Zlib
+Comment: Statically includes QuickJS 2026-06-04, libjpeg-turbo 2.1.5 and
+ NanoSVG. Upstream notices are in licenses/.
+
+Files: usr/lib/cube-browser/cube-browser
+Copyright: 2026 recursive-ai-dev
+License: Apache-2.0 and public-domain
+Comment: Statically includes SQLite 3.53.4, which is in the public domain.
+ The public-domain declaration is included in licenses/sqlite-PUBLIC-DOMAIN.
+
+License: Apache-2.0
+ On Debian systems the complete license is available at
+ /usr/share/common-licenses/Apache-2.0 and in COPYING beside this file.
+
+License: LGPL-2.1
+ The complete license is in licenses/COPYING-LGPL-2.1 and, on Debian
+ systems, /usr/share/common-licenses/LGPL-2.1.
+
+License: MPL-1.1
+ The complete upstream license is in licenses/COPYING-MPL-1.1.
+
+License: MIT
+ See the complete upstream license in licenses/quickjs-LICENSE.
+
+License: BSD-3-Clause
+ See the complete upstream notices in licenses/libjpeg-turbo-copyright.
+
+License: IJG
+ See the complete upstream notices in licenses/libjpeg-turbo-copyright.
+
+License: Zlib
+ See the complete upstream notices in licenses/nanosvg-LICENSE and
+ licenses/libjpeg-turbo-copyright.
+
+License: public-domain
+ SQLite is in the public domain. See licenses/sqlite-PUBLIC-DOMAIN.

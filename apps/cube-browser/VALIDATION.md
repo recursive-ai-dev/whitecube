@@ -1,3 +1,79 @@
+# Cube Browser 0.10.0 validation
+
+Validated locally on Ubuntu 26.04.1 amd64, Linux 7.0.0-38, 2026-10-27.
+The UI, renderer and network worker are built against system desktop libraries,
+with the pinned private X-free Cairo and static SQLite, JPEG, QuickJS and Mbed TLS.
+
+## Current release checks
+
+Timed JavaScript/DOM and native UI suites are scheduled without competing Meson
+tests. The package builder also runs its release gate sequentially. Production
+JavaScript execution limits remain unchanged.
+
+- `./BUILD.sh`: 22 core/worker suites passed, zero failures. The default native
+  integration entry skips when the adjacent Whitecube compositor is absent;
+  the complete native test passed separately against extracted Weston 14 below.
+- `python3 scripts/corpus.py --output build/release-0.10/corpus`: all 10 fixture
+  documents rendered at 1120 and 640 pixels; 20 PNGs, median 492.01 ms on this
+  host. Text assertions and private profile nonpersistence passed. This is a
+  smoke measurement rather than a cross-machine performance benchmark.
+- `python3 scripts/e2e.py --weston-dir .deps/weston --artifacts
+  build/release-0.10/wayland`: real native Wayland presentation passed, with 253
+  shared-memory commits and 252 compositor releases in the recorded run. The
+  local proxy supplies isolated keyboard events; Weston performs actual window
+  configure, presentation and buffer release. Counts vary with scheduling.
+- The native test covers navigation, history traversal, zoom/find, GET/POST forms,
+  cookies/cache, script events and storage, cancellation, settings/diagnostics,
+  downloads, anchors, responsive SVG/tables, preference changes, renderer crash
+  recovery and keyboard close. New workflows verify bookmarks persist across
+  windows, Ctrl+Shift+B opens the library, private reads succeed and private
+  add/remove attempts leave the database's bytes and mtime unchanged.
+- `python3 tests/test_package.py dist/cube-browser_0.10.0_amd64.deb`: all three
+  archive tests passed, including extraction into a directory containing spaces,
+  relocation, desktop validation, payload checksums, private Cairo resolution,
+  no checkout runtime paths, worker diagnostics, local HTML/text and PNG exports.
+- `apt-get --simulate install ./dist/cube-browser_0.10.0_amd64.deb`: accepted on
+  this host, with Cube Browser as the only new package. No system installation
+  was performed. The generated dependency set includes `libc6 (>= 2.43)`; this
+  artifact does not target older Debian/Ubuntu library stacks.
+
+Regression coverage adds UTF-8/URL validation, escaped bounded bookmark lists,
+owner-only profiles, symlink refusal, bookmark capacity/upserts, private mutation
+refusal, read-only missing config behavior, corrected defaults, CLI diagnostics,
+relative paths and ambiguous argument refusal. Private history exports never read
+or change an existing saved-history database. DOM regressions cover inert markup
+insertion, detached node lifetimes, selector-list ordering and quoted commas,
+text/attribute escaping, depth/node/control bounds, atomic quota failures,
+serialization limits, and complete DOM textContent including hidden descendants.
+
+All browser/network fixtures use loopback servers and temporary HOME/XDG profiles.
+The tests do not connect to the live desktop, modify the user's profile, change
+the default browser or require a system package installation. Screenshots and the
+corpus report are in `build/release-0.10/`. The link closure check confirms no
+X11/XCB/SDL dependency in the application and its workers.
+
+## Current sanitizer results
+
+`CUBE_SANITIZER_LEAKS=0 scripts/check-sanitizers.sh` passed all 13 component
+suites with AddressSanitizer and UndefinedBehaviorSanitizer, including the
+instrumented QuickJS core. Covered: storage, IPC/address, web policy, forms,
+media, sessions, downloads, images, JS runtime, engine, layout, DOM lifecycle and
+mutation smoke. Log: `build/release-0.10/sanitizers.log`.
+
+Leak scanning is **not validated on this host**: the default leak-enabled run
+aborted because LeakSanitizer could not attach to its own process (errno 1).
+The address/undefined-behavior run explicitly disabled leak scanning. The script
+retains leak scanning by default on hosts that permit it; no system tracing or
+security policy was changed. Font-related suites already disable leak scanning
+because of retained Pango/Fontconfig caches. UI/Wayland and production network
+workers are exercised by the normal suites; sanitizer components omit worker
+address-space limits to accommodate ASan shadow memory.
+
+The older measurements below are historical 0.9.0 evidence and should not be
+read as fresh 0.10.0 results.
+
+---
+
 # Cube Browser 0.9.0 validation
 
 Validated on Debian 13, Linux 6.12.107, 2026-10-09. The local launcher and built

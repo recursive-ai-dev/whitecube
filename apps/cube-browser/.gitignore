@@ -2,3 +2,6 @@
 /.deps/
 /__pycache__/
 *.pyc
+
+/build-deb/
+/dist/

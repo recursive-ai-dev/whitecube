@@ -45,6 +45,61 @@ class Web(unittest.TestCase):
             r=self.dump(url+'/page');self.assertIn('ABCDEP FETCH_OK',r.stdout);self.assertIn('/api',requests)
             self.assertEqual(next(h['Origin'] for path,h in stats['headers'] if path=='/api'),url)
         self.assertFalse((self.root/'data').exists())
+    def test_html_fragments_serialize_replace_and_keep_scripts_resources_inert(self):
+        html=b'''<body><div id="out"><b id="old">old</b></div><p id="status">initial</p><script>
+        const out=document.getElementById('out'),old=document.getElementById('old');
+        out.innerHTML='<a id="link" href="/relative" title="&quot;&amp;&lt;">A &amp; B</a><input id="edit" value="ready">';
+        if(old.isConnected||old.textContent!=='old')throw Error('removed subtree');
+        if(out.innerHTML!=='<a href="/relative" id="link" title="&quot;&amp;&lt;">A &amp; B</a><input id="edit" value="ready">')throw Error('serialization '+out.innerHTML);
+        const link=out.firstElementChild;
+        link.insertAdjacentHTML('beforebegin','<span id="before">before</span>');
+        link.insertAdjacentHTML('afterend','<span id="after">after</span>');
+        link.insertAdjacentHTML('afterbegin','<b>first</b>');
+        link.insertAdjacentHTML('beforeend','<i>last</i>');
+        if(link.textContent!=='firstA & Blast'||link.previousElementSibling.id!=='before'||link.nextElementSibling.id!=='after')throw Error('positions');
+        document.getElementById('edit').value='changed';
+        if(document.getElementById('edit').value!=='changed')throw Error('fragment control');
+        out.insertAdjacentHTML('beforeend','<script src="/never-script.js">document.title="BAD";<'+ '/script><img src="/never-image.png"><link rel="stylesheet" href="/never.css">');
+        if(document.title==='BAD')throw Error('inert script');
+        document.getElementById('status').textContent='FRAGMENTS_OK';
+        </script></body>'''
+        with server({'/page':(200,'text/html',html,0)}) as (url,requests,_):
+            r=self.dump(url+'/page');self.assertIn('FRAGMENTS_OK',r.stdout);self.assertNotIn('console:',r.stderr)
+            self.assertEqual(requests,['/page'])
+    def test_fragment_quotas_are_atomic_and_selectors_work_on_detached_nodes(self):
+        html=b'''<body><div id="out">safe</div><p id="first" class="same"></p><p id="second" class="same" data-list="a,b"></p><script>
+        const out=document.getElementById('out');let blocked=0;
+        for(const value of ['x'.repeat(60001),'<div>'.repeat(130)+'deep'+'</div>'.repeat(130)]){
+          try{out.innerHTML=value;}catch(e){blocked++;}
+          if(out.textContent!=='safe')throw Error('failed operation mutated document');
+        }
+        const detached=document.createElement('section');detached.className='chosen';
+        if(!detached.matches('section.chosen')||detached.closest('.chosen')!==detached)throw Error('detached matching');
+        const ordered=document.querySelectorAll('#second,#first,.same');
+        if(ordered.length!==2||ordered[0].id!=='first'||ordered[1].id!=='second')throw Error('selector order');
+        if(document.querySelector('[data-list="a,b"]')!==ordered[1])throw Error('quoted comma');
+        if(blocked!==2)throw Error('missing quota');
+        out.textContent='FRAGMENT_LIMITS_OK';
+        </script></body>'''
+        with server({'/page':(200,'text/html',html,0)}) as (url,_,__):
+            r=self.dump(url+'/page');self.assertIn('FRAGMENT_LIMITS_OK',r.stdout);self.assertNotIn('console:',r.stderr)
+    def test_fragment_control_capacity_and_serialization_bounds(self):
+        html=b'''<body><div id="out">safe</div><div id="large"></div><p id="status">initial</p><script>
+        const out=document.getElementById('out'),large=document.getElementById('large');
+        out.innerHTML='<input value="safe">'.repeat(128);
+        const first=out.firstChild;let blocked=0;
+        try{out.innerHTML='<input value="replaced">';}catch(e){blocked++;}
+        if(out.children.length!==128||out.firstChild!==first||first.value!=='safe')throw Error('control quota changed children');
+        for(let i=0;i<3;i++)large.append(document.createTextNode('x'.repeat(60000)));
+        const hidden=document.createElement('span');hidden.hidden=true;hidden.textContent='hidden';large.append(hidden);
+        try{large.innerHTML;}catch(e){blocked++;}
+        if(large.textContent.length!==180006)throw Error('DOM text truncated or skipped hidden nodes');
+        large.textContent='';out.textContent='';
+        if(blocked!==2)throw Error('missing control or serialization limit');
+        document.getElementById('status').textContent='CONTROL_SERIALIZATION_LIMITS_OK';
+        </script></body>'''
+        with server({'/page':(200,'text/html',html,0)}) as (url,_,__):
+            r=self.dump(url+'/page');self.assertIn('CONTROL_SERIALIZATION_LIMITS_OK',r.stdout);self.assertNotIn('console:',r.stderr)
     def test_fetch_origin_redirect_and_text_boundaries(self):
         routes={}
         with server(routes) as (url,requests,stats):

@@ -1,3 +1,52 @@
+# Cube Browser 0.10.0
+
+Built locally on 2026-10-27. The standalone Debian package is
+`dist/cube-browser_0.10.0_amd64.deb`; install with
+`sudo apt install ./dist/cube-browser_0.10.0_amd64.deb`. This release remains an
+independent-engine web preview with the compatibility limits in COMPATIBILITY.md.
+
+## Changes from 0.9.0
+
+- Standalone Debian packaging with a relocatable launcher, sandboxed workers,
+  private X-free Cairo, desktop icon, HTML/HTTP/HTTPS handlers and private-window
+  action. ELF dependencies are generated from the actual binaries. Bundled
+  dependency notices, checksums and extracted-package tests are included.
+- Persistent owner-only SQLite bookmarks, add/remove via Ctrl+D or the address
+  star, a `cube:bookmarks` library, Ctrl+Shift+B and settings entries. Private
+  windows can read bookmarks; mutations are refused before any disk access.
+- Bounded transactional `innerHTML` and adjacent HTML insertion, escaped markup
+  serialization, element sibling navigation and collection helpers. Selector
+  lists now return unique matches in document order, including quoted commas;
+  detached elements support `matches` and `closest`.
+- A refreshed start page, a dedicated private start page, private-window shortcut
+  Ctrl+Shift+P, and private history that never opens or clears saved history.
+- Fixed the unrecognized default homepage and switched default search to the
+  lightweight DuckDuckGo HTML endpoint. Legacy `cube:start` URLs resolve to
+  `cube:home`. Configuration reads no longer create
+  or chmod directories.
+- `--check` reports worker, certificate, Landlock and Wayland prerequisites without
+  touching profiles. CLI supports relative HTML paths, `--` for URL handlers and
+  refuses ambiguous multiple destinations/exports.
+
+## Build and validation
+
+Use `./BUILD.sh` for the complete core/worker suite,
+`scripts/check-sanitizers.sh` for component ASan/UBSan checks,
+`scripts/corpus.py --output build/release-0.10/corpus` for rendering fixtures,
+and `scripts/e2e.py` for native Wayland workflows. An optional `--weston-dir`
+selects an extracted Weston headless compositor. The tests use temporary profiles
+and never interact with the live desktop. See VALIDATION.md for release results.
+
+Run `python3 packaging/build-deb.py` and then
+`python3 tests/test_package.py dist/cube-browser_0.10.0_amd64.deb` to rebuild and
+verify the archive. The build targets Ubuntu 26.04 amd64; older distributions may
+not satisfy its library requirements. Wayland is required for native windows.
+No system package was installed and no default-browser setting was changed.
+
+The previous release notes below describe 0.9.0's original local release.
+
+---
+
 # Cube Browser 0.9.0
 
 Released locally on 2026-10-09 after the eight-phase development sprint. The

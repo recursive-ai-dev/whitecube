@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -52,6 +53,62 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.run_browser('--render', 'cube:home', str(output), '99999x600').returncode, 2)
         self.assertEqual(self.run_browser('--unknown').returncode, 2)
         self.assertEqual(self.run_browser('--dump', 'javascript:alert(1)').returncode, 1)
+    def test_information_commands_do_not_create_profiles(self):
+        for arg in ('--help', '--version', '--check'):
+            with self.subTest(arg=arg):
+                result = self.run_browser(arg)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((self.home/'data').exists())
+                self.assertFalse((self.home/'config').exists())
+        self.assertIn('No Wayland socket', self.run_browser('--check').stdout)
+
+    def test_check_reports_missing_workers(self):
+        app = self.home/'incomplete-install'
+        app.mkdir()
+        shutil.copy2(BROWSER, app/'cube-browser')
+        result = subprocess.run([str(app/'cube-browser'), '--check'], env=self.env,
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('MISSING or not executable', result.stdout)
+        self.assertFalse((self.home/'config').exists())
+
+    def test_relative_local_file_and_ambiguous_cli(self):
+        page = self.home/'relative page.html'
+        page.write_text('<p>Opened relative document</p>')
+        result = subprocess.run([str(BROWSER), '--dump', page.name], cwd=self.home,
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Opened relative document', result.stdout)
+        for args in (('--dump', 'cube:home', 'cube:about'),
+                     ('--dump', 'cube:home', '--dump', 'cube:about'),
+                     ('--', 'cube:home', 'cube:about'), ('--quit-after', 'NaN')):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_browser(*args).returncode, 2)
+        # Once -- ends options, --version is treated as an address, not a command.
+        result = self.run_browser('--quit-after', '0.01', '--', '--version')
+        self.assertNotIn('interactive-web preview', result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_private_pages_do_not_read_or_write_saved_history(self):
+        data = self.home/'data/cube-browser'
+        data.mkdir(parents=True, mode=0o700)
+        db = data/'history.sqlite3'
+        with sqlite3.connect(db) as connection:
+            connection.execute('CREATE TABLE history(url TEXT PRIMARY KEY,title TEXT,visited INTEGER)')
+            connection.execute("INSERT INTO history VALUES ('https://example.com','SAVED_SECRET',123)")
+        before = db.read_bytes()
+        result = self.run_browser('--dump', 'cube:history')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('private trail', result.stdout)
+        self.assertNotIn('SAVED_SECRET', result.stdout)
+        self.assertEqual(before, db.read_bytes())
+        self.assertEqual(list(data.iterdir()), [db])
+        self.assertFalse((self.home/'config').exists())
+        result = self.run_browser('--dump', 'cube:bookmarks')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Bookmarks', result.stdout)
+        self.assertEqual(list(data.iterdir()), [db])
+
     def test_installer_preserves_settings_and_backups(self):
         config = self.home/'config/whitecube/config'
         config.parent.mkdir(parents=True)

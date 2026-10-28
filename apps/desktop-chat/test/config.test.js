@@ -68,3 +68,21 @@ test('invalid settings types never replace a saved configuration', () => fixture
     assert.equal(fs.readFileSync(path.join(directory, 'config.json'), 'utf8'), before);
   }
 }));
+
+test('generation preferences persist across partial settings writes and reject invalid values', () => fixture((config, directory) => {
+  config.save({ toolsEnabled: false, temperature: 1.2, maxTokens: 512 });
+  config.save({ model: 'new-model' });
+  const saved = config.load();
+  assert.equal(saved.toolsEnabled, false); assert.equal(saved.temperature, 1.2); assert.equal(saved.maxTokens, 512);
+  const before = fs.readFileSync(path.join(directory, 'config.json'), 'utf8');
+  for (const bad of [{ toolsEnabled: 'false' }, { temperature: -1 }, { temperature: NaN }, { maxTokens: 0 }, { maxTokens: 32769 }, { maxTokens: 1.5 }, { apiKey: 42 }, { apiKey: 'invalid\nkey' }]) {
+    assert.throws(() => config.save(bad));
+    assert.equal(fs.readFileSync(path.join(directory, 'config.json'), 'utf8'), before);
+  }
+}));
+
+test('malformed generation preferences fall back to usable defaults', () => fixture((config, directory) => {
+  fs.writeFileSync(path.join(directory, 'config.json'), JSON.stringify({ toolsEnabled: 'false', temperature: -1, maxTokens: 999999 }));
+  const settings = config.load();
+  assert.equal(settings.toolsEnabled, true); assert.equal(settings.temperature, 0.7); assert.equal(settings.maxTokens, 8192);
+}));

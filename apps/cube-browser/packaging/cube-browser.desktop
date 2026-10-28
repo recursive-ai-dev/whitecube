@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Cube Browser
+GenericName=Web Browser
+Comment=Browse and preview the web in a native Wayland window
+Exec=cube-browser -- %u
+TryExec=cube-browser
+Icon=cube-browser
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=text/html;application/xhtml+xml;x-scheme-handler/http;x-scheme-handler/https;
+StartupNotify=false
+StartupWMClass=cube-browser
+Actions=Private;
+
+[Desktop Action Private]
+Name=New Private Window
+Exec=cube-browser --private
