@@ -300,6 +300,7 @@ struct wc_server {
 	struct wl_listener output_manager_apply, output_manager_test, layout_change;
 	struct timespec config_mtime[2];
 	struct wc_toplevel *focused, *normal;
+	uint64_t focus_order;
 	struct wc_drag drag;
 	struct wc_desktop_state layout;
 	char state_directory[512];
@@ -350,6 +351,7 @@ struct wc_toplevel {
 	int configured_w, configured_h;
 	unsigned workspace;
 	int saved_index, layout_x, layout_y, layout_w, layout_h;
+	uint64_t focus_order;
 };
 struct wc_keyboard {
 	struct wl_list link;
@@ -440,6 +442,20 @@ static bool wc_is_ancestor(struct wc_toplevel *t, struct wc_toplevel *of) {
 		if (p == t->xdg_toplevel) return true;
 	return false;
 }
+static bool wc_in_focus_chain(struct wc_toplevel *t, struct wc_toplevel *focused) {
+	return t == focused || wc_is_ancestor(t, focused);
+}
+static void wc_raise_family(struct wc_toplevel *t) {
+	if (!t) return;
+	wc_raise_family(wc_toplevel_of(t->xdg_toplevel->parent));
+	if (t->scene_tree->node.enabled) wlr_scene_node_raise_to_top(&t->scene_tree->node);
+}
+static struct wc_toplevel *wc_fullscreen_window(struct wc_server *s) {
+	if (s->desktop_visible) return NULL;
+	for (struct wc_toplevel *t = s->focused; t; t = wc_toplevel_of(t->xdg_toplevel->parent))
+		if (t->mapped && !t->hidden && t->workspace == s->workspace && t->fullscreen) return t;
+	return NULL;
+}
 static bool wc_idle_inhibited(struct wc_server *s);
 static void wc_save_layout(struct wc_server *s) {
 	if (s->shutting_down || !s->state_directory[0]) return;
@@ -497,9 +513,8 @@ static void wc_retile(struct wc_server *server) {
 	if (W <= 0 || H <= 0) return;
 	struct wlr_box box;
 	wlr_output_layout_get_box(server->output_layout, out->wlr_output, &box);
-	struct wc_toplevel *full = server->focused && server->focused->fullscreen &&
-		!server->desktop_visible && !server->focused->hidden && server->focused->mapped &&
-		server->focused->workspace == server->workspace ? server->focused : NULL;
+	struct wc_toplevel *full = wc_fullscreen_window(server);
+	int work_y = full ? 0 : g_tab_h, work_h = H - work_y;
 	fullscreen_hint(full != NULL || server->locked);
 	wlr_scene_node_set_enabled(&server->top->node, !full && !server->locked);
 	wlr_scene_rect_set_size(out->tab_bg, W, g_tab_h);
@@ -537,39 +552,45 @@ static void wc_retile(struct wc_server *server) {
 			}
 		}
 		bool show = t->mapped && t->workspace == server->workspace && !t->hidden && !server->desktop_visible &&
-			(full ? t == full : (t == server->normal || is_scripts(t) || wc_is_ancestor(t, server->normal)));
+			(full ? t == full || (wc_is_ancestor(full, t) && wc_in_focus_chain(t, server->focused)) :
+			(wc_in_focus_chain(t, server->normal) || wc_in_focus_chain(t, server->focused) || is_scripts(t)));
 		wlr_scene_node_set_enabled(&t->scene_tree->node, show);
 		if (!show) continue;
-		int x = 0, y = full ? 0 : g_tab_h, w = W, h = H - y;
+		int x = 0, y = work_y, w = W, h = work_h;
 		if (is_scripts(t) && !full && !t->maximized) {
 			w = W * 88 / 100; h = (H - g_tab_h) * 47 / 100;
 			x = (W - w) / 2; y = H - h - 20;
 			if (y < g_tab_h) y = g_tab_h;
 		}
-		if (!full && !t->maximized && t->layout_w > 0 && t->layout_h > 0) {
-			x = W * t->layout_x / 1000; y = g_tab_h + (H - g_tab_h) * t->layout_y / 1000;
-			w = W * t->layout_w / 1000; h = (H - g_tab_h) * t->layout_h / 1000;
+		if (t != full && !t->maximized && t->layout_w > 0 && t->layout_h > 0) {
+			x = W * t->layout_x / 1000; y = work_y + work_h * t->layout_y / 1000;
+			w = W * t->layout_w / 1000; h = work_h * t->layout_h / 1000;
 		}
 		if (is_dialog(t) && t != full && !t->maximized && !(t->layout_w > 0 && t->layout_h > 0)) {
 			/* The client's own size (it was configured 0x0), within 90% of the screen. */
 			struct wlr_box geo; wlr_xdg_surface_get_geometry(t->xdg_toplevel->base, &geo);
-			int max_w = W * 9 / 10, max_h = (H - g_tab_h) * 9 / 10;
+			int max_w = W * 9 / 10, max_h = work_h * 9 / 10;
 			int min_w = t->xdg_toplevel->current.min_width, min_h = t->xdg_toplevel->current.min_height;
 			w = geo.width > 0 ? geo.width : W * 7 / 10;
-			h = geo.height > 0 ? geo.height : (H - g_tab_h) * 3 / 4;
+			h = geo.height > 0 ? geo.height : work_h * 3 / 4;
 			if (w < min_w) w = min_w;
 			if (h < min_h) h = min_h;
 			if (w > max_w) w = max_w;
 			if (h > max_h) h = max_h;
-			x = (W - w) / 2; y = g_tab_h + (H - g_tab_h - h) / 2;
+			x = (W - w) / 2; y = work_y + (work_h - h) / 2;
 		}
 		wlr_scene_node_set_position(&t->scene_tree->node, box.x + x, box.y + y);
 		if (t->configured_w != w || t->configured_h != h) {
 			wlr_xdg_toplevel_set_size(t->xdg_toplevel, w, h);
 			t->configured_w = w; t->configured_h = h;
 		}
-		if (is_scripts(t) || is_dialog(t)) wlr_scene_node_raise_to_top(&t->scene_tree->node);
 	}
+	/* Layout order also drives tabs, so never reorder it to change stacking.
+	 * Raise parents before their dialogs, with the focused family last. */
+	wc_raise_family(server->normal);
+	wl_list_for_each(t, &server->toplevels, link)
+		if (is_scripts(t)) wc_raise_family(t);
+	wc_raise_family(server->focused);
 	wc_more_update(server, out, W, n_tabs, vis);
 	/* Persist the final placement once on release, rather than fsync per motion. */
 	if (!server->drag.toplevel) wc_save_layout(server);
@@ -582,6 +603,7 @@ static void wc_focus(struct wc_toplevel *t) {
 	if (s->focused && s->focused != t)
 		wlr_xdg_toplevel_set_activated(s->focused->xdg_toplevel, false);
 	s->focused = t; t->hidden = false; s->desktop_visible = false;
+	t->focus_order = ++s->focus_order;
 	if (!is_scripts(t)) s->normal = t;
 	s->saved_focus[s->workspace] = t; s->saved_normal[s->workspace] = s->normal;
 	/* Each set_activated is a configure; clients repaint on it, which delayed
@@ -599,7 +621,8 @@ static bool wc_start_drag(struct wc_server *s, struct wc_toplevel *t, uint32_t b
 	if (!out) return false;
 	int W, H;
 	wlr_output_effective_resolution(out->wlr_output, &W, &H);
-	H -= g_tab_h;
+	int work_y = wc_fullscreen_window(s) ? 0 : g_tab_h;
+	H -= work_y;
 	if (W <= 0 || H <= 0 || t->configured_w <= 0 || t->configured_h <= 0) return false;
 	struct wlr_box box;
 	wlr_output_layout_get_box(s->output_layout, out->wlr_output, &box);
@@ -609,7 +632,7 @@ static bool wc_start_drag(struct wc_server *s, struct wc_toplevel *t, uint32_t b
 		.toplevel = t, .button = button, .resize = button == BTN_RIGHT,
 		.pointer_x = s->cursor->x, .pointer_y = s->cursor->y, .work_w = W, .work_h = H,
 		.x = bounded((int)lround((t->scene_tree->node.x - box.x) * 1000.0 / W), 0, 1000 - w),
-		.y = bounded((int)lround((t->scene_tree->node.y - box.y - g_tab_h) * 1000.0 / H), 0, 1000 - h),
+		.y = bounded((int)lround((t->scene_tree->node.y - box.y - work_y) * 1000.0 / H), 0, 1000 - h),
 		.w = w, .h = h,
 	};
 	wlr_seat_pointer_clear_focus(s->seat);
@@ -671,9 +694,11 @@ static void wc_focus_available(struct wc_server *s) {
 	if (s->focused) wlr_xdg_toplevel_set_activated(s->focused->xdg_toplevel, false);
 	s->focused = NULL; s->saved_focus[s->workspace] = NULL;
 	if (s->locked) { wc_lock_focus(s); wc_retile(s); return; }
-	struct wc_toplevel *t;
+	struct wc_toplevel *t, *recent = NULL;
 	wl_list_for_each(t, &s->toplevels, link)
-		if (t->mapped && !t->hidden && t->workspace == s->workspace) { wc_focus(t); return; }
+		if (t->mapped && !t->hidden && t->workspace == s->workspace &&
+		    (!recent || t->focus_order > recent->focus_order)) recent = t;
+	if (recent) { wc_focus(recent); return; }
 	wlr_seat_keyboard_clear_focus(s->seat);
 	wc_retile(s);
 }
@@ -1202,7 +1227,7 @@ static bool handle_keybinding(struct wc_server *server, xkb_keysym_t sym, uint32
 	case XKB_KEY_b: {
 		struct wc_toplevel *t = wc_find_app(server, g_scripts_app_id);
 		if (!t) { spawn(g_scripts_cmd); break; }
-		if (t->hidden || server->desktop_visible) { wc_focus(t); break; }
+		if (t->hidden || server->desktop_visible || !wc_in_focus_chain(t, server->focused)) { wc_focus(t); break; }
 		if (server->drag.toplevel == t) wc_cancel_drag(server);
 		t->hidden = true;
 		wlr_xdg_toplevel_set_activated(t->xdg_toplevel, false);

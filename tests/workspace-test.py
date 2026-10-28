@@ -22,6 +22,7 @@ def function(name):
     return source[start:end]
 print(r'''
 #include <stddef.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -42,8 +43,8 @@ struct wc_toplevel;
 struct fake_base { void *surface; };
 struct fake_xdg { char *app_id; bool activated; struct fake_base *base; struct fake_xdg *parent; struct { bool activated; } scheduled; };
 struct wlr_keyboard { int *keycodes; int num_keycodes; int modifiers; };
-struct wc_server { struct wl_list toplevels; unsigned workspace; struct wc_toplevel *focused,*normal,*saved_focus[4],*saved_normal[4]; bool desktop_visible,locked; void *seat; struct { struct wc_toplevel *toplevel; } drag; };
-struct wc_toplevel { struct wl_list link; struct wc_server *server; struct fake_xdg *xdg_toplevel; unsigned workspace; bool mapped,hidden,fullscreen,maximized; int layout_x,layout_y,layout_w,layout_h; };
+struct wc_server { struct wl_list toplevels; unsigned workspace; struct wc_toplevel *focused,*normal,*saved_focus[4],*saved_normal[4]; bool desktop_visible,locked; uint64_t focus_order; void *seat; struct { struct wc_toplevel *toplevel; } drag; };
+struct wc_toplevel { struct wl_list link; struct wc_server *server; struct fake_xdg *xdg_toplevel; unsigned workspace; bool mapped,hidden,fullscreen,maximized; uint64_t focus_order; int layout_x,layout_y,layout_w,layout_h; };
 static const char *g_scripts_app_id="cube-scripts";
 static unsigned keyboard_clears=0, pointer_clears=0;
 static void wc_retile(struct wc_server *s) {}

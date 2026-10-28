@@ -136,6 +136,8 @@ retained locally under `apps/cube-editor/upstream/` and excluded from the Debian
 The panel groups windows under one **N tabs** button (Alt+G opens its list), and **Chat** sits beside networking.
 New windows open visibly on the active workspace, keeping their saved size and position.
 Previously hidden windows and placements from other workspaces cannot hide a fresh launch.
+Opening or selecting a window brings it and its dialogs to the front without changing tab order.
+Dialogs stay above fullscreen apps, and closing a window returns to the last-used app on the current workspace.
 Desktop Chat includes a private Electron runtime, its sandbox helper and required library dependencies.
 **Whitecube Trainer** (`cube-train`) is a native GTK4 app for local 1M, 2M, 5M and 10M models.
 It selects datasets, saves named runs in `~/train-out`, monitors progress/loss/temperature,

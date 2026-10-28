@@ -4,6 +4,7 @@
 #include "whitecube.c"
 #undef main
 #include <wlr/interfaces/wlr_keyboard.h>
+#include <sys/socket.h>
 
 static void test_applied_keyboard(void) {
 	struct wlr_keyboard keyboard;
@@ -355,6 +356,167 @@ static void test_reopened_window_is_visible(void) {
 	config_defaults();
 }
 
+/* Real scene nodes and configure scheduling, without rendering or client I/O. */
+struct window_fixture {
+	struct wc_server server;
+	struct wc_output output;
+	struct wlr_output screen;
+	struct wlr_xdg_client client;
+	int peer_fd;
+};
+struct test_window {
+	struct wc_toplevel window;
+	struct wlr_xdg_toplevel xdg;
+	struct wlr_xdg_surface base;
+	struct wlr_surface surface;
+};
+static void window_fixture_init(struct window_fixture *f) {
+	memset(f, 0, sizeof(*f)); config_defaults();
+	struct wc_server *s = &f->server;
+	s->wl_display = wl_display_create(); assert(s->wl_display);
+	int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+	f->client.client = wl_client_create(s->wl_display, sockets[0]); assert(f->client.client);
+	f->peer_fd = sockets[1];
+	s->seat = wlr_seat_create(s->wl_display, "window-test"); assert(s->seat);
+	s->scene = wlr_scene_create(); assert(s->scene);
+	s->windows = wlr_scene_tree_create(&s->scene->tree);
+	s->top = wlr_scene_tree_create(&s->scene->tree);
+	s->output_layout = wlr_output_layout_create(s->wl_display); assert(s->output_layout);
+	wl_list_init(&s->outputs); wl_list_init(&s->toplevels); wl_list_init(&s->keyboards);
+	f->screen = (struct wlr_output){.width = 1280, .height = 800, .scale = 1, .enabled = true};
+	wlr_addon_set_init(&f->screen.addons);
+	f->output.server = s; f->output.wlr_output = &f->screen;
+	f->output.tab_tree = wlr_scene_tree_create(s->top);
+	f->output.tab_bg = wlr_scene_rect_create(f->output.tab_tree, 1, 1, C_WHITE);
+	for (unsigned i = 0; i < WORKSPACES; i++)
+		f->output.workspace_cube[i] = wlr_scene_rect_create(f->output.tab_tree, 1, 1, C_WHITE);
+	wl_list_insert(&s->outputs, &f->output.link);
+}
+static void test_window_init(struct window_fixture *f, struct test_window *t,
+		const char *app, struct test_window *parent) {
+	memset(t, 0, sizeof(*t));
+	t->base.client = &f->client; t->base.surface = &t->surface; t->base.initialized = true;
+	t->base.role = WLR_XDG_SURFACE_ROLE_TOPLEVEL; t->base.toplevel = &t->xdg;
+	t->surface.mapped = true; t->surface.current.width = 600; t->surface.current.height = 400;
+	wl_list_init(&t->surface.current.subsurfaces_above);
+	wl_list_init(&t->surface.current.subsurfaces_below);
+	t->xdg.base = &t->base; t->xdg.app_id = (char *)app; t->xdg.title = (char *)app;
+	t->xdg.parent = parent ? &parent->xdg : NULL;
+	t->window.server = &f->server; t->window.xdg_toplevel = &t->xdg; t->window.saved_index = -1;
+	t->window.scene_tree = wlr_scene_tree_create(f->server.windows);
+	t->window.scene_tree->node.data = &t->window; t->base.data = t->window.scene_tree;
+	wlr_scene_node_set_enabled(&t->window.scene_tree->node, false);
+	wl_list_insert(&f->server.toplevels, &t->window.link);
+}
+static struct wc_toplevel *top_visible_window(struct wc_server *s) {
+	struct wlr_scene_node *node;
+	wl_list_for_each_reverse(node, &s->windows->children, link)
+		if (node->enabled) return node->data;
+	return NULL;
+}
+static void window_fixture_finish(struct window_fixture *f) {
+	struct wc_toplevel *t;
+	wl_list_for_each(t, &f->server.toplevels, link) {
+		struct wlr_xdg_surface *base = t->xdg_toplevel->base;
+		if (base->configure_idle) wl_event_source_remove(base->configure_idle);
+	}
+	wlr_scene_node_destroy(&f->server.scene->tree.node);
+	wl_display_destroy_clients(f->server.wl_display);
+	wl_display_destroy(f->server.wl_display);
+	close(f->peer_fd); config_defaults();
+}
+static void test_new_window_is_raised(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window scripts, editor;
+	test_window_init(&f, &scripts, g_scripts_app_id, NULL);
+	t_map(&scripts.window.map, NULL);
+	assert(f.server.focused == &scripts.window && scripts.window.scene_tree->node.enabled);
+	test_window_init(&f, &editor, "editor", NULL);
+	/* A fresh launch exits the desktop view and takes the front of the stack. */
+	f.server.desktop_visible = true;
+	t_map(&editor.window.map, NULL);
+	assert(!f.server.desktop_visible && f.server.focused == &editor.window);
+	assert(editor.window.scene_tree->node.enabled && editor.xdg.scheduled.activated);
+	assert(top_visible_window(&f.server) == &editor.window);
+	struct wl_list *first_tab = f.server.toplevels.next;
+	/* Scripts behind another app is brought forward before the shortcut hides it. */
+	assert(handle_keybinding(&f.server, XKB_KEY_b, WLR_MODIFIER_ALT));
+	assert(f.server.focused == &scripts.window && top_visible_window(&f.server) == &scripts.window);
+	assert(handle_keybinding(&f.server, XKB_KEY_b, WLR_MODIFIER_ALT));
+	assert(scripts.window.hidden && f.server.focused == &editor.window);
+	wc_focus(&scripts.window);
+	assert(top_visible_window(&f.server) == &scripts.window);
+	wc_retile(&f.server);
+	assert(top_visible_window(&f.server) == &scripts.window);
+	wc_focus(&editor.window);
+	assert(top_visible_window(&f.server) == &editor.window);
+	assert(f.server.toplevels.next == first_tab); /* Focusing never changes tab order. */
+	window_fixture_finish(&f);
+}
+static void test_nested_dialog_stacking(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window editor, dialog, nested;
+	test_window_init(&f, &editor, "editor", NULL); t_map(&editor.window.map, NULL);
+	test_window_init(&f, &dialog, "picker", &editor); t_map(&dialog.window.map, NULL);
+	test_window_init(&f, &nested, "confirmation", &dialog); t_map(&nested.window.map, NULL);
+	assert(f.server.focused == &nested.window);
+	assert(editor.window.scene_tree->node.enabled && dialog.window.scene_tree->node.enabled);
+	assert(nested.window.scene_tree->node.enabled && top_visible_window(&f.server) == &nested.window);
+	assert(editor.window.scene_tree->node.link.next == &dialog.window.scene_tree->node.link);
+	wc_focus(&editor.window); /* Selecting a modal parent keeps its deepest dialog in front. */
+	assert(f.server.focused == &nested.window);
+	wc_retile(&f.server);
+	assert(top_visible_window(&f.server) == &nested.window);
+	/* A dialog over a fullscreen app keeps the app fullscreen behind it. */
+	editor.window.fullscreen = true;
+	wc_retile(&f.server);
+	assert(editor.window.scene_tree->node.enabled && dialog.window.scene_tree->node.enabled);
+	assert(nested.window.scene_tree->node.enabled && !f.server.top->node.enabled);
+	assert(editor.window.scene_tree->node.x == 0 && editor.window.scene_tree->node.y == 0);
+	assert(editor.window.configured_w == 1280 && editor.window.configured_h == 800);
+	assert(dialog.window.scene_tree->node.y == (800 - 400) / 2);
+	assert(nested.window.scene_tree->node.y == (800 - 400) / 2);
+	assert(top_visible_window(&f.server) == &nested.window);
+	/* Beginning a drag over fullscreen uses the same origin as dialog layout. */
+	f.server.cursor = wlr_cursor_create(); assert(f.server.cursor);
+	f.server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24); assert(f.server.cursor_mgr);
+	f.server.cursor->x = 500; f.server.cursor->y = 300;
+	int x = nested.window.scene_tree->node.x, y = nested.window.scene_tree->node.y;
+	int w = nested.window.configured_w, h = nested.window.configured_h;
+	assert(wc_start_drag(&f.server, &nested.window, BTN_LEFT));
+	wc_update_drag(&f.server, 500, 300); wc_retile(&f.server);
+	assert(nested.window.scene_tree->node.x == x && nested.window.scene_tree->node.y == y);
+	assert(nested.window.configured_w == w && nested.window.configured_h == h);
+	wc_cancel_drag(&f.server);
+	wlr_cursor_destroy(f.server.cursor); wlr_xcursor_manager_destroy(f.server.cursor_mgr);
+	f.server.cursor = NULL; f.server.cursor_mgr = NULL;
+	/* Closing nested dialogs returns focus through the parent chain. */
+	t_unmap(&nested.window.unmap, NULL);
+	assert(f.server.focused == &dialog.window && top_visible_window(&f.server) == &dialog.window);
+	t_unmap(&dialog.window.unmap, NULL);
+	assert(f.server.focused == &editor.window && top_visible_window(&f.server) == &editor.window);
+	window_fixture_finish(&f);
+}
+static void test_close_restores_recent_focus(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window a, b, c, away;
+	test_window_init(&f, &a, "first", NULL); t_map(&a.window.map, NULL);
+	test_window_init(&f, &b, "second", NULL); t_map(&b.window.map, NULL);
+	wc_focus(&a.window);
+	test_window_init(&f, &c, "third", NULL); t_map(&c.window.map, NULL);
+	t_unmap(&c.window.unmap, NULL);
+	/* Closing a new app returns to the app just used, not the newest older tab. */
+	assert(f.server.focused == &a.window && top_visible_window(&f.server) == &a.window);
+	test_window_init(&f, &away, "other-workspace", NULL); t_map(&away.window.map, NULL);
+	away.window.workspace = 1;
+	wc_focus(&a.window); a.window.hidden = true;
+	t_map(&c.window.map, NULL);
+	t_unmap(&c.window.unmap, NULL);
+	assert(f.server.focused == &b.window && top_visible_window(&f.server) == &b.window);
+	assert(a.window.hidden && away.window.workspace == 1);
+	window_fixture_finish(&f);
+}
+
 int main(void) {
 	test_applied_keyboard();
 	test_reload_defaults();
@@ -363,6 +525,9 @@ int main(void) {
 	test_pointer_placement();
 	test_privacy_settings();
 	test_reopened_window_is_visible();
+	test_new_window_is_raised();
+	test_nested_dialog_stacking();
+	test_close_restores_recent_focus();
 	test_lock_isolation();
 	test_idle_lock();
 	test_lock_output_geometry();
