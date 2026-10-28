@@ -63,7 +63,9 @@ Supplying the previous archive enables `packaging/smoke-lifecycle.py` and makes
 the graphical smoke use its runtime-only root rather than the builder. The
 bootstrap installs essential packages, declared dependencies and a few test tools
 (apt, fakeroot, Python and certificate data), with recommendations disabled.
-Its installed-package inventory rejects development packages. Debian sources
+Its installed-package inventory rejects unrelated development packages. Debian
+13's NumPy requires `python3-numpy-dev`; this exception is allowed only when
+NumPy's installed dependency metadata declares it. Debian sources
 are authenticated; only the generated local test repository is explicitly trusted.
 This step needs network access to obtain runtime packages.
 

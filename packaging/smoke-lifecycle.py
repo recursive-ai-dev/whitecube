@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -30,9 +31,14 @@ def run(command, log, *, cwd=None, timeout=1200):
         raise RuntimeError(f'{command[0]} failed ({result.returncode}); inspect {log}')
 
 
-def development_packages(inventory):
+def development_packages(inventory, numpy_dependencies=''):
+    # Debian 13 splits NumPy headers into a mandatory dependency of its runtime
+    # package. Permit that exact relationship, not arbitrary development tools.
+    numpy_headers_required = re.search(
+        r'(?:^|,)\s*python3-numpy-dev(?:\s+\([^)]*\))?\s*(?:,|$)', numpy_dependencies)
     return [line.split('\t')[0] for line in inventory.splitlines()
-            if line.split('\t')[0].split(':', 1)[0].endswith('-dev')]
+            if line.split('\t')[0].split(':', 1)[0].endswith('-dev')
+            and not (numpy_headers_required and line.split('\t')[0].split(':', 1)[0] == 'python3-numpy-dev')]
 
 
 def verify_package_payload(log, *, allow_modified_conffiles=False):
@@ -142,9 +148,11 @@ def inside():
     installed = subprocess.run(['dpkg-query', '-W', '-f=${binary:Package}\t${Version}\n'],
                                text=True, capture_output=True, check=True)
     (report / 'installed-packages.tsv').write_text(installed.stdout)
-    if development_packages(installed.stdout):
-        raise RuntimeError('runtime-only root unexpectedly contains development packages')
-    record('runtime package inventory contains no development packages')
+    numpy = subprocess.run(['dpkg-query', '-W', '-f=${Depends}', 'python3-numpy'],
+                           text=True, capture_output=True, check=True)
+    if development_packages(installed.stdout, numpy.stdout):
+        raise RuntimeError('runtime-only root unexpectedly contains unrelated development packages')
+    record('runtime package inventory contains no development packages except headers required by NumPy')
     (report / 'lifecycle-inside.json').write_text(json.dumps({'verification': 'passed', 'checks': checks}, indent=2) + '\n')
     return 0
 

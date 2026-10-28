@@ -67,6 +67,16 @@ class LifecycleFailures(unittest.TestCase):
         inventory = 'libc6:amd64\t2.41\nlibcairo2-dev:amd64\t1.18\npython3-dev\t3.13\n'
         self.assertEqual(lifecycle.development_packages(inventory), ['libcairo2-dev:amd64', 'python3-dev'])
 
+    def test_numpy_headers_are_allowed_only_when_required_by_numpy_runtime(self):
+        inventory = 'python3-numpy\t2.2.4\npython3-numpy-dev:amd64\t2.2.4\npython3-dev\t3.13\n'
+        self.assertEqual(lifecycle.development_packages(inventory), ['python3-numpy-dev:amd64', 'python3-dev'])
+        required = 'python3-numpy-dev (= 1:2.2.4+ds-1), python3 (>= 3.13~), libc6 (>= 2.38)'
+        self.assertEqual(lifecycle.development_packages(inventory, required), ['python3-dev'])
+        for dependencies in ('python3-numpy-dev-tools', 'python3-numpy-dev | other', 'libnumpy-dev'):
+            with self.subTest(dependencies=dependencies):
+                self.assertEqual(lifecycle.development_packages(inventory, dependencies),
+                                 ['python3-numpy-dev:amd64', 'python3-dev'])
+
     def test_zero_exit_with_modified_regular_file_is_failure(self):
         result = subprocess.CompletedProcess(['dpkg'], 0, stdout='??5??????   /usr/bin/cube-status\n', stderr='')
         with patch.object(lifecycle.subprocess, 'run', return_value=result):
