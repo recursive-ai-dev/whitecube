@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.1_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.2_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,15 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.9.2
+
+The compositor now retries failed display updates automatically. Previously,
+a rejected page flip could leave Firefox or another app waiting for its next
+frame until switching windows caused a redraw, making typing appear frozen.
+Retries back off during repeated failures, stop after recovery, and are removed
+when a monitor disconnects. Screen locking still waits for a successfully
+presented lock frame. See [the release notes](docs/RELEASE-0.9.2.md).
 
 ## Improvements in 0.9.1
 
@@ -88,8 +97,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.1_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.1_amd64.deb
+sha256sum --check whitecube-desktop_0.9.2_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.2_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

@@ -5,6 +5,7 @@
 #include "whitecube.c"
 #undef main
 #include <wlr/backend/headless.h>
+#include <wlr/interfaces/wlr_output.h>
 
 static int count_outputs(struct wc_server *s) {
 	int n = 0; struct wc_output *o;
@@ -72,6 +73,73 @@ static struct wlr_output *plug(struct wc_server *s, unsigned w, unsigned h) {
 	assert(!strcmp(o->name, expected));
 	spin(s, 30);
 	return o;
+}
+
+/* A rejected DRM commit schedules no page flip. Reproduce that with the real
+ * scene renderer, then require recovery without any new input or scene damage. */
+static const struct wlr_output_impl *real_output_impl;
+static struct wlr_output_impl failing_output_impl;
+static unsigned failures_left, commit_attempts;
+static bool failing_output_commit(struct wlr_output *output, const struct wlr_output_state *state) {
+	commit_attempts++;
+	if (failures_left) { failures_left--; errno = EBUSY; return false; }
+	output->impl = real_output_impl;
+	bool ok = real_output_impl->commit(output, state);
+	output->impl = &failing_output_impl;
+	return ok;
+}
+static void fail_frames(struct wlr_output *screen, unsigned count) {
+	real_output_impl = screen->impl;
+	failing_output_impl = *real_output_impl;
+	failing_output_impl.commit = failing_output_commit;
+	screen->impl = &failing_output_impl;
+	failures_left = count; commit_attempts = 0;
+}
+static void test_failed_frame_recovers(struct wc_server *s) {
+	struct wlr_output *screen = plug(s, 800, 600);
+	spin(s, 60);
+	struct wc_output *o = server_first_output(s);
+	fail_frames(screen, 2);
+	uint32_t before = screen->commit_seq;
+	wlr_scene_rect_set_color(o->bg_flat, C_WHITE);
+	spin(s, 200);
+	assert(commit_attempts == 3 && failures_left == 0);
+	assert(screen->commit_seq == before + 1 && !screen->needs_frame);
+	spin(s, 100);
+	assert(commit_attempts == 3); /* Successful recovery cancels further retries. */
+	screen->impl = real_output_impl;
+	wlr_output_destroy(screen); spin(s, 20);
+}
+static void test_failed_frame_backoff_and_unplug(struct wc_server *s) {
+	struct wlr_output *screen = plug(s, 800, 600);
+	spin(s, 60);
+	fail_frames(screen, 100);
+	wlr_output_schedule_frame(screen);
+	spin(s, 200);
+	/* Persistent failure leaves the event loop responsive, with bounded work. */
+	assert(commit_attempts >= 2 && commit_attempts <= 5);
+	unsigned attempts = commit_attempts;
+	screen->impl = real_output_impl;
+	wlr_output_destroy(screen);
+	spin(s, 300); /* The pending retry must not access the disconnected output. */
+	assert(commit_attempts == attempts && count_outputs(s) == 0);
+}
+static void test_failed_lock_frame_recovers(struct wc_server *s) {
+	struct wlr_output *screen = plug(s, 800, 600);
+	spin(s, 60);
+	struct wc_output *o = server_first_output(s);
+	fail_frames(screen, 2);
+	s->locked = true;
+	wlr_scene_node_set_enabled(&s->lock_tree->node, true);
+	wc_lock_refresh(s);
+	spin(s, 5);
+	assert(commit_attempts == 1 && !o->lock_frame_submitted && !o->lock_frame_presented);
+	spin(s, 200);
+	assert(commit_attempts == 3 && o->lock_frame_submitted && o->lock_frame_presented);
+	screen->impl = real_output_impl;
+	wlr_output_destroy(screen); spin(s, 20);
+	s->locked = false;
+	wlr_scene_node_set_enabled(&s->lock_tree->node, false);
 }
 
 static void test_hotplug(struct wc_server *s) {
@@ -201,6 +269,9 @@ int main(void) {
 	char home[64];
 	struct wc_server *s = calloc(1, sizeof(*s));
 	setup(s, home, NULL);
+	test_failed_frame_recovers(s);
+	test_failed_frame_backoff_and_unplug(s);
+	test_failed_lock_frame_recovers(s);
 	test_hotplug(s);
 	test_grouped_tabs(s);
 	test_cycles(s);

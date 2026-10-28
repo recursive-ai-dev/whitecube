@@ -318,6 +318,8 @@ struct wc_output {
 	struct wc_server *server;
 	struct wlr_output *wlr_output;
 	struct wl_listener frame, present, request_state, destroy;
+	struct wl_event_source *frame_retry_timer;
+	int frame_retry_delay;
 	struct wlr_scene_rect *lock_bg;
 	uint32_t lock_commit_seq;
 	bool lock_frame_submitted, lock_frame_presented;
@@ -1577,6 +1579,12 @@ static void cursor_frame(struct wl_listener *l, void *data) {
 	if (s->locked) wlr_seat_pointer_send_frame(s->seat);
 	else wlr_seat_pointer_notify_frame(s->seat);
 }
+static int output_retry_frame(void *data) {
+	struct wc_output *o = data;
+	if (o->wlr_output->enabled && !o->server->shutting_down)
+		wlr_output_schedule_frame(o->wlr_output);
+	return 0;
+}
 static void output_frame(struct wl_listener *l, void *data) {
 	struct wc_output *o = wl_container_of(l, o, frame);
 	struct wlr_scene_output *so = wlr_scene_get_scene_output(o->server->scene, o->wlr_output);
@@ -1585,7 +1593,19 @@ static void output_frame(struct wl_listener *l, void *data) {
 		o->lock_commit_seq = o->wlr_output->commit_seq + 1;
 		o->lock_frame_submitted = true;
 	}
-	if (!wlr_scene_output_commit(so, NULL)) { o->lock_frame_submitted = false; return; }
+	if (!wlr_scene_output_commit(so, NULL)) {
+		o->lock_frame_submitted = false;
+		/* A rejected page flip generates no next frame event. Clients waiting
+		 * for frame_done then appear frozen until unrelated scene damage (such
+		 * as switching windows) wakes the output. Retry without new input, but
+		 * back off persistent failures instead of spinning in the event loop. */
+		o->frame_retry_delay = o->frame_retry_delay ? bounded(o->frame_retry_delay * 2, 16, 250) : 16;
+		if (o->frame_retry_timer)
+			wl_event_source_timer_update(o->frame_retry_timer, o->frame_retry_delay);
+		return;
+	}
+	if (o->frame_retry_timer) wl_event_source_timer_update(o->frame_retry_timer, 0);
+	o->frame_retry_delay = 0;
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(so, &now);
@@ -1611,6 +1631,7 @@ static void output_destroy(struct wl_listener *l, void *data) {
 	struct wc_output *o = wl_container_of(l, o, destroy);
 	struct wc_server *s = o->server;
 	wc_cancel_drag(s);
+	if (o->frame_retry_timer) wl_event_source_remove(o->frame_retry_timer);
 	wl_list_remove(&o->frame.link); wl_list_remove(&o->request_state.link);
 	wl_list_remove(&o->present.link);
 	wl_list_remove(&o->destroy.link); wl_list_remove(&o->link);
@@ -1766,6 +1787,8 @@ static void server_new_output(struct wl_listener *l, void *data) {
 	wlr_output_state_finish(&st);
 	struct wc_output *o = calloc(1, sizeof(*o));
 	o->server = s; o->wlr_output = wo;
+	o->frame_retry_timer = wl_event_loop_add_timer(wl_display_get_event_loop(s->wl_display), output_retry_frame, o);
+	if (!o->frame_retry_timer) wlr_log(WLR_ERROR, "could not create frame retry timer for %s", wo->name);
 	o->frame.notify = output_frame; wl_signal_add(&wo->events.frame, &o->frame);
 	o->present.notify = output_present; wl_signal_add(&wo->events.present, &o->present);
 	o->request_state.notify = output_req_state; wl_signal_add(&wo->events.request_state, &o->request_state);
