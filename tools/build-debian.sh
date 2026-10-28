@@ -53,7 +53,7 @@ if [[ $refresh = 1 || $cached_key != "$builder_key" ]]; then
   next=$work/rootfs-extract
   extracted_key=$(cat "$next/.whitecube-extracted" 2>/dev/null || true)
   if [[ $refresh = 1 || $extracted_key != "$builder_key" ]]; then
-    previous=
+    previous=$rootfs
     if [[ -e $next ]]; then
       previous=$next.incomplete-$(date +%s)
       mv -- "$next" "$previous"
@@ -63,6 +63,7 @@ if [[ $refresh = 1 || $cached_key != "$builder_key" ]]; then
     "$host/usr/bin/mmdebstrap" --mode=chrootless --variant=extract --architectures=amd64 \
       --skip=cleanup/apt --keyring="$host/usr/share/keyrings/debian-archive-keyring.pgp" \
       --setup-hook='if [ -n "$WHITECUBE_BUILDER_CACHE" ] && [ -d "$WHITECUBE_BUILDER_CACHE" ]; then mkdir -p "$1/var/cache/apt/archives"; cp -an --reflink=auto "$WHITECUBE_BUILDER_CACHE/." "$1/var/cache/apt/archives/"; fi' \
+      --extract-hook='for archive in $MMDEBSTRAP_ESSENTIAL; do printf "/var/cache/apt/archives/%s\n" "${archive##*/}"; done > "$1/.whitecube-selected-archives"' \
       --include='?essential' --include="$packages" trixie "$next" https://deb.debian.org/debian > "$work/extract.log" 2>&1 || {
         tail -40 "$work/extract.log" >&2; exit 1;
       }
@@ -90,7 +91,14 @@ if [[ $refresh = 1 || $cached_key != "$builder_key" ]]; then
     --setenv FAKEROOTDONTTRYCHOWN 1 --setenv WHITECUBE_BUILDER_PACKAGES "$packages" /bin/bash -euc '
       update-alternatives --install /usr/bin/awk awk /usr/bin/mawk 5
       /usr/bin/fakeroot-sysv /bin/bash -euc '\''
-        dpkg --force-depends --force-confold --force-confdef --unpack /var/cache/apt/archives/*.deb
+        # The cache can contain older or removed packages. Install only the
+        # archives selected by mmdebstrap against authenticated current indices.
+        mapfile -t selected_archives < /.whitecube-selected-archives
+        (( ${#selected_archives[@]} )) || { echo "builder selected no archives" >&2; exit 1; }
+        for archive in "${selected_archives[@]}"; do
+          [[ $archive == /var/cache/apt/archives/*.deb && -f $archive ]] || { echo "invalid selected archive" >&2; exit 1; }
+        done
+        dpkg --force-depends --force-confold --force-confdef --unpack "${selected_archives[@]}"
         dpkg --force-depends --configure -a
         apt-get -y -f install
         apt-get update

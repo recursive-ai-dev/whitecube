@@ -198,7 +198,9 @@ These byte models use a small context and continue prose. The picker shows the c
 **Refresh** finds new checkpoints. A checkpoint replaced by training is reloaded on the next message.
 Advanced overrides: `WHITECUBE_TRAIN_OUT`, `WHITECUBE_TENSEGRITY_DIR`, and `WHITECUBE_MODEL_PYTHON`.
 Local server diagnostics are in `~/.local/state/whitecube/local-model-server.log`.
-For source builds, stage Electron's `dist/` as `build/desktop-chat-runtime` or set `ELECTRON_DIST`;
+For source builds, run `npm --prefix apps/desktop-chat ci` followed by
+`node apps/desktop-chat/node_modules/electron/install.js` to download the pinned
+runtime, then stage its `dist/` as `build/desktop-chat-runtime` or set `ELECTRON_DIST`;
 set `NODE` to a Node executable when it is outside PATH. See `docs/PANEL-CHAT-IMPROVEMENTS.txt` for the
 22 changes and validation. Log out and back in after installing to activate compositor changes.
 

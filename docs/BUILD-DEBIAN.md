@@ -25,8 +25,9 @@ path. It installs no host packages, changes no host services, and keeps the buil
 `build/debian-builder/`.
 
 The first run downloads the Debian dependencies and may take several minutes.
-It then runs `npm --prefix apps/desktop-chat ci` inside Debian when Electron
-inputs have changed or its runtime is missing/stale, builds the native dependencies locally, runs `BUILD.sh` and
+It then runs `npm --prefix apps/desktop-chat ci` and the pinned local Electron
+installer inside Debian when inputs have changed or its runtime is missing/stale,
+builds the native dependencies locally, runs `BUILD.sh` and
 creates the Debian package under `packaging/out/`. Desktop Chat requires Node.js
 22.12 or newer and npm for source builds. The runner stages official Node.js
 22.23.4 locally, verifies its pinned SHA256, and makes it available read-only at
@@ -83,6 +84,7 @@ Install the system development dependencies first. The complete list is in
 
 ```sh
 npm --prefix apps/desktop-chat ci
+node apps/desktop-chat/node_modules/electron/install.js
 export ELECTRON_DIST="$PWD/apps/desktop-chat/node_modules/electron/dist"
 bash tools/prepare-native-deps.sh
 source build/native-deps/environment.sh
@@ -103,7 +105,9 @@ executable, sandbox helper, version, licenses, resources and locale files. Use
 `npm ci` to refresh an existing npm runtime when the lockfile changes; the default
 runner validates package/lockfile hashes and the exact pinned Electron version.
 An explicit distribution skips npm installation but must match that version. Installed packages include Electron
-and require neither Node.js nor npm.
+and require neither Node.js nor npm. Electron 42 and newer require the explicit
+local installer after `npm ci`; npm no longer downloads the binary through a
+postinstall script.
 
 `tools/prepare-native-deps.sh` does not install system packages. It verifies the
 browser's pinned Cairo, SQLite, JPEG, QuickJS and Mbed TLS downloads, rebuilds

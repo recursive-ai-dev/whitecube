@@ -85,7 +85,7 @@ class CachedBuilder(unittest.TestCase):
         # bootstrap fixture, while a current cache must never execute it.
         bootstrap = self.work / 'host/usr/bin/mmdebstrap'
         bootstrap.parent.mkdir(parents=True)
-        bootstrap.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$WHITECUBE_TEST_BOOTSTRAP_ARGS"\necho "bootstrap requested" >&2\nexit 97\n')
+        bootstrap.write_text('#!/bin/sh\nprintf "%s\\n" "$WHITECUBE_BUILDER_CACHE" > "$WHITECUBE_TEST_BOOTSTRAP_ARGS.cache"\nprintf "%s\\n" "$@" > "$WHITECUBE_TEST_BOOTSTRAP_ARGS"\necho "bootstrap requested" >&2\nexit 97\n')
         bootstrap.chmod(0o755)
         keyring = self.work / 'host/usr/share/keyrings/debian-archive-keyring.pgp'
         keyring.parent.mkdir(parents=True)
@@ -116,6 +116,30 @@ class CachedBuilder(unittest.TestCase):
         self.assertIn('apt', includes[1].split(','))
         self.assertIn('build-essential', includes[1].split(','))
         self.assertFalse(any(value.startswith('?essential,') for value in includes))
+
+    def test_refresh_reuses_ready_root_archive_cache_as_download_input(self):
+        self.bootstrap_probe()
+        cache = self.rootfs / 'var/cache/apt/archives'
+        cache.mkdir(parents=True)
+        result = self.run_builder('--refresh', '--prepare-only')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        cache_record = Path(self.env['WHITECUBE_TEST_BOOTSTRAP_ARGS'] + '.cache')
+        self.assertEqual(cache_record.read_text().strip(), str(cache))
+        arguments = Path(self.env['WHITECUBE_TEST_BOOTSTRAP_ARGS']).read_text().splitlines()
+        extract_hooks = [argument for argument in arguments if argument.startswith('--extract-hook=')]
+        self.assertEqual(len(extract_hooks), 1)
+        self.assertIn('MMDEBSTRAP_ESSENTIAL', extract_hooks[0])
+        self.assertIn('.whitecube-selected-archives', extract_hooks[0])
+        # Exercise the real hook with host-prefixed and root-relative inputs.
+        # Every selected archive must survive, while namespace paths must not
+        # retain a build-host prefix.
+        selected_root = Path(self.tmp.name) / 'selected root'
+        selected_root.mkdir()
+        hook = extract_hooks[0].removeprefix('--extract-hook=')
+        subprocess.run(['sh', '-ec', hook, 'extract-hook', str(selected_root)], check=True,
+                       env=dict(os.environ, MMDEBSTRAP_ESSENTIAL='/host/rootfs/var/cache/apt/archives/first.deb /var/cache/apt/archives/second.deb'))
+        self.assertEqual((selected_root / '.whitecube-selected-archives').read_text().splitlines(),
+                         ['/var/cache/apt/archives/first.deb', '/var/cache/apt/archives/second.deb'])
 
     def test_unknown_flag_is_reported(self):
         result = self.run_builder('--unknown-flag')

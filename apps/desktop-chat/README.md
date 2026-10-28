@@ -59,6 +59,7 @@ Requirements: Linux, Node.js 22.12 or newer, npm, and `dpkg-deb`/`dpkg` for Debi
 
 ```sh
 npm ci
+node node_modules/electron/install.js
 npm test
 npm start
 npm run deb

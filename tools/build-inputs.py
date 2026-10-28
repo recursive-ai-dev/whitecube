@@ -57,6 +57,13 @@ def ensure_electron(root, distribution, external=False, refresh=False):
             pass
     if not current:
         subprocess.run(['npm', '--prefix', str(root / 'apps/desktop-chat'), 'ci'], check=True)
+        # Recent Electron npm packages expose installation as a local CLI and
+        # do not fetch their binary during npm ci. Execute the pinned package's
+        # installer with the selected Node runtime, without package resolution.
+        installer = root / 'apps/desktop-chat/node_modules/electron/install.js'
+        if not installer.is_file():
+            raise RuntimeError('Pinned Electron installer is missing after npm ci')
+        subprocess.run([os.environ.get('NODE', 'node'), str(installer)], check=True)
         validate_electron(distribution, expected)
         stamp.write_text(key + '\n')
     return expected
