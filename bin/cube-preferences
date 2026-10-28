@@ -7,17 +7,21 @@ dconf transaction commits the validated group; independent reads verify it.
 import argparse
 import ctypes
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import time
+import tempfile
 
 from gi.repository import Gio, GLib
 
 SCHEMA = 'org.whitecube.desktop'
 PREFIX = '/org/whitecube/desktop/'
+PROFILE_FORMAT = 'org.whitecube.preferences'
+PROFILE_LIMIT = 65536
 
 
 def schema():
@@ -79,7 +83,8 @@ def validate_keyboard(settings, values):
     if not any(key.startswith('xkb-') for key in values):
         return
     inherited = {}
-    for path in (Path('/etc/whitecube/config'), Path.home() / '.config/whitecube/config'):
+    config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'whitecube/config'
+    for path in (Path('/etc/whitecube/config'), config):
         if path.is_file():
             for line in path.read_text().splitlines():
                 if '=' in line and not line.startswith('#'):
@@ -111,10 +116,77 @@ def validate_keyboard(settings, values):
         raise ValueError('Keyboard model, layout or variant was rejected; nothing was saved')
 
 
+def profile_pairs(spec, text):
+    """Validate a portable profile completely before starting any writer."""
+    def unique(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f'Duplicate profile key: {key}')
+            result[key] = value
+        return result
+    if len(text.encode('utf-8')) > PROFILE_LIMIT:
+        raise ValueError('Settings profile is too large')
+    profile = json.loads(text, object_pairs_hook=unique)
+    if not isinstance(profile, dict) or set(profile) != {'format', 'version', 'settings'}:
+        raise ValueError('Expected a Whitecube settings profile')
+    if profile['format'] != PROFILE_FORMAT or type(profile['version']) is not int or profile['version'] != 1:
+        raise ValueError('Unsupported settings profile format or version')
+    values = profile['settings']
+    if not isinstance(values, dict) or len(values) > len(spec.list_keys()):
+        raise ValueError('Invalid profile settings')
+    pairs, names = [], set()
+    for name, value in values.items():
+        key = name.replace('_', '-')
+        if not spec.has_key(key):
+            raise ValueError(f'Unknown Whitecube setting: {name}')
+        if key in names:
+            raise ValueError(f'Duplicate profile setting: {key}')
+        names.add(key)
+        kind = spec.get_key(key).get_value_type().dup_string()
+        expected = {'b': bool, 'i': int, 's': str}[kind]
+        if type(value) is not expected:
+            raise ValueError(f'{key}: expected {expected.__name__} in the profile')
+        plain = ('true' if value else 'false') if kind == 'b' else str(value)
+        validate(spec, name, plain)
+        pairs.append((key, plain))
+    return pairs
+
+
+def profile_export(spec, settings):
+    values = {}
+    for key in sorted(spec.list_keys()):
+        value = settings.get_user_value(key)
+        if value is not None:
+            values[key] = value.unpack()
+    return json.dumps({'format': PROFILE_FORMAT, 'version': 1, 'settings': values},
+                      ensure_ascii=False, indent=2) + '\n'
+
+
+def profile_write(path, text):
+    """Replace an explicitly requested export atomically, with private permissions."""
+    target = Path(path).absolute()
+    fd, temporary = tempfile.mkstemp(prefix=f'.{target.name}.', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def write_many(spec, pairs):
-    values = dict(validate(spec, key, text) for key, text in pairs)
-    if not values or len(values) > 32:
-        raise ValueError('Expected between 1 and 32 settings')
+    values = {}
+    for name, text in pairs:
+        key, value = validate(spec, name, text)
+        if key in values:
+            raise ValueError(f'Duplicate setting: {key}')
+        values[key] = value
+    if not values or len(values) > len(spec.list_keys()):
+        raise ValueError('Expected between 1 and the schema key count settings')
     settings = Gio.Settings.new_full(spec, None, None)
     validate_keyboard(settings, values)
     for key in values:
@@ -132,15 +204,47 @@ def write_many(spec, pairs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=('set', 'set-many', 'reset', 'list'))
+    parser.add_argument('command', choices=('set', 'set-many', 'reset', 'list', 'export', 'import', 'check'))
     parser.add_argument('args', nargs='*')
     args = parser.parse_args()
-    if args.command != 'list' and not os.environ.get('WHITECUBE_PREFS_WRITER'):
+    spec = schema()
+    pairs = None
+    if args.command in ('export', 'import', 'check'):
+        if len(args.args) > 1:
+            parser.error(f'{args.command} accepts one optional FILE (or - for stdin/stdout)')
+        path = args.args[0] if args.args else '-'
+        if args.command == 'export':
+            text = profile_export(spec, Gio.Settings.new_full(spec, None, None))
+            if path == '-':
+                print(text, end='')
+            else:
+                profile_write(path, text)
+            return
+        if path == '-':
+            text = sys.stdin.read(PROFILE_LIMIT + 1)
+        else:
+            with open(path, encoding='utf-8') as source:
+                text = source.read(PROFILE_LIMIT + 1)
+        pairs = profile_pairs(spec, text)
+        if args.command == 'check':
+            validate_keyboard(Gio.Settings.new_full(spec, None, None), dict(validate(spec, k, v) for k, v in pairs))
+            print(f'Valid Whitecube profile: {len(pairs)} settings')
+            return
+        if not pairs:
+            return
+    if args.command not in ('list',) and not os.environ.get('WHITECUBE_PREFS_WRITER'):
         # Always use a fresh writer: a long-lived dconf-service on an unrelated
         # bus can retain stale database contents after another session writes.
         os.environ['WHITECUBE_PREFS_WRITER'] = '1'
-        os.execv('/usr/bin/dbus-run-session', ['dbus-run-session', '--', '/usr/bin/python3',
-                                            '-I', str(Path(__file__).resolve()), *sys.argv[1:]])
+        command = ['/usr/bin/dbus-run-session', '--', '/usr/bin/python3',
+                   '-I', str(Path(__file__).resolve()), *sys.argv[1:]]
+        if args.command == 'import':
+            # The profile may have arrived through a pipe. Forward the validated
+            # snapshot instead of trying to read consumed stdin in the child.
+            command = command[:5] + ['import']
+            result = subprocess.run(command, input=text, text=True)
+            sys.exit(result.returncode)
+        os.execv(command[0], command)
     lock = None
     if args.command != 'list':
         directory = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'whitecube'
@@ -155,8 +259,9 @@ def main():
                 if time.monotonic() >= deadline:
                     raise ValueError('Another Whitecube settings write is still running')
                 time.sleep(.02)
-    spec = schema()
-    if args.command == 'set-many':
+    if args.command == 'import':
+        write_many(spec, pairs)
+    elif args.command == 'set-many':
         if args.args:
             parser.error('set-many takes values on stdin')
         data = sys.stdin.read(16385)
@@ -191,6 +296,6 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OverflowError, GLib.Error, OSError, subprocess.TimeoutExpired) as exc:
+    except (ValueError, OverflowError, UnicodeError, GLib.Error, OSError, subprocess.TimeoutExpired) as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

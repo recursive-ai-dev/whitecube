@@ -20,7 +20,9 @@ an independent implementation and contains no Cubic code or artwork.
 
 The Debian package additionally bundles, under their own licenses:
 
-- wlroots (MIT) and cairo (LGPL-2.1 or MPL-1.1), in /usr/lib/whitecube;
+- wlroots (MIT), libdisplay-info (MIT) and cairo (LGPL-2.1 or MPL-1.1),
+  in /usr/lib/whitecube; libdisplay-info's full notices are in
+  /usr/share/doc/whitecube-desktop/libdisplay-info-copyright;
 - the Electron runtime of Desktop Chat (MIT, with the Chromium component
   licenses listed in LICENSES.chromium.html in
   /usr/lib/whitecube/desktop-chat-runtime).

@@ -3,9 +3,9 @@
 #
 #   ./BUILD.sh                     (compile + every test)   <- run by this script unless --no-build
 #   packaging/install-tree.sh      (lay the files out)
-#   bundle the X-free wlroots and cairo into /usr/lib/whitecube, strip, work out Depends
+#   bundle X-free wlroots, cairo and display-info into /usr/lib/whitecube; derive Depends
 #   packaging/check-tree.py        (every path the package mentions must exist in it)
-#   dpkg-deb --root-owner-group    (no root, no fakeroot needed)
+#   dpkg-deb --root-owner-group    (no root; fakeroot is used for the unpack smoke test)
 #
 # It builds a file and nothing else: it installs nothing, touches no service, needs no sudo.
 # Install the specific package path printed by this build with sudo apt install.
@@ -22,6 +22,14 @@ for a in "$@"; do
   esac
 done
 
+for command in dpkg dpkg-deb dpkg-shlibdeps dpkg-query flock ldd strip objcopy patchelf fakeroot python3; do
+  command -v "$command" >/dev/null || { echo "build-deb.sh: required tool is missing: $command" >&2; exit 1; }
+done
+# Stable archive timestamps; callers can select an explicit source release epoch.
+export SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || date +%s)}
+[[ $SOURCE_DATE_EPOCH =~ ^[0-9]+$ ]] || { echo 'build-deb.sh: SOURCE_DATE_EPOCH must be a nonnegative integer' >&2; exit 2; }
+export LC_ALL=C TZ=UTC
+
 version=$(tr -d '[:space:]' < packaging/VERSION)
 dpkg --validate-version "$version" >/dev/null
 [[ $version =~ ^[0-9][A-Za-z0-9.+:~-]*$ ]] || { echo 'build-deb.sh: invalid package version' >&2; exit 2; }
@@ -36,6 +44,11 @@ deb=$out/whitecube-desktop_${version}_amd64.deb
 
 if [[ $build = 1 ]]; then ./BUILD.sh > "$out.build.log" 2>&1 || { tail -30 "$out.build.log" >&2; echo "build-deb.sh: BUILD.sh failed (log: $out.build.log)" >&2; exit 1; }; fi
 bash packaging/install-tree.sh "$stage"
+# Source builds may embed checkout-local library directories to run their tests.
+# Installed core programs must load only the system-wide private library root.
+for native in whitecube-compositor cube-status cube-settings cube-ca; do
+  patchelf --set-rpath /usr/lib/whitecube "$stage/usr/bin/$native"
+done
 
 # --- bundle the X-free libraries the binaries were linked against
 priv=$stage/usr/lib/whitecube
@@ -55,6 +68,14 @@ bundle_library() {
 # A previous desktop installation can provide the exact library the new build
 # resolves. Include that file too: the new package must own its complete runtime.
 bundle_library "$wlroots"
+# Debian 13 wlroots uses display-info.so.2; newer Ubuntu distributions carry
+# .so.3. Ship this small private ABI alongside wlroots rather than requiring a
+# removed distribution package on the installation host.
+display_info=$(ldd "$wlroots" | awk '$1 ~ /^libdisplay-info\.so\./ {print $3}')
+[[ -f $display_info ]] || { echo 'build-deb.sh: cannot resolve wlroots display-info library' >&2; exit 1; }
+bundle_library "$display_info"
+install -m 0644 /usr/share/doc/"$(dpkg-query -S "$(realpath "$display_info")" | head -1 | cut -d: -f1)"/copyright \
+  "$stage/usr/share/doc/whitecube-desktop/libdisplay-info-copyright"
 cairo_stage=build-cairo/stage/usr/local/lib/x86_64-linux-gnu
 cairo=$(ldd build/cube-settings | awk '$1 == "libcairo.so.2" {print $3}')
 if [[ -f $cairo ]] && ! ldd "$cairo" | grep -qiE 'libX11|libxcb'; then
@@ -65,6 +86,13 @@ else
   echo "build-deb.sh: no X-free cairo available; run tools/build-xfree-cairo.sh first" >&2; exit 1
 fi
 echo "bundled libraries: ${bundled[*]:-none}"
+# DT_RUNPATH on an executable is not inherited by its transitive dependencies.
+# Give each private library its own sibling search path before stripping it.
+while IFS= read -r -d '' library; do
+  patchelf --set-rpath '$ORIGIN' "$library"
+done < <(find "$priv" -maxdepth 1 -type f -name '*.so*' -print0)
+display_resolution=$(env -u LD_LIBRARY_PATH ldd "$priv/$(basename "$(readlink -f "$wlroots")")" | awk '$1 ~ /^libdisplay-info\.so\./ {print $3}')
+[[ $display_resolution == "$priv/"* ]] || { echo 'build-deb.sh: bundled wlroots cannot resolve its private display-info library' >&2; exit 1; }
 
 # --- strip (also removes the build directory recorded in the debug info)
 strip --strip-unneeded "$stage"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player} \
@@ -83,7 +111,7 @@ fi
 # though Chat is launched with Ozone Wayland. Native desktop binaries stay X-free.
 chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-runtime)
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
-runtime=(foot fuzzel swaylock swaybg python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
+runtime=(foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
   gdisk parted dosfstools xz-utils
   dhcpcd-base iproute2 nftables seatd
@@ -94,6 +122,15 @@ for p in "${runtime[@]}"; do pkgs[$p]=1; done
 unset 'pkgs[gir1.2-adw-1]' 'pkgs[libadwaita-1-0]'
 pkgs['gir1.2-adw-1 (>= 1.5)']=1
 pkgs['libadwaita-1-0 (>= 1.5)']=1
+# Record ABI minima for the actual native programs, bundled libraries and Chat
+# runtime. Ownership alone does not prevent installation on an older libc.
+abi_dependencies=$(python3 -I packaging/dependency-versions.py "$stage")
+while IFS= read -r dependency; do
+  [[ -n $dependency ]] || continue
+  package=${dependency%% *}
+  unset 'pkgs['"$package"']'
+  pkgs[$dependency]=1
+done <<< "$abi_dependencies"
 depends=$(printf '%s\n' "${!pkgs[@]}" | sort | paste -sd',' | sed 's/,/, /g')
 [[ -z ${pkgs[whitecube-desktop]:-} ]] || { echo "build-deb.sh: dependency scanner found an unbundled library owned by whitecube-desktop" >&2; exit 1; }
 
@@ -105,16 +142,18 @@ install -m 0755 packaging/debian/postinst packaging/debian/postrm "$stage/DEBIAN
 install -m 0644 packaging/debian/conffiles "$stage/DEBIAN/conffiles"
 ( cd "$stage" && find . -type f ! -path './DEBIAN/*' -printf '%P\n' | sort | xargs -d '\n' md5sum > DEBIAN/md5sums )
 find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 python3 -I packaging/check-tree.py "$stage" --sources src
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"
 temporary_deb=$out/.whitecube-desktop_${version}_amd64.deb
-trap 'rm -rf -- "$stage"; rm -f -- "$temporary_deb"' EXIT
+trap 'rm -rf -- "$stage"; rm -f -- "$temporary_deb" "$temporary_deb.json"' EXIT
 dpkg-deb --root-owner-group --threads-max="${DPKG_DEB_THREADS_MAX:-2}" -Zxz -z"${DPKG_DEB_COMPRESSION_LEVEL:-3}" --build "$stage" "$temporary_deb" > /dev/null
-dpkg-deb --info "$temporary_deb" > /dev/null
+python3 -I packaging/verify-deb.py "$temporary_deb" --unpack --json "$temporary_deb.json"
 mv -f -- "$temporary_deb" "$deb"
-sha256sum "$deb" > "$deb.sha256"
+mv -f -- "$temporary_deb.json" "$deb.json"
+( cd "$out" && sha256sum "$(basename "$deb")" > "$(basename "$deb").sha256" )
 rm -rf -- "$out/stage"
 mv -- "$stage" "$out/stage"
 echo

@@ -16,10 +16,13 @@ rm -rf -- "$dest"
 
 build_app() {
   local app=$1 bindir=$2 src=$root/apps/$1 dir=$out/$1
+  local hardening=(-Db_pie=true -Db_asneeded=true
+    '-Dc_args=-fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security'
+    '-Dc_link_args=-Wl,-z,relro,-z,now')
   if [[ -f $dir/build.ninja ]]; then
-    meson setup --reconfigure "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube > "$dir.setup.log"
+    meson setup --reconfigure "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube "${hardening[@]}" > "$dir.setup.log"
   else
-    meson setup "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube > "$dir.setup.log"
+    meson setup "$dir" "$src" --prefix=/usr --bindir="$bindir" -Dprivate_libdir=/usr/lib/whitecube "${hardening[@]}" > "$dir.setup.log"
   fi
   meson compile -C "$dir"
   meson test -C "$dir" --no-suite integration --print-errorlogs

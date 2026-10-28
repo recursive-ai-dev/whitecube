@@ -4,9 +4,57 @@
 #include <sys/stat.h>
 #include <string.h>
 
+static void test_playlists(const char *root) {
+    char *list = g_build_filename(root, "list.m3u", NULL);
+    char *pls = g_build_filename(root, "radio.pls", NULL);
+    char *expected = g_build_filename(root, "film é.mp4", NULL);
+    GError *error = NULL; bool stream = false;
+    g_assert_true(media_playlist_path(list));
+    g_assert_false(media_playlist_path("https://example.com/stream.m3u8"));
+    g_assert_true(g_file_set_contents(list, "\xef\xbb\xbf#EXTM3U\r\n#EXTINF:100,Film\r\n./film é.mp4\r\nhttps://example.com/song.mp3?x=1\r\n", -1, NULL));
+    GPtrArray *items = media_playlist_read(list, &stream, &error);
+    g_assert_no_error(error); g_assert_false(stream); g_assert_cmpuint(items->len, ==, 2);
+    g_assert_cmpstr(g_ptr_array_index(items, 0), ==, expected);
+    g_assert_cmpstr(g_ptr_array_index(items, 1), ==, "https://example.com/song.mp3?x=1");
+    g_ptr_array_free(items, TRUE);
+    // File10 must follow File2 even when the source file lists it first.
+    g_assert_true(g_file_set_contents(pls, "[playlist]\nFile10=https://example.com/tenth.mp3\nFile2=./film é.mp4\nTitle2=Title is not a path\nNumberOfEntries=999999999\nVersion=2\n", -1, NULL));
+    items = media_playlist_read(pls, &stream, &error);
+    g_assert_no_error(error); g_assert_cmpuint(items->len, ==, 2);
+    g_assert_cmpstr(g_ptr_array_index(items, 0), ==, expected);
+    g_assert_cmpstr(g_ptr_array_index(items, 1), ==, "https://example.com/tenth.mp3");
+    g_ptr_array_free(items, TRUE);
+    // HLS manifests stay intact for mpv's segment/variant handling.
+    g_file_set_contents(list, "#EXTM3U\n#EXT-X-TARGETDURATION:10\nsegment.ts\n", -1, NULL);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_no_error(error); g_assert_true(stream); g_assert_cmpuint(items->len, ==, 0);
+    g_ptr_array_free(items, TRUE);
+    g_file_set_contents(pls, "[unrelated]\nFile1=film.mp4\n", -1, NULL);
+    items = media_playlist_read(pls, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    const char embedded_nul[] = "film.mp4\0hidden.mp4";
+    g_file_set_contents(list, embedded_nul, sizeof(embedded_nul) - 1, NULL);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    g_file_set_contents(list, "\xff\xfe", 2, NULL);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    char *large = g_strnfill(2 * 1024 * 1024 + 1, 'a');
+    g_file_set_contents(list, large, -1, NULL); g_free(large);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    GString *many = g_string_new(NULL);
+    for (int i = 0; i < 2049; i++) g_string_append(many, "film.mp4\n");
+    g_file_set_contents(list, many->str, many->len, NULL); g_string_free(many, TRUE);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    g_remove(list); g_remove(pls); g_free(list); g_free(pls); g_free(expected);
+}
+
 int main(void) {
     GError *error=NULL;char *root=g_dir_make_tmp("cube-player-state-XXXXXX",&error);g_assert_no_error(error);
     g_setenv("XDG_CONFIG_HOME",root,TRUE);g_setenv("XDG_STATE_HOME",root,TRUE);
+    test_playlists(root);
     State s;state_init(&s);g_assert_cmpfloat(s.volume,==,70);g_assert_true(s.resume);
     char *file=g_build_filename(root,"a film ' $ (é).mp4",NULL);g_assert_true(g_file_set_contents(file,"fixture",-1,NULL));
     char *path=media_path(file,&error);g_assert_no_error(error);g_assert_cmpstr(path,==,file);g_free(path);
@@ -28,5 +76,5 @@ int main(void) {
     g_assert_true(state_save(&s));
     char time[32];format_time(3661,time);g_assert_cmpstr(time,==,"1:01:01");format_time(NAN,time);g_assert_cmpstr(time,==,"00:00");
     g_remove(file);g_remove(s.config_path);g_remove(s.history_path);char *dir=g_path_get_dirname(s.config_path);g_rmdir(dir);g_free(dir);g_rmdir(root);
-    state_free(&s);g_free(file);g_free(root);g_print("State, resume, URI handling, privacy, and history bounds passed.\n");return 0;
+    state_free(&s);g_free(file);g_free(root);g_print("State, resume, URI handling, privacy, bounded M3U/PLS parsing, and history bounds passed.\n");return 0;
 }

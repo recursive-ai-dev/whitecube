@@ -200,11 +200,14 @@ static void play_index(App *a,int index) {
     dirty(a);
 }
 static gint path_cmp(gconstpointer x,gconstpointer y) {return g_utf8_collate(*(char *const *)x,*(char *const *)y);}
-static int add_media(App *a,const char *input,int depth) {
+static int add_media_full(App *a,const char *input,int depth,GHashTable *active,int *budget) {
+    if(--*budget<0) {toast(a,"This playlist contains too many nested entries.");return 0;}
     if(a->queue->len>=2048) {toast(a,"The queue is full (2,048 items).");return 0;}
     if(depth>3) {toast(a,"This playlist contains too many nested playlists.");return 0;}
     GError *e=NULL;char *path=media_path(input,&e);
     if(!path) {toast(a,e?e->message:"Could not open this item.");g_clear_error(&e);return 0;}
+    if(g_hash_table_contains(active,path)) {toast(a,"A playlist cycle was skipped.");g_free(path);return 0;}
+    g_hash_table_add(active,g_strdup(path));
     int before=a->queue->len;
     if(g_file_test(path,G_FILE_TEST_IS_DIR)) {
         GDir *dir=g_dir_open(path,0,&e);
@@ -212,26 +215,33 @@ static int add_media(App *a,const char *input,int depth) {
             GPtrArray *names=g_ptr_array_new_with_free_func(g_free);const char *name;
             while((name=g_dir_read_name(dir)) && names->len<4096) if(media_supported(name)) g_ptr_array_add(names,g_build_filename(path,name,NULL));
             g_dir_close(dir);g_ptr_array_sort(names,path_cmp);
-            for(guint i=0;i<names->len;i++) if(g_file_test(g_ptr_array_index(names,i),G_FILE_TEST_IS_REGULAR)) add_media(a,g_ptr_array_index(names,i),depth+1);
+            for(guint i=0;i<names->len && a->queue->len<2048 && *budget>0;i++) if(g_file_test(g_ptr_array_index(names,i),G_FILE_TEST_IS_REGULAR)) add_media_full(a,g_ptr_array_index(names,i),depth+1,active,budget);
             g_ptr_array_free(names,TRUE);
         } else {toast(a,e->message);g_clear_error(&e);}
     } else if(media_subtitle(path) && a->player.loaded) {
         player_subtitle(&a->player,path);toast(a,"Subtitle file added.");
     } else {
-        const char *ext=strrchr(path,'.'); bool playlist=path[0]=='/' && ext && (!g_ascii_strcasecmp(ext,".m3u") || !g_ascii_strcasecmp(ext,".m3u8"));
-        char *data=NULL;gsize size=0;
-        GStatBuf st; if(playlist && (!g_stat(path,&st) && st.st_size<=2*1024*1024) && g_file_get_contents(path,&data,&size,NULL) && !strstr(data,"#EXT-X-")) {
-            char *dir=g_path_get_dirname(path);char **lines=g_strsplit(data,"\n",-1);
-            for(int i=0;lines[i] && a->queue->len<2048;i++) {
-                char *line=g_strstrip(lines[i]); if(!*line || *line=='#') continue;
-                char *scheme=g_uri_parse_scheme(line);
-                char *item=scheme || g_path_is_absolute(line)?g_strdup(line):g_build_filename(dir,line,NULL);
-                add_media(a,item,depth+1);g_free(item);g_free(scheme);
-            }g_strfreev(lines);g_free(dir);
+        if(media_playlist_path(path)) {
+            bool stream=false;
+            GPtrArray *items=media_playlist_read(path,&stream,&e);
+            if(!items) {toast(a,e?e->message:"Could not read this playlist.");g_clear_error(&e);}
+            else {
+                if(stream) g_ptr_array_add(a->queue,media_new(path));
+                else for(guint i=0;i<items->len && a->queue->len<2048 && *budget>0;i++)
+                    add_media_full(a,g_ptr_array_index(items,i),depth+1,active,budget);
+                g_ptr_array_free(items,TRUE);
+            }
         } else g_ptr_array_add(a->queue,media_new(path));
-        g_free(data);
     }
+    g_hash_table_remove(active,path);
     g_free(path);dirty(a);return (int)a->queue->len-before;
+}
+static int add_media(App *a,const char *input,int depth) {
+    GHashTable *active=g_hash_table_new_full(g_str_hash,g_str_equal,g_free,NULL);
+    int budget=8192;
+    int count=add_media_full(a,input,depth,active,&budget);
+    if(budget<=0) toast(a,"Playlist import stopped after 8,192 entries.");
+    g_hash_table_destroy(active);return count;
 }
 static void open_input(App *a,const char *input,bool append) {
     int first=a->queue->len;

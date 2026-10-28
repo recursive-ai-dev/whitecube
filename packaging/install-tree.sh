@@ -77,7 +77,13 @@ find "$share/boot-theme" -name __pycache__ -prune -exec rm -rf {} +
 
 # --- workspace suite and bundled apps (python / javascript, run in place from /usr/share)
 cp -a workspace "$share/workspace"
-cp -a apps/desktop-chat "$share/desktop-chat"
+# Avoid staging hundreds of megabytes of development/runtime copies only to
+# delete them. Electron is staged once, separately, in the private runtime.
+install -d -m 0755 "$share/desktop-chat"
+tar -C apps/desktop-chat --exclude='./node_modules' --exclude='./dist' \
+  --exclude='./test' --exclude='./packaging' --exclude='./.git' \
+  --exclude='__pycache__' --exclude='*.pyc' -cf - . \
+  | tar -C "$share/desktop-chat" -xf -
 cp -a apps/cube-apps "$share/cube-apps"
 # Keep local training environments and standalone build artifacts out of the desktop.
 install -d -m 0755 "$share/cube-train"
@@ -86,6 +92,11 @@ for f in apps/cube-train/*.py apps/cube-train/*.md; do
 done
 cp -a apps/cube-train/pipeline "$share/cube-train/pipeline"
 find "$share/cube-train/pipeline" -name __pycache__ -prune -exec rm -rf {} +
+# Upstream modules carry executable bits despite having no shebang. Keep real
+# command scripts executable; imported Python modules are ordinary shared data.
+while IFS= read -r -d '' module; do
+  [[ $(head -c 2 -- "$module") == '#!' ]] || chmod 0644 "$module"
+done < <(find "$share/cube-train/pipeline" -type f -name '*.py' -print0)
 install -d -m 0755 "$share/cube-editor"
 # Exclude the extracted AppImage and development-only directories before copying.
 while IFS= read -r -d '' source; do
@@ -144,8 +155,8 @@ install -m 0644 data/icons/cube-strap.svg "$dest/usr/share/icons/hicolor/scalabl
 install -m 0644 data/icons/cube-prompts.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-prompts.svg"
 install -m 0644 data/icons/cube-browser.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-browser.svg"
 install -m 0644 data/icons/cube-player.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-player.svg"
-python3 -I apps/cube-apps/install.py --destdir "$dest" > /dev/null   # cube-lock/pdf/hash/rename: launchers, entries, icons
-python3 -I packaging/install-wc-suite.py "$dest" > /dev/null          # wc-* commands, /usr/lib/wc-suite, completions
+env -u LD_LIBRARY_PATH python3 -I apps/cube-apps/install.py --destdir "$dest" > /dev/null   # GTK helpers use distro Cairo
+env -u LD_LIBRARY_PATH python3 -I packaging/install-wc-suite.py "$dest" > /dev/null          # wc-* commands, /usr/lib/wc-suite, completions
 
 # --- skeleton for new accounts: the same defaults the desktop ships, as plain dotfiles
 install -d -m 0755 "$dest/etc/skel/.config/foot" "$dest/etc/skel/.config/fuzzel" "$dest/etc/skel/.config/fnott"

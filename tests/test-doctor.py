@@ -4,6 +4,8 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
+import socket
 import sys
 import tempfile
 import time
@@ -183,10 +185,10 @@ class OtherChecks(Fixture):
         for name in ("whitecube", "cube-status"):
             self.put(f".local/bin/{name}", "", self.home)
         for text, level in (("libxcb.so.1 => /lib/libxcb.so.1\n", "WARN"), ("libwayland-client.so.0 => /lib/x\n", "ok")):
-            with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout=text)):
+            with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout=text, returncode=0)):
                 found = doctor.check_xfree(self.env)[0]
             self.assertEqual(found["level"], level)
-        with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout="libX11.so.6 => /lib/x\n")):
+        with mock.patch.object(doctor.subprocess, "run", return_value=mock.Mock(stdout="libX11.so.6 => /lib/x\n", returncode=0)):
             self.assertIn("build-xfree-cairo.sh", doctor.check_xfree(self.env)[0]["fix"])
 
     def test_no_installed_binaries_means_nothing_to_flag(self):
@@ -195,6 +197,148 @@ class OtherChecks(Fixture):
     def test_x11_in_the_environment_is_flagged(self):
         with mock.patch.dict(doctor.os.environ, {"DISPLAY": ":0"}):
             self.assertEqual(doctor.check_session(self.env)[0]["level"], "WARN")
+
+
+class PackageChecks(Fixture):
+    def package(self):
+        executables = ('usr/bin/whitecube-compositor', 'usr/bin/whitecube-session',
+                       'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
+                       'usr/bin/whitecube-terminal', 'usr/bin/desktop-chat',
+                       'usr/libexec/whitecube/cube-settings-helper',
+                       'usr/lib/whitecube/desktop-chat-runtime/electron')
+        data = ('usr/share/wayland-sessions/whitecube.desktop',
+                'usr/share/whitecube/schemas/gschemas.compiled', 'etc/whitecube/config',
+                'usr/share/whitecube/desktop-chat/main.js')
+        for name in executables + data:
+            target = self.put(name, '')
+            if name in executables:
+                target.chmod(0o755)
+
+    def test_a_complete_package_has_no_failure(self):
+        self.package()
+        with mock.patch.object(doctor.subprocess, 'run', return_value=mock.Mock(stdout='libc.so.6 => /lib/libc.so.6', returncode=0)):
+            found = doctor.check_package(self.env)
+        self.assertEqual([item['level'] for item in found], ['ok'])
+
+    def test_partial_package_reports_missing_compositor_and_unexecutable_panel(self):
+        self.package()
+        (self.root / 'usr/bin/whitecube-compositor').unlink()
+        (self.root / 'usr/bin/cube-status').chmod(0o644)
+        with mock.patch.object(doctor.subprocess, 'run', return_value=mock.Mock(stdout='', returncode=0)):
+            found = doctor.check_package(self.env)[0]
+        self.assertEqual(found['level'], 'FAIL')
+        self.assertIn('whitecube-compositor', found['detail'])
+        self.assertIn('cube-status', found['detail'])
+
+    def test_missing_transitive_libraries_name_binary_and_soname(self):
+        self.package()
+        with mock.patch.object(doctor.subprocess, 'run', return_value=mock.Mock(stdout='libwlroots.so.12 => not found\n', returncode=0)):
+            found = doctor.check_package(self.env)[-1]
+        self.assertEqual(found['level'], 'FAIL')
+        self.assertIn('whitecube-compositor: libwlroots.so.12', found['detail'])
+
+    def test_chat_runtime_dependencies_are_checked(self):
+        self.package()
+
+        def inspect(command, **kwargs):
+            output = 'libasound.so.2 => not found\n' if command[1].endswith('/electron') else 'libc.so.6 => /lib/libc.so.6\n'
+            return mock.Mock(stdout=output, returncode=0)
+
+        with mock.patch.object(doctor.subprocess, 'run', side_effect=inspect):
+            findings = doctor.check_package(self.env)
+        self.assertEqual(findings[-1]['level'], 'FAIL')
+        self.assertIn('desktop-chat: libasound.so.2', findings[-1]['detail'])
+
+    def test_failed_ldd_probes_are_reported_as_unknown_instead_of_healthy(self):
+        self.package()
+        for failure in (mock.Mock(stdout='', returncode=1), OSError('ldd unavailable')):
+            patch = {'side_effect': failure} if isinstance(failure, Exception) else {'return_value': failure}
+            with self.subTest(failure=failure), mock.patch.object(doctor.subprocess, 'run', **patch):
+                libraries = doctor.check_xfree(self.env)
+                package = doctor.check_package(self.env)
+            self.assertEqual(libraries[0]['level'], 'WARN')
+            self.assertIn('could not inspect', libraries[0]['detail'])
+            self.assertTrue(any(item['level'] == 'WARN' and item['name'] == 'runtime libraries' for item in package))
+
+    def test_packaged_drift_uses_system_paths_and_preserves_user_config(self):
+        self.put('usr/bin/whitecube-compositor', 'new')
+        self.put('build/whitecube', 'new', self.project)
+        self.put('build/cube-status', 'new', self.project)
+        self.put('usr/bin/cube-status', 'old')
+        self.put('net/whitecube-network.service', 'unit', self.project)
+        self.put('usr/lib/systemd/system/whitecube-network.service', 'unit')
+        self.put('data/foot.ini', 'default', self.project)
+        found = doctor.check_drift(self.env)[0]
+        self.assertEqual(found['level'], 'WARN')
+        self.assertIn('cube-status', found['detail'])
+        self.assertNotIn('whitecube-compositor', found['detail'])
+        self.assertNotIn('whitecube-network', found['detail'])
+        self.assertNotIn('foot.ini', found['detail'])
+        self.assertIn('Debian package', found['fix'])
+        self.assertNotIn('INSTALL-USER', found['fix'])
+
+    def test_unavailable_source_tree_does_not_claim_to_match(self):
+        found = doctor.check_drift(self.env)[0]
+        self.assertEqual(found['level'], 'info')
+        self.assertIn('skipped', found['detail'])
+
+    def test_packaged_library_check_inspects_system_binaries(self):
+        self.put('usr/bin/whitecube-compositor', '')
+        with mock.patch.object(doctor.subprocess, 'run', return_value=mock.Mock(stdout='libX11.so => /lib/libX11.so', returncode=0)) as run:
+            found = doctor.check_xfree(self.env)[0]
+        self.assertEqual(found['level'], 'WARN')
+        self.assertEqual(run.call_args.args[0][1], str(self.root / 'usr/bin/whitecube-compositor'))
+        self.assertIn('Debian package', found['fix'])
+
+    def test_package_does_not_confuse_uninstalled_sudoers_example_with_active_rule(self):
+        self.put('usr/bin/whitecube-compositor', '')
+        self.put('data/sudoers/whitecube-settings', '%sudo ALL=(root) NOPASSWD: CUBE_FREE\n', self.project)
+        found = doctor.check_sudoers(self.env)[0]
+        self.assertEqual(found['detail'], 'sudoers rule file not found')
+
+
+class SessionChecks(Fixture):
+    def test_non_desktop_shell_is_informational(self):
+        with mock.patch.dict(doctor.os.environ, {}, clear=True):
+            self.assertEqual(doctor.check_session(self.env)[0]['level'], 'info')
+
+    def test_wayland_without_runtime_is_a_failure(self):
+        with mock.patch.dict(doctor.os.environ, {'XDG_SESSION_TYPE': 'wayland'}, clear=True):
+            self.assertEqual(doctor.check_session(self.env)[0]['level'], 'FAIL')
+
+    def test_world_accessible_runtime_is_a_failure(self):
+        runtime = self.home / 'runtime'
+        runtime.mkdir(mode=0o755)
+        runtime.chmod(0o755)  # Exercise permissions independently of the builder's umask.
+        with mock.patch.dict(doctor.os.environ, {'XDG_RUNTIME_DIR': str(runtime)}, clear=True):
+            self.assertEqual(doctor.check_session(self.env)[0]['level'], 'FAIL')
+
+    def test_runtime_symlink_is_rejected_like_the_session_launcher(self):
+        runtime = self.home / 'runtime'
+        runtime.mkdir(mode=0o700)
+        alias = self.home / 'runtime-alias'
+        alias.symlink_to(runtime, target_is_directory=True)
+        with mock.patch.dict(doctor.os.environ, {'XDG_RUNTIME_DIR': str(alias)}, clear=True):
+            found = doctor.check_session(self.env)[0]
+        self.assertEqual(found['level'], 'FAIL')
+        self.assertIn('no symlinks', found['detail'])
+
+    def test_active_socket_and_private_runtime_are_healthy(self):
+        runtime = self.home / 'runtime'
+        runtime.mkdir(mode=0o700)
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(runtime / 'wayland-0'))
+            with mock.patch.dict(doctor.os.environ, {'XDG_RUNTIME_DIR': str(runtime),
+                                 'XDG_SESSION_TYPE': 'wayland', 'WAYLAND_DISPLAY': 'wayland-0'}, clear=True):
+                self.assertEqual([item['level'] for item in doctor.check_session(self.env)], ['ok', 'ok'])
+
+    def test_regular_file_is_not_accepted_as_a_wayland_socket(self):
+        runtime = self.home / 'runtime'
+        runtime.mkdir(mode=0o700)
+        (runtime / 'wayland-0').touch()
+        with mock.patch.dict(doctor.os.environ, {'XDG_RUNTIME_DIR': str(runtime),
+                             'WAYLAND_DISPLAY': 'wayland-0'}, clear=True):
+            self.assertEqual(doctor.check_session(self.env)[-1]['level'], 'WARN')
 
 
 class RunTests(Fixture):
@@ -214,6 +358,31 @@ class RunTests(Fixture):
             code = doctor.main(["--json", "--project", str(self.project)])
         self.assertEqual(code, 1)
         self.assertTrue(any(f["level"] == "FAIL" for f in json.loads(out.getvalue())))
+
+    def test_selected_checks_skip_loading_network_code(self):
+        with mock.patch.object(doctor, 'load_cube_net', side_effect=AssertionError('must not import')):
+            results = doctor.run_checks(self.env, ['drift'])
+        self.assertEqual([item['name'] for item in results], ['installed copies'])
+
+    def test_broken_network_module_does_not_hide_other_checks(self):
+        with mock.patch.object(doctor, 'load_cube_net', side_effect=SyntaxError('broken module')):
+            names = self.levels(doctor.run_checks(self.env))
+        self.assertIn('installed copies', names)
+        self.assertEqual(names['wifi controller'], 'WARN')
+
+    def test_strict_mode_changes_exit_status_and_preserves_json_list_contract(self):
+        rows = [doctor.finding('WARN', 'folders', 'missing default')]
+        for flags, expected in (([], 0), (['--strict'], 1)):
+            with mock.patch.object(doctor, 'run_checks', return_value=rows), contextlib.redirect_stdout(io.StringIO()) as out:
+                code = doctor.main(['--json', '--check', 'folders'] + flags)
+            self.assertEqual(code, expected)
+            self.assertEqual(json.loads(out.getvalue()), rows)
+
+    def test_list_checks_is_json_without_running_any_probe(self):
+        with mock.patch.object(doctor, 'run_checks', side_effect=AssertionError('must not probe')), contextlib.redirect_stdout(io.StringIO()) as out:
+            code = doctor.main(['--json', '--list-checks'])
+        self.assertEqual(code, 0)
+        self.assertIn('package', json.loads(out.getvalue()))
 
     def test_the_command_is_read_only_and_uses_the_isolated_interpreter(self):
         source = (HERE / "bin" / "whitecube-doctor").read_text()

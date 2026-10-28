@@ -39,6 +39,19 @@ GUEST_PATH_FRAGMENTS = {
 GUEST_OWNED_PATHS = {
     'usr/share/whitecube/cube-strap/deb-strap.sh': ('/usr/bin/zsh', '/usr/bin/fish', '/usr/bin/qemu-'),
 }
+# Exact references to other products, or optional helpers with explicit
+# missing-command handling. Keep this per file: a misspelled runtime path in
+# another script must still fail, even when it starts with a familiar name.
+EXTERNAL_REFERENCES = {
+    'usr/share/doc/whitecube-desktop/README.md': {'/usr/bin/whitecube'},
+    'usr/share/whitecube/cube-prompts/README.md': {'/usr/bin/cube-prompts-studio'},  # Standalone edition.
+    'usr/libexec/whitecube/cube-settings-helper': {
+        '/usr/bin/amixer', '/usr/bin/wpctl', '/usr/bin/chronyc', '/usr/bin/setupcon',
+    },
+}
+COMMENT_ONLY_REFERENCES = {
+    'usr/bin/whitecube-session': {b'# /usr/bin/whitecube can belong to the unrelated image tool.'},
+}
 ALLOW_FORBIDDEN_IN = ('usr/bin/whitecube-migrate', 'usr/share/doc/', 'usr/share/whitecube/workspace/docs', 'usr/share/whitecube/boot-theme/',
                       'usr/share/whitecube/desktop-chat/assets', 'usr/lib/whitecube/')
 
@@ -77,20 +90,24 @@ def main():
         rel = str(path.relative_to(stage))
         if rel.startswith('DEBIAN/'):
             continue
-        data = path.read_bytes()
-        if not is_elf(data) and b'\0' in data[:4096]:
-            continue                                   # other binary data (images, compiled schemas)
-        if not is_elf(data) and path.stat().st_mode & 0o111 and not data.startswith(b'#!'):
+        with path.open('rb') as stream:
+            prefix = stream.read(4096)
+            if is_elf(prefix) or b'\0' in prefix:
+                continue                               # native literals checked from sources; skip binary data early
+            data = prefix + stream.read()
+        if path.stat().st_mode & 0o111 and not data.startswith(b'#!'):
             problems.append(f'{rel}: executable without a #! line')
-        if is_elf(data):
-            continue                                       # their string literals are checked from the sources below
         strings = [data]
         owned = set()
         for seg in strings:
+            comments = COMMENT_ONLY_REFERENCES.get(rel, ())
+            seg = b'\n'.join(line for line in seg.splitlines() if line.lstrip() not in comments)
             owned.update(OWNED.findall(seg))
         for match in sorted(owned):
             checked += 1
             ref = match.decode()
+            if ref in EXTERNAL_REFERENCES.get(rel, ()):
+                continue
             if ref.startswith(RUNTIME_FILES):
                 continue                                   # created at run time, not shipped
             if ref.startswith(GUEST_OWNED_PATHS.get(rel, ())):

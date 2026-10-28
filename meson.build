@@ -1,4 +1,4 @@
-project('whitecube', 'c', version: '0.2.0', default_options: ['c_std=c11', 'warning_level=2'])
+project('whitecube', 'c', version: files('packaging/VERSION'), default_options: ['c_std=c11', 'warning_level=2'])
 add_project_arguments('-I' + meson.current_source_dir() / 'src', '-I' + meson.current_source_dir() / 'src/protocols', language: 'c')
 wlroots = dependency('wlroots-0.18')
 wayland_server = dependency('wayland-server')

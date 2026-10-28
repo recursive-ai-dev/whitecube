@@ -61,6 +61,10 @@ PROTECTED = {
 }
 GROUPS = ("audio", "video", "input", "render", "plugdev", "netdev", "sudo", "lp", "dialout", "users")
 POWER_ACTIONS = {"poweroff": "poweroff", "reboot": "reboot", "suspend": "suspend"}
+OPTIONAL_COMMANDS = {
+    "/usr/bin/amixer": "alsa-utils", "/usr/bin/wpctl": "wireplumber",
+    "/usr/bin/chronyc": "chrony", "/usr/bin/setupcon": "console-setup",
+}
 
 
 def fail(message):
@@ -77,6 +81,11 @@ def emit(*fields):
 
 
 def run(*args, timeout=10, check=False, input_text=None):
+    if args[0] in OPTIONAL_COMMANDS and not os.access(args[0], os.X_OK):
+        message = f"{args[0]} is unavailable; install {OPTIONAL_COMMANDS[args[0]]}."
+        if check:
+            fail(message)
+        return subprocess.CompletedProcess(args, 127, stdout="", stderr=message)
     result = subprocess.run(args, capture_output=True, text=True, timeout=timeout, input=input_text)
     if check and result.returncode != 0:
         fail((result.stderr or result.stdout).strip().splitlines()[-1] if (result.stderr or result.stdout).strip()
@@ -515,6 +524,8 @@ def console_keyboard(layout, variant):
     require_root()
     if not re.fullmatch(r"[a-z]{2,8}", layout) or not re.fullmatch(r"[a-z0-9_-]{0,32}", variant):
         fail("Invalid keyboard layout")
+    if not os.access("/usr/bin/setupcon", os.X_OK):
+        fail("Console keyboard setup is unavailable; install console-setup.")
     path = Path("/etc/default/keyboard")
     lines = read(path).splitlines()
     values = {"XKBLAYOUT": layout, "XKBVARIANT": variant}
@@ -524,7 +535,7 @@ def console_keyboard(layout, variant):
         out.append(f'{key}="{values.pop(key)}"' if key in values else line)
     out += [f'{k}="{v}"' for k, v in values.items()]
     path.write_text("\n".join(out) + "\n")
-    run("/usr/bin/setupcon", "--save-only", timeout=30)
+    run("/usr/bin/setupcon", "--save-only", timeout=30, check=True)
     emit("ok", "console-keyboard", layout, variant)
 
 

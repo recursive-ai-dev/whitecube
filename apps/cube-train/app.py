@@ -1671,7 +1671,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.open_button.set_sensitive(bool(run))
         self.duplicate_button.set_sensitive(bool(run and run['meta']))
         self.metrics_button.set_sensitive(bool(run))
-        chat_available = os.access('/usr/bin/desktop-chat', os.X_OK)
+        chat_available = engine.chat_launcher() is not None
         self.best_button.set_sensitive(bool(run and run['best'] and chat_available))
         self.latest_button.set_sensitive(bool(run and run['latest'] and chat_available))
         for widget in (self.best_button, self.latest_button):
@@ -2508,8 +2508,6 @@ class TrainerWindow(Adw.ApplicationWindow):
                            lambda: json.dumps(self.trainer.report(run_id), indent=2, ensure_ascii=False) + '\n')
 
     def chat(self, kind):
-        if not os.access('/usr/bin/desktop-chat', os.X_OK):
-            self.notify('Desktop Chat is not installed. Generate text in the Preview tab.'); return
         try:
             subprocess.Popen(self.trainer.chat_command(self.selected_id, kind), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except (ValueError, OSError) as error:

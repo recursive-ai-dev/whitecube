@@ -57,6 +57,14 @@ def inside(fixture, screenshots):
             assert w.selected_id == 'fixture-run'
             assert w.resume_button.get_sensitive() and w.best_button.get_sensitive()
             assert w.latest_button.get_sensitive() and w.delete_button.get_sensitive()
+            # Chat availability and launch commands must share one discovery path.
+            with patch.object(engine, 'chat_launcher', return_value=None):
+                w.refresh()
+                assert not w.best_button.get_sensitive() and not w.latest_button.get_sensitive()
+                assert not w.actions['chat-best'].get_enabled() and not w.actions['chat-latest'].get_enabled()
+            w.refresh()
+            assert w.best_button.get_sensitive() and w.latest_button.get_sensitive()
+            assert w.actions['chat-best'].get_enabled() and w.actions['chat-latest'].get_enabled()
             assert '2.4000' in w.run_detail.get_text()
             assert w.resume_steps.get_value() > 4
             assert 'Fixture log' in w.last_log and len(w.losses) == 3

@@ -37,6 +37,19 @@ int main(void) {
     char *media=g_build_filename(root,"a ' strange; name.mp4",NULL);g_file_set_contents(media,"test",-1,NULL);
     char *list=g_build_filename(root,"list.m3u",NULL);g_file_set_contents(list,"#EXTM3U\na ' strange; name.mp4\n",-1,NULL);
     g_assert_cmpint(add_media(&a,list,0),==,1);g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,0))->path,==,media);
+    // BOM, relative paths and a PLS file are expanded into the application's queue.
+    g_file_set_contents(list,"\xef\xbb\xbf#EXTM3U\n./a ' strange; name.mp4\n",-1,NULL);
+    g_assert_cmpint(add_media(&a,list,0),==,1);
+    char *pls=g_build_filename(root,"list.pls",NULL);
+    g_file_set_contents(pls,"[playlist]\nFile2=https://example.com/radio.mp3\nFile1=list.m3u\nVersion=2\n",-1,NULL);
+    g_assert_cmpint(add_media(&a,pls,0),==,2);
+    g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,2))->path,==,media);
+    g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,3))->path,==,"https://example.com/radio.mp3");
+    // HLS remains one media item; mpv must receive the complete manifest.
+    g_file_set_contents(list,"#EXTM3U\n#EXT-X-TARGETDURATION:10\nsegment.ts\n",-1,NULL);
+    g_assert_cmpint(add_media(&a,list,0),==,1);
+    g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,4))->path,==,list);
+    g_remove(pls);g_free(pls);
     // Caret movement and deletion preserve UTF-8 boundaries inside paths.
     show_panel(&a,LOCATION);a.input_focus=true;a.input[0]=0;a.input_cursor=0;
     insert(&a,"aéz");key_app(&a,XKB_KEY_Home,"",false,false,false);key_app(&a,XKB_KEY_Right,"",false,false,false);
@@ -45,7 +58,10 @@ int main(void) {
     key_app(&a,XKB_KEY_Home,"",false,false,false);insert(&a,"ø");g_assert_cmpstr(a.input,==,"øa");
     key_app(&a,XKB_KEY_a,"",true,false,false);insert(&a,"replacement.mkv");g_assert_cmpstr(a.input,==,"replacement.mkv");
     // A self-reference stops at the nesting bound rather than growing forever.
-    g_file_set_contents(list,"list.m3u\n",-1,NULL);g_assert_cmpint(add_media(&a,list,0),==,0);g_assert_cmpuint(a.queue->len,==,1);
+    g_file_set_contents(list,"list.m3u\n",-1,NULL);g_assert_cmpint(add_media(&a,list,0),==,0);g_assert_cmpuint(a.queue->len,==,5);
+    // A cycle skips only its own branch; repeated valid entries remain intentional.
+    g_file_set_contents(list,"./list.m3u\na ' strange; name.mp4\na ' strange; name.mp4\n",-1,NULL);
+    g_assert_cmpint(add_media(&a,list,0),==,2);g_assert_cmpuint(a.queue->len,==,7);
     g_remove(config);g_remove(access);g_rmdir(dir);g_remove(media);g_remove(list);g_rmdir(root);
     g_free(config);g_free(access);g_free(dir);g_free(media);g_free(list);g_free(root);
     state_free(&a.state);g_ptr_array_free(a.queue,TRUE);g_ptr_array_free(a.entries,TRUE);g_array_free(a.player.tracks,TRUE);g_array_free(a.player.chapters,TRUE);g_free(a.folder);

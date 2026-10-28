@@ -1,3 +1,6 @@
 /etc/whitecube/config
 /etc/whitecube/network/dhcpcd.conf
 /etc/whitecube/net-switch.conf
+/etc/skel/.config/foot/foot.ini
+/etc/skel/.config/fuzzel/fuzzel.ini
+/etc/skel/.config/fnott/fnott.ini

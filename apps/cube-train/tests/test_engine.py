@@ -55,6 +55,31 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(report['configuration']['display_name'], 'My 5M model')
         self.assertEqual(report['result']['best_val_loss'], 2.1)
 
+    def test_chat_launcher_prefers_system_then_standalone_then_source(self):
+        system = self.root / 'system-chat'
+        source = self.root / 'apps/desktop-chat/desktop-chat.sh'
+        source.parent.mkdir(parents=True)
+        source.write_text('#!/bin/sh\nexit 0\n'); source.chmod(0o755)
+        with patch.object(engine, 'SYSTEM_CHAT', system), patch.object(engine, 'HERE', self.root / 'apps/cube-train'), \
+                patch.object(engine.shutil, 'which', return_value=None):
+            self.assertEqual(engine.chat_launcher(), str(source))
+            system.write_text('#!/bin/sh\nexit 0\n'); system.chmod(0o755)
+            self.assertEqual(engine.chat_launcher(), str(system))
+            system.chmod(0o644)
+            self.assertEqual(engine.chat_launcher(), str(source))
+            with patch.object(engine.shutil, 'which', side_effect=lambda name: '/standalone/whitecube-chat' if name == 'whitecube-chat' else None):
+                self.assertEqual(engine.chat_launcher(), '/standalone/whitecube-chat')
+            source.chmod(0o644)
+            self.assertIsNone(engine.chat_launcher())
+
+    def test_chat_command_uses_discovered_literal_launcher_and_rejects_missing_chat(self):
+        self.make_run()
+        with patch.object(engine, 'chat_launcher', return_value='/path with spaces/desktop-chat'):
+            self.assertEqual(self.trainer.chat_command('stable-run', 'best'),
+                             ['/path with spaces/desktop-chat', '--show', '--checkpoint', 'stable-run/ckpt_best.pt'])
+        with patch.object(engine, 'chat_launcher', return_value=None), self.assertRaisesRegex(ValueError, 'Desktop Chat is not installed'):
+            self.trainer.chat_command('stable-run', 'best')
+
     def test_preferences_are_private_and_atomic(self):
         self.trainer.save_preferences({'model_size': '10m', 'steps': 1500, 'python': '/python path with spaces'})
         self.assertEqual(self.trainer.preferences()['model_size'], '10m')

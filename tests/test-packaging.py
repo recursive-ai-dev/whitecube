@@ -2,13 +2,16 @@
 """The install tree and the path checker: layout facts that must stay true as the project changes."""
 from pathlib import Path
 import importlib.util
+import importlib.machinery
 import json
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parent.parent
@@ -64,6 +67,9 @@ class Tree(unittest.TestCase):
         self.assertIn('X-Wayland-Native=true', desktop)
         self.assertFalse((trainer / 'tests').exists())
         self.assertFalse(any(trainer.rglob('*.pt')))
+        for module in (trainer / 'pipeline').rglob('*.py'):
+            if not module.read_bytes().startswith(b'#!'):
+                self.assertFalse(module.stat().st_mode & 0o111, str(module.relative_to(trainer)))
 
     def test_the_image_tools_command_name_is_left_alone(self):
         self.assertFalse((self.stage / 'usr/bin/whitecube').exists(), 'the separate "whitecube" package owns /usr/bin/whitecube')
@@ -232,17 +238,38 @@ class Tree(unittest.TestCase):
         original = script.read_text()
         worker = self.stage / 'usr/share/whitecube/cube-editor/worker.py'
         original_worker = worker.read_text()
+        helper = self.stage / 'usr/libexec/whitecube/cube-settings-helper'
+        original_helper = helper.read_text()
         try:
-            script.write_text(original + '\n# /usr/share/whitecube/no-such-file\n# /usr/local/bin/old-copy\n')
+            script.write_text(original + '\n# /usr/share/whitecube/no-such-file\n# /usr/local/bin/old-copy\n# /usr/bin/amixer\n')
             worker.write_text(original_worker + '\n# Host path regression: /usr/local/bin/old-worker\n')
+            helper.write_text(original_helper + '\n# /usr/bin/amixer-typo\n')
             done = subprocess.run(check, capture_output=True, text=True)
             self.assertEqual(done.returncode, 1)
             self.assertIn('no-such-file', done.stdout)
             self.assertIn('/usr/local/', done.stdout)
             self.assertIn('cube-editor/worker.py', done.stdout)
+            self.assertIn('amixer-typo', done.stdout)
+            if not Path('/usr/bin/amixer').exists():
+                self.assertIn('cube-check: refers to /usr/bin/amixer', done.stdout)
         finally:
             script.write_text(original)
             worker.write_text(original_worker)
+            helper.write_text(original_helper)
+
+    def test_comment_about_unrelated_whitecube_does_not_exempt_a_runtime_reference(self):
+        session = self.stage / 'usr/bin/whitecube-session'
+        original = session.read_text()
+        host = Path(self.tmp.name) / 'empty-host'
+        host.mkdir()
+        try:
+            session.write_text(original + '\nexec /usr/bin/whitecube\n')
+            done = subprocess.run([sys.executable, '-I', str(ROOT / 'packaging/check-tree.py'), str(self.stage),
+                                   '--host-root', str(host)], capture_output=True, text=True)
+            self.assertNotEqual(done.returncode, 0)
+            self.assertIn('whitecube-session: refers to /usr/bin/whitecube,', done.stdout)
+        finally:
+            session.write_text(original)
 
 
 class DependencyOwnership(unittest.TestCase):
@@ -287,6 +314,201 @@ class DependencyOwnership(unittest.TestCase):
     def test_real_graphics_library_owners_are_found(self):
         self.assertEqual(self.scanner.owner_for_library('/lib/x86_64-linux-gnu/libEGL.so.1'), 'libegl1')
         self.assertEqual(self.scanner.owner_for_library('/lib/x86_64-linux-gnu/libGLESv2.so.2'), 'libgles2')
+
+
+class ArchiveVerification(unittest.TestCase):
+    """Exercise the final archive checker on real deb files, independent of a desktop build."""
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('whitecube_archive_check', ROOT / 'packaging/verify-deb.py')
+        cls.checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.checker)
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stage = Path(self.tmp.name) / 'stage'
+        metadata = self.stage / 'DEBIAN'
+        metadata.mkdir(parents=True)
+        self.control = metadata / 'control'
+        self.control.write_text(
+            'Package: whitecube-desktop\nVersion: 0.8.0\nArchitecture: amd64\n'
+            'Maintainer: Whitecube <whitecube@localhost>\nSection: x11\nPriority: optional\n'
+            'Installed-Size: 1\nDepends: libc6 (>= 2.34), python3\nDescription: test fixture\n')
+        for name in ('postinst', 'postrm'):
+            script = metadata / name
+            script.write_text('#!/bin/sh\nexit 0\n')
+            script.chmod(0o755)
+        self.config = self.stage / 'etc/whitecube/config'
+        self.config.parent.mkdir(parents=True)
+        self.config.write_text('setting=yes\n')
+        self.config.chmod(0o644)
+        self.sandbox = self.stage / self.checker.SANDBOX
+        self.sandbox.parent.mkdir(parents=True)
+        self.sandbox.write_bytes(b'fixture')
+        self.sandbox.chmod(0o4755)
+        (metadata / 'conffiles').write_text('/etc/whitecube/config\n')
+        for path in self.stage.rglob('*'):
+            if path.is_dir():
+                path.chmod(0o755)
+        self.write_checksums()
+        self.package = Path(self.tmp.name) / 'whitecube-desktop_0.8.0_amd64.deb'
+
+    def write_checksums(self):
+        hashes = []
+        for path in sorted(self.stage.rglob('*')):
+            if path.is_file() and not path.is_relative_to(self.stage / 'DEBIAN'):
+                hashes.append(hashlib.md5(path.read_bytes()).hexdigest() + '  ' + str(path.relative_to(self.stage)))
+        (self.stage / 'DEBIAN/md5sums').write_text('\n'.join(hashes) + '\n')
+        for path in (self.stage / 'DEBIAN').iterdir():
+            if path.name not in ('postinst', 'postrm'):
+                path.chmod(0o644)
+
+    def verify(self):
+        result = subprocess.run(['dpkg-deb', '--root-owner-group', '-Znone', '--build',
+                                 str(self.stage), str(self.package)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return self.checker.check(self.package)
+
+    def test_complete_archive_passes_and_reports_a_verifiable_manifest(self):
+        problems, summary = self.verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(summary['verification'], 'passed')
+        self.assertEqual(summary['payload_files'], 2)
+        self.assertEqual(summary['filename'], self.package.name)
+        self.assertEqual(summary['sha256'], hashlib.sha256(self.package.read_bytes()).hexdigest())
+
+    def test_modified_payload_is_rejected(self):
+        self.config.write_text('changed=yes\n')
+        problems, _ = self.verify()
+        self.assertTrue(any('incorrect payload checksum' in problem for problem in problems), problems)
+
+    def test_unregistered_configuration_would_not_survive_an_upgrade(self):
+        extra = self.stage / 'etc/whitecube/extra.conf'
+        extra.write_text('extra=yes\n')
+        extra.chmod(0o644)
+        self.write_checksums()
+        problems, _ = self.verify()
+        self.assertIn('configuration file is not registered as a conffile: etc/whitecube/extra.conf', problems)
+
+    def test_sandbox_losing_setuid_is_rejected(self):
+        self.sandbox.chmod(0o755)
+        problems, _ = self.verify()
+        self.assertTrue(any('sandbox helper' in problem for problem in problems), problems)
+
+    def test_unexpected_privileged_file_is_rejected(self):
+        self.config.chmod(0o4644)
+        problems, _ = self.verify()
+        self.assertIn('unexpected setuid/setgid file: etc/whitecube/config', problems)
+
+    def test_world_writable_runtime_file_is_rejected(self):
+        self.config.chmod(0o666)
+        problems, _ = self.verify()
+        self.assertIn('payload is writable by group or others: etc/whitecube/config', problems)
+
+    def test_abi_minimum_cannot_be_omitted(self):
+        self.control.write_text(self.control.read_text().replace('libc6 (>= 2.34)', 'libc6'))
+        problems, _ = self.verify()
+        self.assertIn('libc6 ABI minimum is missing from Depends', problems)
+
+    def test_self_dependency_is_rejected(self):
+        self.control.write_text(self.control.read_text().replace('python3', 'whitecube-desktop (>= 0.1)'))
+        problems, _ = self.verify()
+        self.assertIn('package depends on itself', problems)
+
+    def test_unsafe_tar_paths_are_rejected(self):
+        for name in ('../etc/passwd', '/usr/bin/escape', './usr/../../escape'):
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'unsafe archive path'):
+                self.checker.payload_path(name)
+
+    def test_external_symlink_cannot_escape_installed_root(self):
+        (self.config.parent / 'bad').symlink_to('../../../outside')
+        problems, _ = self.verify()
+        self.assertIn('symlink escapes installed root: etc/whitecube/bad', problems)
+
+    def test_absolute_symlink_must_resolve_in_the_package_instead_of_the_host(self):
+        (self.config.parent / 'bad').symlink_to('/etc/passwd')
+        problems, _ = self.verify()
+        self.assertIn('dangling symlink: etc/whitecube/bad -> etc/passwd', problems)
+        (self.config.parent / 'bad').unlink()
+        (self.config.parent / 'good').symlink_to('/etc/whitecube/config')
+        problems, _ = self.verify()
+        self.assertEqual(problems, [])
+
+    def test_symlink_cycles_are_rejected(self):
+        (self.config.parent / 'cycle-a').symlink_to('cycle-b')
+        (self.config.parent / 'cycle-b').symlink_to('cycle-a')
+        problems, _ = self.verify()
+        self.assertIn('cyclic symlink: etc/whitecube/cycle-a', problems)
+
+    def test_real_dpkg_unpack_registers_payload_and_configuration(self):
+        self.verify()
+        self.checker.smoke_unpack(self.package)
+
+    def test_rootless_unpack_refuses_packages_that_would_execute_a_preinst(self):
+        script = self.stage / 'DEBIAN/preinst'
+        script.write_text('#!/bin/sh\nexit 0\n')
+        script.chmod(0o755)
+        self.verify()
+        with self.assertRaisesRegex(RuntimeError, 'without preinst'):
+            self.checker.smoke_unpack(self.package)
+
+
+class ABIDependencies(unittest.TestCase):
+    def test_real_elf_gets_distribution_symbol_version_minima(self):
+        spec = importlib.util.spec_from_file_location('whitecube_dependency_versions', ROOT / 'packaging/dependency-versions.py')
+        scanner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scanner)
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            destination = stage / 'usr/bin'
+            destination.mkdir(parents=True)
+            shutil.copyfile('/usr/bin/true', destination / 'example')
+            dependencies = scanner.discover(stage)
+            self.assertTrue(any(value.startswith('libc6 (>= ') for value in dependencies), dependencies)
+            (destination / 'example').unlink()
+            with self.assertRaisesRegex(RuntimeError, 'no ELF'):
+                scanner.discover(stage)
+
+
+class OptionalSettingsTools(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        loader = importlib.machinery.SourceFileLoader('whitecube_optional_settings_helper', str(ROOT / 'libexec/cube-settings-helper'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        cls.helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.helper)
+
+    def test_missing_optional_read_tools_return_an_actionable_result(self):
+        with patch.object(self.helper.os, 'access', return_value=False), patch.object(self.helper.subprocess, 'run') as execute:
+            for command, package in self.helper.OPTIONAL_COMMANDS.items():
+                result = self.helper.run(command, '--status')
+                self.assertEqual(result.returncode, 127)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('install ' + package, result.stderr)
+            execute.assert_not_called()
+
+    def test_missing_optional_write_tool_fails_before_execution(self):
+        with patch.object(self.helper.os, 'access', return_value=False), patch.object(self.helper.subprocess, 'run') as execute:
+            with self.assertRaises(SystemExit):
+                self.helper.run('/usr/bin/wpctl', 'set-volume', 'sink', '0.5', check=True)
+            execute.assert_not_called()
+
+    def test_console_keyboard_needs_setupcon_before_changing_configuration(self):
+        with patch.object(self.helper, 'require_root'), patch.object(self.helper.os, 'access', return_value=False), patch.object(self.helper, 'read') as read:
+            with self.assertRaises(SystemExit):
+                self.helper.console_keyboard('us', '')
+            read.assert_not_called()
+
+    def test_optional_packages_are_declared_and_checker_references_are_narrow(self):
+        control = (ROOT / 'packaging/debian/control.in').read_text()
+        optional = '\n'.join(line for line in control.splitlines() if line.startswith(('Suggests:', 'Recommends:')))
+        for package in self.helper.OPTIONAL_COMMANDS.values():
+            self.assertIn(package, optional)
+        spec = importlib.util.spec_from_file_location('whitecube_path_checker_optional', ROOT / 'packaging/check-tree.py')
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        self.assertEqual(checker.EXTERNAL_REFERENCES['usr/libexec/whitecube/cube-settings-helper'], set(self.helper.OPTIONAL_COMMANDS))
 
 
 if __name__ == '__main__':

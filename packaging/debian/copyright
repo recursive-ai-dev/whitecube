@@ -27,6 +27,13 @@ Copyright: The cairo contributors
 License: LGPL-2.1 or MPL-1.1
 Comment: The LGPL-2.1 text is in /usr/share/common-licenses/LGPL-2.1.
 
+Files: usr/lib/whitecube/libdisplay-info*
+Copyright: 2022-2023 The libdisplay-info Contributors
+           2006-2012 Red Hat, Inc.
+           2018-2021 Cisco Systems, Inc. and/or its affiliates
+License: MIT
+Comment: Full upstream and Debian notices are in libdisplay-info-copyright beside this file.
+
 Files: usr/lib/whitecube/desktop-chat-runtime/*
 Copyright: GitHub Inc., the Electron contributors and the Chromium authors
 License: MIT

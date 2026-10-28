@@ -18,6 +18,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PIPELINE = HERE / 'pipeline'
+SYSTEM_CHAT = Path('/usr/bin/desktop-chat')
 sys.path.insert(0, str(PIPELINE))
 from files import atomic_json
 from model_presets import MODEL_PRESETS, DESKTOP_SIZES
@@ -48,6 +49,20 @@ NOTES_LIMIT = 2000
 RECENT_LIMIT = 8
 CHECKPOINT_KIND = export_notebook.CHECKPOINT_KIND
 KERNEL_NAME = export_notebook.KERNEL_NAME
+
+
+def chat_launcher():
+    """Find the same Chat launcher for action availability and process startup."""
+    if SYSTEM_CHAT.is_file() and os.access(SYSTEM_CHAT, os.X_OK):
+        return str(SYSTEM_CHAT)
+    for name in ('whitecube-chat', 'desktop-chat'):
+        executable = shutil.which(name)
+        if executable:
+            return executable
+    source = HERE.parent / 'desktop-chat/desktop-chat.sh'
+    if source.is_file() and os.access(source, os.X_OK):
+        return str(source)
+    return None
 
 
 def bits_per_byte(loss):
@@ -799,7 +814,10 @@ class Trainer:
         run = self.find_run(run_id)
         if kind not in ('best', 'latest') or not run[kind]:
             raise ValueError('This checkpoint has not been saved yet.')
-        return ['/usr/bin/desktop-chat', '--show', '--checkpoint', f'{run_id}/ckpt_{kind}.pt']
+        launcher = chat_launcher()
+        if launcher is None:
+            raise ValueError('Desktop Chat is not installed. Generate text in the Preview tab.')
+        return [launcher, '--show', '--checkpoint', f'{run_id}/ckpt_{kind}.pt']
 
     def report(self, run_id):
         run = self.find_run(run_id)

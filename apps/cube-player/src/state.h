@@ -23,6 +23,9 @@ char *media_path(const char *input, GError **error);
 char *media_title(const char *path);
 bool media_supported(const char *path);
 bool media_subtitle(const char *path);
+bool media_playlist_path(const char *path);
+/* Resolved paths, owned by the array. HLS returns an empty array with stream=true. */
+GPtrArray *media_playlist_read(const char *path, bool *stream, GError **error);
 Media *media_new(const char *path);
 void media_free(gpointer media);
 void format_time(double seconds, char out[32]);

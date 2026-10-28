@@ -6,8 +6,8 @@ Priority: optional
 Installed-Size: @SIZE@
 Maintainer: Whitecube <whitecube@localhost>
 Depends: @DEPENDS@
-Recommends: fnott, ufw, dconf-cli, pipewire, wireplumber, pipewire-pulse, qemu-system-x86, qemu-system-gui, ovmf
-Suggests: python3-torch, python3-numpy
+Recommends: fnott, ufw, pipewire, wireplumber, pipewire-pulse, qemu-system-x86, qemu-system-gui, ovmf
+Suggests: python3-torch, python3-numpy, alsa-utils, chrony, console-setup
 Description: Whitecube - Wayland desktop with native image and model training studios
  A compositor (whitecube), top bar (cube-status), settings, living cube wallpaper (cube-ca),
  a native Wi-Fi controller (cube-net), a workspace suite and small apps.

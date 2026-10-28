@@ -10,7 +10,9 @@ cd "$native_dir"
 # set ASAN_OPTIONS=detect_leaks=1 to look anyway). The normal build/ is untouched.
 out=build
 cc=${CC:-cc}
-flags=(-std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Isrc -Isrc/protocols -Wl,-rpath,/usr/lib/whitecube)
+flags=(-std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Isrc -Isrc/protocols
+  -fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security
+  -fPIE -pie -Wl,-z,relro,-z,now)
 if [[ -n ${SANITIZE:-} ]]; then
   out=build-asan
   flags+=(-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
@@ -36,11 +38,26 @@ if [[ -n $sysroot ]]; then
   export PKG_CONFIG_SYSROOT_DIR=$sysroot
   export PKG_CONFIG_LIBDIR=$sysroot/usr/local/lib/x86_64-linux-gnu/pkgconfig:$sysroot/usr/lib/x86_64-linux-gnu/pkgconfig:$sysroot/usr/share/pkgconfig
   pkg() { "$loader" --library-path "$libpath" "$sysroot/usr/bin/pkg-config" "$@"; }
-  flags+=("--sysroot=$sysroot" "-B$native_dir/$out/toolchain/" "-Wl,-rpath-link,$sysroot/usr/local/lib/x86_64-linux-gnu" "-Wl,-rpath-link,$sysroot/usr/lib/x86_64-linux-gnu" "-Wl,-rpath-link,$sysroot/usr/lib/mesa-diverted/x86_64-linux-gnu")
+  flags+=("--sysroot=$sysroot" "-B$native_dir/$out/toolchain/" "-Wl,-rpath,/usr/lib/whitecube" "-Wl,-rpath-link,$sysroot/usr/local/lib/x86_64-linux-gnu" "-Wl,-rpath-link,$sysroot/usr/lib/x86_64-linux-gnu" "-Wl,-rpath-link,$sysroot/usr/lib/mesa-diverted/x86_64-linux-gnu")
 else
-  export PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:${PKG_CONFIG_PATH:-}
+  # Respect the caller's selected private dependencies before system defaults.
+  # pkg-config already searches /usr/local through its built-in path.
   pkg() { pkg-config "$@"; }
 fi
+# Fail before compiling rather than hiding pkg-config errors in a successful read.
+pkg --exists wlroots-0.18 wayland-server wayland-client wayland-cursor xkbcommon pangocairo cairo gio-2.0 libinput || {
+  echo 'BUILD.sh: native development dependencies are missing; use tools/build-debian.sh for an isolated Debian build' >&2
+  exit 1
+}
+if [[ -z $sysroot ]]; then
+  # Source binaries find the selected private libraries without globally
+  # replacing Cairo for Python/GTK, whose distro build also needs Xlib symbols.
+  # Packaging replaces these source paths with /usr/lib/whitecube.
+  wlroots_libdir=$(pkg --variable=libdir wlroots-0.18)
+  cairo_libdir=$(pkg --variable=libdir cairo)
+  flags+=("-Wl,-rpath,$wlroots_libdir:$cairo_libdir:/usr/lib/whitecube")
+fi
+unset LD_LIBRARY_PATH
 # pkg-config output consists of compiler options, expanded as individual words.
 read -r -a compositor_flags <<< "$(pkg --cflags --libs wlroots-0.18 wayland-server xkbcommon pangocairo cairo gio-2.0 libinput)"
 read -r -a client_flags <<< "$(pkg --cflags --libs wayland-client)"
@@ -99,12 +116,16 @@ else
   $out/cube-ca --preview $out/cube-space.ppm
   $out/cube-status --render "$out" >/dev/null
 fi
+# Package tests inspect the complete tree, including these native apps.
+[[ -n $sysroot || -n ${SANITIZE:-} ]] || bash apps/build-native-apps.sh "$native_dir/$out"
 # Network controller (cube-net, DHCP hook, unit, helper): pure Python, needs no root, radio or network.
 python3 -I net/test_cube_net.py
 python3 -I net/test_cube_wifi.py
 python3 -I net/test_net_switch.py
 python3 -I tests/test-privacy.py
 python3 -I tests/test-doctor.py
+python3 -I tests/test-session.py
+python3 -I tests/test-builder.py
 python3 -I tests/test-sudoers.py
 python3 -I tests/test-clean.py
 python3 -I tests/test-whitecube-install.py
@@ -142,6 +163,4 @@ python3 -I tests/test-cube-apps-ui.py
 # The wc suite tests run wrappers from temporary homes, which a noexec /tmp would refuse.
 TMPDIR="$native_dir/$out" python3 -I -m unittest discover -s apps/wc-suite -p test_suite.py
 bash -n net/apply.sh
-# Native meson apps (cube-browser, cube-player): compiled, tested and staged in $out/native-apps-root for the package.
-[[ -n $sysroot || -n ${SANITIZE:-} ]] || bash apps/build-native-apps.sh "$native_dir/$out"
 printf 'Built: %s/%s/{whitecube,cube-ca,cube-settings,cube-status}; previews: %s/cube-space.ppm %s/{bar,menu,menu-search}.png\n' "$native_dir" "$out" "$out" "$out"

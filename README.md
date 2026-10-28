@@ -22,6 +22,11 @@ each account keeps only its own settings in `~/.config/whitecube` and the usual 
 
 ## Build and test
 
+For a complete Debian 13 build from another amd64 Linux host, run
+`bash tools/build-debian.sh`. It prepares an isolated builder without installing
+host packages; see [the Debian build guide](docs/BUILD-DEBIAN.md) for requirements,
+caches and validation scope.
+
     ./BUILD.sh        # compiles everything and runs every test; must stay green
 
 Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.sh`.
@@ -32,13 +37,48 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.7.1_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.8.0_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
-(bundled X-free wlroots and cairo), `/etc/whitecube` (conffiles) and `/etc/skel`. The package starts no
+(bundled X-free wlroots, cairo and private display-info), `/etc/whitecube` (conffiles) and `/etc/skel`. The package starts no
 service and edits no home directory. The sudoers rule is **not** installed; examples are in
 `/usr/share/doc/whitecube-desktop/`.
+
+The build verifies the final archive independently, checks every payload checksum,
+tests a real `dpkg --unpack` in a disposable directory, and writes matching
+`.deb.sha256` and `.deb.json` release files. The dependency list includes ABI
+version requirements from the shipped binaries. The package targets amd64;
+building in Debian 13 provides the supported release baseline.
+
+## Desktop and package improvements in 0.8.0
+
+The session launcher now checks runtime ownership and permissions, prevents
+duplicate launches, forwards termination signals, and protects private session
+logs. `whitecube-session --check` reports startup prerequisites;
+`whitecube-session --safe-mode` starts only the compositor for recovery. See
+[session recovery](docs/SESSION-RECOVERY.md).
+
+`whitecube-doctor` now inspects installed package binaries and Chat's runtime,
+detects missing libraries, and checks the active Wayland socket. Select individual
+checks with `--check`; use `--strict` to make warnings fail scripted checks.
+See [diagnostics](docs/DIAGNOSTICS.md).
+
+Desktop settings can be exported, checked and imported as typed JSON profiles:
+
+```sh
+cube-preferences export ~/whitecube-settings.json
+cube-preferences check ~/whitecube-settings.json
+cube-preferences import ~/whitecube-settings.json
+```
+
+Imports validate all values before committing a single changeset and retain
+settings absent from the profile. See [settings profiles](docs/SETTINGS-PROFILES.md).
+
+Cube Player now expands PLS playlists in numeric track order, handles M3U files
+with a UTF-8 BOM and relative paths, preserves HLS streaming manifests, and bounds
+recursive playlist imports. Debian upgrades also preserve the shipped skeleton
+configuration files as conffiles.
 
 ## Network switch
 

@@ -21,8 +21,11 @@ them to the queue. Files begin playing immediately when the player is idle.
 
 The queue supports selecting/removing items, clearing, shuffle, repeat queue,
 repeat one, and automatic advance. Opening a folder adds its supported files in
-name order; it does not recursively scan subfolders. Local M3U playlists are
-expanded with a nesting limit. The Recent tab reopens previously played media.
+name order; it does not recursively scan subfolders. Local UTF-8 M3U and PLS playlists are
+expanded in queue order, including BOM-prefixed M3U files and paths relative to
+the playlist. PLS files follow their numeric `FileN` order. HLS manifests stay
+intact for streaming playback. Imports skip cyclic references, limit nesting and
+total work, and reject malformed or oversized playlists (2 MiB, 2,048 items). The Recent tab reopens previously played media.
 
 The sound/subtitle panel selects audio and subtitle tracks, loads external
 subtitles, adjusts subtitle delay, and provides chapter navigation. Embedded

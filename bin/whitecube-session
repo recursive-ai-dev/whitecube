@@ -1,72 +1,296 @@
-#!/bin/sh
-# Whitecube: pure Wayland, no dbus, no logind. Started by ~/.bash_profile on tty1;
-# seatd provides DRM/input access. The browser and scripts terminal open on demand.
-set -u
-umask 077  # session logs and runtime records are private to this account
-# A per-user installation keeps its compositor next to this session script.
-session_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1
-# The packaged compositor is /usr/bin/whitecube-compositor: /usr/bin/whitecube belongs to the separate whitecube image tool.
-compositor="$session_dir/whitecube-compositor"
-[ -x "$compositor" ] || compositor="$session_dir/whitecube"
-[ -x "$compositor" ] || compositor=/usr/bin/whitecube-compositor
-export PATH="$session_dir:${PATH:-/usr/bin:/usr/bin:/bin}"
-export XDG_SESSION_TYPE=wayland XDG_CURRENT_DESKTOP=whitecube
-export MOZ_ENABLE_WAYLAND=1 QT_QPA_PLATFORM=wayland SDL_VIDEODRIVER=wayland ELM_DISPLAY=wl
-unset DISPLAY DBUS_SESSION_BUS_ADDRESS
+#!/usr/bin/python3 -I
+"""Start the Wayland desktop with private runtime files and recoverable startup."""
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
 
-# Nothing creates /run/user/$UID without logind, and wlroots will not start
-# without a private XDG_RUNTIME_DIR, so make one ourselves.
-if [ -z "${XDG_RUNTIME_DIR:-}" ] || [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
-  XDG_RUNTIME_DIR="/run/user/$(id -u)"
-  if [ ! -d "$XDG_RUNTIME_DIR" ] || [ ! -w "$XDG_RUNTIME_DIR" ]; then
-    XDG_RUNTIME_DIR="${TMPDIR:-/tmp}/xdg-runtime-$(id -u)"
-    mkdir -p -m 700 "$XDG_RUNTIME_DIR"
-    [ -O "$XDG_RUNTIME_DIR" ] || { echo "whitecube: $XDG_RUNTIME_DIR not owned by $(id -un)" >&2; exit 1; }
-    chmod 700 "$XDG_RUNTIME_DIR"
-  fi
-  export XDG_RUNTIME_DIR
-fi
 
-state="${XDG_STATE_HOME:-$HOME/.local/state}/whitecube"
-mkdir -p -m 700 "$state" 2>/dev/null && [ -w "$state" ] || state="$XDG_RUNTIME_DIR"
-log="$state/session.log"
-fails="$state/failed-starts"
+class SessionError(Exception):
+    pass
 
-# Crash guard: after 3 failed starts within 60 s, stay on a plain shell instead
-# of letting getty autologin respawn us forever. `exit` from that shell retries.
-now=$(date +%s)
-recent=$(awk -v now="$now" 'now - $1 < 60' "$fails" 2>/dev/null | wc -l)
-if [ "$recent" -ge 3 ]; then
-  : > "$fails"
-  printf '\nwhitecube failed to start 3 times. Last log (%s):\n\n' "$log"
-  tail -n 25 "$log" 2>/dev/null
-  printf '\nType exit to try again.\n\n'
-  exec bash -i  # non-login shell: does not re-run ~/.bash_profile
-fi
 
-[ -f "$log" ] && mv -f "$log" "$log.old"
+def private_directory(path, create=False):
+    """Accept only a real directory owned by this account with mode 0700."""
+    path = Path(path)
+    if not path.is_absolute():
+        raise SessionError(f'{path}: directory must be an absolute path')
+    if create:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            raise SessionError(f'{path}: {exc.strerror}') from exc
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise SessionError(f'{path}: {exc.strerror}') from exc
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise SessionError(f'{path}: expected a directory owned by this account (no symlinks)')
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise SessionError(f'{path}: expected private permissions 0700')
+    if not os.access(path, os.W_OK | os.X_OK):
+        raise SessionError(f'{path}: directory is not writable')
+    return path
 
-# audio=pipewire (set from cube-settings > Sound) runs PipeWire as session
-# children: no system service, and it stops with the compositor.
-audio=$(sed -n 's/^audio=//p' /etc/whitecube/config "$HOME/.config/whitecube/config" 2>/dev/null | tail -n 1)
-clients='for app in cube-ca cube-status; do command -v "$app" >/dev/null 2>&1 && "$app" & done; if command -v cube-check >/dev/null 2>&1; then cube-check --first-boot & fi'
-if [ "$audio" = pipewire ] && command -v pipewire >/dev/null 2>&1; then
-  clients="pipewire & sleep 0.5; wireplumber & pipewire-pulse & $clients"
-fi
 
-(
-  echo "=== whitecube session $(date -Is) on $(tty) runtime=$XDG_RUNTIME_DIR audio=${audio:-alsa}"
-  # The compositor exports its actual socket before starting these clients.
-  "$compositor" -s "$clients"
-  status=$?
-  echo "=== whitecube exited with status $status at $(date -Is)"
-  exit "$status"
-) >>"$log" 2>&1
-status=$?
+def runtime_directory(env):
+    """Never repair or follow an untrusted runtime directory in a shared /tmp."""
+    inherited = env.get('XDG_RUNTIME_DIR')
+    if inherited:
+        return private_directory(inherited)
+    try:
+        return private_directory(Path('/run/user') / str(os.getuid()))
+    except SessionError:
+        pass
+    temporary = Path(env.get('TMPDIR') or '/tmp')
+    if not temporary.is_absolute():
+        raise SessionError('TMPDIR must be an absolute path')
+    candidate = temporary / f'xdg-runtime-{os.getuid()}'
+    try:
+        return private_directory(candidate, create=True)
+    except SessionError:
+        # An unsafe preexisting path must not prevent starting a private session.
+        try:
+            return private_directory(tempfile.mkdtemp(prefix=f'whitecube-runtime-{os.getuid()}-', dir=temporary))
+        except OSError as exc:
+            raise SessionError(f'unable to create runtime directory: {exc.strerror}') from exc
 
-if [ "$status" -ne 0 ]; then
-  echo "$now" >> "$fails"
-else
-  : > "$fails"
-fi
-exit "$status"
+
+def state_directory(env, runtime):
+    home = Path(env.get('HOME') or Path.home())
+    base = Path(env.get('XDG_STATE_HOME') or home / '.local/state')
+    try:
+        return private_directory(base / 'whitecube', create=True)
+    except SessionError:
+        return private_directory(runtime / 'whitecube-state', create=True)
+
+
+def private_file(path, flags):
+    """Open session records without following symlinks or accepting foreign files."""
+    # Validate before truncating: an existing hard link must keep its contents.
+    truncate = bool(flags & os.O_TRUNC)
+    fd = os.open(path, (flags & ~os.O_TRUNC) | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        os.close(fd)
+        raise SessionError(f'{path}: expected a regular file owned by this account')
+    os.fchmod(fd, 0o600)
+    if truncate:
+        os.ftruncate(fd, 0)
+    return fd
+
+
+def find_compositor(script):
+    directory = Path(script).resolve().parent
+    candidates = [directory / 'whitecube-compositor']
+    # /usr/bin/whitecube can belong to the unrelated image tool.
+    if directory != Path('/usr/bin'):
+        candidates.append(directory / 'whitecube')
+    candidates.append(Path('/usr/bin/whitecube-compositor'))
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    raise SessionError('whitecube-compositor is missing or not executable; reinstall whitecube-desktop')
+
+
+def session_environment(env, runtime, script):
+    result = dict(env)
+    directory = str(Path(script).resolve().parent)
+    result['PATH'] = directory + ':' + (env.get('PATH') or '/usr/bin:/bin')
+    result.update(XDG_RUNTIME_DIR=str(runtime), XDG_SESSION_TYPE='wayland',
+                  XDG_CURRENT_DESKTOP='whitecube', MOZ_ENABLE_WAYLAND='1',
+                  QT_QPA_PLATFORM='wayland', SDL_VIDEODRIVER='wayland', ELM_DISPLAY='wl')
+    # Keep a parent socket only when explicitly requesting a nested backend.
+    # The compositor publishes its own socket before spawning desktop clients.
+    if 'wayland' not in env.get('WLR_BACKENDS', '').split(','):
+        result.pop('WAYLAND_DISPLAY', None)
+    for key in ('DISPLAY', 'DBUS_SESSION_BUS_ADDRESS'):
+        result.pop(key, None)
+    return result
+
+
+def audio_setting(env):
+    home = Path(env.get('HOME') or Path.home())
+    config = Path(env.get('XDG_CONFIG_HOME') or home / '.config') / 'whitecube/config'
+    audio = 'alsa'
+    for path in (Path('/etc/whitecube/config'), config):
+        try:
+            for line in path.read_text(encoding='utf-8').splitlines():
+                key, separator, value = line.partition('=')
+                if separator and key.strip() == 'audio':
+                    audio = value.strip()
+        except (OSError, UnicodeError):
+            pass
+    return audio
+
+
+def startup_command(audio):
+    clients = ('for app in cube-ca cube-status; do '
+               'if command -v "$app" >/dev/null 2>&1; then "$app" & fi; done; '
+               'if command -v cube-check >/dev/null 2>&1; then cube-check --first-boot & fi')
+    if audio == 'pipewire':
+        clients = ('if command -v pipewire >/dev/null 2>&1; then pipewire & sleep 0.5; '
+                   'for app in wireplumber pipewire-pulse; do '
+                   'if command -v "$app" >/dev/null 2>&1; then "$app" & fi; done; fi; ' + clients)
+    return clients
+
+
+def recent_failures(path, now):
+    try:
+        with os.fdopen(private_file(path, os.O_RDONLY), 'r', encoding='ascii') as stream:
+            records = stream.read(65536).splitlines()
+    except FileNotFoundError:
+        return []
+    except UnicodeError:
+        return []
+    result = []
+    for record in records:
+        try:
+            stamp = int(record)
+        except ValueError:
+            continue
+        if 0 <= now - stamp < 60:
+            result.append(stamp)
+    return result[-3:]
+
+
+def write_failures(path, records):
+    with os.fdopen(private_file(path, os.O_WRONLY | os.O_CREAT), 'w', encoding='ascii') as stream:
+        stream.truncate()
+        stream.write(''.join(f'{stamp}\n' for stamp in records))
+
+
+def crash_recovery(log, records):
+    print(f'whitecube: {len(records)} failed starts within 60 seconds.', file=sys.stderr)
+    print(f'Last session log: {log}', file=sys.stderr)
+    try:
+        with os.fdopen(private_file(log, os.O_RDONLY), 'r', encoding='utf-8', errors='replace') as stream:
+            # Logs can grow during a long session; read only a bounded tail.
+            size = os.fstat(stream.fileno()).st_size
+            stream.seek(max(0, size - 16384))
+            for line in stream.read().splitlines()[-25:]:
+                print(line, file=sys.stderr)
+    except FileNotFoundError:
+        pass
+    print('Try whitecube-session --safe-mode, or run whitecube-doctor for diagnostics.', file=sys.stderr)
+
+
+def run_compositor(command, env, log):
+    child = None
+    received = []
+
+    def forward(number, frame):
+        received.append(number)
+        if child is not None:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(number)
+
+    previous = {number: signal.signal(number, forward)
+                for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+    try:
+        child = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if received:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(received[-1])
+        status = child.wait()
+        return (128 - status if status < 0 else status), bool(received)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true', help='check startup prerequisites and print JSON without starting the desktop')
+    parser.add_argument('--safe-mode', action='store_true', help='start the compositor without wallpaper, panel, health checks or audio services')
+    parser.add_argument('--reset-crash-guard', action='store_true', help='clear recent startup failures and exit')
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    try:
+        runtime = runtime_directory(os.environ)
+        state = state_directory(os.environ, runtime)
+        env = session_environment(os.environ, runtime, __file__)
+        failures = state / 'failed-starts'
+        if args.reset_crash_guard:
+            write_failures(failures, [])
+            print('Whitecube startup failure counter cleared.')
+            return 0
+        audio = audio_setting(env)
+        if args.check:
+            compositor = find_compositor(__file__)
+            print(json.dumps({'compositor': str(compositor), 'runtime': str(runtime),
+                              'state': str(state), 'audio': audio,
+                              'recent_failures': len(recent_failures(failures, int(time.time())))}, indent=2))
+            return 0
+        # The lock is account-wide even if callers choose different runtime dirs.
+        lock = private_file(state / 'session.lock', os.O_RDWR | os.O_CREAT)
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise SessionError('a Whitecube session is already running for this account')
+            os.ftruncate(lock, 0)
+            os.write(lock, f'{os.getpid()}\n'.encode('ascii'))
+            log = state / 'session.log'
+            records = recent_failures(failures, int(time.time()))
+            if len(records) >= 3 and not args.safe_mode:
+                crash_recovery(log, records)
+                # Keep the guard armed across display-manager/getty retries.
+                # Clearing it here would immediately allow the next failed
+                # launch and turn the guard itself into part of a restart loop.
+                # A successful safe-mode session, explicit reset or expiry of
+                # the 60-second failure window makes another start possible.
+                # A display manager has no interactive terminal to recover into.
+                if sys.stdin.isatty() and sys.stdout.isatty():
+                    print('Type exit to return to the login prompt and retry.')
+                    os.close(lock)
+                    os.execv('/bin/bash', ['bash', '-i'])
+                return 1
+            try:
+                check = private_file(log, os.O_RDONLY)
+            except FileNotFoundError:
+                pass
+            else:
+                os.close(check)
+                os.replace(log, state / 'session.log.old')
+            with os.fdopen(private_file(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), 'w', buffering=1) as stream:
+                stream.write(f'=== whitecube session {time.strftime("%Y-%m-%dT%H:%M:%S%z")} runtime={runtime} audio={audio} safe_mode={args.safe_mode}\n')
+                started = time.monotonic()
+                try:
+                    command = [str(find_compositor(__file__))]
+                    if not args.safe_mode:
+                        command.extend(['-s', startup_command(audio)])
+                    status, interrupted = run_compositor(command, env, stream)
+                except (OSError, SessionError) as exc:
+                    # A removed or broken binary must also trigger the restart
+                    # guard instead of creating a getty autologin loop.
+                    stream.write(f'whitecube-session: {exc}\n')
+                    status, interrupted = 1, False
+                stream.write(f'=== whitecube exited with status {status} at {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
+            records = recent_failures(failures, int(time.time()))
+            if status and not interrupted and time.monotonic() - started < 60:
+                records.append(int(time.time()))
+                write_failures(failures, records[-3:])
+            else:
+                write_failures(failures, [])
+            if status:
+                print(f'whitecube: compositor exited with status {status}; see {log}', file=sys.stderr)
+            return status
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(lock)
+    except (OSError, SessionError) as exc:
+        print(f'whitecube-session: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

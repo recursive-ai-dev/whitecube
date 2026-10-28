@@ -210,14 +210,19 @@ class Workers(unittest.TestCase):
                 '<div class="probe">Environment</div>')
         with worker() as (_, sock):
             load(sock, html)
-            self.assertEqual(frame_pixel(sock, width=800, height=300, flags=0), 0x123456)
-            self.assertEqual(frame_pixel(sock, width=800, height=600, flags=0), 0x4a8563)
-            self.assertEqual(frame_pixel(sock, width=400, height=600, flags=0), 0x7652a1)
-            self.assertEqual(frame_pixel(sock, width=800, height=600, zoom=2, flags=0), 0x123456)
-            self.assertEqual(frame_pixel(sock, width=800, height=300, flags=1), 0xad6f52)
-            self.assertEqual(frame_pixel(sock, width=800, height=300, flags=2), 0x3869a2)
-            self.assertEqual(frame_pixel(sock, width=800, height=300, flags=3), 0x3869a2)
-            self.assertEqual(frame_pixel(sock, width=800, height=300, flags=0), 0x123456)
+            cases = [(800, 300, 1, 0, 0x123456), (800, 600, 1, 0, 0x4a8563),
+                     (400, 600, 1, 0, 0x7652a1), (800, 600, 2, 0, 0x123456),
+                     (800, 300, 1, 1, 0xad6f52), (800, 300, 1, 2, 0x3869a2),
+                     (800, 300, 1, 3, 0x3869a2), (800, 300, 1, 0, 0x123456)]
+            for width, height, zoom, flags, expected in cases:
+                with self.subTest(width=width, height=height, zoom=zoom, flags=flags):
+                    pixels, _ = layout_pixels(sock, width, height, zoom, flags)
+                    # Sample a background-only patch below the text at both
+                    # zoom levels. A point at (100, 40) intersects a glyph at
+                    # 2x zoom with Debian's fonts and measures text ink instead.
+                    colors = {struct.unpack_from('=I', pixels, (y*width+x)*4)[0] & 0xffffff
+                              for y in range(80, 88) for x in range(32, 96)}
+                    self.assertEqual(colors, {expected})
 
     def test_conditional_stylesheets_keep_source_order_and_edited_values(self):
         html = ('<style>body{margin:0}.probe{min-height:100px;background:#123456}</style>'
