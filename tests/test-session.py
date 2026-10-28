@@ -19,6 +19,7 @@ SESSION = runpy.run_path(str(SOURCE))
 
 class SessionTest(unittest.TestCase):
     def setUp(self):
+        (ROOT / 'build').mkdir(exist_ok=True)
         self.temp = tempfile.TemporaryDirectory(prefix='session-test-', dir=ROOT / 'build')
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
