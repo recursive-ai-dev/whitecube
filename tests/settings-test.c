@@ -137,6 +137,48 @@ static int test_real_transactions(const char *helper) {
 	puts("settings UI transactions: grouped save, helper execution, verified success, rejected change and reset passed");
 	return 0;
 }
+static void test_text_input(void) {
+	assert(setlocale(LC_CTYPE, "C.UTF-8"));
+	g.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS); assert(g.xkb);
+	struct xkb_rule_names names = {.layout = "us", .options = "compose:ralt"};
+	g.keymap = xkb_keymap_new_from_names(g.xkb, &names, XKB_KEYMAP_COMPILE_NO_FLAGS); assert(g.keymap);
+	g.xstate = xkb_state_new(g.keymap); g.compose = wc_compose_create(g.xkb); assert(g.compose);
+	struct field field = {0};
+	ui.nhits = 1; ui.hits[0] = (struct hit){.id = 100, .kind = H_FIELD}; ui.focus = 100; ui.edit = &field;
+	handle_key(xkb_keymap_key_by_name(g.keymap, "RALT") - 8);
+	handle_key(xkb_keymap_key_by_name(g.keymap, "AC11") - 8);
+	handle_key(xkb_keymap_key_by_name(g.keymap, "AD03") - 8);
+	assert(!strcmp(field.buf, "é"));
+	handle_key(xkb_keymap_key_by_name(g.keymap, "BKSP") - 8); assert(!field.buf[0]);
+	handle_key(xkb_keymap_key_by_name(g.keymap, "RALT") - 8);
+	kb_leave(NULL, NULL, 0, NULL);
+	assert(xkb_compose_state_get_status(g.compose) == XKB_COMPOSE_NOTHING);
+	xkb_state_unref(g.xstate); xkb_keymap_unref(g.keymap);
+	names.variant = "intl";
+	g.keymap = xkb_keymap_new_from_names(g.xkb, &names, XKB_KEYMAP_COMPILE_NO_FLAGS); assert(g.keymap);
+	g.xstate = xkb_state_new(g.keymap);
+	handle_key(xkb_keymap_key_by_name(g.keymap, "AC11") - 8);
+	handle_key(xkb_keymap_key_by_name(g.keymap, "AD03") - 8);
+	assert(!strcmp(field.buf, "é"));
+	xkb_state_unref(g.xstate); xkb_keymap_unref(g.keymap); xkb_compose_state_unref(g.compose); xkb_context_unref(g.xkb);
+	g.xkb = NULL; g.keymap = NULL; g.xstate = NULL; g.compose = NULL; ui.edit = NULL; ui.nhits = 0; ui.focus = -1;
+}
+
+static void test_launch_errors(void) {
+	ui.toast[0] = 0;
+	spawn_detached("/missing-whitecube-settings-launch");
+	double deadline = now_s() + 3;
+	while (any_job() && now_s() < deadline) pump_jobs(10);
+	assert(!any_job() && strstr(ui.toast, "Cannot launch") && strstr(ui.toast, "No such file"));
+	ui.toast[0] = 0;
+	spawn_detached("/bin/true");
+	while (any_job() && now_s() < deadline) pump_jobs(10);
+	assert(!any_job() && !ui.toast[0]);
+	spawn_detached("/bin/sh -c 'exit 17'");
+	while (any_job() && now_s() < deadline) pump_jobs(10);
+	assert(!any_job() && !ui.toast[0]);
+}
+
 int main(int argc, char **argv) {
 	if (argc == 3 && !strcmp(argv[1], "--transactions")) return test_real_transactions(argv[2]);
 	char temporary[] = "/tmp/whitecube-settings-test-XXXXXX";
@@ -146,6 +188,8 @@ int main(int argc, char **argv) {
 	ncfg_sys = ncfg_user = 0;
 	assert(wc_prefs_init());
 	test_config(); test_navigation(); test_theme(); test_accessibility_and_display(); test_advanced();
+	test_text_input();
+	test_launch_errors();
 	char path[512]; user_config_path(path,sizeof(path)); unlink(path);
 	snprintf(path,sizeof(path),"%s/.config/whitecube",dir); rmdir(path);
 	snprintf(path,sizeof(path),"%s/.config",dir); rmdir(path);

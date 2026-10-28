@@ -21,6 +21,7 @@ import tarfile
 import tempfile
 
 PACKAGE = 'whitecube-desktop'
+PROVENANCE = 'usr/share/doc/whitecube-desktop/build-provenance.json'
 SANDBOX = 'usr/lib/whitecube/desktop-chat-runtime/chrome-sandbox'
 HARDENED = {
     'usr/bin/' + name for name in
@@ -195,6 +196,8 @@ def check(package):
             problems.append(f'duplicate md5sums entry: {name}')
         expected_hashes[name] = match[1]
     payload, checksums = {}, {}
+    provenance = None
+    electron_version = None
     with archive_members(package, '--fsys-tarfile') as archive:
         for member in archive:
             name = payload_path(member.name)
@@ -214,7 +217,31 @@ def check(package):
             if member.mode & 0o6000 and name != SANDBOX:
                 problems.append(f'unexpected setuid/setgid file: {name}')
             if member.isfile():
-                checksums[name] = payload_digest(archive.extractfile(member), name, problems)
+                stream = archive.extractfile(member)
+                if name == PROVENANCE:
+                    if member.size > 1024 * 1024:
+                        problems.append('build provenance exceeds 1 MiB')
+                    else:
+                        data = stream.read()
+                        try:
+                            provenance = json.loads(data)
+                            if (not isinstance(provenance, dict)
+                                    or provenance.get('format') != 'org.whitecube.build-provenance'
+                                    or provenance.get('version') != 1
+                                    or not isinstance(provenance.get('source'), dict)
+                                    or not isinstance(provenance.get('inputs_sha256'), dict)
+                                    or not isinstance(provenance.get('runtime'), dict)):
+                                problems.append('invalid build provenance format')
+                        except (ValueError, UnicodeError):
+                            problems.append('invalid build provenance JSON')
+                        checksums[name] = hashlib.md5(data).hexdigest()
+                        continue
+                elif name == 'usr/lib/whitecube/desktop-chat-runtime/version' and member.size <= 1024:
+                    data = stream.read()
+                    electron_version = data.decode(errors='replace').strip().removeprefix('v')
+                    checksums[name] = hashlib.md5(data).hexdigest()
+                    continue
+                checksums[name] = payload_digest(stream, name, problems)
     for name, member in payload.items():
         # A later entry must not overwrite a previously declared symlink's
         # target, or traverse a regular file as a directory when unpacked.
@@ -247,6 +274,15 @@ def check(package):
     sandbox = payload.get(SANDBOX)
     if sandbox is None or not sandbox.isfile() or sandbox.mode != 0o4755:
         problems.append('Chromium sandbox helper must be a root-owned 4755 regular file')
+    if isinstance(provenance, dict) and not any('invalid build provenance' in item for item in problems):
+        source, inputs, runtime = provenance['source'], provenance['inputs_sha256'], provenance['runtime']
+        if (source.get('dirty') not in (True, False, None)
+                or not inputs or not all(isinstance(value, str) and re.fullmatch(r'[0-9a-f]{64}', value) for value in inputs.values())
+                or not runtime.get('electron') or runtime['electron'] != electron_version):
+            problems.append('build provenance inputs or Electron runtime do not match the payload')
+    release_version = re.match(r'^(\d+)\.(\d+)', fields.get('Version', ''))
+    if release_version and tuple(map(int, release_version.groups())) >= (0, 9) and provenance is None:
+        problems.append('build provenance is missing from release payload')
     with package.open('rb') as stream:
         sha256 = hashlib.file_digest(stream, 'sha256').hexdigest()
     summary = {
@@ -258,6 +294,7 @@ def check(package):
         'payload_files': len(checksums), 'dependencies': dependencies,
         'hardened_executables': sorted(HARDENED & checksums.keys()),
         'conffiles': sorted(conffiles), 'verification': 'passed' if not problems else 'failed',
+        'build_provenance': provenance,
     }
     return problems, summary
 

@@ -286,6 +286,7 @@ if (!gotLock) {
   app.on('will-quit', () => {
     currentAbort?.abort();
     try { saveConversation(); } catch (err) { console.error(err.message); }
+    history?.close();
     localModels.stop();
     globalShortcut.unregisterAll();
   });
@@ -525,7 +526,8 @@ listen('panel:show', () => {
 });
 
 // Saved conversations use opaque IDs; renderer input never becomes a file path.
-handle('chats:list', (_evt, query = '') => getHistory().list(query));
+handle('chats:list', (_evt, query = '') => getHistory().listAsync(query));
+handle('chats:page', (_evt, query = '', options = {}) => getHistory().listAsync(query, options));
 handle('chats:current', () => ensureChat());
 handle('chats:get', (_evt, id) => getHistory().get(id));
 handle('chats:select', (_evt, id) => {

@@ -17,6 +17,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / 'cube-apps'))
 import engine
+from snapshots import RunSnapshots
 import export_notebook
 import diagnostics
 import cli
@@ -422,6 +423,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.last_job = None
         self.probing = False
         self.launching = False
+        self.launch_error = None
         self.sampling = False
         self.form = {}
         self.losses = []
@@ -438,6 +440,11 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.active_job_info = None
         self.displayed_id = None
         self.runs = []
+        self.snapshots = RunSnapshots(trainer, sparkline_points)
+        self.refresh_running = False
+        self.refresh_pending = False
+        self.refresh_force = False
+        self.snapshot = {}
         self.stop_requested = False
         self.throughput_cache = {}
         self.corpus_bytes = None
@@ -911,7 +918,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.sample_prompt = Gtk.Entry(placeholder_text='Short prompt…', text='Once upon a time', hexpand=True)
         self.sample_prompt.connect('activate', lambda *_: self.sample() if self.sample_button.get_sensitive() else None)
         self.sample_kind = Gtk.DropDown.new_from_strings(['Best', 'Latest', 'Both'])
-        self.sample_kind.connect('notify::selected', lambda *_: self.refresh())
+        self.sample_kind.connect('notify::selected', lambda *_: self.update_sample_action())
         self.sample_button = button('Preview', self.sample, True)
         sample_row.append(self.sample_prompt); sample_row.append(self.sample_kind); sample_row.append(self.sample_button); preview.append(sample_row)
         knobs = Gtk.Grid(column_spacing=14, row_spacing=10)
@@ -1422,11 +1429,11 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.batch_summary.set_text(f'Effective batch: {batch * accumulation:,} sequences · {batch * accumulation * 256:,} byte tokens per optimizer step. Gradient accumulation increases this without enlarging each GPU batch.')
         size = engine.DESKTOP_SIZES[self.size_picker.get_selected()]
         device = 'cuda' if self.device_picker.get_selected() == 0 else 'cpu'
-        if (size, device) not in self.throughput_cache:
-            try:
-                self.throughput_cache[size, device] = self.trainer.throughput(size, device)
-            except OSError:
-                self.throughput_cache[size, device] = None
+        rates = sorted(rate for run in self.runs
+                       if run['size'] == size and run['meta'].get('device') == device
+                       for rate in [run.get('_progress', {}).get('tokens_per_second')]
+                       if finite_number(rate) and rate > 0)
+        self.throughput_cache[size, device] = rates[len(rates) // 2] if rates else None
         self.plan_label.set_text('Plan: ' + plan_estimate(int(self.form['steps'].get_value()), batch, accumulation,
                                                           self.corpus_bytes, self.form['val_fraction'].get_value(),
                                                           self.throughput_cache[size, device]))
@@ -1503,6 +1510,14 @@ class TrainerWindow(Adw.ApplicationWindow):
         else:
             message = f'{target - run["completed_steps"]:,} additional optimizer steps.'
         self.resume_hint.set_text(message)
+
+    def update_sample_action(self):
+        if not hasattr(self, 'sample_button'):
+            return
+        run = self.current_run()
+        kinds = (('best',), ('latest',), ('best', 'latest'))[self.sample_kind.get_selected()]
+        busy = self.launching or self.sampling or bool(self.active_job_info)
+        self.sample_button.set_sensitive(bool(run and all(run[kind] for kind in kinds) and not busy))
 
     def use_run_settings(self):
         run = self.current_run()
@@ -1582,10 +1597,12 @@ class TrainerWindow(Adw.ApplicationWindow):
     def launch(self, values, **options):
         if self.launching or self.sampling:
             return
+        self.launch_error = None
         self.launching = True; self.refresh(); self.status.set_text('Checking training plan…')
         def done(job, error):
             self.launching = False
             if error:
+                self.launch_error = str(error)
                 self.refresh(); self.notify(error); self.status.set_text(str(error))
             else:
                 self.stop_requested = False
@@ -1598,7 +1615,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         if self.stop_requested:
             return
         try:
-            job = self.trainer.active_job() or self.last_job
+            job = self.active_job_info or self.last_job
             if job:
                 self.trainer.stop(job); self.stop_requested = True; self.stop_button.set_sensitive(False)
                 self.status.set_text('Stopping; finishing the current step and saving when weights are available…')
@@ -1608,7 +1625,7 @@ class TrainerWindow(Adw.ApplicationWindow):
     def current_run(self):
         # The one-second refresh keeps self.runs current; avoid rescanning every run folder per click.
         cached = next((run for run in self.runs if run['id'] == self.selected_id), None)
-        return cached or next((run for run in self.trainer.list_runs() if run['id'] == self.selected_id), None)
+        return cached
 
     def run_selected(self, _, row):
         if self.rebuilding or row is None:
@@ -1627,9 +1644,38 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.last_log = None; self.refresh()
 
     def refresh(self, force=False):
-        runs = self.trainer.list_runs()
+        if self.closed:
+            return False
+        self.refresh_force = self.refresh_force or force
+        if self.refresh_running:
+            self.refresh_pending = True
+            return False
+        self.refresh_running = True
+        self.refresh_pending = False
+        force, self.refresh_force = self.refresh_force, False
+        selected_id, compare_id = self.selected_id, self.selected_compare()
+        last_job = dict(self.last_job) if self.last_job else None
+        def done(snapshot, error):
+            try:
+                if error:
+                    self.status.set_text(str(error))
+                elif self.selected_id != selected_id or self.selected_compare() != compare_id or self.refresh_force:
+                    self.refresh_pending = True
+                else:
+                    self.apply_refresh(snapshot, force)
+            finally:
+                self.refresh_running = False
+                if self.refresh_pending and not self.closed:
+                    GLib.idle_add(self.refresh)
+            return False
+        self.background(lambda: self.snapshots.collect(selected_id, compare_id, last_job, force), done)
+        return False
+
+    def apply_refresh(self, snapshot, force=False):
+        self.snapshot = snapshot
+        runs = snapshot['runs']
         self.runs = runs
-        active = self.trainer.active_job()
+        active = snapshot['active']
         self.active_job_info = active
         busy = bool(active) or self.launching
         if active:
@@ -1648,7 +1694,11 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.selected_id = None; self.last_log = None; self.metrics_signature = None
             self.preview_request += 1; self.clear_preview()
         if not self.selected_id and runs:
-            self.selected_id = runs[0]['id']
+            # The worker may prefer an active run when the previous selection
+            # disappeared. Its details and our selection must identify the same
+            # run before chart/checkpoint signatures are committed.
+            snapshot_id = snapshot.get('details', {}).get('id')
+            self.selected_id = next((run['id'] for run in runs if run['id'] == snapshot_id), runs[0]['id'])
         if self.displayed_id != self.selected_id:
             self.displayed_id = self.selected_id
             self.preview_request += 1; self.clear_preview()
@@ -1671,7 +1721,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.open_button.set_sensitive(bool(run))
         self.duplicate_button.set_sensitive(bool(run and run['meta']))
         self.metrics_button.set_sensitive(bool(run))
-        chat_available = engine.chat_launcher() is not None
+        chat_available = snapshot['chat_available']
         self.best_button.set_sensitive(bool(run and run['best'] and chat_available))
         self.latest_button.set_sensitive(bool(run and run['latest'] and chat_available))
         for widget in (self.best_button, self.latest_button):
@@ -1683,8 +1733,7 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.weights_button.set_sensitive(bool(run and (run['best'] or run['latest'])))
         self.benchmark_button.set_sensitive(bool(run and run['prepared'] and (run['best'] or run['latest'] or run['snapshots'])
                                                  and not busy and not self.sampling))
-        kinds = (('best',), ('latest',), ('best', 'latest'))[self.sample_kind.get_selected()]
-        self.sample_button.set_sensitive(bool(run and all(run[kind] for kind in kinds) and not busy and not self.sampling))
+        self.update_sample_action()
         self.notebook_button.set_sensitive(bool(run and (run['best'] or run['latest'] or run['snapshots'])))
         self.notebook_export_button.set_sensitive(self.notebook_button.get_sensitive())
         self.snippet_button.set_sensitive(bool(run and (run['best'] or run['latest'])))
@@ -1696,20 +1745,18 @@ class TrainerWindow(Adw.ApplicationWindow):
         self.update_compare_options(runs)
         self.update_comparison_options(runs)
         self.update_rail_job(active, runs)
+        self.show_benchmarks(); self.show_preview_history()
         if run:
             self.run_detail.set_text(run_details(run, getattr(self, 'run_disk', {}).get(run['id'])))
             validation = f'{run["val_loss"]:.4f}' if isinstance(run['val_loss'], (int, float)) else 'not evaluated'
-            metrics_path = Path(run['directory']) / 'train_log.jsonl'
-            try:
-                stat = metrics_path.stat()
-                metrics_signature = (str(metrics_path), stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                metrics_signature = (str(metrics_path), None)
+            details = snapshot['details']
+            metrics_signature = (run['id'], run['_log_signature'])
             if force or metrics_signature != self.metrics_signature:
                 self.metrics_signature = metrics_signature
-                self.losses = engine.read_metrics(run['directory']); self.chart.queue_draw()
+                self.losses = details.get('metrics', []) if details.get('id') == run['id'] else []
+                self.chart.queue_draw()
             latest = next((metric for metric in reversed(self.losses) if 'total_loss' in metric), {})
-            progress = engine.read_json(Path(run['directory']) / 'progress.json')
+            progress = run['_progress']
             loss_value = latest.get('total_loss', progress.get('loss'))
             loss = f'{loss_value:.4f}' if finite_number(loss_value) else '—'
             self.metrics_label.set_text(f'{run["name"]} · Training loss {loss} · best validation {validation} · {run["completed_steps"]:,} completed steps')
@@ -1726,7 +1773,7 @@ class TrainerWindow(Adw.ApplicationWindow):
                 self.metrics_label.set_text(self.metrics_label.get_text() + '\n' + ' · '.join(performance))
             if run['detail']:
                 self.metrics_label.set_text(self.metrics_label.get_text() + '\n' + str(run['detail']))
-            telemetry = engine.latest_telemetry(run['directory'])
+            telemetry = details.get('telemetry', {}) if details.get('id') == run['id'] else {}
             thermal = []
             if telemetry.get('temperature_c') is not None:
                 thermal.append(f'GPU {telemetry["temperature_c"]} °C')
@@ -1759,9 +1806,7 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.metrics_label.set_text('Training and validation losses appear here.')
             self.progress.set_fraction(0)
             self.progress.set_text('Preparing…' if busy else 'Ready')
-            job = self.last_job
-            if job:
-                stored = engine.read_json(job['path']); job = {**job, **stored}
+            job = snapshot['job']
             logfile = job['log'] if job else None
             if not busy:
                 self.status.set_text(f'Job {job.get("state", "ready")}. See logs for details.' if job else 'Ready')
@@ -1771,11 +1816,13 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.status.set_text('Stopping and saving…' if active.get('state') == 'stopping' or self.stop_requested else f'{phase.capitalize()} · {active_run["name"] if active_run else Path(active["run"]).name}')
             if phase in ('preparing', 'starting', 'queued'):
                 self.progress.pulse()
-        text = engine.tail_text(logfile) if logfile else ''
+        text = snapshot['log']
         self.export_log_button.set_sensitive(bool(text))
         if text != self.last_log:
             self.last_log = text
             self.show_log()
+        if self.launch_error and not busy:
+            self.status.set_text(self.launch_error)
 
     # Run list: rows are created once per run and updated in place, so a
     # running job's per-second refresh never destroys the row being clicked.
@@ -1825,14 +1872,10 @@ class TrainerWindow(Adw.ApplicationWindow):
         return row
 
     def update_run_row(self, row, run, force=False):
-        log = Path(run['directory']) / 'train_log.jsonl'
-        try:
-            stat = log.stat(); log_signature = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            log_signature = None
+        log_signature = run.get('_log_signature')
         cached = self.spark_cache.get(run['id'])
         if force or not cached or cached[0] != log_signature:
-            self.spark_cache[run['id']] = (log_signature, sparkline_points(spark_metrics(log)) if log_signature else [])
+            self.spark_cache[run['id']] = (log_signature, run.get('_spark_points', []))
             row.spark.queue_draw()
         signature = json.dumps({key: run[key] for key in ('name', 'phase', 'size', 'completed_steps', 'steps', 'best', 'latest',
                                                            'pinned', 'val_loss', 'snapshots')})
@@ -1934,22 +1977,13 @@ class TrainerWindow(Adw.ApplicationWindow):
 
     def update_checkpoints(self, run):
         # Checkpoint files change only when saved, unlike the step count, so a training run does not rebuild these rows every second.
-        signature = None
-        if run:
-            try:
-                with os.scandir(run['directory']) as entries:
-                    files = tuple(sorted((entry.name, entry.stat().st_mtime_ns) for entry in entries
-                                         if entry.name.startswith('ckpt_') and entry.name.endswith('.pt')))
-            except OSError:
-                files = ()
-            signature = (run['id'], files, run['val_loss'])
+        details = self.snapshot.get('details', {})
+        items = details.get('checkpoints', []) if run and details.get('id') == run['id'] else []
+        signature = (run['id'], json.dumps(items, sort_keys=True)) if run else None
         if signature == self.checkpoint_signature:
             return
         self.checkpoint_signature = signature
-        try:
-            self.checkpoint_items = self.trainer.checkpoints(run['id']) if run else []
-        except (ValueError, OSError):
-            self.checkpoint_items = []
+        self.checkpoint_items = items
         self.benchmark_kinds = [(item['kind'],) for item in self.checkpoint_items]
         titles = [item['label'] for item in self.checkpoint_items]
         if run and run['best'] and run['latest']:
@@ -1973,7 +2007,7 @@ class TrainerWindow(Adw.ApplicationWindow):
             self.checkpoint_box.append(row)
 
     def update_compare_options(self, runs):
-        candidates = [run for run in runs if run['id'] != self.selected_id and (Path(run['directory']) / 'train_log.jsonl').is_file()]
+        candidates = [run for run in runs if run['id'] != self.selected_id and run.get('_log_signature')]
         ids = [run['id'] for run in candidates]
         if ids != self.compare_ids:
             previous = self.selected_compare()
@@ -2000,13 +2034,15 @@ class TrainerWindow(Adw.ApplicationWindow):
             if self.compare_losses:
                 self.compare_losses = []; self.compare_signature = None; self.chart.queue_draw()
             return
-        try:
-            stat = (Path(run['directory']) / 'train_log.jsonl').stat(); signature = (run_id, stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            signature = (run_id, None)
+        comparison = self.snapshot.get('comparison')
+        if not comparison or comparison['id'] != run_id:
+            self.compare_losses = []; self.compare_signature = None; self.chart.queue_draw()
+            self.refresh()
+            return
+        signature = (run_id, run.get('_log_signature'))
         if signature != self.compare_signature:
             self.compare_signature = signature
-            self.compare_losses = engine.read_metrics(run['directory']); self.compare_name = run['name']
+            self.compare_losses = comparison['metrics']; self.compare_name = run['name']
             self.chart.queue_draw()
 
     def update_rail_job(self, active, runs):
@@ -2576,10 +2612,8 @@ class TrainerWindow(Adw.ApplicationWindow):
 
     def show_benchmarks(self):
         run = self.current_run()
-        try:
-            self.benchmark_reports = self.trainer.benchmarks(run['id']) if run else []
-        except (ValueError, OSError):
-            self.benchmark_reports = []
+        details = self.snapshot.get('details', {})
+        self.benchmark_reports = details.get('benchmarks', []) if run and details.get('id') == run['id'] else []
         self.benchmark_output.set_text(benchmark_text(self.benchmark_reports))
         for widget in (self.benchmark_json_button, self.benchmark_csv_button):
             widget.set_sensitive(bool(self.benchmark_reports))
@@ -2634,13 +2668,11 @@ class TrainerWindow(Adw.ApplicationWindow):
         except (ValueError, OSError) as error:
             self.notify(error); return
         self.save_sample_button.set_sensitive(False)
-        self.show_preview_history(); self.notify('Preview saved with the run')
+        self.refresh(True); self.notify('Preview saved with the run')
 
     def show_preview_history(self):
-        try:
-            saved = self.trainer.previews(self.selected_id, 3) if self.selected_id else []
-        except ValueError:
-            saved = []
+        details = self.snapshot.get('details', {})
+        saved = details.get('previews', [])[-3:] if details.get('id') == self.selected_id else []
         lines = [f'{item.get("checkpoint", "?")} · “{str(item.get("prompt", ""))[:40]}” → {item["text"][:90].replace(chr(10), " ")}…' for item in reversed(saved)]
         self.preview_history.set_text(('Saved previews (newest first):\n' + '\n'.join(lines)) if lines else '')
 

@@ -12,6 +12,11 @@ let currentChat = null;
 let switchingChat = true;
 let chatDialogAction = null;
 let chatListRequest = 0;
+let chatSearchTimer = null;
+let chatPageOffset = 0;
+let chatListRunning = false;
+let chatListPending = null;
+const chatMore = document.getElementById('chat-more');
 let turnUsage = null;
 
 const settingsOverlay = document.getElementById('settings-overlay');
@@ -562,12 +567,28 @@ function chatDate(value) {
   if (!Number.isFinite(date.getTime())) return '';
   return date.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
 }
-async function refreshChats() {
+async function refreshChats(append = false) {
+  clearTimeout(chatSearchTimer);
+  if (chatListRunning) {
+    ++chatListRequest;
+    // A fresh first page supersedes queued pagination. Keep only the latest
+    // query; slow libraries cannot accumulate a scan per keystroke.
+    chatListPending = chatListPending === false ? false : append;
+    return;
+  }
+  chatListRunning = true;
   const request = ++chatListRequest;
+  const query = document.getElementById('chat-search').value.trim();
+  const offset = append ? chatPageOffset : 0;
+  chatMore.disabled = true;
   try {
-    const list = await window.api.listChats(document.getElementById('chat-search').value.trim());
+    const page = await window.api.listChatsPage(query, { offset, limit: 50 });
     if (request !== chatListRequest) return;
-    chatList.replaceChildren();
+    const list = page.items;
+    if (!append) chatList.replaceChildren();
+    chatPageOffset = offset + list.length;
+    chatMore.hidden = !page.hasMore;
+    chatMore.textContent = `Show more conversations (${chatPageOffset} of ${page.total})`;
     if (!list.length) {
       const hint = document.createElement('p'); hint.className = 'chat-empty';
       hint.textContent = document.getElementById('chat-search').value.trim() ? 'No conversations match your search.' : 'Your conversations will appear here.';
@@ -588,7 +609,16 @@ async function refreshChats() {
     // Renames and automatic titles can arrive after a streamed reply.
     const active = list.find(chat => chat.id === currentChat?.id);
     if (active) { currentChat.title = active.title; document.getElementById('chat-title').textContent = active.title; }
-  } catch (err) { showHistoryError(err); }
+  } catch (err) { if (request === chatListRequest) showHistoryError(err); }
+  finally {
+    chatListRunning = false;
+    if (request === chatListRequest) chatMore.disabled = false;
+    if (chatListPending !== null) {
+      const appendNext = chatListPending;
+      chatListPending = null;
+      refreshChats(appendNext);
+    }
+  }
 }
 function renderChat(chat) {
   if (!chat) return;
@@ -640,7 +670,13 @@ const compactLayout = window.matchMedia('(max-width: 660px)');
 compactLayout.addEventListener('change', event => { if (event.matches) toggleSidebar(false); });
 document.getElementById('btn-sidebar').addEventListener('click', () => toggleSidebar());
 document.getElementById('btn-sidebar-new').addEventListener('click', () => newBtn.click());
-document.getElementById('chat-search').addEventListener('input', refreshChats);
+document.getElementById('chat-search').addEventListener('input', () => {
+  ++chatListRequest; // A response for the previous query cannot repaint this one.
+  clearTimeout(chatSearchTimer);
+  chatMore.hidden = true;
+  chatSearchTimer = setTimeout(() => refreshChats(), 200);
+});
+chatMore.addEventListener('click', () => refreshChats(true));
 document.getElementById('btn-chat-rename').addEventListener('click', () => openChatDialog('rename'));
 document.getElementById('btn-chat-delete').addEventListener('click', () => openChatDialog('delete'));
 document.getElementById('chat-dialog-cancel').addEventListener('click', closeChatDialog);

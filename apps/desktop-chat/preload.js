@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('api', {
   onModelsChanged: (cb) => ipcRenderer.on('models:changed', (evt, payload) => cb(payload)),
   newChat: () => ipcRenderer.invoke('chat:new'),
   listChats: (query = '') => ipcRenderer.invoke('chats:list', query),
+  listChatsPage: (query = '', options = {}) => ipcRenderer.invoke('chats:page', query, options),
   getCurrentChat: () => ipcRenderer.invoke('chats:current'),
   getChat: id => ipcRenderer.invoke('chats:get', id),
   selectChat: id => ipcRenderer.invoke('chats:select', id),

@@ -150,6 +150,84 @@ class GuiRegressions(unittest.TestCase):
         self.assertEqual(self.window.root_selector.get_model().get_n_items(), 0)
         self.assertNotIn('old.squashfs', self.window.inspect_label.get_text())
 
+    def answer_unsaved(self, response):
+        dialog = self.window.unsaved_dialog
+        self.assertIsNotNone(dialog)
+        dialog.response(response)
+        self.pump()
+
+    def test_invalid_edits_can_be_kept_or_discarded_when_switching_projects(self):
+        w = self.window
+        other = app.engine.Project.create(self.source, 'Other', self.path / 'projects', self.path / 'releases')
+        original = (self.project.directory / 'cube-editor.json').read_bytes()
+        w.entries['output_name'].set_text('invalid/output')
+        self.assertTrue(w.dirty)
+        w.load_project(other.directory)
+        self.assertIs(w.project, self.project)
+        self.assertIsNone(w.save_timer, 'autosave must stop while the discard choice is open')
+        self.answer_unsaved('keep')
+        self.assertEqual(w.entries['output_name'].get_text(), 'invalid/output')
+        self.assertTrue(w.dirty)
+        w.load_project(other.directory)
+        self.answer_unsaved('discard')
+        self.assertEqual(w.project.directory, other.directory)
+        self.assertFalse(w.dirty)
+        self.assertEqual((self.project.directory / 'cube-editor.json').read_bytes(), original)
+
+    def test_save_choice_persists_valid_edits_before_switching(self):
+        w = self.window
+        other = app.engine.Project.create(self.source, 'Other', self.path / 'projects', self.path / 'releases')
+        w.entries['name'].set_text('Saved by choice')
+        w.load_project(other.directory)
+        self.answer_unsaved('save')
+        self.assertEqual(w.project.directory, other.directory)
+        self.assertEqual(app.engine.Project.load(self.project.directory).data['name'], 'Saved by choice')
+
+    def test_discard_on_close_never_writes_invalid_edits(self):
+        w = self.window
+        original = (self.project.directory / 'cube-editor.json').read_bytes()
+        w.entries['output_name'].set_text('../invalid.iso')
+        with mock.patch.object(w, 'close') as close, mock.patch.object(self.project, 'save') as save:
+            self.assertTrue(w.on_close())
+            self.answer_unsaved('discard')
+        close.assert_called_once()
+        save.assert_not_called()
+        self.assertFalse(w.dirty)
+        self.assertEqual((self.project.directory / 'cube-editor.json').read_bytes(), original)
+
+    def test_failed_save_keeps_draft_and_offers_discard_without_modifying_disk(self):
+        w = self.window
+        original = (self.project.directory / 'cube-editor.json').read_bytes()
+        w.entries['name'].set_text('Unwritable edit')
+        finished = []
+        w.review_unsaved(lambda: finished.append(True))
+        with mock.patch.object(self.project, 'save', side_effect=PermissionError('read-only project')):
+            self.answer_unsaved('save')
+        self.assertEqual(finished, [])
+        self.assertTrue(w.dirty)
+        self.assertEqual(w.entries['name'].get_text(), 'Unwritable edit')
+        self.assertIn('read-only project', w.unsaved_dialog.get_body())
+        self.answer_unsaved('discard')
+        self.assertEqual(finished, [True])
+        self.assertEqual(w.entries['name'].get_text(), 'Original')
+        self.assertFalse(w.dirty)
+        self.assertEqual((self.project.directory / 'cube-editor.json').read_bytes(), original)
+
+    def test_close_review_and_new_project_discard_use_the_same_dirty_state(self):
+        w = self.window
+        w.entries['install_packages'].set_text('not a valid package!')
+        self.assertTrue(w.on_close())
+        self.answer_unsaved('keep')
+        self.assertTrue(w.dirty)
+        w.entries['name'].set_text('New candidate')
+        with mock.patch.object(w, 'inspect_project'):
+            w.create_project()
+            self.answer_unsaved('discard')
+        self.assertNotEqual(w.project.directory, self.project.directory)
+        self.assertEqual(w.project.data['name'], 'New candidate')
+        self.assertEqual(app.engine.Project.load(self.project.directory).data['name'], 'Original')
+        self.assertFalse(w.dirty)
+
     def test_stale_root_selection_cannot_be_saved(self):
         self.show_old_root()
         self.project.save(inspection={})

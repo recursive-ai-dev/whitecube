@@ -10,6 +10,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from urllib.parse import quote
@@ -213,6 +214,7 @@ class Trainer:
         self.runs_dir = Path(os.environ.get('WHITECUBE_TRAIN_OUT', self.home / 'train-out')).expanduser().resolve()
         self.children = []
         self.pending_jobs = {}
+        self._children_lock = threading.Lock()
 
     def preferences(self):
         defaults = {'python': default_python(), 'dataset': str(self.home / 'train-in'), 'draft_name': '',
@@ -294,11 +296,13 @@ class Trainer:
         atomic_json(self.config, current)
 
     def jobs(self):
-        for child in self.children[:]:
-            if child.poll() is not None:
-                self.children.remove(child)
-        self.pending_jobs = {path: entry for path, entry in self.pending_jobs.items()
-                             if entry['child'].poll() is None}
+        # Refresh, launch and preview workers can scan jobs concurrently. Keep
+        # process bookkeeping atomic and perform filesystem reads outside it.
+        with self._children_lock:
+            self.children = [child for child in self.children if child.poll() is None]
+            self.pending_jobs = {path: entry for path, entry in self.pending_jobs.items()
+                                 if entry['child'].poll() is None}
+            pending_jobs = dict(self.pending_jobs)
         jobs = []
         for path in (self.state / 'jobs').glob('*.json'):
             job = read_json(path)
@@ -311,7 +315,7 @@ class Trainer:
             except (OSError, ValueError, RuntimeError):
                 continue
             job['path'] = str(path)
-            pending = self.pending_jobs.get(str(path))
+            pending = pending_jobs.get(str(path))
             if not job.get('pid') and pending and pending['child'].poll() is None:
                 job.update(pid=pending['child'].pid, identity=pending['identity'])
             job['running'] = job_running(job)
@@ -320,21 +324,27 @@ class Trainer:
             jobs.append(job)
         return sorted(jobs, key=lambda item: str(item.get('started_at', '')), reverse=True)
 
+    def _register_child(self, child, job_path, identity):
+        with self._children_lock:
+            self.children.append(child)
+            self.pending_jobs[str(job_path)] = {'child': child, 'identity': identity}
+
     def active_job(self):
         return next((job for job in self.jobs() if job['running']), None)
 
-    def list_runs(self):
-        jobs = {job['run']: job for job in reversed(self.jobs())}
+    def list_runs(self, jobs=None, reader=None, include_progress=False):
+        jobs = {job['run']: job for job in reversed(self.jobs() if jobs is None else jobs)}
+        reader = reader or read_json
         runs = []
         if not self.runs_dir.is_dir():
             return runs
         for directory in sorted(self.runs_dir.iterdir(), reverse=True):
             if not directory.is_dir() or directory.is_symlink():
                 continue
-            meta = read_json(directory / 'run.json')
-            result = read_json(directory / 'result.json')
-            progress = read_json(directory / 'progress.json')
-            status = read_json(directory / 'status.json')
+            meta = reader(directory / 'run.json')
+            result = reader(directory / 'result.json')
+            progress = reader(directory / 'progress.json')
+            status = reader(directory / 'status.json')
             job = jobs.get(str(directory.resolve()))
             prepared = all((directory / 'data' / f'{split}.bin').is_file() for split in ('train', 'val'))
             size = meta.get('model_size')
@@ -368,6 +378,8 @@ class Trainer:
                          'finished_at': result.get('finished_at') if isinstance(result.get('finished_at'), str) else None,
                          'peak_vram_mib': result.get('peak_vram_mib') if finite_number(result.get('peak_vram_mib')) else None,
                          'snapshots': len(snapshot_files(directory))})
+            if include_progress:
+                runs[-1]['_progress'] = progress
         return runs
 
     def pipeline_busy(self):
@@ -434,9 +446,9 @@ class Trainer:
             handle.write(json.dumps(entry, ensure_ascii=False) + '\n')
         return entry
 
-    def previews(self, run_id, limit=20):
+    def previews(self, run_id, limit=20, *, run=None):
         result = []
-        for line in tail_text(Path(self.find_run(run_id)['directory']) / 'previews.jsonl', 400_000).splitlines():
+        for line in tail_text(Path((run or self.find_run(run_id))['directory']) / 'previews.jsonl', 400_000).splitlines():
             try:
                 item = strict_json(line)
                 if isinstance(item, dict) and isinstance(item.get('text'), str):
@@ -449,11 +461,11 @@ class Trainer:
         """Best, Latest or a step snapshot (stepNNNNNNNN) of a run."""
         return export_notebook.checkpoint_file(self.find_run(run_id)['directory'], kind)
 
-    def checkpoints(self, run_id):
+    def checkpoints(self, run_id, *, run=None, metrics=None):
         """Saved checkpoints with their step (exact for snapshots), size and time."""
-        run = self.find_run(run_id)
+        run = run or self.find_run(run_id)
         directory = Path(run['directory'])
-        metrics = read_metrics(directory)
+        metrics = read_metrics(directory) if metrics is None else metrics
         evaluated = [(item['step'], item['val_loss']) for item in metrics if finite_number(item.get('val_loss'))]
         result = []
         for kind in ('best', 'latest', *(name[5:-3] for name in reversed(snapshot_files(directory)))):
@@ -519,8 +531,8 @@ class Trainer:
             command += ['--prompt', prompt]
         return command
 
-    def benchmarks(self, run_id, limit=20):
-        directory = Path(self.find_run(run_id)['directory']) / 'benchmarks'
+    def benchmarks(self, run_id, limit=20, *, run=None):
+        directory = Path((run or self.find_run(run_id))['directory']) / 'benchmarks'
         reports = []
         for path in sorted(directory.glob('*.json'), reverse=True)[:limit]:
             report = read_json(path, max_bytes=2 * 1024 * 1024)
@@ -739,9 +751,8 @@ class Trainer:
         except OSError as error:
             atomic_json(job_path, {**job, 'state': 'failed', 'detail': str(error), 'finished_at': now(), 'exit_code': 1})
             raise ValueError(f'Unable to start the training worker: {error}') from error
-        self.children.append(child)
         job.update(pid=child.pid, identity=process_identity(child.pid))
-        self.pending_jobs[str(job_path)] = {'child': child, 'identity': job['identity']}
+        self._register_child(child, job_path, job['identity'])
         # The worker owns subsequent state writes. Never overwrite its progress.
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Build Whitecube for Debian 13 without installing build dependencies on the host.
-# Usage: tools/build-debian.sh [--prepare-only | --shell | -- COMMAND...]
+# Usage: tools/build-debian.sh [--refresh] [--prepare-only | --shell | -- COMMAND...]
 # Requires host apt, dpkg, Perl, Python3, curl and bubblewrap. Apt downloads use
 # Debian's archive keyring. Builder stays under build/; app dependencies in checkout.
 set -euo pipefail
@@ -10,14 +10,17 @@ mkdir -p "$work"
 work=$(realpath -- "$work")
 rootfs=$work/rootfs
 mode=build
-case ${1:-} in
-  --prepare-only) mode=prepare; shift ;;
-  --shell) mode=shell; shift ;;
-  --) mode=command; shift ;;
-  -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
-  '') ;;
-  *) echo "build-debian.sh: unknown option: $1" >&2; exit 2 ;;
-esac
+refresh=0
+while (( $# )); do
+  case $1 in
+    --refresh) refresh=1; shift ;;
+    --prepare-only) mode=prepare; shift ;;
+    --shell) mode=shell; shift ;;
+    --) mode=command; shift; break ;;
+    -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+    *) echo "build-debian.sh: unknown option: $1" >&2; exit 2 ;;
+  esac
+done
 if [[ $mode == command && $# == 0 ]]; then
   echo 'build-debian.sh: -- requires a command' >&2; exit 2
 fi
@@ -26,15 +29,18 @@ extra_binds=()
 if [[ $mode != prepare && -n ${ELECTRON_DIST:-} ]]; then
   [[ -x $ELECTRON_DIST/electron ]] || { echo 'build-debian.sh: ELECTRON_DIST must contain an executable electron' >&2; exit 1; }
   electron_dist=$(realpath -- "$ELECTRON_DIST")
+  python3 -I "$root/tools/build-inputs.py" check-electron "$electron_dist" >/dev/null
   extra_binds=(--ro-bind "$electron_dist" "$electron_dist")
 fi
 for command in apt-get dpkg dpkg-deb bwrap perl python3 flock curl sha256sum tar; do
   command -v "$command" >/dev/null || { echo "build-debian.sh: required host tool: $command" >&2; exit 1; }
 done
 [[ $(dpkg --print-architecture) == amd64 ]] || { echo 'build-debian.sh: this release requires an amd64 host' >&2; exit 1; }
+builder_key=$(python3 -I "$root/tools/build-inputs.py" builder-key)
 exec 9>"$work/.prepare.lock"
 flock 9
-if [[ ! -f $rootfs/.whitecube-builder-ready ]]; then
+cached_key=$(cat "$rootfs/.whitecube-builder-ready" 2>/dev/null || true)
+if [[ $refresh = 1 || $cached_key != "$builder_key" ]]; then
   host=$work/host
   mkdir -p "$host"
   if [[ ! -x $host/usr/bin/mmdebstrap || ! -f $host/usr/share/keyrings/debian-archive-keyring.pgp ]]; then
@@ -43,9 +49,10 @@ if [[ ! -f $rootfs/.whitecube-builder-ready ]]; then
       dpkg-deb --extract "$package" "$host"
     done
   fi
-  packages='?essential,apt,build-essential,fakeroot,patchelf,ca-certificates,curl,git,unzip,pkg-config,meson,ninja-build,python3,python3-gi,python3-cairo,python3-gi-cairo,python3-yaml,python3-requests,python3-pikepdf,python3-pil,nodejs,npm,libwlroots-0.18-dev,libwayland-dev,wayland-protocols,libxkbcommon-dev,libpango1.0-dev,libcairo2-dev,libinput-dev,libglib2.0-dev,libmpv-dev,libegl-dev,libgles-dev,libpng-dev,libexpat1-dev,libfontconfig-dev,libfreetype-dev,libpixman-1-dev,libadwaita-1-0,gir1.2-adw-1,gir1.2-gtk-4.0,desktop-file-utils,libnss3,libasound2t64,libatk-bridge2.0-0,libdrm2,libgbm1,dbus,dconf-cli,foot,mc,procps,fonts-dejavu-core,libdisplay-info-dev,libliftoff-dev,libseat-dev,libdrm-dev,libgbm-dev,libudev-dev,libgles2-mesa-dev,libvulkan-dev,glslang-tools,hwdata,libgtk-3-0t64,libxcomposite1,libxdamage1,libxrandr2,sudo,fuzzel,swaylock,swaybg,xorriso,squashfs-tools,debootstrap,e2fsprogs,gdisk,parted,dosfstools,xz-utils,dhcpcd-base,iproute2,nftables,seatd,libwayland-egl1'
+  packages='apt,build-essential,fakeroot,patchelf,ca-certificates,curl,git,unzip,pkg-config,meson,ninja-build,python3,python3-gi,python3-cairo,python3-gi-cairo,python3-yaml,python3-requests,python3-pikepdf,python3-pil,nodejs,npm,libwlroots-0.18-dev,libwayland-dev,wayland-protocols,libxkbcommon-dev,libpango1.0-dev,libcairo2-dev,libinput-dev,libglib2.0-dev,libmpv-dev,libegl-dev,libgles-dev,libpng-dev,libexpat1-dev,libfontconfig-dev,libfreetype-dev,libpixman-1-dev,libadwaita-1-0,gir1.2-adw-1,gir1.2-gtk-4.0,desktop-file-utils,libnss3,libasound2t64,libatk-bridge2.0-0,libdrm2,libgbm1,dbus,dconf-cli,foot,mc,procps,fonts-dejavu-core,libdisplay-info-dev,libliftoff-dev,libseat-dev,libdrm-dev,libgbm-dev,libudev-dev,libgles2-mesa-dev,libvulkan-dev,glslang-tools,hwdata,libgtk-3-0t64,libxcomposite1,libxdamage1,libxrandr2,sudo,fuzzel,swaylock,swaybg,xorriso,squashfs-tools,debootstrap,e2fsprogs,gdisk,parted,dosfstools,xz-utils,dhcpcd-base,iproute2,nftables,seatd,libwayland-egl1'
   next=$work/rootfs-extract
-  if [[ ! -f $next/.whitecube-extracted ]]; then
+  extracted_key=$(cat "$next/.whitecube-extracted" 2>/dev/null || true)
+  if [[ $refresh = 1 || $extracted_key != "$builder_key" ]]; then
     previous=
     if [[ -e $next ]]; then
       previous=$next.incomplete-$(date +%s)
@@ -56,10 +63,10 @@ if [[ ! -f $rootfs/.whitecube-builder-ready ]]; then
     "$host/usr/bin/mmdebstrap" --mode=chrootless --variant=extract --architectures=amd64 \
       --skip=cleanup/apt --keyring="$host/usr/share/keyrings/debian-archive-keyring.pgp" \
       --setup-hook='if [ -n "$WHITECUBE_BUILDER_CACHE" ] && [ -d "$WHITECUBE_BUILDER_CACHE" ]; then mkdir -p "$1/var/cache/apt/archives"; cp -an --reflink=auto "$WHITECUBE_BUILDER_CACHE/." "$1/var/cache/apt/archives/"; fi' \
-      --include="$packages" trixie "$next" https://deb.debian.org/debian > "$work/extract.log" 2>&1 || {
+      --include='?essential' --include="$packages" trixie "$next" https://deb.debian.org/debian > "$work/extract.log" 2>&1 || {
         tail -40 "$work/extract.log" >&2; exit 1;
       }
-    touch "$next/.whitecube-extracted"
+    printf '%s\n' "$builder_key" > "$next/.whitecube-extracted"
   fi
   printf '%s\n' 'deb https://deb.debian.org/debian trixie main' \
     'deb-src https://deb.debian.org/debian trixie main' \
@@ -94,7 +101,7 @@ if [[ ! -f $rootfs/.whitecube-builder-ready ]]; then
       chmod 0700 /tmp/whitecube-build-home
       dpkg-query -W libc6 dpkg gcc nodejs libwlroots-0.18-dev
     ' > "$work/configure.log" 2>&1 || { tail -60 "$work/configure.log" >&2; exit 1; }
-  touch "$next/.whitecube-builder-ready"
+  printf '%s\n' "$builder_key" > "$next/.whitecube-builder-ready"
   if [[ -e $rootfs ]]; then mv -- "$rootfs" "$rootfs.incomplete-$(date +%s)"; fi
   mv -- "$next" "$rootfs"
 fi
@@ -148,7 +155,7 @@ arguments=()
 case $mode in
   shell) arguments=(/bin/bash) ;;
   command) [[ $# -gt 0 ]] || { echo 'build-debian.sh: -- requires a command' >&2; exit 2; }; arguments=("$@") ;;
-  build) arguments=(/bin/bash -euc '[[ -x "$ELECTRON_DIST/electron" ]] || npm --prefix apps/desktop-chat ci; bash tools/prepare-native-deps.sh; source build/native-deps/environment.sh; bash packaging/build-deb.sh') ;;
+  build) arguments=(/bin/bash -euc 'electron_args=(); [[ $WHITECUBE_EXTERNAL_ELECTRON = 0 ]] || electron_args+=(--external); [[ $WHITECUBE_REFRESH = 0 ]] || electron_args+=(--refresh); python3 -I tools/build-inputs.py ensure-electron "$ELECTRON_DIST" "${electron_args[@]}"; bash tools/prepare-native-deps.sh; source build/native-deps/environment.sh; bash packaging/build-deb.sh') ;;
 esac
 bwrap --unsetenv LD_LIBRARY_PATH --unsetenv PKG_CONFIG_PATH --unsetenv GI_TYPELIB_PATH \
   --unsetenv PYTHONPATH --unsetenv PYTHONHOME --unsetenv NODE_PATH --unsetenv TMPDIR \
@@ -157,6 +164,8 @@ bwrap --unsetenv LD_LIBRARY_PATH --unsetenv PKG_CONFIG_PATH --unsetenv GI_TYPELI
   --bind "$rootfs" / --bind "$root" "$root" --ro-bind "$work/node" /opt/whitecube-node --dev /dev --proc /proc \
   --unshare-user --uid "$(id -u)" --gid "$(id -g)" --chdir "$root" --setenv HOME /tmp/whitecube-build-home \
   --setenv PATH /opt/whitecube-node/bin:/usr/sbin:/usr/bin:/sbin:/bin --setenv NODE /opt/whitecube-node/bin/node --setenv LANG C.UTF-8 \
+  --setenv WHITECUBE_BUILDER_KEY "$builder_key" --setenv WHITECUBE_REFRESH "$refresh" \
+  --setenv WHITECUBE_EXTERNAL_ELECTRON "$([[ -n ${ELECTRON_DIST:-} ]] && echo 1 || echo 0)" \
   --setenv ELECTRON_DIST "$electron_dist" "${extra_binds[@]}" "${arguments[@]}"
 if [[ $mode == build ]]; then
   version=$(tr -d '[:space:]' < "$root/packaging/VERSION")

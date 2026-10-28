@@ -500,6 +500,36 @@ class ArchiveVerification(unittest.TestCase):
         self.assertEqual(summary['filename'], self.package.name)
         self.assertEqual(summary['sha256'], hashlib.sha256(self.package.read_bytes()).hexdigest())
 
+
+    def test_new_release_requires_embedded_build_provenance(self):
+        self.control.write_text(self.control.read_text().replace('Version: 0.8.1', 'Version: 0.9.0'))
+        problems, _ = self.verify()
+        self.assertIn('build provenance is missing from release payload', problems)
+
+    def add_provenance(self, runtime='45.1.0'):
+        payload = {'format': 'org.whitecube.build-provenance', 'version': 1,
+                   'source': {'commit': 'a' * 40, 'dirty': True},
+                   'inputs_sha256': {'BUILD.sh': 'b' * 64},
+                   'runtime': {'electron': runtime}}
+        path = self.stage / self.checker.PROVENANCE
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(payload))
+        (self.sandbox.parent / 'version').write_text('45.1.0\n')
+        self.write_checksums()
+        return payload
+
+    def test_manifest_copies_provenance_from_verified_payload(self):
+        expected = self.add_provenance()
+        self.control.write_text(self.control.read_text().replace('Version: 0.8.1', 'Version: 0.9.0'))
+        problems, summary = self.verify()
+        self.assertEqual(problems, [])
+        self.assertEqual(summary['build_provenance'], expected)
+
+    def test_provenance_runtime_must_match_shipped_electron(self):
+        self.add_provenance(runtime='44.0.0')
+        problems, _ = self.verify()
+        self.assertTrue(any('Electron runtime do not match' in problem for problem in problems), problems)
+
     def test_modified_payload_is_rejected(self):
         self.config.write_text('changed=yes\n')
         problems, _ = self.verify()

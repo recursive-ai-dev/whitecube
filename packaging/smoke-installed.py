@@ -72,7 +72,7 @@ def inside():
         'limitations': [
             'Headless Pixman output; physical display, input, GPU and audio hardware are not exercised.',
             'Chat uses --no-sandbox only in this isolated smoke namespace; Chromium sandbox operation requires a real configured installation.',
-            'Runtime comes from the Debian builder and contains build dependencies; this does not establish minimal Depends completeness.',
+            'Dependency completeness requires the lifecycle runtime root; using a Debian builder root containing development packages does not establish minimal Depends completeness.',
             'Package configuration scripts, system services, login-manager integration and real model/API requests are not exercised.',
         ],
     }

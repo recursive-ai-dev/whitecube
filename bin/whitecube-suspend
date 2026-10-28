@@ -1,0 +1,95 @@
+#!/usr/bin/python3 -I
+"""Lock the graphical session before asking the system to suspend."""
+import os
+import selectors
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+
+class SuspendError(Exception):
+    pass
+
+
+def lock_then_suspend(locker, suspend, timeout=15):
+    """swaylock sends a newline only after the compositor acknowledges locking.
+
+    Keep the locker running if suspend fails: the graphical session must remain
+    protected. Commands are arguments supplied by the caller, never shell text.
+    """
+    ready, writer = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    process = None
+    errors = tempfile.TemporaryFile()
+    try:
+        process = subprocess.Popen([*locker, '--ready-fd', str(writer)],
+                                   pass_fds=(writer,), stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=errors,
+                                   start_new_session=True)
+        os.close(writer)
+        writer = -1
+        with selectors.DefaultSelector() as selector:
+            selector.register(ready, selectors.EVENT_READ, 'ready')
+            deadline = time.monotonic() + timeout
+            acknowledged = False
+            while not acknowledged:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise SuspendError('Screen lock timed out; the computer was not suspended. '
+                                       'The locker may still be running.')
+                for key, _ in selector.select(min(remaining, .1)):
+                    chunk = os.read(key.fd, 4096)
+                    if b'\n' in chunk:
+                        acknowledged = True
+                    elif not chunk:
+                        errors.seek(max(0, os.fstat(errors.fileno()).st_size - 4096))
+                        detail = errors.read().decode('utf-8', 'replace').strip().splitlines()
+                        raise SuspendError('Screen lock failed; the computer was not suspended' +
+                                           (': ' + detail[-1] if detail else '.'))
+        # --daemonize exits its parent after successful locking. A failure exit
+        # accompanying a readiness notification must still prevent suspension.
+        try:
+            status = process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            raise SuspendError('Screen locker did not finish starting; the computer was not suspended.')
+        if status:
+            raise SuspendError('Screen locker failed after its readiness notification; the computer was not suspended.')
+        result = subprocess.run(suspend, stdin=subprocess.DEVNULL, capture_output=True,
+                                text=True, timeout=40, check=False)
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()
+            raise SuspendError('Suspend failed; the screen remains locked' +
+                               (': ' + detail[-1] if detail else '.'))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SuspendError(f'Unable to lock and suspend: {exc}') from exc
+    finally:
+        # The daemon keeps an ordinary file descriptor for diagnostics. Closing
+        # our copy must not give it SIGPIPE when it later reports a PAM error.
+        errors.close()
+        os.close(ready)
+        if writer >= 0:
+            os.close(writer)
+        if process is not None:
+            # Reap an exited daemonizing parent, without waiting for or killing
+            # a locker that is still protecting the graphical session.
+            if process.poll() is None:
+                threading.Thread(target=process.wait, daemon=True).start()
+
+
+def main():
+    if len(sys.argv) != 1:
+        print('usage: whitecube-suspend', file=sys.stderr)
+        return 2
+    try:
+        lock_then_suspend(['swaylock', '--daemonize', '--color', '111827'],
+                          ['/usr/bin/sudo', '-n', '--',
+                           '/usr/libexec/whitecube/cube-settings-helper', 'power-action', 'suspend'])
+    except SuspendError as exc:
+        print(f'whitecube-suspend: {exc}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -203,6 +203,8 @@ class EditorWindow(Adw.ApplicationWindow):
         self.running_action = None
         self.hydrating = False
         self.save_timer = None
+        self.dirty = False
+        self.unsaved_dialog = None
         self.entries = {}
         self.field_errors = {}
         self.selected_release = None
@@ -1003,6 +1005,7 @@ class EditorWindow(Adw.ApplicationWindow):
         self.refresh_buttons()
         if not self.project or self.busy:
             return
+        self.dirty = True
         self.saved_label.set_text('SAVING…')
         if self.save_timer:
             GLib.source_remove(self.save_timer)
@@ -1028,6 +1031,9 @@ class EditorWindow(Adw.ApplicationWindow):
     def save_project(self):
         if not self.project or self.hydrating or self.busy:
             return False
+        if self.save_timer:
+            GLib.source_remove(self.save_timer)
+            self.save_timer = None
         try:
             errors = self.validate_fields()
             if errors: raise ValueError(next(iter(errors.values())))
@@ -1048,12 +1054,61 @@ class EditorWindow(Adw.ApplicationWindow):
             self.saved_label.set_text('SAVED LOCALLY')
             self.saved_label.set_tooltip_text(None)
             self.project_label.set_text(self.project.data.get('name', 'Project'))
+            self.dirty = False
             return True
         except Exception as exc:
+            self.dirty = True
             self.saved_label.set_text('SAVE FAILED')
             self.validate_fields()
             self.saved_label.set_tooltip_text(str(exc))
             return False
+
+    def review_unsaved(self, callback):
+        """Resolve one pending transition without writing invalid or discarded edits."""
+        if not self.project or not self.dirty:
+            callback()
+            return
+        if self.unsaved_dialog:
+            self.unsaved_dialog.present()
+            return
+        if self.save_timer:
+            GLib.source_remove(self.save_timer)
+            self.save_timer = None
+        body = 'Save your changes before leaving this project? Discard edits keeps the last saved project on disk.'
+        if self.saved_label.get_text() == 'SAVE FAILED':
+            body += '\n\nSaving failed: ' + (self.saved_label.get_tooltip_text() or 'Check the highlighted fields and project permissions.')
+        dialog = Adw.MessageDialog(transient_for=self, heading='Unsaved project changes', body=body)
+        self.unsaved_dialog = dialog
+        dialog.add_response('keep', 'Keep editing')
+        dialog.add_response('discard', 'Discard edits')
+        dialog.add_response('save', 'Save')
+        dialog.set_response_appearance('discard', Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.set_response_appearance('save', Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_default_response('keep'); dialog.set_close_response('keep')
+        def response(_dialog, choice):
+            self.unsaved_dialog = None
+            _dialog.destroy()
+            if choice == 'save':
+                if not self.save_project():
+                    # Keep the same decision available after validation or I/O failure.
+                    def reopen():
+                        self.review_unsaved(callback)
+                        return False
+                    GLib.idle_add(reopen)
+                    return
+            elif choice == 'discard':
+                # Hydration changes widgets only. A missing/unreadable project must
+                # still allow an explicit discard and close.
+                try:
+                    self.hydrate()
+                except Exception as exc:
+                    self.toast(f'Could not reload the saved project: {exc}')
+                self.dirty = False
+            else:
+                return
+            callback()
+        dialog.connect('response', response)
+        dialog.present()
 
     def pick(self, title, callback, kind='any'):
         action = Gtk.FileChooserAction.SELECT_FOLDER if kind == 'folder' else Gtk.FileChooserAction.OPEN
@@ -1080,17 +1135,21 @@ class EditorWindow(Adw.ApplicationWindow):
             self.toast('Finish or cancel the current operation before switching projects.'); return
         self.pick('Open cube-editor.json', self.load_project, 'project')
 
-    def create_project(self):
+    def create_project(self, confirmed=False, values=None):
         if self.busy or self.vm_running(): return
-        if self.project and not self.save_project():
-            self.toast('Correct the highlighted fields before creating another project.'); return
+        values = values or {key: self.entries[key].get_text() for key in ('source_iso', 'name', 'base_dir', 'output_dir')}
+        if not confirmed and self.project and self.dirty:
+            self.review_unsaved(lambda: self.create_project(True, values)); return
         try:
             self.selected_release = None
             self.test_disk = None
             self.disk_label.set_text('No test disk selected.')
-            self.project = engine.Project.create(self.entries['source_iso'].get_text(), self.entries['name'].get_text(),
-                        base_dir=self.entries['base_dir'].get_text(), output_dir=self.entries['output_dir'].get_text())
+            self.project = engine.Project.create(values['source_iso'], values['name'],
+                        base_dir=values['base_dir'], output_dir=values['output_dir'])
             self.worker = engine.Engine(self.project, on_event=self.on_event)
+            self.entries['name'].set_text(values['name'])
+            self.entries['output_dir'].set_text(values['output_dir'])
+            self.entries['output_name'].set_text(self.project.data['output_name'])
             self.save_project()
             self.hydrate(); self.refresh_recent()
             self.log(f'Created project: {self.project.directory}')
@@ -1098,11 +1157,11 @@ class EditorWindow(Adw.ApplicationWindow):
         except Exception as exc:
             self.toast(str(exc)); self.log(f'Create failed: {exc}')
 
-    def load_project(self, path):
+    def load_project(self, path, confirmed=False):
         if self.busy or self.vm_running():
             self.toast('Finish the current operation and close the test VM before switching projects.'); return
-        if self.project and not self.save_project():
-            self.toast('Correct the highlighted fields before switching projects.'); return
+        if not confirmed and self.project and self.dirty:
+            self.review_unsaved(lambda: self.load_project(path, True)); return
         try:
             candidate = engine.Project.load(path)
             candidate_worker = engine.Engine(candidate, on_event=self.on_event)
@@ -1185,6 +1244,7 @@ class EditorWindow(Adw.ApplicationWindow):
             self.show_inspection(data.get('inspection', {}))
         finally:
             self.hydrating = hydrating
+        self.dirty = False
         self.refresh_buttons()
 
     def inspect_project(self):
@@ -1760,8 +1820,8 @@ class EditorWindow(Adw.ApplicationWindow):
     def on_close(self, *_):
         if self.busy:
             self.toast('Finish or cancel the running operation before closing the editor.'); return True
-        if self.project and not self.save_project():
-            self.toast('Correct the highlighted fields before closing.'); return True
+        if self.project and self.dirty:
+            self.review_unsaved(self.close); return True
         if self.save_timer:
             GLib.source_remove(self.save_timer); self.save_timer = None
         if self.release_monitor:

@@ -1,0 +1,33 @@
+name: Checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  isolated-unit-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install archive-test tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fakeroot bubblewrap dpkg-dev
+      - name: Cache and release-tool regression tests
+        run: |
+          python3 -I tests/test-builder.py
+          python3 -I tests/test-build-tools.py
+          python3 -I tests/test-lifecycle.py
+          python3 -I tests/test-packaging.py ArchiveVerification
+      - name: Session and privileged-write regression tests
+        run: |
+          python3 -I tests/test-session.py
+          python3 -I tests/test-settings-transactions.py
+          python3 -I tests/test-suspend.py
+      - name: Chat tests
+        run: node --test apps/desktop-chat/test/*.test.js
+      - name: Shell syntax
+        run: bash -n BUILD.sh tools/build-debian.sh packaging/build-deb.sh

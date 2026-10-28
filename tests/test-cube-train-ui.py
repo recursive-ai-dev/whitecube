@@ -45,8 +45,19 @@ def inside(fixture, screenshots):
             except BaseException:
                 self.failure = traceback.format_exc(); print(self.failure, file=sys.stderr); self.quit(); return False
         def exercise(self): return self.guarded(self.actions)
+        def wait_refresh(self):
+            deadline = time.monotonic() + 5
+            context = app.GLib.MainContext.default()
+            while self.window.refresh_running or self.window.refresh_pending:
+                assert time.monotonic() < deadline, 'Background run snapshot did not finish'
+                context.iteration(False)
+                time.sleep(.002)
+        def refresh_sync(self, force=False):
+            self.window.refresh(force)
+            self.wait_refresh()
         def actions(self):
             w = self.window
+            self.wait_refresh()
             assert not w.stop_button.get_sensitive()
             w.size_picker.set_selected(2); assert '4,987,448' in w.model_detail.get_text()
             w.size_picker.set_selected(3); assert '10,034,184' in w.model_detail.get_text()
@@ -54,15 +65,16 @@ def inside(fixture, screenshots):
                 assert w.key_pressed(None, app.Gdk.KEY_1 + index, 0, app.Gdk.ModifierType.CONTROL_MASK)
                 assert w.stack.get_visible_child_name() == ('train', 'runs', 'activity')[index]
             w.run_list.select_row(w.run_list.get_row_at_index(0))
+            self.wait_refresh()
             assert w.selected_id == 'fixture-run'
             assert w.resume_button.get_sensitive() and w.best_button.get_sensitive()
             assert w.latest_button.get_sensitive() and w.delete_button.get_sensitive()
             # Chat availability and launch commands must share one discovery path.
             with patch.object(engine, 'chat_launcher', return_value=None):
-                w.refresh()
+                self.refresh_sync()
                 assert not w.best_button.get_sensitive() and not w.latest_button.get_sensitive()
                 assert not w.actions['chat-best'].get_enabled() and not w.actions['chat-latest'].get_enabled()
-            w.refresh()
+            self.refresh_sync()
             assert w.best_button.get_sensitive() and w.latest_button.get_sensitive()
             assert w.actions['chat-best'].get_enabled() and w.actions['chat-latest'].get_enabled()
             assert '2.4000' in w.run_detail.get_text()
@@ -124,10 +136,10 @@ def inside(fixture, screenshots):
             w.form['batch_size'].set_value(2); w.form['grad_accum_steps'].set_value(3)
             assert '1,536 byte tokens' in w.batch_summary.get_text()
             with patch.object(app.engine, 'read_metrics', wraps=app.engine.read_metrics) as read:
-                w.refresh(); w.refresh(); assert read.call_count == 0
+                self.refresh_sync(); self.refresh_sync(); assert read.call_count == 0
                 with (run / 'train_log.jsonl').open('a') as metrics:
                     metrics.write('\n' + json.dumps({'step': 4, 'total_loss': 4.4}))
-                w.refresh(); assert read.call_count == 1 and len(w.losses) == 4
+                self.refresh_sync(); assert read.call_count == 1 and len(w.losses) == 4
             w.stack.set_visible_child_name('activity')
             assert not w.key_pressed(None, app.Gdk.KEY_Return, 0, app.Gdk.ModifierType.CONTROL_MASK)
             assert w.key_pressed(None, app.Gdk.KEY_f, 0, app.Gdk.ModifierType.CONTROL_MASK)
@@ -145,16 +157,16 @@ def inside(fixture, screenshots):
                 app.write_export(fixture / name, text)
                 assert (fixture / name).read_bytes().decode('utf-8') == text
             moved = fixture / 'temporarily-moved-run'
-            run.rename(moved); w.sample_output.set_text('Old preview'); w.refresh()
+            run.rename(moved); w.sample_output.set_text('Old preview'); self.refresh_sync()
             assert w.selected_id is None and not w.losses and not w.sample_output.get_text()
             assert 'Choose a run' in w.run_detail.get_text() and not w.resume_button.get_sensitive()
-            moved.rename(run); w.refresh()
+            moved.rename(run); self.refresh_sync()
             assert w.selected_id == 'fixture-run' and len(w.losses) == 4
             w.sample_kind.set_selected(1); assert w.sample_button.get_sensitive()
             (run / 'ckpt_best.pt').rename(run / 'best-backup')
-            w.refresh(True); assert w.sample_button.get_sensitive()
+            self.refresh_sync(True); assert w.sample_button.get_sensitive()
             w.sample_kind.set_selected(0); assert not w.sample_button.get_sensitive()
-            (run / 'best-backup').rename(run / 'ckpt_best.pt'); w.refresh(True)
+            (run / 'best-backup').rename(run / 'ckpt_best.pt'); self.refresh_sync(True)
             w.copy_path(); assert w.get_display().get_clipboard().get_formats().to_string()
             w.rename()
             dialog = w.get_visible_dialog(); assert dialog
@@ -187,7 +199,7 @@ def inside(fixture, screenshots):
             assert not prefs['thermal_pause'] and prefs['draft_name'] == 'Native fixture (copy)'
             assert not prefs['deduplicate'] and not prefs['shuffle_files'] and prefs['max_document_bytes'] == 0 and prefs['batch_rows'] == 32
             w.stack.set_visible_child_name('runs')
-            w.toggle_pin(); assert trainer.find_run('fixture-run')['pinned'] and w.pin_button.get_label() == 'Unpin'
+            w.toggle_pin(); self.wait_refresh(); assert trainer.find_run('fixture-run')['pinned'] and w.pin_button.get_label() == 'Unpin'
             w.run_filter.set_selected(4); assert '1 of 1' in w.run_count.get_text(); w.run_filter.set_selected(0)
             w.notes_view.get_buffer().set_text('Fixture note'); assert w.notes_button.get_sensitive()
             w.save_notes(); assert trainer.find_run('fixture-run')['notes'] == 'Fixture note'
@@ -269,22 +281,23 @@ def inside(fixture, screenshots):
                 {'step': 0, 'total_loss': 5.0}, {'step': 1, 'val_loss': 3.0}, {'step': 3, 'val_loss': 2.0}]))
             failed = trainer.runs_dir / 'failed-run'; failed.mkdir()
             engine.atomic_json(failed / 'status.json', {'state': 'failed', 'detail': 'No recognized text column'})
-            w.stack.set_visible_child_name('runs'); w.selected_id = 'fixture-run'; w.refresh(True)
+            w.stack.set_visible_child_name('runs'); w.selected_id = 'fixture-run'; self.refresh_sync(True)
             row = w.run_rows['fixture-run']
             engine.atomic_json(run / 'progress.json', {'completed_steps': 5, 'loss': 4.4})
-            w.refresh(); assert w.run_rows['fixture-run'] is row and '5/' in row.meta.get_text(), row.meta.get_text()
+            self.refresh_sync(); assert w.run_rows['fixture-run'] is row and '5/' in row.meta.get_text(), row.meta.get_text()
             assert row.is_selected() and len(w.spark_cache['second-run'][1]) == 2
             assert w.cleanup_button.get_visible()
-            w.run_list.select_row(w.run_rows['second-run']); assert w.selected_id == 'second-run'
+            w.run_list.select_row(w.run_rows['second-run']); self.wait_refresh(); assert w.selected_id == 'second-run'
             assert [item['kind'] for item in w.checkpoint_items] == ['best', 'step00000002'], w.checkpoint_items
             assert w.actions['export-notebook'].get_enabled() and not w.actions['chat-latest'].get_enabled()
             assert '2.885' in w.detail_tiles.tile_signature  # bits per byte of 2.0
-            w.run_list.select_row(w.run_rows['fixture-run']); w.refresh()
+            w.run_list.select_row(w.run_rows['fixture-run']); self.refresh_sync()
             index = w.compare_ids.index('second-run') + 1; w.compare_picker.set_selected(index)
+            self.wait_refresh()
             assert w.compare_losses and w.compare_name == 'Second fixture'
             w.chart_geometry = (48, 500, 4); w.chart_pointer(300); assert 'Second fixture' in w.chart_readout.get_text()
             w.chart_pointer(None); w.compare_picker.set_selected(0); assert not w.compare_losses
-            w.run_list.select_row(w.run_rows['second-run']); w.refresh()
+            w.run_list.select_row(w.run_rows['second-run']); self.refresh_sync()
             w.export_notebook('step00000002'); dialog = w.get_visible_dialog(); assert dialog
             entries = [item for item in self.widgets(dialog) if isinstance(item, app.Gtk.Entry)]
             entries[0].set_text(str(fixture / 'exports'))
@@ -322,6 +335,7 @@ def inside(fixture, screenshots):
             self.wait(lambda: not (trainer.runs_dir / 'failed-run').exists() and not w.get_visible_dialog(), self.cleaned)
         def cleaned(self):
             w = self.window
+            self.wait_refresh()
             assert 'failed-run' not in w.run_rows and not w.cleanup_button.get_visible()
             corpus = fixture / 'mixed-corpus'; corpus.mkdir()
             (corpus / 'stories.jsonl').write_text(json.dumps({'story': 'A long story. ' * 30}) + '\n')
@@ -356,7 +370,7 @@ def inside(fixture, screenshots):
             w.get_visible_dialog().close()
             assert w.run_list.get_selected_row() is w.run_rows['second-run']
             assert w.run_list_key(None, app.Gdk.KEY_Menu, 0, 0) and w.run_menu.get_visible(); w.run_menu.popdown()
-            w.run_list.select_row(w.run_rows['fixture-run']); w.refresh()
+            w.run_list.select_row(w.run_rows['fixture-run']); self.refresh_sync()
             self.pages = iter(('train', 'runs', 'activity'))
             app.GLib.timeout_add(250, lambda: self.guarded(self.capture_next)); return False
         def capture_next(self):

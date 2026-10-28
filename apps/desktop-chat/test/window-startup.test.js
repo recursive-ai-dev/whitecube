@@ -125,6 +125,16 @@ test('ordinary app-menu launch shows a window', async () => {
   assert.equal(win.isVisible(), true);
 });
 
+test('paged and compatibility history IPC use asynchronous searches and quit releases the worker', async () => {
+  const { handlers, app } = await start(['--hide']);
+  const current = handlers.get('chats:current')();
+  const page = await handlers.get('chats:page')({}, '', { offset: 0, limit: 1 });
+  assert.equal(page.items[0].id, current.id);
+  assert.equal(page.total, 1);
+  assert.equal((await handlers.get('chats:list')({}, 'New conversation'))[0].id, current.id);
+  app.emit('will-quit');
+});
+
 test('trainer checkpoint launches select the model on first and existing instances', async () => {
   const first = await start(['--show', '--checkpoint', 'run/ckpt_best.pt']);
   first.win.webContents.emit('did-finish-load');

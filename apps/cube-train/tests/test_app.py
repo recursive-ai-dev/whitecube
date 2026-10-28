@@ -210,7 +210,8 @@ class PresentationTests(unittest.TestCase):
         stopped = []
         job = {'path': '/job'}
         trainer = SimpleNamespace(active_job=lambda: job, stop=lambda item: stopped.append(item))
-        window = SimpleNamespace(trainer=trainer, stop_requested=False, stop_button=Control(), status=Control())
+        window = SimpleNamespace(trainer=trainer, active_job_info=job, last_job=None,
+                                 stop_requested=False, stop_button=Control(), status=Control())
         app.TrainerWindow.stop(window); app.TrainerWindow.stop(window)
         self.assertEqual(stopped, [job])
         self.assertFalse(window.stop_button.sensitive)

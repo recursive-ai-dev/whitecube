@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.8.1_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.0_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -51,10 +51,47 @@ tests a real `dpkg --unpack` in a disposable directory, and writes matching
 version requirements from the shipped binaries. The package targets amd64;
 building in Debian 13 provides the supported release baseline.
 
-Version 0.8.1 coexists with the standalone `chrootables` and `cube-browser`
+Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `cube-browser`
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.9.0
+
+Suspend from Settings or the panel first waits for the screen locker to confirm
+that the compositor has locked the session. Failed application launches and
+quick-setting operations now report their errors on screen. Helper processes
+have bounded lifetimes, and rapid volume/brightness changes keep the latest
+requested value. Native Settings and launcher text fields support Compose and
+dead keys; the launcher also supports held-key repeat.
+
+System hostname, timezone and console-keyboard changes stage complete files,
+preserve permissions, and roll back partial writes or failed apply commands.
+These updates serialize Whitecube writers and retain unrelated concurrent edits.
+Each file replacement is atomic; multiple files are not one filesystem transaction.
+
+Chat searches conversation history in a worker, caches its index, debounces
+typing and pages the sidebar. Trainer refreshes run/job metadata in the background
+without overlapping scans. Editor offers Save, Discard edits and Keep editing
+when leaving a modified project, including invalid or unwritable drafts.
+
+The native build definitions are shared through Meson, dependency caches follow
+their recipes and lockfiles, and packages record source/build provenance.
+The [release guide](docs/RELEASE-0.9.0.md) describes the changes and verification;
+the [maintenance guide](docs/MAINTENANCE.md) documents the release checks.
+
+Download the Debian amd64 binary package and its checksum from
+[GitHub Releases](https://github.com/recursive-ai-dev/whitecube/releases).
+Verify the downloaded artifact before installing:
+
+```sh
+sha256sum --check whitecube-desktop_0.9.0_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.0_amd64.deb
+```
+
+Log out and back in after upgrading to load the new native desktop programs.
+Multiple-monitor window placement, panels and mixed-scale rendering remain a
+separate follow-up; hardware suspend/resume still needs verification on the target machine.
 
 ## Desktop and package improvements in 0.8.0
 

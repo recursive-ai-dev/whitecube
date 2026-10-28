@@ -38,9 +38,11 @@
 #include "status-theme.h"
 #include "desktop-state.h"
 #include "native-preferences.h"
+#include "native-input.h"
 
 #define HELPER "/usr/libexec/whitecube/cube-settings-helper"
 #define SUDO "/usr/bin/sudo"
+#define SUSPEND_COMMAND "/usr/bin/whitecube-suspend"
 #define MAXF 10
 #define MAXJOBS 24
 #define MAXHITS 768
@@ -58,19 +60,8 @@ static double now_s(void) {
 static void copy(char *dst, size_t cap, const char *src) { g_strlcpy(dst, src ? src : "", cap); }
 static const char *home_dir(void) { const char *h = getenv("HOME"); return h && *h ? h : "/tmp"; }
 
-// Detached /bin/sh -c (terminals, wallpaper tools). Never waited for.
-static void spawn_detached(const char *cmd) {
-	pid_t pid = fork();
-	if (pid == 0) {
-		if (fork() != 0) _exit(0);
-		setsid();
-		int fd = open("/dev/null", O_RDWR);
-		if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
-		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-		_exit(127);
-	}
-	if (pid > 0) waitpid(pid, NULL, 0);
-}
+// Fixed desktop commands launch asynchronously with an exec-error handshake.
+static void spawn_detached(const char *cmd);
 
 // ------------------------------------------------------- helper output tables
 
@@ -115,7 +106,7 @@ static bool yes(const char *v) { return !strcmp(v, "yes"); }
 
 // ------------------------------------------------------------------- jobs
 
-enum priv { P_USER, P_FREE, P_PASS, P_PRIVACY, P_PREFS };
+enum priv { P_USER, P_FREE, P_PASS, P_PRIVACY, P_PREFS, P_SUSPEND, P_LAUNCH };
 static char preferences_helper[PATH_MAX];
 // User-only helper, separate from the privileged system helper and sudo policy.
 static char privacy_helper[PATH_MAX];
@@ -181,7 +172,7 @@ static bool job_launch(int table, const char *label, enum priv priv, enum chain 
 	const char *argv[16]; int a = 0;
 	if (priv == P_FREE) { argv[a++] = SUDO; argv[a++] = "-n"; argv[a++] = "--"; }
 	if (priv == P_PASS) { argv[a++] = SUDO; argv[a++] = "-S"; argv[a++] = "-p"; argv[a++] = ""; argv[a++] = "--"; }
-	argv[a++] = priv == P_PREFS ? preferences_helper : priv == P_PRIVACY ? privacy_helper : HELPER;
+	argv[a++] = priv == P_SUSPEND ? SUSPEND_COMMAND : priv == P_PREFS ? preferences_helper : priv == P_PRIVACY ? privacy_helper : HELPER;
 	for (int i = 0; i < nargs && a < 15; i++) argv[a++] = args[i];
 	argv[a] = NULL;
 	pid_t pid = fork();
@@ -292,6 +283,10 @@ static void job_finish(struct job *j, int status) {
 	j->ebuf[j->elen] = 0;
 	bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
 	char line[256];
+	if (j->priv == P_LAUNCH) {
+		if (!ok || j->elen) toast("Cannot launch %s: %s", j->label, last_line(j->ebuf, line, sizeof(line))[0] ? line : "process creation failed");
+		free(j->obuf); memset(j, 0, sizeof(*j)); request_redraw(); return;
+	}
 	if (j->table >= 0) {
 		struct table *t = &tables[j->table];
 		t->loading = false;
@@ -692,6 +687,7 @@ static struct {
 	int w, h, pending_w, pending_h; bool configured, closed, dirty;
 	struct buffer bufs[2];
 	struct xkb_context *xkb; struct xkb_keymap *keymap; struct xkb_state *xstate;
+	struct xkb_compose_state *compose;
 	int repeat_rate, repeat_delay, repeat_fd; uint32_t repeat_key;
 	double px, py; uint32_t ptr_serial;
 	bool render_only, session_lock_available;
@@ -752,6 +748,36 @@ static void toast(const char *fmt, ...) {
 	va_end(ap);
 	ui.toast_until = now_s() + 5;
 	request_redraw();
+}
+
+static void spawn_detached(const char *cmd) {
+    char **argv = NULL;
+    if (!g_shell_parse_argv(cmd, NULL, &argv, NULL) || !argv || !argv[0]) {
+        toast("Cannot launch: invalid command"); return;
+    }
+    struct job *j = NULL;
+    for (int i = 0; i < MAXJOBS; i++) if (!jobs[i].used) { j = &jobs[i]; break; }
+    if (!j) { toast("Too many tasks running; try again"); g_strfreev(argv); return; }
+    int errors[2];
+    if (pipe2(errors, O_CLOEXEC) < 0) { toast("Cannot launch: %s", strerror(errno)); g_strfreev(argv); return; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(errors[0]);
+        pid_t detached = fork();
+        if (detached < 0) { dprintf(errors[1], "%s", strerror(errno)); _exit(127); }
+        if (detached > 0) _exit(0);
+        setsid();
+        sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, NULL);
+        signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_DFL);
+        int null = open("/dev/null", O_RDONLY); if (null >= 0) dup2(null, 0);
+        execvp(argv[0], argv);
+        dprintf(errors[1], "%s: %s", argv[0], strerror(errno)); _exit(127);
+    }
+    close(errors[1]);
+    if (pid < 0) { close(errors[0]); toast("Cannot launch: %s", strerror(errno)); g_strfreev(argv); return; }
+    fcntl(errors[0], F_SETFL, O_NONBLOCK);
+    *j = (struct job){.used = true, .pid = pid, .out = -1, .err = errors[0], .table = -1, .priv = P_LAUNCH};
+    copy(j->label, sizeof(j->label), argv[0]); g_strfreev(argv);
 }
 
 // Palette: whitecube's light theme, or high contrast.
@@ -1576,7 +1602,7 @@ static void page_power(void) {
 	if (!*b && tables[T_POWER].loaded) para("No adjustable backlight found.", NULL);
 	heading("Session");
 	if (button("Lock screen")) spawn_detached("swaylock -f -c ffffff");
-	if (button("Suspend")) action("Suspend", P_FREE, 2, "power-action", "suspend");
+	if (button("Suspend")) action("Suspend", P_SUSPEND, 0);
 	if (button("Restart…")) { struct pending p = make_pending("Restart", P_FREE, 2, "power-action", "reboot"); confirm("Restart", "Restart the computer now? Open windows will close.", "Restart", true, &p); }
 	if (button_ex("Power off…", false, true, true)) { struct pending p = make_pending("Power off", P_FREE, 2, "power-action", "poweroff"); confirm("Power off", "Power off now? Disks are synced and unmounted cleanly first.", "Power off", true, &p); }
 	row_end();
@@ -2112,6 +2138,7 @@ static void key_press(xkb_keysym_t sym, const char *utf8, bool ctrl, bool shift)
 	request_redraw();
 }
 
+static void stop_repeat(void);
 static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t format, int32_t fd, uint32_t size) {
 	if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) { close(fd); return; }
 	char *map = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -2120,6 +2147,8 @@ static void kb_keymap(void *d, struct wl_keyboard *k, uint32_t format, int32_t f
 	struct xkb_keymap *km = xkb_keymap_new_from_string(g.xkb, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	munmap(map, size);
 	if (!km) return;
+	stop_repeat();
+	if (g.compose) xkb_compose_state_reset(g.compose);
 	if (g.xstate) xkb_state_unref(g.xstate);
 	if (g.keymap) xkb_keymap_unref(g.keymap);
 	g.keymap = km; g.xstate = xkb_state_new(km);
@@ -2130,24 +2159,39 @@ static void stop_repeat(void) {
 	struct itimerspec off = {0};
 	if (g.repeat_fd >= 0) timerfd_settime(g.repeat_fd, 0, &off, NULL);
 }
-static void kb_leave(void *d, struct wl_keyboard *k, uint32_t serial, struct wl_surface *s) { stop_repeat(); }
+static void kb_leave(void *d, struct wl_keyboard *k, uint32_t serial, struct wl_surface *s) {
+	stop_repeat();
+	if (g.compose) xkb_compose_state_reset(g.compose);
+}
 static void handle_key(uint32_t key) {
 	if (!g.xstate) return;
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(g.xstate, key + 8);
-	char utf8[16] = "";
+	char utf8[64] = "";
 	xkb_state_key_get_utf8(g.xstate, key + 8, utf8, sizeof(utf8));
 	bool ctrl = xkb_state_mod_name_is_active(g.xstate, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0;
 	bool shift = xkb_state_mod_name_is_active(g.xstate, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0;
+	struct hit *field = focused_hit();
+	if (field && field->kind == H_FIELD && !ctrl && sym != XKB_KEY_Tab && sym != XKB_KEY_ISO_Left_Tab &&
+	    sym != XKB_KEY_Escape && sym != XKB_KEY_Return && sym != XKB_KEY_BackSpace) {
+		if (wc_compose_key(g.compose, sym, utf8, sizeof(utf8))) {
+			if (!utf8[0]) { request_redraw(); return; }
+			sym = XKB_KEY_NoSymbol;
+		}
+	} else if (g.compose) xkb_compose_state_reset(g.compose);
 	key_press(sym, utf8, ctrl, shift);
 }
 static void kb_key(void *d, struct wl_keyboard *k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
 	if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+		stop_repeat();
 		handle_key(key);
+		if (g.compose && xkb_compose_state_get_status(g.compose) == XKB_COMPOSE_COMPOSING) return;
 		if (g.keymap && xkb_keymap_key_repeats(g.keymap, key + 8) && g.repeat_rate > 0 && g.repeat_fd >= 0) {
 			g.repeat_key = key;
+			int delay = g.repeat_delay > 0 ? g.repeat_delay : 1;
+			int rate = g.repeat_rate > 100 ? 100 : g.repeat_rate;
 			struct itimerspec its = {
-				.it_value = { g.repeat_delay / 1000, (g.repeat_delay % 1000) * 1000000L },
-				.it_interval = { 0, 1000000000L / g.repeat_rate },
+				.it_value = { delay / 1000, (delay % 1000) * 1000000L },
+				.it_interval = { 0, 1000000000L / rate },
 			};
 			timerfd_settime(g.repeat_fd, 0, &its, NULL);
 		}
@@ -2156,7 +2200,7 @@ static void kb_key(void *d, struct wl_keyboard *k, uint32_t serial, uint32_t tim
 static void kb_mods(void *d, struct wl_keyboard *k, uint32_t serial, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t group) {
 	if (g.xstate) xkb_state_update_mask(g.xstate, dep, lat, lock, 0, 0, group);
 }
-static void kb_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay) { g.repeat_rate = rate; g.repeat_delay = delay; }
+static void kb_repeat(void *d, struct wl_keyboard *k, int32_t rate, int32_t delay) { g.repeat_rate = rate; g.repeat_delay = delay; stop_repeat(); }
 static const struct wl_keyboard_listener kb_listener = { kb_keymap, kb_enter, kb_leave, kb_key, kb_mods, kb_repeat };
 
 static void set_cursor(uint32_t serial) {
@@ -2181,6 +2225,8 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t time, wl_fixed_t 
 static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
 	if (button != BTN_LEFT) return;
 	if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+		stop_repeat();
+		if (g.compose) xkb_compose_state_reset(g.compose);
 		struct hit *h = hit_at(g.px, g.py);
 		ui.focus_visible = false;
 		if (!h) { ui.focus = -1; request_redraw(); return; }
@@ -2208,6 +2254,10 @@ static const struct wl_pointer_listener ptr_listener = { ptr_enter, ptr_leave, p
 
 static void seat_caps(void *d, struct wl_seat *s, uint32_t caps) {
 	if ((caps & WL_SEAT_CAPABILITY_KEYBOARD) && !g.kbd) { g.kbd = wl_seat_get_keyboard(s); wl_keyboard_add_listener(g.kbd, &kb_listener, NULL); }
+	else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && g.kbd) {
+		stop_repeat(); if (g.compose) xkb_compose_state_reset(g.compose);
+		wl_keyboard_destroy(g.kbd); g.kbd = NULL;
+	}
 	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g.ptr) { g.ptr = wl_seat_get_pointer(s); wl_pointer_add_listener(g.ptr, &ptr_listener, NULL); }
 }
 static void seat_name(void *d, struct wl_seat *s, const char *n) {}
@@ -2287,6 +2337,7 @@ static int render_png(int page, const char *path, int W, int H) {
 }
 
 int main(int argc, char **argv) {
+	setlocale(LC_CTYPE, "");
 	signal(SIGPIPE, SIG_IGN);
 	signal(SIGCHLD, SIG_DFL);
 	find_privacy_helper();
@@ -2326,6 +2377,7 @@ int main(int argc, char **argv) {
 	g.display = wl_display_connect(NULL);
 	if (!g.display) { fprintf(stderr, "cube-settings: no Wayland display (run inside whitecube)\n"); return 1; }
 	g.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	g.compose = wc_compose_create(g.xkb);
 	g.registry = wl_display_get_registry(g.display);
 	wl_registry_add_listener(g.registry, &reg_listener, NULL);
 	wl_display_roundtrip(g.display);

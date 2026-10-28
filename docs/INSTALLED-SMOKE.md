@@ -6,7 +6,7 @@ host (Bubblewrap and the cached Debian builder are required):
 ```sh
 python3 -I packaging/smoke-installed.py \
   --rootfs build/debian-builder/rootfs \
-  --deb packaging/out/whitecube-desktop_0.8.1_amd64.deb \
+  --deb packaging/out/whitecube-desktop_0.9.0_amd64.deb \
   --output build/installed-smoke
 ```
 
@@ -40,3 +40,34 @@ sandbox behavior. Debian's builder includes development dependencies, so this
 test does not prove that the package's minimal dependency list is complete.
 Package maintainer scripts, login-manager integration, system services and model
 or API requests require separate installation testing.
+
+## Minimal dependencies and package lifecycle
+
+The full release gate also tests real apt/dpkg installation, configuration,
+upgrade, removal and purge in a new Debian runtime root:
+
+```sh
+python3 -I tools/verify-release.py \
+  --deb packaging/out/whitecube-desktop_0.9.0_amd64.deb \
+  --previous-deb packaging/out/whitecube-desktop_0.8.1_amd64.deb \
+  --rootfs build/debian-builder/rootfs \
+  --output build/release-0.9.0
+```
+
+Supplying the previous archive enables `packaging/smoke-lifecycle.py` and makes
+the graphical smoke use its runtime-only root rather than the builder. The
+bootstrap installs essential packages, declared dependencies and a few test tools
+(apt, fakeroot, Python and certificate data), with recommendations disabled.
+Its installed-package inventory rejects development packages. Debian sources
+are authenticated; only the generated local test repository is explicitly trusted.
+This step needs network access to obtain runtime packages.
+
+The lifecycle checks preserve modified conffiles and user dotfiles across
+upgrade/removal, and keep standalone Browser/Chrootables fixture paths and dpkg
+ownership intact. Maintainer scripts execute in private user/PID/network namespaces;
+service starts are blocked. Logs, package inventory, reports and the resulting
+runtime root remain under the output directory for diagnosis.
+
+A booted system is still required for actual systemd/login integration, hardware
+resume and Chromium setuid sandbox verification. Rootless headless checks alone
+do not establish those properties.

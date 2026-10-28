@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { History, exportMarkdown } = require('../src/history');
+const { randomUUID } = require('node:crypto');
 function fixture(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'desktop-chat-history-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
@@ -92,4 +93,60 @@ test('valid interrupted tool context remains loadable for engine repair', t => {
     tool_calls: [{ id: 'call-1', type: 'function', function: { name: 'read_file', arguments: '{"path":"/tmp/example"}' } }] }];
   history.save(chat);
   assert.deepEqual(history.get(chat.id), chat);
+});
+
+test('large conversation libraries search off-thread, paginate and detect external edits and deletion', async t => {
+  const { history } = fixture(t);
+  t.after(() => history.close());
+  const template = history.create({ model: 'library' });
+  const ids = [];
+  for (let index = 0; index < 1000; index++) {
+    const id = randomUUID(); ids.push(id);
+    const chat = { ...template, id, title: `Conversation ${index}`,
+      messages: [{ role: 'user', content: 'x'.repeat(12000) + ` deep-needle-${index}` }] };
+    fs.writeFileSync(history.filename(id), JSON.stringify(chat));
+  }
+  let eventLoopAdvanced = false;
+  setTimeout(() => { eventLoopAdvanced = true; }, 0);
+  const first = await history.listAsync('', { offset: 0, limit: 50 });
+  assert.equal(eventLoopAdvanced, true, 'search must release the main event loop');
+  assert.equal(first.total, 1001); assert.equal(first.items.length, 50); assert.equal(first.hasMore, true);
+  const second = await history.listAsync('', { offset: 50, limit: 50 });
+  assert.equal(new Set([...first.items, ...second.items].map(chat => chat.id)).size, 100);
+  assert.equal((await history.listAsync('DEEP-NEEDLE-999', { limit: 50 })).items[0].id, ids[999]);
+  const changed = history.get(ids[999]);
+  changed.messages[0].content = 'A new external searchable transcript';
+  history.save(changed);
+  assert.equal((await history.listAsync('deep-needle-999')).length, 0);
+  assert.equal((await history.listAsync('external searchable'))[0].id, changed.id);
+  history.rename(changed.id, 'Renamed externally');
+  assert.equal((await history.listAsync('renamed externally'))[0].id, changed.id);
+  history.delete(changed.id);
+  assert.equal((await history.listAsync('external searchable')).length, 0);
+  fs.writeFileSync(history.filename(ids[998]), '{broken');
+  assert.equal((await history.listAsync('', { limit: 1 })).total, 999);
+  assert.equal(fs.readFileSync(history.filename(ids[998]), 'utf8'), '{broken');
+});
+
+test('conversation page bounds are checked and a closed search worker can restart', async t => {
+  const { history } = fixture(t);
+  t.after(() => history.close());
+  const chat = history.create({});
+  for (const options of [{ limit: 0 }, { limit: 101 }, { offset: -1 }, { offset: 1.2 }, []]) {
+    await assert.rejects(history.listAsync('', options), /Invalid conversation page/);
+  }
+  assert.equal((await history.listAsync())[0].id, chat.id);
+  await history.close();
+  assert.equal((await history.listAsync())[0].id, chat.id);
+});
+
+test('closing an in-flight history worker settles its request and permits a fresh search', async t => {
+  const { history } = fixture(t);
+  t.after(() => history.close());
+  const chat = history.create({});
+  const pending = history.listAsync('', { limit: 50 });
+  const rejected = assert.rejects(pending, /search closed/);
+  await history.close();
+  await rejected;
+  assert.equal((await history.listAsync())[0].id, chat.id);
 });

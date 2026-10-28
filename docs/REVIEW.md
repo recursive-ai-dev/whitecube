@@ -1,5 +1,10 @@
 # Whitecube — Pre-Release Review
 
+> Historical review of the 2026-10-09 tree. Many findings were resolved in later
+> releases; this is evidence from that revision, not the current release checklist.
+> Use README.md, BUILD-DEBIAN.md, MAINTENANCE.md and the versioned release notes
+> for current build, installation and verification instructions.
+
 **32 improvements that must be made before release.** Every item below was verified against the
 tree on 2026-10-09; evidence is file:line so it can be checked, not argued with.
 

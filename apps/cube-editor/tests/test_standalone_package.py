@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -29,9 +30,9 @@ class StandalonePackageTests(unittest.TestCase):
         subprocess.run(['dpkg-deb', '--raw-extract', str(cls.deb), str(cls.stage)], check=True,
                        capture_output=True)
 
-    def run_launcher(self, name, *arguments):
+    def run_launcher(self, name, *arguments, environment=None):
         return subprocess.run([str(self.stage / 'usr/bin' / name), *arguments],
-                              text=True, capture_output=True, timeout=15)
+                              text=True, capture_output=True, timeout=15, env=environment)
 
     def test_installed_launchers_work_without_a_display(self):
         version = (PACKAGING / 'VERSION').read_text().strip()
@@ -48,7 +49,24 @@ class StandalonePackageTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('GDK_BACKEND') == 'broadway', 'run tools/check.py for packaged GUI smoke test')
     def test_installed_gui_starts_and_renders(self):
         screenshot = Path(self.temporary.name) / 'installed-studio.png'
-        result = self.run_launcher('cube-editor-studio', '--screenshot', str(screenshot))
+        # Broadway retains display state across GTK test applications. Give the
+        # packaged process its own display so earlier modal/widget tests cannot
+        # leave its first frame unallocated.
+        runtime = Path(self.temporary.name) / 'installed-runtime'
+        runtime.mkdir(mode=0o700)
+        environment = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), BROADWAY_DISPLAY=':178')
+        with (runtime / 'broadway.log').open('w') as log:
+            daemon = subprocess.Popen(['gtk4-broadwayd', '--address=127.0.0.1', '--port=0', ':178'],
+                                      env=environment, stdout=log, stderr=log)
+            try:
+                deadline = time.monotonic() + 8
+                while daemon.poll() is None and not list(runtime.glob('broadway*.socket')) and time.monotonic() < deadline:
+                    time.sleep(.02)
+                self.assertTrue(list(runtime.glob('broadway*.socket')), 'Private packaged-app display did not start')
+                result = self.run_launcher('cube-editor-studio', '--screenshot', str(screenshot), environment=environment)
+            finally:
+                daemon.terminate()
+                daemon.wait(timeout=3)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(screenshot.is_file(), result.stdout + result.stderr)
         self.assertEqual(screenshot.read_bytes()[:8], b'\x89PNG\r\n\x1a\n')

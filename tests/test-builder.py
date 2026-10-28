@@ -17,7 +17,8 @@ class CachedBuilder(unittest.TestCase):
         self.work = Path(self.tmp.name) / 'builder with spaces'
         self.rootfs = self.work / 'rootfs'
         (self.rootfs / 'etc').mkdir(parents=True)
-        (self.rootfs / '.whitecube-builder-ready').touch()
+        key = subprocess.check_output(['python3', '-I', str(ROOT / 'tools/build-inputs.py'), 'builder-key'], text=True).strip()
+        (self.rootfs / '.whitecube-builder-ready').write_text(key + '\n')
         (self.rootfs / 'etc/passwd').write_text('root:x:0:0:root:/root:/bin/bash\n')
         (self.rootfs / 'etc/group').write_text('root:x:0:\n')
         # A local version-probe fixture skips the real, already separately
@@ -35,6 +36,7 @@ class CachedBuilder(unittest.TestCase):
         bwrap.chmod(0o755)
         self.env = dict(os.environ, WHITECUBE_BUILDER_DIR=str(self.work),
                         PATH=str(commands) + os.pathsep + os.environ['PATH'])
+        self.env['WHITECUBE_TEST_BOOTSTRAP_ARGS'] = str(Path(self.tmp.name) / 'bootstrap-args')
         self.env.pop('ELECTRON_DIST', None)
 
     def run_builder(self, *args, **extra_env):
@@ -77,6 +79,43 @@ class CachedBuilder(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('ELECTRON_DIST must contain an executable electron', result.stderr)
         self.assertFalse((self.work / '.prepare.lock').exists())
+
+    def bootstrap_probe(self):
+        # No network: a stale recipe or explicit refresh reaches this local
+        # bootstrap fixture, while a current cache must never execute it.
+        bootstrap = self.work / 'host/usr/bin/mmdebstrap'
+        bootstrap.parent.mkdir(parents=True)
+        bootstrap.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$WHITECUBE_TEST_BOOTSTRAP_ARGS"\necho "bootstrap requested" >&2\nexit 97\n')
+        bootstrap.chmod(0o755)
+        keyring = self.work / 'host/usr/share/keyrings/debian-archive-keyring.pgp'
+        keyring.parent.mkdir(parents=True)
+        keyring.touch()
+
+    def test_changed_recipe_invalidates_ready_root(self):
+        self.bootstrap_probe()
+        (self.rootfs / '.whitecube-builder-ready').write_text('obsolete recipe\n')
+        result = self.run_builder('--prepare-only')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('bootstrap requested', result.stderr)
+        self.assertTrue((self.rootfs / 'etc/passwd').is_file())
+
+    def test_refresh_rebuilds_even_a_current_cache(self):
+        self.bootstrap_probe()
+        result = self.run_builder('--refresh', '--prepare-only')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('bootstrap requested', result.stderr)
+        self.assertTrue((self.rootfs / 'etc/passwd').is_file())
+
+    def test_bootstrap_separates_apt_pattern_from_named_packages(self):
+        self.bootstrap_probe()
+        result = self.run_builder('--refresh', '--prepare-only')
+        self.assertEqual(result.returncode, 1, result.stderr)
+        arguments = Path(self.env['WHITECUBE_TEST_BOOTSTRAP_ARGS']).read_text().splitlines()
+        includes = [arg.removeprefix('--include=') for arg in arguments if arg.startswith('--include=')]
+        self.assertEqual(includes[0], '?essential')
+        self.assertIn('apt', includes[1].split(','))
+        self.assertIn('build-essential', includes[1].split(','))
+        self.assertFalse(any(value.startswith('?essential,') for value in includes))
 
     def test_unknown_flag_is_reported(self):
         result = self.run_builder('--unknown-flag')

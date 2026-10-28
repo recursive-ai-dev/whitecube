@@ -1,6 +1,7 @@
 #!/usr/bin/python3 -I
 """Verify Desktop Chat ships a usable private Electron runtime."""
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +16,11 @@ def check(stage):
         path = runtime / name
         if not path.is_file() or not path.resolve().is_relative_to(runtime.resolve()):
             problems.append(f'missing or escaping runtime file: {name}')
+    version_file = runtime / 'version'
+    if version_file.is_file():
+        expected = json.loads((Path(__file__).resolve().parent.parent / 'apps/desktop-chat/package.json').read_text())['devDependencies']['electron']
+        if version_file.read_text().strip().removeprefix('v') != expected:
+            problems.append(f'Electron runtime version does not match package.json ({expected})')
     if not (runtime / 'locales/en-US.pak').is_file():
         problems.append('runtime locale is missing')
     executable = runtime / 'electron'

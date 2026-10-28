@@ -135,6 +135,9 @@ done <<< "$abi_dependencies"
 depends=$(printf '%s\n' "${!pkgs[@]}" | sort | paste -sd',' | sed 's/,/, /g')
 [[ -z ${pkgs[whitecube-desktop]:-} ]] || { echo "build-deb.sh: dependency scanner found an unbundled library owned by whitecube-desktop" >&2; exit 1; }
 
+# Record the actual source, dependency recipes and selected runtime in the payload.
+python3 -I tools/build-provenance.py "$stage"
+
 # --- DEBIAN/
 install -d -m 0755 "$stage/DEBIAN"
 size=$(du -sk --exclude=DEBIAN "$stage" | cut -f1)

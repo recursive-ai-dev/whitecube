@@ -25,8 +25,8 @@ path. It installs no host packages, changes no host services, and keeps the buil
 `build/debian-builder/`.
 
 The first run downloads the Debian dependencies and may take several minutes.
-It then runs `npm --prefix apps/desktop-chat ci` inside Debian when the Electron
-executable is absent, builds the native dependencies locally, runs `BUILD.sh` and
+It then runs `npm --prefix apps/desktop-chat ci` inside Debian when Electron
+inputs have changed or its runtime is missing/stale, builds the native dependencies locally, runs `BUILD.sh` and
 creates the Debian package under `packaging/out/`. Desktop Chat requires Node.js
 22.12 or newer and npm for source builds. The runner stages official Node.js
 22.23.4 locally, verifies its pinned SHA256, and makes it available read-only at
@@ -35,8 +35,10 @@ the host's Node.js installation is not used.
 `BUILD.sh` includes the native application tests; optional hardware training
 tests still require the explicit flags described in the main README.
 
-The prepared root filesystem is cached for subsequent builds; a ready cache skips
-the root filesystem setup. Node.js downloads are cached in `node-downloads/`
+The prepared root filesystem is cached by a hash of its build/dependency recipes.
+A matching ready cache skips root filesystem setup; changed recipes rebuild it
+while retaining the previous root. `--refresh` explicitly refreshes the Debian
+builder and npm inputs. Node.js downloads are cached in `node-downloads/`
 under the selected builder directory, with the extracted runtime in `node/`.
 Dependency archives and npm files also remain cached,
 while native preparation rebuilds generated state for the selected toolchain.
@@ -94,13 +96,13 @@ An explicit distribution can also be supplied to the isolated builder:
 ELECTRON_DIST=/absolute/path/to/electron-dist bash tools/build-debian.sh
 ```
 
-The runner validates its executable and makes the supplied directory available
+The runner validates its executable and pinned version and makes the supplied directory available
 read-only inside the builder at the same path. For direct builds, `ELECTRON_DIST` can name another complete Electron `dist/`
 directory, or stage it at `build/desktop-chat-runtime`. It must include the
 executable, sandbox helper, version, licenses, resources and locale files. Use
 `npm ci` to refresh an existing npm runtime when the lockfile changes; the default
-runner reuses an already present executable and skips npm installation when an
-explicit distribution is supplied. Installed packages include Electron
+runner validates package/lockfile hashes and the exact pinned Electron version.
+An explicit distribution skips npm installation but must match that version. Installed packages include Electron
 and require neither Node.js nor npm.
 
 `tools/prepare-native-deps.sh` does not install system packages. It verifies the
@@ -142,7 +144,7 @@ isolated runner also checks the finished archive against the real host's file
 ownership database. To perform that read-only host check separately:
 
 ```sh
-python3 -I packaging/check-installed-conflicts.py packaging/out/whitecube-desktop_0.8.1_amd64.deb
+python3 -I packaging/check-installed-conflicts.py packaging/out/whitecube-desktop_0.9.0_amd64.deb
 ```
 
 This catches file ownership collisions that an apt dependency simulation cannot
@@ -155,10 +157,12 @@ to require amd64, PIE, full RELRO and non-executable stacks; the manifest lists
 the verified executables. Cached Meson builds explicitly refresh compiler and
 linker options before recompilation.
 
-After building, run the [installed runtime smoke test](INSTALLED-SMOKE.md) on
-the host to launch the delivered archive with its installed absolute paths in
-a disposable Debian root. It retains a report and window captures without
-changing the host installation or cached builder.
+After building, run the [release verification command](MAINTENANCE.md#release-verification)
+on the host. With a previous release archive, it executes strict session-lock and
+live-settings integrations, a real apt/dpkg install/upgrade/remove lifecycle, and
+an [installed runtime smoke test](INSTALLED-SMOKE.md) against declared runtime
+dependencies. It retains reports, logs and window captures without changing the
+host installation or cached builder.
 
 To run Cube Player's optional real Wayland playback checks after a successful
 build:
@@ -175,7 +179,8 @@ guides for their additional checks.
 
 The output directory retains earlier packages. A successful release also produces
 `<package>.deb.sha256` and `<package>.deb.json`, with the latter recording the
-verified archive hash, dependency list and file counts. The checksum file uses
+verified archive hash, dependency list, file counts and the embedded source/build
+provenance (commit, dirty state, input hashes and toolchain/runtime versions). The checksum file uses
 just the artifact filename, so check it from `packaging/out/` with
 `sha256sum --check <package>.deb.sha256`. `SOURCE_DATE_EPOCH` controls normalized
 archive timestamps; by default it comes from the last source commit.

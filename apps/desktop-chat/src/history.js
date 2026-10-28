@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const { randomUUID } = require('node:crypto');
+const { Worker } = require('node:worker_threads');
 
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
@@ -54,6 +55,9 @@ class History {
     this.directory = directory;
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     fs.chmodSync(directory, 0o700);
+    this.worker = null;
+    this.requests = new Map();
+    this.nextRequest = 0;
   }
   filename(id) {
     if (typeof id !== 'string' || !ID.test(id)) throw new Error('Invalid conversation ID.');
@@ -83,6 +87,48 @@ class History {
       } catch (err) { console.warn(`Skipped unreadable conversation ${name}: ${err.message}`); }
     }
     return result.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+  // Directory scans, transcript parsing and full-text matching run away from
+  // Electron's event loop. The worker retains a bounded, disposable text index.
+  listAsync(query = '', options = null) {
+    if (typeof query !== 'string' || query.length > 1000) return Promise.reject(new Error('Enter a search of up to 1,000 characters.'));
+    if (options !== null && (!object(options) || !Number.isInteger(options.offset ?? 0) || (options.offset ?? 0) < 0 ||
+        !Number.isInteger(options.limit ?? 50) || (options.limit ?? 50) < 1 || (options.limit ?? 50) > 100)) {
+      return Promise.reject(new Error('Invalid conversation page.'));
+    }
+    if (!this.worker) {
+      const worker = new Worker(path.join(__dirname, 'history-worker.js'), { workerData: { directory: this.directory } });
+      this.worker = worker;
+      const failed = error => {
+        if (this.worker !== worker) return;
+        this.worker = null;
+        for (const { reject } of this.requests.values()) reject(error);
+        this.requests.clear();
+      };
+      worker.on('message', ({ id, value, error }) => {
+        const request = this.requests.get(id);
+        if (!request) return;
+        this.requests.delete(id);
+        if (error) request.reject(new Error(error)); else request.resolve(value);
+        if (!this.requests.size) worker.unref();
+      });
+      worker.on('error', failed);
+      worker.on('exit', code => { if (this.worker === worker) failed(new Error(`Conversation search stopped (${code}). Please retry.`)); });
+      worker.unref();
+    }
+    this.worker.ref();
+    const id = ++this.nextRequest;
+    return new Promise((resolve, reject) => {
+      this.requests.set(id, { resolve, reject });
+      this.worker.postMessage({ id, query, options });
+    });
+  }
+  close() {
+    const worker = this.worker;
+    this.worker = null;
+    for (const { reject } of this.requests.values()) reject(new Error('Conversation search closed.'));
+    this.requests.clear();
+    return worker?.terminate();
   }
   current() {
     try { return this.get(JSON.parse(fs.readFileSync(path.join(this.directory, 'active.json'), 'utf8')).id); }

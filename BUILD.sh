@@ -12,7 +12,7 @@ out=build
 cc=${CC:-cc}
 flags=(-std=c11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Isrc -Isrc/protocols
   -fstack-protector-strong -D_FORTIFY_SOURCE=3 -Wformat -Werror=format-security
-  -fPIE -pie -Wl,-z,relro,-z,now)
+  -fPIE -pie -Wl,-z,relro,-z,now "-ffile-prefix-map=$native_dir=.")
 if [[ -n ${SANITIZE:-} ]]; then
   out=build-asan
   flags+=(-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
@@ -65,10 +65,29 @@ read -r -a settings_flags <<< "$(pkg --cflags --libs wayland-client wayland-curs
 mkdir -p "$out/schemas"
 cp data/schemas/org.whitecube.desktop.gschema.xml "$out/schemas/"
 glib-compile-schemas --strict "$out/schemas"
-"$cc" "${flags[@]}" -DWLR_USE_UNSTABLE src/whitecube.c -o $out/whitecube "${compositor_flags[@]}" -lm
-"$cc" "${flags[@]}" src/cube-ca.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-ca "${client_flags[@]}" -lm
-"$cc" "${flags[@]}" src/cube-settings.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/cube-settings "${settings_flags[@]}" -lm
-"$cc" "${flags[@]}" src/cube-status.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-status "${settings_flags[@]}" -lm
+if [[ -n $sysroot ]]; then
+  "$cc" "${flags[@]}" -DWLR_USE_UNSTABLE src/whitecube.c -o $out/whitecube "${compositor_flags[@]}" -lm
+  "$cc" "${flags[@]}" src/cube-ca.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-ca "${client_flags[@]}" -lm
+  "$cc" "${flags[@]}" src/cube-settings.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/cube-settings "${settings_flags[@]}" -lm
+  "$cc" "${flags[@]}" src/cube-status.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-status "${settings_flags[@]}" -lm
+else
+  # Meson owns the native target, hardening and C test definitions. Stage the
+  # compatibility paths used by existing source launchers and package tooling.
+  core="$native_dir/$out/native-core"
+  sanitize=none
+  [[ -z ${SANITIZE:-} ]] || sanitize=address,undefined
+  setup_args=("$core" "$native_dir" -Db_pie=true -Db_asneeded=true -Db_sanitize="$sanitize" -Db_lundef=false)
+  # Refresh compiler/dependency discovery when moving between the host and the
+  # Debian builder. BUILD.sh historically recompiled native sources each run.
+  [[ ! -f $core/build.ninja ]] || setup_args+=(--wipe)
+  CC="$cc" meson setup "${setup_args[@]}"
+  meson compile -C "$core" -j "${JOBS:-4}"
+  install -m 0755 "$core/whitecube-compositor" "$out/whitecube"
+  for native in cube-ca cube-settings cube-status compositor-test hotplug-test status-theme-test settings-test status-apps-test status-jobs-test native-input-test workspace-test desktop-state-test; do
+    install -m 0755 "$core/$native" "$out/$native"
+  done
+  cp "$core/data/schemas/gschemas.compiled" "$out/schemas/"
+fi
 # X-free policy (MAINTENANCE.md): report libX11/libxcb reaching our binaries through the distro cairo.
 # REQUIRE_XFREE=1 makes it fatal. Fix: tools/build-xfree-cairo.sh stages an X-free cairo (no root needed to build).
 if [[ -z $sysroot ]]; then
@@ -83,38 +102,35 @@ if [[ -z $sysroot ]]; then
     echo "X-free: no libX11/libxcb in our binaries"
   fi
 fi
-python3 tests/workspace-test.py > $out/workspace-test.c
-"$cc" "${flags[@]}" $out/workspace-test.c -o $out/workspace-test
-"$cc" "${flags[@]}" tests/desktop-state-test.c -o $out/desktop-state-test
-"$cc" "${flags[@]}" -DWLR_USE_UNSTABLE tests/compositor-test.c -o $out/compositor-test "${compositor_flags[@]}" -lm
-"$cc" "${flags[@]}" -DWLR_USE_UNSTABLE tests/hotplug-test.c -o $out/hotplug-test "${compositor_flags[@]}" -lm
-"$cc" "${flags[@]}" tests/status-theme-test.c -o $out/status-theme-test -lm
-"$cc" "${flags[@]}" tests/settings-test.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/settings-test "${settings_flags[@]}" -lm
-"$cc" "${flags[@]}" tests/status-apps-test.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/status-apps-test "${settings_flags[@]}" -lm
 if [[ -n $sysroot ]]; then
-	"$loader" --library-path "$libpath" $out/compositor-test
-	WLR_RENDERER=pixman "$loader" --library-path "$libpath" $out/hotplug-test
-	"$loader" --library-path "$libpath" $out/status-theme-test
-	"$loader" --library-path "$libpath" $out/settings-test
-	"$loader" --library-path "$libpath" $out/status-apps-test
-	"$loader" --library-path "$libpath" $out/cube-status --selftest
+  python3 tests/workspace-test.py > $out/workspace-test.c
+  "$cc" "${flags[@]}" $out/workspace-test.c -o $out/workspace-test
+  "$cc" "${flags[@]}" tests/desktop-state-test.c -o $out/desktop-state-test
+  "$cc" "${flags[@]}" -DWLR_USE_UNSTABLE tests/compositor-test.c -o $out/compositor-test "${compositor_flags[@]}" -lm
+  "$cc" "${flags[@]}" -DWLR_USE_UNSTABLE tests/hotplug-test.c -o $out/hotplug-test "${compositor_flags[@]}" -lm
+  "$cc" "${flags[@]}" tests/status-theme-test.c -o $out/status-theme-test -lm
+  "$cc" "${flags[@]}" tests/settings-test.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/settings-test "${settings_flags[@]}" -lm
+  "$cc" "${flags[@]}" tests/status-apps-test.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/status-apps-test "${settings_flags[@]}" -lm
+  "$cc" "${flags[@]}" tests/status-jobs-test.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/status-jobs-test "${settings_flags[@]}" -lm
+  read -r -a input_flags <<< "$(pkg --cflags --libs xkbcommon)"
+  "$cc" "${flags[@]}" tests/native-input-test.c -o $out/native-input-test "${input_flags[@]}"
+  "$loader" --library-path "$libpath" $out/compositor-test
+  WLR_RENDERER=pixman "$loader" --library-path "$libpath" $out/hotplug-test
+  "$loader" --library-path "$libpath" $out/status-theme-test
+  "$loader" --library-path "$libpath" $out/settings-test
+  "$loader" --library-path "$libpath" $out/status-apps-test
+  "$loader" --library-path "$libpath" $out/status-jobs-test
+  "$loader" --library-path "$libpath" $out/native-input-test
+  "$loader" --library-path "$libpath" $out/cube-status --selftest
   "$loader" --library-path "$libpath" $out/workspace-test
   "$loader" --library-path "$libpath" $out/desktop-state-test
   "$loader" --library-path "$libpath" $out/cube-ca --self-test
   "$loader" --library-path "$libpath" $out/cube-ca --preview $out/cube-space.ppm
   "$loader" --library-path "$libpath" $out/cube-status --render "$out" >/dev/null
 else
-	$out/compositor-test
-	WLR_RENDERER=pixman $out/hotplug-test      # real wlroots headless backend: outputs added and removed at runtime
-	$out/status-theme-test
-	$out/settings-test
-	$out/status-apps-test
-	$out/cube-status --selftest
-  $out/workspace-test
-  $out/desktop-state-test
-  $out/cube-ca --self-test
-  $out/cube-ca --preview $out/cube-space.ppm
-  $out/cube-status --render "$out" >/dev/null
+  meson test -C "$core" --suite core --print-errorlogs
+  cp "$core/cube-space.ppm" "$out/cube-space.ppm"
+  cp "$core"/{bar,menu,menu-search}.png "$out/"
 fi
 # Package tests inspect the complete tree, including these native apps.
 [[ -n $sysroot || -n ${SANITIZE:-} ]] || bash apps/build-native-apps.sh "$native_dir/$out"
@@ -126,6 +142,10 @@ python3 -I tests/test-privacy.py
 python3 -I tests/test-doctor.py
 python3 -I tests/test-session.py
 python3 -I tests/test-builder.py
+python3 -I tests/test-build-tools.py
+python3 -I tests/test-lifecycle.py
+python3 -I tests/test-settings-transactions.py
+python3 -I tests/test-suspend.py
 python3 -I tests/test-sudoers.py
 python3 -I tests/test-clean.py
 python3 -I tests/test-whitecube-install.py
@@ -141,6 +161,7 @@ python3 -I apps/desktop-chat/test/local-server-test.py
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_engine*.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_app.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_worker_descendants.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_snapshots.py' -v
 if [[ -n ${TRAINING_PYTHON:-} ]]; then
   "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_pipeline.py' -v
   "$TRAINING_PYTHON" -I -m unittest discover -s apps/cube-train/tests -p 'test_corpus_improvements.py' -v

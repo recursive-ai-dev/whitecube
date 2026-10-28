@@ -27,7 +27,9 @@
 #include <locale.h>
 #include <math.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <errno.h>
+#include <sys/wait.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
@@ -44,6 +46,7 @@
 #include "status-theme.h"
 #include "bar-layout.h"
 #include "native-preferences.h"
+#include "native-input.h"
 
 // Logical widths before ui_scale; must match whitecube.c.
 #define APPS_W 104       // BAR_APPS_W
@@ -64,8 +67,11 @@ static struct status_theme theme;
 #define TERMINAL "/usr/bin/whitecube-terminal"
 #define SETTINGS "/usr/bin/cube-settings"
 #define NET_STATUS "/run/whitecube-net/status.json"
+#ifndef HELPER
 #define HELPER "/usr/libexec/whitecube/cube-settings-helper"
+#endif
 #define SUDO "/usr/bin/sudo"
+#define SUSPEND_COMMAND "/usr/bin/whitecube-suspend"
 #define MAX_PROFILES 5
 
 // ------------------------------------------------------------------ apps
@@ -140,6 +146,9 @@ struct st {
 	struct xkb_context *xkb;
 	struct xkb_keymap *keymap;
 	struct xkb_state *xkb_state;
+	struct xkb_compose_state *compose;
+	int repeat_fd, repeat_rate, repeat_delay;
+	uint32_t repeat_key;
 	struct panel apps_btn, status, menu, qs;
 	struct panel chat_btn, chat;
 	bool chat_open;
@@ -177,7 +186,33 @@ struct st {
 	double q_sep[3];
 	struct rect r_chat, r_chat_open, r_chat_settings, r_chat_quit;
 	struct rect r_pwr, r_pwr_item[PW_COUNT];
+	struct panel notice;
+	char notice_text[512];
+	double notice_until;
 };
+
+static struct st *g_st;
+static double monotonic_s(void) {
+	struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+	return now.tv_sec + now.tv_nsec / 1e9;
+}
+static void status_notice(const char *format, ...) {
+	char message[512];
+	va_list args; va_start(args, format); vsnprintf(message, sizeof(message), format, args); va_end(args);
+	const char *invalid;
+	if (!g_utf8_validate(message, -1, &invalid)) message[invalid - message] = 0;
+	fprintf(stderr, "cube-status: %s\n", message);
+	if (g_st) {
+		g_strlcpy(g_st->notice_text, message, sizeof(g_st->notice_text));
+		g_st->notice_until = monotonic_s() + 12;
+	}
+}
+
+static void repeat_stop(struct st *s) {
+	s->repeat_key = 0;
+	struct itimerspec off = {0};
+	if (s->repeat_fd >= 0) timerfd_settime(s->repeat_fd, 0, &off, NULL);
+}
 
 static bool is_hot(const struct st *s, int hit) {
 	return s->hover == hit || (s->keyboard_focus && s->focus == hit);
@@ -197,44 +232,36 @@ static void read_file_first(const char *path, char *out, size_t n) {
 }
 
 // --------------------------------------------------------------- spawning
+static bool job_start(int kind, const char *const argv[]);
+static void launch_tracked(const char *const argv[], const char *cwd, const char *label);
+
+// These fixed desktop commands are argv, including the historical "exec"
+// prefix. No shell is needed to launch them or report exec failures.
 static void spawn_shell(const char *cmd) {
-	pid_t pid = fork();
-	if (pid == 0) {
-		setsid();
-		sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
-		signal(SIGCHLD, SIG_DFL); // SIG_IGN would be inherited across exec
-		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-		_exit(127);
-	}
-	if (pid < 0) fprintf(stderr, "cube-status: fork: %s\n", strerror(errno));
-	else fprintf(stderr, "cube-status: launch %s\n", cmd);
+    char **args = NULL;
+    if (!g_shell_parse_argv(cmd, NULL, &args, NULL) || !args || !args[0]) {
+        status_notice("Cannot launch: invalid command"); return;
+    }
+    const char *const *argv = (const char *const *)args;
+    if (!strcmp(args[0], "exec")) argv++;
+    if (*argv) launch_tracked(argv, NULL, *argv);
+    g_strfreev(args);
 }
 
-// Per-user upgrades must also apply to launches from a previously installed bar.
-// Keep HOME and page names out of a shell command.
 static void launch_settings(const char *page) {
-	char path[1024];
-	const char *home = getenv("HOME");
-	int n = home ? snprintf(path, sizeof(path), "%s/.local/bin/cube-settings", home) : -1;
-	if (n < 0 || (size_t)n >= sizeof(path) || access(path, X_OK))
-		snprintf(path, sizeof(path), "%s", SETTINGS);
-	pid_t pid = fork();
-	if (pid == 0) {
-		setsid();
-		sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
-		signal(SIGCHLD, SIG_DFL);
-		if (page) execl(path, "cube-settings", "--page", page, (char *)NULL);
-		else execl(path, "cube-settings", (char *)NULL);
-		fprintf(stderr, "cube-status: cannot launch settings: %s\n", strerror(errno));
-		_exit(127);
-	}
-	if (pid < 0) fprintf(stderr, "cube-status: fork settings: %s\n", strerror(errno));
+    char path[1024];
+    const char *home = getenv("HOME");
+    int n = home ? snprintf(path, sizeof(path), "%s/.local/bin/cube-settings", home) : -1;
+    if (n < 0 || (size_t)n >= sizeof(path) || access(path, X_OK))
+        snprintf(path, sizeof(path), "%s", SETTINGS);
+    const char *args[] = {path, page ? "--page" : NULL, page, NULL};
+    launch_tracked(args, NULL, "Settings");
 }
 
 static void quick_launch(int button) {
-	if (button == QB_TERMINAL) spawn_shell("exec " TERMINAL);
-	else launch_settings(button == QB_PRIVACY ? "privacy" : button == QB_WIFI ? "network" :
-		button == QB_POWER ? "power" : NULL);
+    if (button == QB_TERMINAL) spawn_shell("exec " TERMINAL);
+    else launch_settings(button == QB_PRIVACY ? "privacy" : button == QB_WIFI ? "network" :
+        button == QB_POWER ? "power" : NULL);
 }
 
 static char **app_argv(const struct app *a) {
@@ -279,55 +306,171 @@ static char **app_argv(const struct app *a) {
 
 static void launch_app(const struct app *a) {
     char **args = app_argv(a);
-    if (!args) { fprintf(stderr, "cube-status: invalid Exec in %s\n", a->id); return; }
-    pid_t pid = fork();
-    if (pid == 0) {
-        setsid();
-        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
-        signal(SIGCHLD, SIG_DFL);
-        if (a->cwd[0] && chdir(a->cwd)) { perror("cube-status: application directory"); _exit(126); }
-        execvp(args[0], args);
-        perror("cube-status: application launch"); _exit(127);
-    }
-    if (pid < 0) perror("cube-status: fork");
+    if (!args) { status_notice("Cannot launch %s: invalid desktop command", a->name); return; }
+    launch_tracked((const char *const *)args, a->cwd, a->name);
     g_strfreev(args);
 }
 
 // ------------------------------------------------------------------- jobs
-// Helper calls run in the background; output is parsed when the pipe closes.
-enum { JOB_SOUND, JOB_POWER, JOB_NET, JOB_SET_SOUND, JOB_ACTION };
-struct job { bool active; int fd, kind; char buf[16384]; size_t len; };
+// Helper results, diagnostics and exec handshakes are bounded and nonblocking.
+enum { JOB_SOUND, JOB_POWER, JOB_NET, JOB_SET_SOUND, JOB_ACTION, JOB_LAUNCH, JOB_SUSPEND };
+struct job {
+    bool active, reaped, timed_out; int fd, err, kind, status; pid_t pid;
+    double deadline; char buf[16384], ebuf[2048], label[96], operation[32];
+    size_t len, elen;
+};
 #define MAX_JOBS 8
 static struct job jobs[MAX_JOBS];
+static char pending_volume[16], pending_brightness[16];
+static void job_parse(struct st *s, struct job *j);
 
-static void job_start(int kind, const char *const argv[]) {
-	struct job *j = NULL;
-	for (int i = 0; i < MAX_JOBS && !j; i++) if (!jobs[i].active) j = &jobs[i];
-	int fds[2];
-	if (!j || pipe2(fds, O_CLOEXEC) < 0) return;
-	pid_t pid = fork();
-	if (pid == 0) {
-		sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
-		signal(SIGCHLD, SIG_DFL);
-		int devnull = open("/dev/null", O_RDWR);
-		dup2(devnull, 0); dup2(fds[1], 1); dup2(devnull, 2);
-		execv(argv[0], (char *const *)argv);
-		_exit(127);
-	}
-	close(fds[1]);
-	if (pid < 0) { close(fds[0]); return; }
-	fcntl(fds[0], F_SETFL, O_NONBLOCK);
-	j->active = true; j->fd = fds[0]; j->kind = kind; j->len = 0;
+static struct job *job_slot(void) {
+    for (int i = 0; i < MAX_JOBS; i++) if (!jobs[i].active) return &jobs[i];
+    status_notice("Desktop is busy; wait for the current changes and try again");
+    return NULL;
 }
 
-// root: through sudo -n, which the whitecube sudoers rule allows for these.
+static bool job_start(int kind, const char *const argv[]) {
+    struct job *j = job_slot();
+    if (!j) return false;
+    int out[2], err[2];
+    if (pipe2(out, O_CLOEXEC) < 0) { status_notice("Cannot start task: %s", strerror(errno)); return false; }
+    if (pipe2(err, O_CLOEXEC) < 0) { close(out[0]); close(out[1]); status_notice("Cannot start task: %s", strerror(errno)); return false; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        setsid();
+        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_DFL);
+        int null = open("/dev/null", O_RDONLY);
+        dup2(null, 0); dup2(out[1], 1); dup2(err[1], 2);
+        execv(argv[0], (char *const *)argv);
+        dprintf(2, "Cannot run %s: %s\n", argv[0], strerror(errno)); _exit(127);
+    }
+    close(out[1]); close(err[1]);
+    if (pid < 0) { close(out[0]); close(err[0]); status_notice("Cannot start task: %s", strerror(errno)); return false; }
+    fcntl(out[0], F_SETFL, O_NONBLOCK); fcntl(err[0], F_SETFL, O_NONBLOCK);
+    *j = (struct job){.active = true, .pid = pid, .fd = out[0], .err = err[0], .kind = kind,
+        .deadline = monotonic_s() + (kind == JOB_SUSPEND ? 65 : 35)};
+    g_strlcpy(j->label, kind == JOB_SUSPEND ? "Suspend" : "Settings change", sizeof(j->label));
+    return true;
+}
+
+static void launch_tracked(const char *const argv[], const char *cwd, const char *label) {
+    struct job *j = job_slot();
+    if (!j) return;
+    int errors[2];
+    if (pipe2(errors, O_CLOEXEC) < 0) { status_notice("Cannot launch %s: %s", label, strerror(errno)); return; }
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(errors[0]); setsid();
+        sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
+        signal(SIGCHLD, SIG_DFL);
+        if (cwd && cwd[0] && chdir(cwd)) {
+            dprintf(errors[1], "Application folder: %s", strerror(errno)); _exit(126);
+        }
+        execvp(argv[0], (char *const *)argv);
+        dprintf(errors[1], "%s: %s", argv[0], strerror(errno)); _exit(127);
+    }
+    close(errors[1]);
+    if (pid < 0) { close(errors[0]); status_notice("Cannot launch %s: %s", label, strerror(errno)); return; }
+    fcntl(errors[0], F_SETFL, O_NONBLOCK);
+    *j = (struct job){.active = true, .pid = pid, .fd = errors[0], .err = -1,
+        .kind = JOB_LAUNCH, .deadline = monotonic_s() + 10};
+    g_strlcpy(j->label, label, sizeof(j->label));
+}
+
 static void helper(int kind, bool root, const char *a, const char *b) {
-	const char *argv[8]; int n = 0;
-	if (root) { argv[n++] = SUDO; argv[n++] = "-n"; argv[n++] = "--"; }
-	argv[n++] = HELPER; argv[n++] = a;
-	if (b) argv[n++] = b;
-	argv[n] = NULL;
-	job_start(kind, argv);
+    char *pending = !strcmp(a, "volume") ? pending_volume : !strcmp(a, "brightness") ? pending_brightness : NULL;
+    if (pending && b) {
+        for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].active && !strcmp(jobs[i].operation, a)) {
+            g_strlcpy(pending, b, 16); return;
+        }
+    }
+    // Reopening panels must not queue duplicate reads behind slow hardware.
+    if (!b && kind <= JOB_NET) for (int i = 0; i < MAX_JOBS; i++)
+        if (jobs[i].active && jobs[i].kind == kind) return;
+    const char *argv[8]; int n = 0;
+    if (root) { argv[n++] = SUDO; argv[n++] = "-n"; argv[n++] = "--"; }
+    argv[n++] = HELPER; argv[n++] = a;
+    if (b) argv[n++] = b;
+    argv[n] = NULL;
+    if (job_start(kind, argv)) {
+        for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].active && !jobs[i].operation[0] && jobs[i].kind == kind) {
+            g_strlcpy(jobs[i].operation, a, sizeof(jobs[i].operation));
+            g_strlcpy(jobs[i].label, a, sizeof(jobs[i].label)); break;
+        }
+    }
+}
+
+static void job_drain(int *fd, char *buffer, size_t *length, size_t capacity, bool tail) {
+    if (*fd < 0) return;
+    char chunk[4096]; ssize_t n;
+    size_t drained = 0;
+    while ((n = read(*fd, chunk, sizeof(chunk))) > 0) {
+        size_t take = (size_t)n;
+        if (tail && take > capacity - 1 - *length) {
+            size_t drop = take - (capacity - 1 - *length);
+            if (drop > *length) drop = *length;
+            memmove(buffer, buffer + drop, *length - drop); *length -= drop;
+        }
+        if (take > capacity - 1 - *length) take = capacity - 1 - *length;
+        memcpy(buffer + *length, chunk + (tail ? (size_t)n - take : 0), take); *length += take;
+        drained += (size_t)n;
+        if (drained >= 65536) { buffer[*length] = 0; return; }
+    }
+    buffer[*length] = 0;
+    if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) { close(*fd); *fd = -1; }
+}
+
+static void jobs_pump(struct st *s) {
+    for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].active) {
+        struct job *j = &jobs[i];
+        job_drain(&j->fd, j->buf, &j->len, sizeof(j->buf), false);
+        job_drain(&j->err, j->ebuf, &j->elen, sizeof(j->ebuf), true);
+        if (monotonic_s() >= j->deadline && !j->timed_out) {
+            j->timed_out = true;
+            // Descendants may retain pipes after their leader was reaped and
+            // leave its group. Both numeric PID and PGID can then be reused.
+            if (!j->reaped) { kill(-j->pid, SIGKILL); kill(j->pid, SIGKILL); }
+            if (j->fd >= 0) close(j->fd);
+            if (j->err >= 0) close(j->err);
+            j->fd = j->err = -1;
+        }
+    }
+    int status; pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0)
+        for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].active && jobs[i].pid == pid) {
+            jobs[i].reaped = true; jobs[i].status = status; break;
+        }
+    for (int i = 0; i < MAX_JOBS; i++) {
+        struct job *j = &jobs[i];
+        if (!j->active || j->fd >= 0 || j->err >= 0 || (j->kind != JOB_LAUNCH && !j->reaped)) continue;
+        bool ok = !j->timed_out && (j->kind == JOB_LAUNCH ? !j->len : WIFEXITED(j->status) && WEXITSTATUS(j->status) == 0);
+        int kind = j->kind;
+        char operation[32]; g_strlcpy(operation, j->operation, sizeof(operation));
+        j->active = false;
+        if (!ok) {
+            char *detail = j->kind == JOB_LAUNCH ? j->buf : j->ebuf;
+            size_t length = strlen(detail);
+            while (length && (unsigned char)detail[length - 1] <= ' ') detail[--length] = 0;
+            char *line = strrchr(detail, '\n');
+            if (line) detail = line + 1;
+            if (strlen(detail) > 350) {
+                detail += strlen(detail) - 350;
+                while (((unsigned char)*detail & 0xc0) == 0x80) detail++;
+            }
+            for (char *p = detail; *p; p++) if ((unsigned char)*p < 32) *p = ' ';
+            char *valid = g_utf8_make_valid(detail, -1);
+            status_notice("%s failed: %s", j->label, j->timed_out ? "timed out; try again" : *valid ? valid : "operation was rejected");
+            g_free(valid);
+        } else if (kind <= JOB_NET) job_parse(s, j);
+        char *pending = !strcmp(operation, "volume") ? pending_volume : !strcmp(operation, "brightness") ? pending_brightness : NULL;
+        if (pending && pending[0]) {
+            char value[16]; g_strlcpy(value, pending, sizeof(value)); pending[0] = 0;
+            helper(!strcmp(operation, "volume") ? JOB_SET_SOUND : JOB_ACTION, !strcmp(operation, "brightness"), operation, value);
+        } else if (kind == JOB_SET_SOUND) helper(JOB_SOUND, false, "sound", NULL);
+        else if (!strcmp(operation, "brightness")) helper(JOB_POWER, false, "power", NULL);
+    }
 }
 
 // ------------------------------------------------------- desktop entries
@@ -1230,7 +1373,6 @@ static void job_parse(struct st *s, struct job *j) {
 			s->nprofiles++;
 		}
 	}
-	if (j->kind == JOB_SET_SOUND) helper(JOB_SOUND, false, "sound", NULL);
 }
 
 // ---------------------------------------------------------------- buffers
@@ -1267,7 +1409,6 @@ static void paint(struct st *s, struct panel *p, void (*fn)(struct st *, cairo_t
 }
 
 // ---------------------------------------------------------------- surfaces
-static struct st *g_st;
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t serial, uint32_t w, uint32_t h);
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls);
 static const struct zwlr_layer_surface_v1_listener layer_listener = { layer_configure, layer_closed };
@@ -1290,6 +1431,28 @@ static void panel_destroy(struct panel *p) {
 	if (p->layer) zwlr_layer_surface_v1_destroy(p->layer);
 	if (p->surf) wl_surface_destroy(p->surf);
 	memset(p, 0, sizeof(*p));
+}
+
+static void draw_notice(struct st *s, cairo_t *cr, int w, int h) {
+	color(cr, C_PANEL); cairo_paint(cr);
+	text(cr, s->notice_text, 14 * s->scale, false, 16 * s->scale, 8 * s->scale,
+		w - 32 * s->scale, h - 16 * s->scale, false, 3, C_INK);
+}
+static void notice_sync(struct st *s) {
+	if (!s->dpy) return;
+	if (!s->notice_text[0] || monotonic_s() >= s->notice_until) {
+		if (s->notice.layer) panel_destroy(&s->notice);
+		s->notice_text[0] = 0; return;
+	}
+	if (!s->notice.layer) {
+		panel_create(s, &s->notice, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "cube-notice",
+			ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP, (int)(480 * s->scale), (int)(92 * s->scale), 0, 0);
+		zwlr_layer_surface_v1_set_margin(s->notice.layer, (int)(48 * s->scale), 0, 0, 0);
+		struct wl_region *empty = wl_compositor_create_region(s->comp);
+		wl_surface_set_input_region(s->notice.surf, empty); wl_region_destroy(empty);
+		wl_surface_commit(s->notice.surf);
+	}
+	paint(s, &s->notice, draw_notice);
 }
 
 static void bar_sizes(struct st *s, int *aw, int *sw, int *h, int *mr) {
@@ -1350,6 +1513,8 @@ static void menu_open(struct st *s) {
 
 static void menu_close(struct st *s) {
 	if (!s->menu_open) return;
+	repeat_stop(s);
+	if (s->compose) xkb_compose_state_reset(s->compose);
 	if (s->hover_panel == &s->menu) s->hover_panel = NULL;
 	panel_destroy(&s->menu);
 	s->menu_open = false;
@@ -1374,6 +1539,7 @@ static void qs_open(struct st *s) {
 
 static void qs_close(struct st *s) {
 	if (!s->qs_open) return;
+	repeat_stop(s);
 	if (s->hover_panel == &s->qs) s->hover_panel = NULL;
 	panel_destroy(&s->qs);
 	s->qs_open = false; s->hover = HIT_NONE; s->dragging = DRAG_NONE; s->armed = -1;
@@ -1399,6 +1565,7 @@ static void chat_open(struct st *s) {
 
 static void chat_close(struct st *s) {
 	if (!s->chat_open) return;
+	repeat_stop(s);
 	if (s->hover_panel == &s->chat) s->hover_panel = NULL;
 	panel_destroy(&s->chat);
 	s->chat_open = false; s->hover = HIT_NONE;
@@ -1423,6 +1590,7 @@ static void pwr_open(struct st *s) {
 
 static void pwr_close(struct st *s) {
 	if (!s->pwr_open) return;
+	repeat_stop(s);
 	if (s->hover_panel == &s->pwr) s->hover_panel = NULL;
 	panel_destroy(&s->pwr);
 	s->pwr_open = false; s->hover = HIT_NONE; s->armed = -1;
@@ -1438,7 +1606,8 @@ static void chat_hit_to_cmd(struct st *s, int h) {
 }
 
 static void repaint(struct st *s, struct panel *p) {
-	if (p == &s->menu) paint(s, p, draw_menu);
+	if (p == &s->notice) paint(s, p, draw_notice);
+	else if (p == &s->menu) paint(s, p, draw_menu);
 	else if (p == &s->qs) paint(s, p, draw_qs);
 	else if (p == &s->chat) paint(s, p, draw_chat);
 	else if (p == &s->chat_btn) paint(s, p, draw_chat_btn);
@@ -1469,7 +1638,8 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32
 
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
 	struct panel *p = data;
-	if (p == &g_st->menu) menu_close(g_st);
+	if (p == &g_st->notice) { panel_destroy(p); g_st->notice_text[0] = 0; }
+	else if (p == &g_st->menu) menu_close(g_st);
 	else if (p == &g_st->qs) qs_close(g_st);
 	else if (p == &g_st->chat) chat_close(g_st);
 	else if (p == &g_st->pwr) pwr_close(g_st);
@@ -1542,7 +1712,7 @@ static void drag_commit(struct st *s) {
 // panel should close. Shared by Quick settings and the power dropdown.
 static bool power_activate(struct st *s, int i) {
 	if (i == PW_LOCK) { spawn_shell("exec swaylock -f -c ffffff"); return true; }
-	if (i == PW_SUSPEND) { helper(JOB_ACTION, true, "power-action", "suspend"); return true; }
+	if (i == PW_SUSPEND) { const char *args[] = {SUSPEND_COMMAND, NULL}; job_start(JOB_SUSPEND, args); return true; }
 	if (s->armed != i) { s->armed = i; s->armed_at = time(NULL); return false; }
 	helper(JOB_ACTION, true, "power-action", i == PW_RESTART ? "reboot" : "poweroff");
 	return true;
@@ -1641,6 +1811,8 @@ static void p_button(void *data, struct wl_pointer *p, uint32_t serial, uint32_t
 	struct st *s = data;
 	if (state == WL_POINTER_BUTTON_STATE_RELEASED && s->dragging) { drag_commit(s); paint(s, &s->qs, draw_qs); return; }
 	if (state != WL_POINTER_BUTTON_STATE_PRESSED || button != BTN_LEFT || !s->hover_panel) return;
+	repeat_stop(s);
+	if (s->compose) xkb_compose_state_reset(s->compose);
 	s->keyboard_focus = false;
 	activate(s, hit(s));
 }
@@ -1676,12 +1848,17 @@ static void k_keymap(void *data, struct wl_keyboard *k, uint32_t format, int32_t
 	struct xkb_keymap *km = xkb_keymap_new_from_string(s->xkb, map, XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
 	munmap(map, size);
 	if (!km) return;
+	repeat_stop(s);
+	if (s->compose) xkb_compose_state_reset(s->compose);
 	if (s->xkb_state) xkb_state_unref(s->xkb_state);
 	if (s->keymap) xkb_keymap_unref(s->keymap);
 	s->keymap = km; s->xkb_state = xkb_state_new(km);
 }
 static void k_enter(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *surf, struct wl_array *keys) {}
-static void k_leave(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *surf) {}
+static void k_leave(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *surf) {
+	struct st *s = data; repeat_stop(s);
+	if (s->compose) xkb_compose_state_reset(s->compose);
+}
 
 static void ensure_visible(struct st *s) {
 	if (!s->nfiltered) return;
@@ -1756,9 +1933,8 @@ static void panel_key(struct st *s, xkb_keysym_t sym) {
 	else if (s->pwr_open) paint(s, &s->pwr, draw_pwr);
 }
 
-static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
-	struct st *s = data;
-	if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !s->xkb_state) return;
+static void handle_status_key(struct st *s, uint32_t key) {
+	if (!s->xkb_state) return;
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, key + 8);
 	if (s->chat_open || s->pwr_open || s->qs_open) { panel_key(s, sym); return; }
 	if (!s->menu_open) return;
@@ -1772,6 +1948,7 @@ static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t t
         (sym == XKB_KEY_u || sym == XKB_KEY_U)) { s->query[0] = 0; s->sel = 0; }
     else switch (sym) {
 	case XKB_KEY_Escape:
+		if (s->compose) xkb_compose_state_reset(s->compose);
 		if (s->query[0]) { s->query[0] = 0; s->sel = 0; break; }
 		menu_close(s); return;
 	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
@@ -1798,8 +1975,10 @@ static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t t
 	default:
 		if (xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 ||
 		    xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0) return;
-		char utf8[16];
-		int n = xkb_state_key_get_utf8(s->xkb_state, key + 8, utf8, sizeof(utf8));
+		char utf8[64] = "";
+		int n;
+		if (wc_compose_key(s->compose, sym, utf8, sizeof(utf8))) n = strlen(utf8);
+		else n = xkb_state_key_get_utf8(s->xkb_state, key + 8, utf8, sizeof(utf8));
 		if (n <= 0 || (unsigned char)utf8[0] < 0x20 || utf8[0] == 0x7f || len + n + 1 > sizeof(s->query)) return;
 		memcpy(s->query + len, utf8, n + 1);
 		s->sel = 0; s->scroll = 0;
@@ -1809,11 +1988,35 @@ static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t t
 	ensure_visible(s);
 	paint(s, &s->menu, draw_menu);
 }
+static void k_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) {
+    struct st *s = data;
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+        if (key == s->repeat_key) repeat_stop(s);
+        return;
+    }
+    repeat_stop(s);
+    handle_status_key(s, key);
+    if (!s->menu_open || !s->keymap || s->repeat_rate <= 0 || s->repeat_fd < 0 ||
+        !xkb_keymap_key_repeats(s->keymap, key + 8)) return;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, key + 8);
+    if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter || sym == XKB_KEY_Escape ||
+        sym == XKB_KEY_Tab || sym == XKB_KEY_ISO_Left_Tab ||
+        (s->compose && xkb_compose_state_get_status(s->compose) == XKB_COMPOSE_COMPOSING)) return;
+    s->repeat_key = key;
+    int rate = s->repeat_rate > 100 ? 100 : s->repeat_rate;
+    int delay = s->repeat_delay > 0 ? s->repeat_delay : 1;
+    struct itimerspec repeat = {.it_value = {delay / 1000, (delay % 1000) * 1000000L},
+        .it_interval = {0, 1000000000L / rate}};
+    timerfd_settime(s->repeat_fd, 0, &repeat, NULL);
+}
+
 static void k_mods(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t dep, uint32_t lat, uint32_t lock, uint32_t group) {
 	struct st *s = data;
 	if (s->xkb_state) xkb_state_update_mask(s->xkb_state, dep, lat, lock, 0, 0, group);
 }
-static void k_repeat(void *data, struct wl_keyboard *k, int32_t rate, int32_t delay) {}
+static void k_repeat(void *data, struct wl_keyboard *k, int32_t rate, int32_t delay) {
+	struct st *s = data; s->repeat_rate = rate; s->repeat_delay = delay; repeat_stop(s);
+}
 static const struct wl_keyboard_listener keyboard_listener = { k_keymap, k_enter, k_leave, k_key, k_mods, k_repeat };
 
 static void seat_caps(void *data, struct wl_seat *seat, uint32_t caps) {
@@ -1828,6 +2031,8 @@ static void seat_caps(void *data, struct wl_seat *seat, uint32_t caps) {
 		s->keyboard = wl_seat_get_keyboard(seat);
 		wl_keyboard_add_listener(s->keyboard, &keyboard_listener, s);
 	} else if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD) && s->keyboard) {
+		repeat_stop(s);
+		if (s->compose) xkb_compose_state_reset(s->compose);
 		wl_keyboard_destroy(s->keyboard); s->keyboard = NULL;
 	}
 }
@@ -2004,13 +2209,14 @@ int main(int argc, char **argv) {
 	g_st = &s;
 	s.hover = HIT_NONE;
 	s.armed = -1;
+	s.repeat_fd = -1; s.repeat_rate = 25; s.repeat_delay = 600;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) return status_selftest();
 	if (argc == 3 && !strcmp(argv[1], "--render")) return render_mode(&s, argv[2]);
 	// Block before anything else: an early Super press must not kill us (default SIGUSR1 action).
-	sigset_t sigs; sigemptyset(&sigs); sigaddset(&sigs, SIGUSR1); sigaddset(&sigs, SIGUSR2);
+	sigset_t sigs; sigemptyset(&sigs); sigaddset(&sigs, SIGUSR1); sigaddset(&sigs, SIGUSR2); sigaddset(&sigs, SIGCHLD);
 	sigprocmask(SIG_BLOCK, &sigs, NULL);
 	int sfd = signalfd(-1, &sigs, SFD_CLOEXEC | SFD_NONBLOCK);
-	signal(SIGCHLD, SIG_IGN); // launched apps are reaped automatically
+	signal(SIGCHLD, SIG_DFL); // job completion preserves helper exit status
 	s.running = true;
 	read_geometry(&s);
 	status_update(&s);
@@ -2024,6 +2230,8 @@ int main(int argc, char **argv) {
 		return 1;
 	}
 	s.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	s.compose = wc_compose_create(s.xkb);
+	s.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	const char *size = getenv("XCURSOR_SIZE");
 	s.cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size ? atoi(size) : 24, s.shm);
 	s.cursor_surf = wl_compositor_create_surface(s.comp);
@@ -2034,14 +2242,16 @@ int main(int argc, char **argv) {
 	timerfd_settime(tfd, 0, &ts, NULL);
 	int dfd = wl_display_get_fd(s.dpy);
 	while (s.running) {
-		struct pollfd fds[3 + MAX_JOBS];
-		struct job *owner[3 + MAX_JOBS];
+		struct pollfd fds[4 + MAX_JOBS * 2];
 		int nf = 0;
 		fds[nf++] = (struct pollfd){ dfd, POLLIN, 0 };
 		fds[nf++] = (struct pollfd){ tfd, POLLIN, 0 };
 		fds[nf++] = (struct pollfd){ sfd, POLLIN, 0 };
-		for (int i = 0; i < MAX_JOBS; i++)
-			if (jobs[i].active) { owner[nf] = &jobs[i]; fds[nf++] = (struct pollfd){ jobs[i].fd, POLLIN, 0 }; }
+		fds[nf++] = (struct pollfd){ s.repeat_fd, POLLIN, 0 };
+		for (int i = 0; i < MAX_JOBS; i++) if (jobs[i].active) {
+			if (jobs[i].fd >= 0) fds[nf++] = (struct pollfd){ jobs[i].fd, POLLIN, 0 };
+			if (jobs[i].err >= 0) fds[nf++] = (struct pollfd){ jobs[i].err, POLLIN, 0 };
+		}
 		while (wl_display_prepare_read(s.dpy) != 0) wl_display_dispatch_pending(s.dpy);
 		wl_display_flush(s.dpy);
 		if (poll(fds, nf, -1) < 0) {
@@ -2053,20 +2263,14 @@ int main(int argc, char **argv) {
 		else wl_display_cancel_read(s.dpy);
 		if (fds[0].revents & (POLLERR | POLLHUP)) break;
 		if (wl_display_dispatch_pending(s.dpy) < 0) break;
-		for (int i = 3; i < nf; i++) {
-			if (!fds[i].revents) continue;
-			struct job *j = owner[i];
-			ssize_t n;
-			char discard[4096];
-			while ((n = read(j->fd, j->len + 1 < sizeof(j->buf) ? j->buf + j->len : discard,
-					j->len + 1 < sizeof(j->buf) ? sizeof(j->buf) - 1 - j->len : sizeof(discard))) > 0)
-				if (j->len + 1 < sizeof(j->buf)) j->len += n;
-			if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
-				close(j->fd); j->active = false;
-				job_parse(&s, j);
-				if (s.qs_open) paint(&s, &s.qs, draw_qs);
-			}
-		}
+        jobs_pump(&s);
+        if (s.qs_open) paint(&s, &s.qs, draw_qs);
+        if (fds[3].revents & POLLIN) {
+            uint64_t repeats;
+            if (read(s.repeat_fd, &repeats, sizeof(repeats)) > 0 && s.repeat_key)
+                for (uint64_t i = 0; i < repeats && i < 8 && s.repeat_key; i++) handle_status_key(&s, s.repeat_key);
+        }
+        notice_sync(&s);
 		if (fds[2].revents & POLLIN) {
 			struct signalfd_siginfo si;
 			while (read(sfd, &si, sizeof(si)) == sizeof(si)) {

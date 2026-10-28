@@ -9,6 +9,8 @@ through sudo (see /etc/sudoers.d/whitecube-settings): network, brightness,
 power and status reads are password-free; everything else asks for a password.
 Every argument is validated here, never trusted from the caller.
 """
+import contextlib
+import fcntl
 import grp
 import importlib.machinery
 import importlib.util
@@ -16,8 +18,10 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,6 +31,12 @@ ZONEINFO = Path("/usr/share/zoneinfo")
 XKB_LIST = Path("/usr/share/X11/xkb/rules/evdev.lst")
 BACKLIGHT = Path("/sys/class/backlight")
 POWER = Path("/sys/class/power_supply")
+HOSTNAME = Path("/etc/hostname")
+HOSTS = Path("/etc/hosts")
+LOCALTIME = Path("/etc/localtime")
+TIMEZONE = Path("/etc/timezone")
+KEYBOARD = Path("/etc/default/keyboard")
+SYSTEM_LOCK = Path("/run/lock/whitecube-settings.lock")
 
 # Services the panel may change. Anything else is shown read-only or not at all.
 SERVICES = {
@@ -436,17 +446,133 @@ def power_action(action):
 
 # ------------------------------------------------ root, password required
 
+@contextlib.contextmanager
+def system_config_lock():
+    """Serialize our system-file transactions, including their initial reads."""
+    fd = os.open(SYSTEM_LOCK, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            raise RuntimeError("Unsafe Whitecube system settings lock")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def file_snapshot(path):
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        return ("link", os.readlink(path), info.st_mode, info.st_uid, info.st_gid)
+    if not stat.S_ISREG(info.st_mode):
+        raise RuntimeError(f"Refusing to replace a non-regular settings file: {path}")
+    return ("file", path.read_bytes(), info.st_mode, info.st_uid, info.st_gid)
+
+
+def stage_system_file(path, state):
+    """Prepare a complete replacement alongside its destination; never truncate it."""
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.whitecube-", dir=path.parent)
+    temporary = Path(name)
+    try:
+        if state[0] == "link":
+            os.close(fd)
+            fd = -1
+            temporary.unlink()
+            temporary.symlink_to(state[1])
+            if os.geteuid() == 0:
+                os.chown(temporary, state[3], state[4], follow_symlinks=False)
+        else:
+            with os.fdopen(fd, "wb") as stream:
+                fd = -1
+                stream.write(state[1])
+                if os.geteuid() == 0:
+                    os.fchown(stream.fileno(), state[3], state[4])
+                os.fchmod(stream.fileno(), stat.S_IMODE(state[2]) & 0o777)
+                stream.flush()
+                os.fsync(stream.fileno())
+        return temporary
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def replace_system_files(changes, apply=None):
+    """Stage every file before committing; roll back partial writes/apply failures.
+
+    Each rename is atomic and durable. Multiple files are not a single atomic
+    filesystem operation; rollback covers reported I/O and command failures.
+    An unrelated edit made after our commit is retained rather than overwritten.
+    Call with system_config_lock held. A tuple ('link', target) requests a symlink.
+    """
+    old, new, staged, committed = {}, {}, {}, []
+    try:
+        for path, value in changes.items():
+            old[path] = file_snapshot(path)
+            metadata = old[path][2:] if old[path] else (0o644, os.geteuid(), os.getegid())
+            if old[path] and old[path][0] == "link" and not isinstance(value, tuple):
+                metadata = (0o644, *metadata[1:])
+            new[path] = (("link", value[1], *metadata) if isinstance(value, tuple)
+                         else ("file", value.encode("utf-8"), *metadata))
+            staged[path] = stage_system_file(path, new[path])
+        for path, temporary in staged.items():
+            if file_snapshot(path) != old[path]:
+                raise RuntimeError(f"Settings changed concurrently: {path}; retry the change")
+            os.replace(temporary, path)
+            committed.append(path)
+            # Symlinks do not preserve the old regular file's mode.
+            new[path] = file_snapshot(path)
+            sync_directory(path.parent)
+        if apply:
+            apply()
+    except BaseException as error:
+        failures = []
+        for path in reversed(committed):
+            try:
+                if file_snapshot(path) != new[path]:
+                    raise RuntimeError("changed by another process; retained its edit")
+                if old[path] is None:
+                    path.unlink()
+                else:
+                    temporary = stage_system_file(path, old[path])
+                    try:
+                        os.replace(temporary, path)
+                    finally:
+                        temporary.unlink(missing_ok=True)
+                sync_directory(path.parent)
+            except (OSError, RuntimeError) as rollback_error:
+                failures.append(f"{path}: {rollback_error}")
+        if failures:
+            raise RuntimeError("Settings update failed; recovery needs attention: " + "; ".join(failures)) from error
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
 def set_hostname(name):
     require_root()
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", name):
         fail("Hostname: lowercase letters, digits and hyphens, 1-63 characters")
-    old = read("/etc/hostname")
-    Path("/etc/hostname").write_text(name + "\n")
-    hosts = read("/etc/hosts").splitlines()
-    hosts = [l for l in hosts if not l.startswith("127.0.1.1")]
-    hosts.insert(1 if hosts else 0, f"127.0.1.1\t{name}")
-    Path("/etc/hosts").write_text("\n".join(hosts) + "\n")
-    run("/usr/bin/hostname", name, check=True)
+    with system_config_lock():
+        old = HOSTNAME.read_text().strip() if HOSTNAME.exists() else ""
+        hosts = HOSTS.read_text().splitlines() if HOSTS.exists() else []
+        hosts = [line for line in hosts if line.split()[:1] != ["127.0.1.1"]]
+        hosts.insert(1 if hosts else 0, f"127.0.1.1\t{name}")
+        replace_system_files({HOSTNAME: name + "\n", HOSTS: "\n".join(hosts) + "\n"},
+                             lambda: run("/usr/bin/hostname", name, check=True))
     emit("ok", "hostname", old, name)
 
 
@@ -457,11 +583,8 @@ def set_timezone(zone):
     target = (ZONEINFO / zone).resolve()
     if not target.is_file() or ZONEINFO.resolve() not in target.parents:
         fail("Unknown time zone")
-    tmp = Path("/etc/.localtime.cube-settings")
-    tmp.unlink(missing_ok=True)
-    tmp.symlink_to(ZONEINFO / zone)
-    os.replace(tmp, "/etc/localtime")
-    Path("/etc/timezone").write_text(zone + "\n")
+    with system_config_lock():
+        replace_system_files({LOCALTIME: ("link", str(ZONEINFO / zone)), TIMEZONE: zone + "\n"})
     emit("ok", "timezone", zone)
 
 
@@ -526,16 +649,20 @@ def console_keyboard(layout, variant):
         fail("Invalid keyboard layout")
     if not os.access("/usr/bin/setupcon", os.X_OK):
         fail("Console keyboard setup is unavailable; install console-setup.")
-    path = Path("/etc/default/keyboard")
-    lines = read(path).splitlines()
-    values = {"XKBLAYOUT": layout, "XKBVARIANT": variant}
-    out = []
-    for line in lines:
-        key = line.split("=", 1)[0]
-        out.append(f'{key}="{values.pop(key)}"' if key in values else line)
-    out += [f'{k}="{v}"' for k, v in values.items()]
-    path.write_text("\n".join(out) + "\n")
-    run("/usr/bin/setupcon", "--save-only", timeout=30, check=True)
+    with system_config_lock():
+        lines = KEYBOARD.read_text().splitlines() if KEYBOARD.exists() else []
+        values = {"XKBLAYOUT": layout, "XKBVARIANT": variant}
+        out = []
+        for line in lines:
+            key = line.split("=", 1)[0].strip()
+            if key in values:
+                out.append(f'{key}="{values[key]}"')
+            else:
+                out.append(line)
+        seen = {line.split("=", 1)[0].strip() for line in lines}
+        out += [f'{key}="{value}"' for key, value in values.items() if key not in seen]
+        replace_system_files({KEYBOARD: "\n".join(out) + "\n"},
+                             lambda: run("/usr/bin/setupcon", "--save-only", timeout=30, check=True))
     emit("ok", "console-keyboard", layout, variant)
 
 
