@@ -13,6 +13,7 @@ struct status_theme {
 	char ink[7], muted[7], cube_top[7], cube_side[7];
 };
 static inline bool status_theme_color(char out[7], const char *value) {
+	if (!value) return false;
 	if (*value == '#') value++;
 	if (strlen(value) != 6) return false;
 	for (unsigned i = 0; i < 6; i++) if (!isxdigit((unsigned char)value[i])) return false;

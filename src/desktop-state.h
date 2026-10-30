@@ -87,9 +87,11 @@ static inline bool wc_state_load(const char *path, struct wc_desktop_state *stat
     struct wc_desktop_state result; wc_state_defaults(&result);
     char line[1200], a[257], title[513], trailing;
     unsigned workspace, desktop;
-    bool valid = fgets(line, sizeof(line), f) && sscanf(line, "WC_LAYOUT_1 %u %u %c", &workspace, &desktop, &trailing) == 2 && workspace < 4 && desktop < 2;
+    bool valid = fgets(line, sizeof(line), f) && (strchr(line, '\n') || feof(f)) &&
+        sscanf(line, "WC_LAYOUT_1 %u %u %c", &workspace, &desktop, &trailing) == 2 && workspace < 4 && desktop < 2;
     if (valid) { result.workspace = workspace; result.desktop_visible = desktop; }
     while (valid && fgets(line, sizeof(line), f)) {
+        if (!strchr(line, '\n') && !feof(f)) { valid = false; break; }
         if (line[0] == 'N') {
             unsigned index;
             valid = sscanf(line, "N %u %256s %c", &index, a, &trailing) == 2 && index < 4 && wc_hex_decode(a, result.names[index], 64);
@@ -185,13 +187,14 @@ static inline double wc_json_number(const char *data, const char *key, double fa
     char pattern[80]; snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     const char *p = strstr(data, pattern); if (!p || !(p = strchr(p, ':'))) return fallback;
     char *end; double value = strtod(p + 1, &end);
-    return end != p + 1 && value >= minimum && value <= maximum ? value : fallback;
+    bool delim = end != p + 1 && (*end == ',' || *end == '}' || *end == ' ' || *end == '\t' || *end == '\r' || *end == '\n' || *end == '\0');
+    return delim && value >= minimum && value <= maximum ? value : fallback;
 }
 static inline bool wc_json_true(const char *data, const char *key) {
     char pattern[80]; snprintf(pattern, sizeof(pattern), "\"%s\"", key);
     const char *p = strstr(data, pattern); if (!p || !(p = strchr(p, ':'))) return false;
     do { p++; } while (*p == ' ' || *p == '\t');
-    return !strncmp(p, "true", 4);
+    return !strncmp(p, "true", 4) && (p[4] == ',' || p[4] == '}' || p[4] == ' ' || p[4] == '\t' || p[4] == '\r' || p[4] == '\n' || p[4] == '\0');
 }
 static inline bool wc_accessibility_load(const char *path, struct wc_accessibility *settings) {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK); if (fd < 0) return false;

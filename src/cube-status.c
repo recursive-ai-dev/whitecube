@@ -281,10 +281,14 @@ static char **app_argv(const struct app *a) {
             continue;
         }
         if (!strcmp(parsed[i], "%f") || !strcmp(parsed[i], "%F") ||
-            !strcmp(parsed[i], "%u") || !strcmp(parsed[i], "%U")) continue;
+            !strcmp(parsed[i], "%u") || !strcmp(parsed[i], "%U") ||
+            !strcmp(parsed[i], "%d") || !strcmp(parsed[i], "%D") ||
+            !strcmp(parsed[i], "%n") || !strcmp(parsed[i], "%N") ||
+            !strcmp(parsed[i], "%v") || !strcmp(parsed[i], "%m")) continue;
         GString *value = g_string_new(NULL);
         for (const char *c = parsed[i]; *c; c++) {
-            if (*c == '%' && c[1]) {
+            if (*c == '%') {
+                if (!c[1]) { g_string_free(value, TRUE); value = NULL; break; }
                 c++;
                 if (*c == '%') g_string_append_c(value, '%');
                 else if (*c == 'c') g_string_append(value, a->name);
@@ -342,7 +346,8 @@ static bool job_start(int kind, const char *const argv[]) {
         sigset_t none; sigemptyset(&none); sigprocmask(SIG_SETMASK, &none, NULL);
         signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_DFL);
         int null = open("/dev/null", O_RDONLY);
-        dup2(null, 0); dup2(out[1], 1); dup2(err[1], 2);
+        if (null >= 0) { dup2(null, 0); if (null > 2) close(null); }
+        dup2(out[1], 1); dup2(err[1], 2);
         execv(argv[0], (char *const *)argv);
         dprintf(2, "Cannot run %s: %s\n", argv[0], strerror(errno)); _exit(127);
     }

@@ -1879,15 +1879,20 @@ static void t_commit(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, commit);
 	if (t->xdg_toplevel->base->initial_commit) {
 		struct wc_output *out = server_first_output(t->server);
-		int W = out && out->wlr_output->width > 0 ? out->wlr_output->width : 1280;
-		int H = out && out->wlr_output->height > 0 ? out->wlr_output->height : 800;
+		int W = 1280, H = 800;
+		if (out && out->wlr_output) {
+			wlr_output_effective_resolution(out->wlr_output, &W, &H);
+			if (W <= 0) W = 1280;
+			if (H <= 0) H = 800;
+		}
+		int work_h = H - g_tab_h > 100 ? H - g_tab_h : 100;
 		/* 0x0 lets a dialog pick its own size; retile centres and caps it. */
 		if (is_dialog(t)) wlr_xdg_toplevel_set_size(t->xdg_toplevel, 0, 0);
-		else wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, H - g_tab_h);
+		else wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, work_h);
 		/* No minimize and no window menu here, so clients hide those buttons. */
 		wlr_xdg_toplevel_set_wm_capabilities(t->xdg_toplevel,
 			WLR_XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE | WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
-		wlr_xdg_toplevel_set_bounds(t->xdg_toplevel, W, H - g_tab_h);
+		wlr_xdg_toplevel_set_bounds(t->xdg_toplevel, W, work_h);
 	}
 }
 static void t_destroy(struct wl_listener *l, void *data) {

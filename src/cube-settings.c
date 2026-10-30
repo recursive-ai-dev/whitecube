@@ -131,8 +131,10 @@ static void find_privacy_helper(void) {
 	snprintf(privacy_helper, sizeof(privacy_helper), "%s/.local/bin/cube-privacy", home_dir());
 }
 enum chain { C_NONE, C_CONNECT_ADDED };
+#define MAX_JOB_OUT (4 * 1024 * 1024)
 struct job {
-	bool used; pid_t pid; int out, err; int table; enum priv priv; enum chain chain;
+	bool used, reaped, timed_out; pid_t pid; int status; int out, err; int table; enum priv priv; enum chain chain;
+	double deadline;
 	char *obuf; size_t olen, ocap; char ebuf[2048]; size_t elen; char label[96];
 };
 static struct job jobs[MAXJOBS];
@@ -181,17 +183,34 @@ static bool job_launch(int table, const char *label, enum priv priv, enum chain 
 		return false;
 	}
 	if (pid == 0) {
+		setsid();
+		sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, NULL);
 		dup2(in[0], 0); dup2(out[1], 1); dup2(err[1], 2);
+		signal(SIGCHLD, SIG_DFL);
 		signal(SIGPIPE, SIG_DFL);
 		execv(argv[0], (char *const *)argv);
 		fprintf(stderr, "cannot run %s: %s\n", argv[0], strerror(errno));
 		_exit(127);
 	}
 	close(in[0]); close(out[1]); close(err[1]);
-	char feed[12800]; int n = 0;
-	if (priv == P_PASS) n = snprintf(feed, sizeof(feed), "%s\n", g_password);
-	if (input) n += snprintf(feed + n, sizeof(feed) - n, "%s", input);
-	if (n > 0) { ssize_t w = write(in[1], feed, (size_t)n); (void)w; }
+	char feed[12800]; size_t len = 0;
+	if (priv == P_PASS) {
+		int k = snprintf(feed, sizeof(feed), "%s\n", g_password);
+		if (k > 0) len = (size_t)k < sizeof(feed) ? (size_t)k : sizeof(feed) - 1;
+	}
+	if (input && len + 1 < sizeof(feed)) {
+		int k = snprintf(feed + len, sizeof(feed) - len, "%s", input);
+		if (k > 0) {
+			size_t add = (size_t)k < sizeof(feed) - len ? (size_t)k : sizeof(feed) - len - 1;
+			len += add;
+		}
+	}
+	for (size_t off = 0; off < len; ) {
+		ssize_t w = write(in[1], feed + off, len - off);
+		if (w > 0) off += (size_t)w;
+		else if (w < 0 && errno == EINTR) continue;
+		else break;
+	}
 	explicit_bzero(feed, sizeof(feed));
 	if (priv == P_PASS) { explicit_bzero(g_password, sizeof(g_password)); g_have_password = false; }
 	close(in[1]);
@@ -199,6 +218,7 @@ static bool job_launch(int table, const char *label, enum priv priv, enum chain 
 	struct job *j = &jobs[slot];
 	memset(j, 0, sizeof(*j));
 	j->used = true; j->pid = pid; j->out = out[0]; j->err = err[0]; j->table = table; j->priv = priv; j->chain = chain;
+	j->deadline = now_s() + (table >= 0 ? 35 : 65);
 	copy(j->label, sizeof(j->label), label);
 	if (table >= 0) tables[table].loading = true;
 	request_redraw();
@@ -280,8 +300,9 @@ static bool sudo_auth_failed(const char *err) {
 
 static void job_finish(struct job *j, int status) {
 	if (j->obuf) j->obuf[j->olen] = 0;
+	if (j->timed_out && !j->elen) j->elen = (size_t)snprintf(j->ebuf, sizeof(j->ebuf), "timed out");
 	j->ebuf[j->elen] = 0;
-	bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	bool ok = !j->timed_out && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 	char line[256];
 	if (j->priv == P_LAUNCH) {
 		if (!ok || j->elen) toast("Cannot launch %s: %s", j->label, last_line(j->ebuf, line, sizeof(line))[0] ? line : "process creation failed");
@@ -316,6 +337,14 @@ static void job_finish(struct job *j, int status) {
 	request_redraw();
 }
 
+static void job_reap(struct job *j) {
+	if (j->reaped || j->pid <= 0) return;
+	int status = 0;
+	pid_t r = waitpid(j->pid, &status, WNOHANG);
+	if (r == j->pid) { j->reaped = true; j->status = status; }
+	else if (r < 0 && errno != EINTR) { j->reaped = true; j->status = 1; }
+}
+
 static void job_read(struct job *j) {
 	char buf[4096];
 	for (;;) {
@@ -323,8 +352,19 @@ static void job_read(struct job *j) {
 		if (j->out >= 0) {
 			ssize_t n = read(j->out, buf, sizeof(buf));
 			if (n > 0) {
-				if (j->olen + n + 1 > j->ocap) { j->ocap = (j->olen + n + 1) * 2; j->obuf = realloc(j->obuf, j->ocap); }
-				memcpy(j->obuf + j->olen, buf, n); j->olen += n; progress = true;
+				size_t room = j->olen < MAX_JOB_OUT ? MAX_JOB_OUT - j->olen : 0;
+				size_t take = (size_t)n < room ? (size_t)n : room;
+				if (take > 0) {
+					if (j->olen + take + 1 > j->ocap) {
+						size_t ncap = (j->olen + take + 1) * 2;
+						if (ncap > MAX_JOB_OUT + 1) ncap = MAX_JOB_OUT + 1;
+						char *nb = realloc(j->obuf, ncap);
+						if (nb) { j->obuf = nb; j->ocap = ncap; }
+						else take = 0;
+					}
+					if (take > 0 && j->obuf) { memcpy(j->obuf + j->olen, buf, take); j->olen += take; }
+				}
+				progress = true;
 			} else if (n == 0 || (errno != EAGAIN && errno != EINTR)) { close(j->out); j->out = -1; }
 		}
 		if (j->err >= 0) {
@@ -343,10 +383,22 @@ static void job_read(struct job *j) {
 		}
 		if (!progress) break;
 	}
+	job_reap(j);
+	if (!j->timed_out && j->deadline > 0 && now_s() >= j->deadline) {
+		j->timed_out = true;
+		if (!j->reaped && j->pid > 0) {
+			if (j->priv != P_LAUNCH) kill(-j->pid, SIGKILL);
+			kill(j->pid, SIGKILL);
+		}
+		if (j->out >= 0) { close(j->out); j->out = -1; }
+		if (j->err >= 0) { close(j->err); j->err = -1; }
+	}
 	if (j->out < 0 && j->err < 0) {
-		int status = 0;
-		waitpid(j->pid, &status, 0);
-		job_finish(j, status);
+		for (int spin = 0; !j->reaped && spin < 10; spin++) {
+			job_reap(j);
+			if (!j->reaped) usleep(200);
+		}
+		if (j->reaped) job_finish(j, j->status);
 	}
 }
 
@@ -769,14 +821,14 @@ static void spawn_detached(const char *cmd) {
         setsid();
         sigset_t empty; sigemptyset(&empty); sigprocmask(SIG_SETMASK, &empty, NULL);
         signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_DFL);
-        int null = open("/dev/null", O_RDONLY); if (null >= 0) dup2(null, 0);
+        int null = open("/dev/null", O_RDONLY); if (null >= 0) { dup2(null, 0); if (null > 2) close(null); }
         execvp(argv[0], argv);
         dprintf(errors[1], "%s: %s", argv[0], strerror(errno)); _exit(127);
     }
     close(errors[1]);
     if (pid < 0) { close(errors[0]); toast("Cannot launch: %s", strerror(errno)); g_strfreev(argv); return; }
     fcntl(errors[0], F_SETFL, O_NONBLOCK);
-    *j = (struct job){.used = true, .pid = pid, .out = -1, .err = errors[0], .table = -1, .priv = P_LAUNCH};
+    *j = (struct job){.used = true, .pid = pid, .out = -1, .err = errors[0], .table = -1, .priv = P_LAUNCH, .deadline = now_s() + 10};
     copy(j->label, sizeof(j->label), argv[0]); g_strfreev(argv);
 }
 
@@ -2304,9 +2356,9 @@ static void pump_jobs(int timeout_ms) {
 		if (jobs[i].out >= 0) { fds[n] = (struct pollfd){jobs[i].out, POLLIN, 0}; owner[n++] = &jobs[i]; }
 		if (jobs[i].err >= 0) { fds[n] = (struct pollfd){jobs[i].err, POLLIN, 0}; owner[n++] = &jobs[i]; }
 	}
-	if (!n) return;
-	if (poll(fds, n, timeout_ms) > 0)
+	if (n && poll(fds, n, timeout_ms) > 0)
 		for (int i = 0; i < n; i++) if (fds[i].revents && owner[i]->used) job_read(owner[i]);
+	for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) job_read(&jobs[i]);
 }
 static bool any_job(void) { for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) return true; return false; }
 
@@ -2428,6 +2480,7 @@ int main(int argc, char **argv) {
 		if (fds[2].revents & POLLIN && read(g.repeat_fd, &ticks, sizeof(ticks)) > 0 && g.repeat_key)
 			for (uint64_t i = 0; i < ticks && i < 8; i++) handle_key(g.repeat_key);
 		for (int i = 3; i < n; i++) if (fds[i].revents && owner[i] && owner[i]->used) job_read(owner[i]);
+		for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) job_read(&jobs[i]);
 	}
 	explicit_bzero(g_password, sizeof(g_password));
 	(void)any_action_running;

@@ -780,6 +780,7 @@ static void registry_remove(void *data, struct wl_registry *reg, uint32_t name) 
 		if (o->wl == c->entered) c->entered = NULL;
 		if (o->ver >= 3) wl_output_release(o->wl); else wl_output_destroy(o->wl);
 		o->wl = NULL; o->name[0] = 0; // a supervised child exits on its own when its layer surface closes
+		if (c->supervisor && o->pid > 0) kill(o->pid, SIGTERM);
 	}
 }
 static const struct wl_registry_listener reg_listener = { registry_global, registry_remove };
@@ -834,7 +835,15 @@ static int supervisor_main(struct ca *c) {
 		if (fds[0].revents & (POLLHUP | POLLERR)) break;
 		if ((fds[0].revents & POLLIN) && wl_display_dispatch(c->dpy) < 0) break;
 	}
-	for (int i = 0; i < c->nouts; i++) if (c->outs[i].pid) kill(c->outs[i].pid, SIGTERM);
+	for (int i = 0; i < c->nouts; i++) if (c->outs[i].pid > 0) kill(c->outs[i].pid, SIGTERM);
+	for (int spin = 0; spin < 25; spin++) {
+		int status;
+		while (waitpid(-1, &status, WNOHANG) > 0) {}
+		bool any = false;
+		for (int i = 0; i < c->nouts; i++) if (c->outs[i].pid > 0 && kill(c->outs[i].pid, 0) == 0) any = true;
+		if (!any) break;
+		usleep(2000);
+	}
 	close(sigfd);
 	wl_display_disconnect(c->dpy);
 	return 0;
@@ -875,7 +884,7 @@ static int cosmos_self_test(void) {
 	c.cs.on = false; c.configured = true;
 	if (!cosmos_control(&c, "cosmos", "on") || !c.cs.on) return 6;
 	if (!cosmos_control(&c, "phase", "land") || c.cs.auto_zoom || c.cs.target != 2) return 7;
-	if (cosmos_control(&c, "phase", "nowhere") || cosmos_control(&c, "zoom", "9") || cosmos_control(&c, "speed", "100") || cosmos_control(&c, "zoom", "nan")) return 8;
+	if (cosmos_control(&c, "phase", "nowhere") || cosmos_control(&c, "zoom", "9") || cosmos_control(&c, "speed", "100") || cosmos_control(&c, "zoom", "nan") || cosmos_control(&c, "speed", "nan")) return 8;
 	if (!cosmos_control(&c, "zoom", "2.5") || fabs(c.cs.zoom - 2.5) > 1e-9 || !cosmos_control(&c, "speed", "2") || c.cs.speed != 2) return 9;
 	if (!apply_control(&c, "phase 4") || apply_control(&c, "edit") || apply_control(&c, "3d")) return 10;
 	// A rule change mid-journey keeps the landscape, the forming stars and the expansion.
@@ -890,7 +899,11 @@ static int cosmos_self_test(void) {
 	snprintf(path, sizeof(path), "%s/.config", home); mkdir(path, 0700);
 	snprintf(path, sizeof(path), "%s/.config/whitecube", home); mkdir(path, 0700);
 	snprintf(path, sizeof(path), "%s/.config/whitecube/config", home);
-	FILE *f = fopen(path, "w"); if (!f) return 14; fputs("cosmos=0\n", f); fclose(f);
+	FILE *f = fopen(path, "w"); if (!f) return 14;
+	fputs("cosmos=0\n#", f);
+	for (int i = 0; i < 126; i++) fputc('x', f);
+	fputs("cosmos=1\n", f);
+	fclose(f);
 	char *oldhome = getenv("HOME") ? strdup(getenv("HOME")) : NULL, *oldenv = getenv("CUBE_CA_COSMOS") ? strdup(getenv("CUBE_CA_COSMOS")) : NULL;
 	setenv("HOME", home, 1); setenv("CUBE_CA_COSMOS", "1", 1);
 	struct ca e = {0}; cosmos_config(&e); bool env_on = e.cs.want_on;

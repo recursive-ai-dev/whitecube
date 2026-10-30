@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -367,7 +368,16 @@ def check_folder_handler(env):
     command = ''
     for line in desktop.read_text(errors='replace').splitlines():
         if line.startswith('Exec='):
-            command = line[5:].split()[0] if line[5:].split() else ''
+            raw = line[5:].strip()
+            try:
+                tokens = shlex.split(raw)
+            except ValueError:
+                tokens = raw.split()
+            if tokens and tokens[0] in ('env', '/usr/bin/env'):
+                tokens = tokens[1:]
+                while tokens and '=' in tokens[0] and not tokens[0].startswith(('/', '-')):
+                    tokens = tokens[1:]
+            command = tokens[0] if tokens else ''
             break
     found = command and (env.at(command).is_file() if command.startswith('/') else
                          any((d / command).is_file() for d in (env.at('/usr/bin'), env.at('/usr') / 'local/bin', env.at('/bin'))))

@@ -42,6 +42,8 @@ int main(void) {
     assert(settings.ui_scale == 1.4 && settings.terminal_scale == 1.8 && settings.strong && settings.reduced_motion);
     f = fopen(path, "w"); assert(f); fprintf(f, "{\"ui_scale\":99,\"terminal_scale\":0,\"reduced_motion\":false}"); fclose(f);
     assert(wc_accessibility_load(path, &settings) && settings.ui_scale == 1 && settings.terminal_scale == 1 && !settings.reduced_motion);
+    f = fopen(path, "w"); assert(f); fprintf(f, "{\"ui_scale\":nan,\"terminal_scale\":1.2junk,\"reduced_motion\":trueish}"); fclose(f);
+    assert(wc_accessibility_load(path, &settings) && settings.ui_scale == 1 && settings.terminal_scale == 1 && !settings.reduced_motion);
     unlink(path); snprintf(path, sizeof(path), "%s/native-names.json", directory);
     f = fopen(path, "w"); assert(f); fprintf(f, "{\"w0\":\"436f6465\",\"w1\":\"506c6179\",\"w2\":\"4d6f6e69746f72\",\"w3\":\"42726f777365\"}"); fclose(f);
     assert(wc_names_load(path, &loaded) && !strcmp(loaded.names[0], "Code"));

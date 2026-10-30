@@ -6,6 +6,7 @@
 struct wc_bar_layout { int status_width, chat_x, chat_width, tabs_end; };
 
 static inline struct wc_bar_layout wc_bar_layout(int width, double scale) {
+	if (!(scale >= 0.5 && scale <= 4.0)) scale = scale < 0.5 ? 0.5 : scale > 4.0 ? 4.0 : 1.0;
 	int apps = (int)(104 * scale), right = (int)(160 * scale);
 	int gap = (int)(4 * scale), available = width - apps - right - 3 * gap;
 	int status = (int)(300 * scale), chat = (int)((width / scale >= 1100 ? 140 : 80) * scale);

@@ -26,7 +26,8 @@ int main(void) {
 		assert(contrast(theme.panel, theme.ink) == 21);
 		assert(!strcmp(theme.muted, theme.ink));
 	}
-	char encoded[7];
+	char encoded[7] = "112233";
+	assert(!status_theme_color(encoded, NULL) && !strcmp(encoded, "112233"));
 	assert(status_theme_color(encoded, "#ABCDEF") && !strcmp(encoded, "abcdef"));
 	puts("status themes: Space, White cube, Graphite and Paper contrast, strong contrast and invalid-color handling passed");
 	return 0;

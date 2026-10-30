@@ -90,6 +90,7 @@ int main(void) {
     assert(!strcmp(args[0], TERMINAL) && !strcmp(args[1], "--") && !strcmp(args[2], "program"));
     g_strfreev(args);
     snprintf(app.exec, sizeof(app.exec), "program %%invalid"); assert(!app_argv(&app));
+    snprintf(app.exec, sizeof(app.exec), "program trailing%%"); assert(!app_argv(&app));
     snprintf(app.exec, sizeof(app.exec), "program \"unclosed"); assert(!app_argv(&app));
     char temporary[] = "/tmp/whitecube-apps-XXXXXX";
     char *directory = mkdtemp(temporary); assert(directory);

@@ -215,7 +215,7 @@ static bool apply_control(struct ca *c, const char *command) {
 	else if (!strcmp(verb, "edit")) { if (c->cs.on) return false; c->edit = !c->edit; c->paused = c->edit; c->manual = true; if (c->volume && c->edit && c->slice < 0) c->slice = c->depth / 2; update_input(c); }
 	else if (!strcmp(verb, "clear")) { memset(c->grid, 0, sim_count(c)); memset(c->age, 0, sim_count(c)); c->manual = true; c->paused = true; }
 	else if (!strcmp(verb, "2d") || !strcmp(verb, "3d")) { if (c->cs.on && !strcmp(verb, "3d")) return false; c->volume = !strcmp(verb, "3d"); c->slice = -1; c->edit = false; c->paused = false; c->manual = false; update_input(c); if (!sim_alloc(c)) { c->running = false; return false; } reseed(c); }
-	else if (!strcmp(verb, "rotate")) { if (!c->volume) return false; c->slice = -1; c->yaw += !strcmp(arg, "left") ? -.20 : .20; }
+	else if (!strcmp(verb, "rotate")) { if (!c->volume || (strcmp(arg, "left") && strcmp(arg, "right"))) return false; c->slice = -1; c->yaw += !strcmp(arg, "left") ? -.20 : .20; }
 	else if (!strcmp(verb, "spin")) {
 		if (!*arg) c->spin = !c->spin;
 		else if (!strcmp(arg, "on") || !strcmp(arg, "off")) c->spin = !strcmp(arg, "on");
@@ -295,7 +295,7 @@ static int field_self_test(void) {
 	sim_step(&c); if (!c.grid[0]) return 2;
 	memset(c.grid, 0, sim_count(&c)); c.grid[0]=1; sim_step(&c); if (c.grid[0]) return 3;
 	if (!apply_control(&c, "2d") || !apply_control(&c, "clear") || !paint_cell(&c, 25, 25, 1) || !c.grid[c.cols + 1]) return 4;
-	if (!apply_control(&c, "3d") || !apply_control(&c, "slice 8") || apply_control(&c, "slice 18")) return 5;
+	if (!apply_control(&c, "3d") || !apply_control(&c, "slice 8") || apply_control(&c, "slice 18") || !apply_control(&c, "rotate left") || apply_control(&c, "rotate nowhere")) return 5;
 	if (!apply_control(&c, "spin off") || c.spin || !apply_control(&c, "spin") || !c.spin || apply_control(&c, "spin fast") || !apply_control(&c, "status")) return 5;
 	// Seed roundtrip and deterministic evolution through the persistence format.
 	char scratch[] = "/tmp/cube-ca-test-XXXXXX"; if (!mkdtemp(scratch)) return 6;

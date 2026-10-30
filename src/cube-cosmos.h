@@ -446,9 +446,15 @@ static void cosmos_config(struct ca *c) {
 	const char *env = getenv("CUBE_CA_COSMOS"); bool want = false;
 	char user[512]; const char *home = getenv("HOME"); const char *paths[2] = { "/etc/whitecube/config", NULL };
 	if (home && snprintf(user, sizeof(user), "%s/.config/whitecube/config", home) < (int)sizeof(user)) paths[1] = user;
-	for (int i = 0; i < 2; i++) { if (!paths[i]) continue; FILE *f = fopen(paths[i], "r"); char line[128]; if (!f) continue;
-		while (fgets(line, sizeof(line), f)) { if (!strncmp(line, "cosmos=", 7)) want = line[7] == '1'; }
-		fclose(f); }
+	for (int i = 0; i < 2; i++) {
+		if (!paths[i]) continue;
+		FILE *f = fopen(paths[i], "r"); char line[128]; if (!f) continue;
+		while (fgets(line, sizeof(line), f)) {
+			if (!strchr(line, '\n')) { int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') {} }
+			if (!strncmp(line, "cosmos=", 7)) want = line[7] == '1';
+		}
+		fclose(f);
+	}
 	if (env && *env) want = *env == '1'; // the environment wins over both config files
 	c->cs.speed = 1; c->cs.want_on = want;
 }

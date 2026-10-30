@@ -20,7 +20,7 @@ def terminal_argv(args, settings, home=None):
     options_with_values = {'-c', '--config', '-a', '--app-id', '-T', '--title', '-o', '--override', '-f', '--font', '-w', '--window-size-pixels', '-W', '--window-size-chars'}
     while index < len(args):
         arg = args[index]
-        if arg == '--' or not arg.startswith('-'):
+        if arg in ('--', '-e') or not arg.startswith('-'):
             break
         if arg.startswith('--config='):
             config = Path(arg.partition('=')[2]).expanduser()

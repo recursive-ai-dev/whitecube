@@ -7,7 +7,7 @@
 // How many tabs fit with no overflow button: the largest k with left + gap + k*(w+gap) < end.
 static inline int wc_tab_capacity(int left, int gap, int tab_w, int end) {
 	int k = 0;
-	if (tab_w < 1) return 0;
+	if (tab_w < 1 || gap < 0 || tab_w > 10000 || gap > 10000) return 0;
 	while (left + gap + (k + 1) * (tab_w + gap) < end) k++;
 	return k;
 }

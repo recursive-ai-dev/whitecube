@@ -361,6 +361,7 @@ struct window_fixture {
 	struct wc_server server;
 	struct wc_output output;
 	struct wlr_output screen;
+	struct wlr_xdg_shell shell;
 	struct wlr_xdg_client client;
 	int peer_fd;
 };
@@ -375,6 +376,8 @@ static void window_fixture_init(struct window_fixture *f) {
 	struct wc_server *s = &f->server;
 	s->wl_display = wl_display_create(); assert(s->wl_display);
 	int sockets[2]; assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+	f->shell.version = 5;
+	f->client.shell = &f->shell;
 	f->client.client = wl_client_create(s->wl_display, sockets[0]); assert(f->client.client);
 	f->peer_fd = sockets[1];
 	s->seat = wlr_seat_create(s->wl_display, "window-test"); assert(s->seat);
@@ -514,6 +517,14 @@ static void test_close_restores_recent_focus(void) {
 	t_unmap(&c.window.unmap, NULL);
 	assert(f.server.focused == &b.window && top_visible_window(&f.server) == &b.window);
 	assert(a.window.hidden && away.window.workspace == 1);
+	/* Initial commit on a scaled/rotated HiDPI screen uses logical effective resolution. */
+	f.screen.width = 3840; f.screen.height = 2160; f.screen.scale = 2.0f;
+	f.screen.transform = WL_OUTPUT_TRANSFORM_90;
+	struct test_window hidpi;
+	test_window_init(&f, &hidpi, "hidpi-app", NULL);
+	hidpi.base.initial_commit = true;
+	t_commit(&hidpi.window.commit, NULL);
+	assert(hidpi.xdg.scheduled.width == 1080 && hidpi.xdg.scheduled.height == 1920 - g_tab_h);
 	window_fixture_finish(&f);
 }
 

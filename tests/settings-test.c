@@ -177,6 +177,20 @@ static void test_launch_errors(void) {
 	spawn_detached("/bin/sh -c 'exit 17'");
 	while (any_job() && now_s() < deadline) pump_jobs(10);
 	assert(!any_job() && !ui.toast[0]);
+	// A hung helper or a helper that closes pipes before exiting never freezes the UI and times out cleanly.
+	char saved_prefs[512]; copy(saved_prefs, sizeof(saved_prefs), preferences_helper);
+	copy(preferences_helper, sizeof(preferences_helper), "/bin/sh");
+	char hang_args[2][256] = {"-c", "exec >/dev/null 2>&1; sleep 10"};
+	char overlong_input[13000]; memset(overlong_input, 'a', sizeof(overlong_input) - 1); overlong_input[sizeof(overlong_input) - 1] = 0;
+	ui.toast[0] = 0;
+	assert(job_launch(-1, "Hung helper", P_PREFS, C_NONE, overlong_input, 2, hang_args));
+	pump_jobs(10);
+	assert(any_job()); // Closed stdout/stderr does not block synchronously while child still sleeps.
+	for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) jobs[i].deadline = now_s() - 1;
+	deadline = now_s() + 3;
+	while (any_job() && now_s() < deadline) pump_jobs(10);
+	assert(!any_job() && strstr(ui.toast, "Hung helper failed: timed out"));
+	copy(preferences_helper, sizeof(preferences_helper), saved_prefs);
 }
 
 int main(int argc, char **argv) {

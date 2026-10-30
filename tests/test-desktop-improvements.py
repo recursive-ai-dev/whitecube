@@ -70,6 +70,11 @@ class Preferences(unittest.TestCase):
         self.assertIn('font=monospace:size=12.0', argv)
         self.assertEqual(argv[-len(args):], args)
         self.assertIn('colors.foreground=ffffff', argv)
+        # Child command flags after -e are never mistaken for foot's own --config.
+        ignored = self.root / 'ignored.ini'; ignored.write_text('font=wrong:size=50\n')
+        e_args = ['--config=' + str(config), '-e', 'python3', '-c', str(ignored)]
+        e_argv = terminal['terminal_argv'](e_args, {'terminal_scale':1.0,'contrast':'normal'}, self.root)
+        self.assertIn('font=monospace:size=10.0', e_argv)
 
     def test_terminal_survives_invalid_font_and_encoding(self):
         config = self.root / 'bad.ini'

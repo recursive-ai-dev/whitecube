@@ -88,11 +88,16 @@ int main(void) {
 	CHECK(!wav_open(&w, "tbad.wav", err, sizeof err) && strstr(err, "unsupported"));
 	FILE *tr = fopen("ttrunc.wav", "wb"); fwrite("RIFF\0\0\0\0WAVE", 1, 12, tr); fclose(tr);
 	CHECK(!wav_open(&w, "ttrunc.wav", err, sizeof err));
+	// Malformed 0xFFFFFFFF chunk length must not wrap to 0 or seek past EOF without error.
+	FILE *ovf = fopen("tovf.wav", "wb");
+	const uint8_t bad_chunk[20] = { 'R','I','F','F', 12,0,0,0, 'W','A','V','E', 'J','U','N','K', 0xff,0xff,0xff,0xff };
+	fwrite(bad_chunk, 1, sizeof bad_chunk, ovf); fclose(ovf);
+	CHECK(!wav_open(&w, "tovf.wav", err, sizeof err) && strstr(err, "truncated"));
 
 	// Resampler: 1 s of 24 kHz constant becomes ~48000 frames; 96 kHz becomes ~48000; equal rate is 1:1.
 	struct conv c;
-	int16_t out[2 * 64];
-	unsigned up = 0, down = 0, same = 0;
+	int16_t out[2 * CONV_MAX_FRAMES];
+	unsigned up = 0, down = 0, same = 0, extreme = 0;
 	conv_init(&c, 24000, 48000);
 	for (int i = 0; i < 24000; i++) { up += conv_push(&c, 0.5f, 0.5f, out); }
 	CHECK(abs((int)up - 48000) <= 2);
@@ -102,6 +107,17 @@ int main(void) {
 	conv_init(&c, 48000, 48000);
 	for (int i = 0; i < 100; i++) same += conv_push(&c, 0.0f, 0.0f, out);
 	CHECK(same == 100);
+	// Extreme 96x upsampling (4000 Hz -> 384000 Hz) fits within CONV_MAX_FRAMES without stack overflow.
+	conv_init(&c, 4000, 384000);
+	for (int i = 0; i < 101; i++) {
+		unsigned k = conv_push(&c, 0.25f, -0.25f, out);
+		CHECK(k <= CONV_MAX_FRAMES);
+		extreme += k;
+	}
+	CHECK(abs((int)extreme - 9600) <= 2);
+	// Degenerate 0 Hz input/output rate never hangs in conv_push.
+	conv_init(&c, 0, 48000);
+	CHECK(conv_push(&c, 0.1f, 0.1f, out) == 1);
 	// interpolation is linear and bounded: a ramp 0 -> 1 upsampled 2x never overshoots
 	conv_init(&c, 1, 2);
 	conv_push(&c, 0.0f, 0.0f, out);
@@ -109,7 +125,7 @@ int main(void) {
 	CHECK(n == 2 && out[0] == 0 && abs(out[2] - 16384) <= 1);
 	CHECK(to_s16(2.0f) == 32767 && to_s16(-2.0f) == -32767 && to_s16(NAN) == 0);
 
-	remove("t16.wav"); remove("t8.wav"); remove("tf.wav"); remove("t24.wav"); remove("tbad.wav"); remove("ttrunc.wav");
+	remove("t16.wav"); remove("t8.wav"); remove("tf.wav"); remove("t24.wav"); remove("tbad.wav"); remove("ttrunc.wav"); remove("tovf.wav");
 	if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
 	puts("cube-audio: volume mapping, WAV decoding and resampling passed");
 	return 0;

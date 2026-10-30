@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <sound/asound.h>
@@ -487,7 +488,14 @@ static bool wav_open(struct wav *w, const char *path, char *err, size_t errn) {
 			if (!have_fmt) { snprintf(err, errn, "%s: data before fmt", path); goto bad; }
 			w->data_left = len;
 			break;
-		} else if (fseek(w->f, (long)len + (len & 1), SEEK_CUR) != 0) { snprintf(err, errn, "%s: truncated", path); goto bad; }
+		} else {
+			int64_t skip = (int64_t)len + (len & 1), pos = ftello(w->f);
+			struct stat st;
+			if (pos < 0 || (fstat(fileno(w->f), &st) == 0 && S_ISREG(st.st_mode) && pos + skip > st.st_size) ||
+			    fseeko(w->f, skip, SEEK_CUR) != 0) {
+				snprintf(err, errn, "%s: truncated", path); goto bad;
+			}
+		}
 	}
 	bool pcm_ok = w->fmt == 1 && (w->bits == 8 || w->bits == 16 || w->bits == 24 || w->bits == 32);
 	bool flt_ok = w->fmt == 3 && w->bits == 32;
@@ -523,6 +531,9 @@ static int16_t to_s16(float f) {
 }
 
 // Streaming linear-interpolation resampler + stereo S16 packer.
+// Maximum supported upsampling ratio is 384000 Hz / 4000 Hz = 96 frames per input frame.
+#define CONV_MAX_FRAMES 128
+
 struct conv {
 	double step, pos;            // input frames per output frame; fractional position between prev and cur
 	float pl, pr;
@@ -531,16 +542,19 @@ struct conv {
 
 static void conv_init(struct conv *c, unsigned src, unsigned dst) {
 	memset(c, 0, sizeof *c);
+	if (!src) src = 48000;
+	if (!dst) dst = 48000;
 	c->same_rate = src == dst;
 	c->step = (double)src / (double)dst;
+	if (!(c->step >= 1.0 / CONV_MAX_FRAMES)) c->step = 1.0 / CONV_MAX_FRAMES;
 }
 
-// Push one input frame; writes 0..n output frames to out, returns the count.
+// Push one input frame; writes 0..CONV_MAX_FRAMES output frames to out, returns the count.
 static unsigned conv_push(struct conv *c, float l, float r, int16_t *out) {
 	if (c->same_rate) { out[0] = to_s16(l); out[1] = to_s16(r); return 1; }
 	unsigned n = 0;
 	if (c->have_prev)
-		while (c->pos < 1.0) {
+		while (c->pos < 1.0 && n < CONV_MAX_FRAMES) {
 			out[n * 2] = to_s16(c->pl + (l - c->pl) * (float)c->pos);
 			out[n * 2 + 1] = to_s16(c->pr + (r - c->pr) * (float)c->pos);
 			n++; c->pos += c->step;
@@ -562,10 +576,12 @@ static int cmd_play(struct target t, const char *path) {
 
 	struct conv cv;
 	conv_init(&cv, w.rate, pcm.rate);
-	size_t chunk_frames = 4096, bufn = pcm.period * 2 * 4;
+	size_t chunk_frames = 4096;
+	size_t period_frames = pcm.period > CONV_MAX_FRAMES ? pcm.period : CONV_MAX_FRAMES;
+	size_t bufn = period_frames * 2 * 4;
 	uint8_t *in = malloc(chunk_frames * w.align);
 	int16_t *out = malloc(bufn * sizeof *out);
-	if (!in || !out) return die("out of memory");
+	if (!in || !out) { free(in); free(out); pcm_close(&pcm); fclose(w.f); return die("out of memory"); }
 	size_t filled = 0;      // output frames waiting in out
 	size_t out_cap = bufn / 2, flush_at = pcm.period;
 	int rc = 0;
@@ -578,10 +594,10 @@ static int cmd_play(struct target t, const char *path) {
 		for (size_t off = 0; off + w.align <= got && !rc; off += w.align) {
 			float l, rr;
 			wav_frame(&w, in + off, &l, &rr);
-			int16_t tmp[2 * 64];
+			int16_t tmp[2 * CONV_MAX_FRAMES];
 			unsigned n = conv_push(&cv, l, rr, tmp);
 			for (unsigned i = 0; i < n; i++) { out[filled * 2] = tmp[i * 2]; out[filled * 2 + 1] = tmp[i * 2 + 1]; filled++; }
-			if (filled >= flush_at || filled + 64 > out_cap) { rc = pcm_write(&pcm, out, filled); filled = 0; }
+			if (filled >= flush_at || filled + CONV_MAX_FRAMES > out_cap) { rc = pcm_write(&pcm, out, filled); filled = 0; }
 		}
 	}
 	if (!rc && filled) rc = pcm_write(&pcm, out, filled);

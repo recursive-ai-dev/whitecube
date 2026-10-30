@@ -123,6 +123,9 @@ class FolderHandlerTests(Fixture):
     def test_an_installed_default_is_fine(self):
         result = self.handler('[Default Applications]\ninode/directory=thunar.desktop\n', 'thunar.desktop', binary=True)
         self.assertEqual((result['level'], result['detail']), ('ok', 'folders open with thunar.desktop'))
+        (self.root / 'usr/share/applications/thunar.desktop').write_text('[Desktop Entry]\nExec=env GTK_THEME=Adwaita "/usr/bin/thunar" %F\n')
+        result = doctor.check_folder_handler(self.env)[0]
+        self.assertEqual((result['level'], result['detail']), ('ok', 'folders open with thunar.desktop'))
 
 
 class OtherChecks(Fixture):
