@@ -100,8 +100,14 @@ static int cubes_left(int W) { return W - (int)((112 + BAR_POWER_W) * g_accessib
 static int g_base_tab_w, g_base_tab_h;
 static float g_saved_border[4], g_saved_unfocused[4];
 static void parse_hex(const char *s, float c[4]) {
+	if (!s) return;
+	while (isspace((unsigned char)*s)) s++;
+	if (*s == '#') s++;
+	for (unsigned i = 0; i < 6; i++) if (!isxdigit((unsigned char)s[i])) return;
+	const char *rest = s + 6;
+	while (isspace((unsigned char)*rest)) rest++;
+	if (*rest != '\0') return;
 	unsigned r, g, b;
-	while (*s == ' ' || *s == '#') s++;
 	if (sscanf(s, "%02x%02x%02x", &r, &g, &b) == 3) {
 		c[0] = r / 255.f; c[1] = g / 255.f; c[2] = b / 255.f; c[3] = 1.f;
 	}
@@ -163,11 +169,20 @@ static void load_config_file(const char *path) {
 	if (!f) return;
 	char *line = NULL; size_t cap = 0;
 	while (getline(&line, &cap, f) >= 0) {
-		if (line[0] == '#' || line[0] == '\n') continue;
-		char *eq = strchr(line, '=');
+		char *k = line;
+		while (*k == ' ' || *k == '\t') k++;
+		if (*k == '#' || *k == '\n' || *k == '\r' || !*k) continue;
+		char *eq = strchr(k, '=');
 		if (!eq) continue;
-		*eq++ = 0; eq[strcspn(eq, "\r\n")] = 0;
-		config_apply(line, eq, NULL);
+		char *ke = eq;
+		while (ke > k && (ke[-1] == ' ' || ke[-1] == '\t')) ke--;
+		*ke = 0;
+		char *v = eq + 1;
+		while (*v == ' ' || *v == '\t') v++;
+		v[strcspn(v, "\r\n")] = 0;
+		size_t vl = strlen(v);
+		while (vl > 0 && (v[vl - 1] == ' ' || v[vl - 1] == '\t')) v[--vl] = 0;
+		config_apply(k, v, NULL);
 	}
 	free(line); fclose(f);
 }
@@ -205,8 +220,11 @@ static void load_config(void) {
 	}
 	wc_prefs_visit(config_apply, NULL);
 	if (g_tab_w < 60) g_tab_w = 60;
+	if (g_tab_w > 400) g_tab_w = 400;
 	if (g_tab_h < 20) g_tab_h = 20;
+	if (g_tab_h > 80) g_tab_h = 80;
 	if (g_grid < 16) g_grid = 16;
+	if (g_grid > 256) g_grid = 256;
 	if (g_repeat_rate < 0 || g_repeat_rate > 100) g_repeat_rate = 25;
 	if (g_repeat_delay < 100 || g_repeat_delay > 2000) g_repeat_delay = 600;
 }
@@ -507,6 +525,23 @@ static void fullscreen_hint(bool active) {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd >= 0) { char value = active ? '1' : '0'; ssize_t n = write(fd, &value, 1); (void)n; close(fd); }
 }
+static void wc_toplevel_drop_tab(struct wc_toplevel *t) {
+	if (t->tab_label) { wlr_scene_node_destroy(&t->tab_label->node); t->tab_label = NULL; }
+	if (t->tab_cube) { wlr_scene_node_destroy(&t->tab_cube->node); t->tab_cube = NULL; }
+	if (t->tab_border) { wlr_scene_node_destroy(&t->tab_border->node); t->tab_border = NULL; }
+	t->output = NULL; t->label_w = 0; t->label_h = 0; t->label_title[0] = 0;
+}
+static void wc_toplevel_ensure_tab(struct wc_toplevel *t, struct wc_output *out) {
+	if (!t->mapped || !t->scene_tree || !out || !out->tab_tree) return;
+	if (t->output && t->output != out) wc_toplevel_drop_tab(t);
+	if (!t->tab_border) {
+		t->output = out;
+		t->tab_border = wlr_scene_rect_create(out->tab_tree, g_tab_w, g_tab_h - 12, g_border);
+		t->tab_cube = wlr_scene_rect_create(out->tab_tree, g_tab_w - 4, g_tab_h - 16, C_WHITE);
+		t->tab_label = wlr_scene_buffer_create(out->tab_tree, NULL);
+		t->label_w = 0;
+	}
+}
 static void wc_retile(struct wc_server *server) {
 	struct wc_output *out = server_first_output(server);
 	if (!out || !out->wlr_output) return;
@@ -529,8 +564,10 @@ static void wc_retile(struct wc_server *server) {
 	}
 	int idx = 0, n_tabs = 0;
 	struct wc_toplevel *t;
-	wl_list_for_each(t, &server->toplevels, link)
+	wl_list_for_each(t, &server->toplevels, link) {
+		wc_toplevel_ensure_tab(t, out);
 		if (t->tab_border && t->mapped && t->workspace == server->workspace) n_tabs++;
+	}
 	struct wc_bar_layout bar = wc_bar_layout(W, g_accessibility.ui_scale);
 	int vis = wc_tab_visible(n_tabs, wc_tab_capacity(tabs_left(), TAB_GAP, g_tab_w, bar.tabs_end));
 	wl_list_for_each(t, &server->toplevels, link) {
@@ -1635,10 +1672,14 @@ static void output_destroy(struct wl_listener *l, void *data) {
 	wl_list_remove(&o->frame.link); wl_list_remove(&o->request_state.link);
 	wl_list_remove(&o->present.link);
 	wl_list_remove(&o->destroy.link); wl_list_remove(&o->link);
+	struct wc_toplevel *t;
+	wl_list_for_each(t, &s->toplevels, link) if (t->output == o) wc_toplevel_drop_tab(t);
+	if (o->tab_tree) wlr_scene_node_destroy(&o->tab_tree->node);
+	if (o->bg_tree) wlr_scene_node_destroy(&o->bg_tree->node);
 	if (o->lock_bg) wlr_scene_node_destroy(&o->lock_bg->node);
 	free(o);
 	wc_lock_maybe_ack(s);
-	if (!s->shutting_down) output_manager_update(s);
+	if (!s->shutting_down) { output_manager_update(s); wc_retile(s); }
 }
 static void build_bg_grid(struct wc_output *o, int W, int H) {
 	struct wlr_scene_node *n, *tmp;
@@ -1671,6 +1712,10 @@ static struct wc_output_saved saved_output(const char *name) {
 	if (!f) return r;
 	char line[512];
 	while (fgets(line, sizeof(line), f)) {
+		if (!strchr(line, '\n') && !feof(f)) {
+			int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+			continue;
+		}
 		char *save = NULL, *tok = strtok_r(line, " \t\r\n", &save);
 		if (!tok || tok[0] == '#' || strcmp(tok, name)) continue;
 		r.found = true;
@@ -1842,14 +1887,7 @@ static void wc_restore_window(struct wc_toplevel *t) {
 static void t_map(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, map);
 	t->mapped = true;
-	struct wc_output *out = server_first_output(t->server);
-	if (out && !t->tab_border) {
-		t->output = out;
-		t->tab_border = wlr_scene_rect_create(out->tab_tree, g_tab_w, g_tab_h - 12, g_border);
-		t->tab_cube = wlr_scene_rect_create(out->tab_tree, g_tab_w - 4, g_tab_h - 16, C_WHITE);
-		t->tab_label = wlr_scene_buffer_create(out->tab_tree, NULL);
-		t->label_w = 0;
-	}
+	wc_toplevel_ensure_tab(t, server_first_output(t->server));
 	wl_list_remove(&t->link);
 	wl_list_insert(&t->server->toplevels, &t->link);
 	wc_restore_window(t);
@@ -1897,9 +1935,7 @@ static void t_commit(struct wl_listener *l, void *data) {
 }
 static void t_destroy(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, destroy);
-	if (t->tab_label) wlr_scene_node_destroy(&t->tab_label->node);
-	if (t->tab_cube) wlr_scene_node_destroy(&t->tab_cube->node);
-	if (t->tab_border) wlr_scene_node_destroy(&t->tab_border->node);
+	wc_toplevel_drop_tab(t);
 	forget_toplevel(t);
 	bool was_focused = t->server->focused == t;
 	if (was_focused) t->server->focused = NULL;
@@ -2028,7 +2064,13 @@ static void layer_destroy(struct wl_listener *l, void *data) {
 static void layer_commit(struct wl_listener *l, void *data) {
 	struct wc_layer_surface *s = wl_container_of(l, s, commit);
 	if (s->layer_surface->initial_commit || s->layer_surface->current.committed) {
-		int w, h; wlr_output_effective_resolution(s->output->wlr_output, &w, &h);
+		struct wlr_output *wo = s->layer_surface->output;
+		if (!wo) {
+			struct wc_output *out = server_first_output(s->server);
+			if (out) wo = out->wlr_output;
+		}
+		if (!wo) return;
+		int w, h; wlr_output_effective_resolution(wo, &w, &h);
 		struct wlr_box full = {0, 0, w, h}, usable = full;
 		wlr_scene_layer_surface_v1_configure(s->scene, &full, &usable);
 	}

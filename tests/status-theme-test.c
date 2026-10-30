@@ -28,7 +28,9 @@ int main(void) {
 	}
 	char encoded[7] = "112233";
 	assert(!status_theme_color(encoded, NULL) && !strcmp(encoded, "112233"));
-	assert(status_theme_color(encoded, "#ABCDEF") && !strcmp(encoded, "abcdef"));
+	assert(!status_theme_color(encoded, "123") && !strcmp(encoded, "112233"));
+	assert(!status_theme_color(encoded, "11223344") && !strcmp(encoded, "112233"));
+	assert(status_theme_color(encoded, " #ABCDEF \n") && !strcmp(encoded, "abcdef"));
 	puts("status themes: Space, White cube, Graphite and Paper contrast, strong contrast and invalid-color handling passed");
 	return 0;
 }

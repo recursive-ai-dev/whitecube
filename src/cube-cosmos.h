@@ -232,7 +232,7 @@ static void cos_terrain_colour(float h, float shade, uint32_t *out) {
 static void cos_land(struct ca *c, uint32_t *p, double s) {
 	const struct cosmos *cs = &c->cs; if (!cs->hmap) return;
 	enum { N = 64 };
-	static float hh[(N + 1) * (N + 1)];
+	float hh[(N + 1) * (N + 1)];
 	for (int j = 0; j <= N; j++) for (int i = 0; i <= N; i++) {
 		int mx = (i % N) * COS_MAP_W / N, my = (j % N) * COS_MAP_H / N;
 		hh[j * (N + 1) + i] = cs->hmap[my * COS_MAP_W + mx];

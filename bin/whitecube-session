@@ -124,9 +124,13 @@ def audio_setting(env):
     for path in (Path('/etc/whitecube/config'), config):
         try:
             for line in path.read_text(encoding='utf-8').splitlines():
-                key, separator, value = line.partition('=')
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue
+                key, separator, value = stripped.partition('=')
                 if separator and key.strip() == 'audio':
-                    audio = value.strip()
+                    candidate = value.partition('#')[0].strip().lower()
+                    audio = candidate if candidate in ('alsa', 'pipewire') else 'alsa'
         except (OSError, UnicodeError):
             pass
     return audio
@@ -172,11 +176,15 @@ def crash_recovery(log, records):
     print(f'whitecube: {len(records)} failed starts within 60 seconds.', file=sys.stderr)
     print(f'Last session log: {log}', file=sys.stderr)
     try:
-        with os.fdopen(private_file(log, os.O_RDONLY), 'r', encoding='utf-8', errors='replace') as stream:
+        with os.fdopen(private_file(log, os.O_RDONLY), 'rb') as stream:
             # Logs can grow during a long session; read only a bounded tail.
             size = os.fstat(stream.fileno()).st_size
-            stream.seek(max(0, size - 16384))
-            for line in stream.read().splitlines()[-25:]:
+            offset = max(0, size - 16384)
+            stream.seek(offset)
+            lines = stream.read().decode('utf-8', errors='replace').splitlines()
+            if offset > 0 and len(lines) > 1:
+                lines = lines[1:]
+            for line in lines[-25:]:
                 print(line, file=sys.stderr)
     except FileNotFoundError:
         pass

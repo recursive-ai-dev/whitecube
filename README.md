@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.3_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.4_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,33 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.9.4
+
+Version 0.9.4 hardens output hotplug safety, Wayland event-loop responsiveness,
+audio validation, and configuration parsing across 12 reliability and safety
+improvements:
+- **Compositor output hotplug and scene-graph lifecycle (`whitecube-compositor`)**:
+  `output_destroy` now cleans up `o->bg_tree` and `o->tab_tree` scene trees, drops
+  and migrates toplevel tab scene nodes (`t->tab_border`, `t->tab_cube`, `t->tab_label`)
+  when outputs disconnect or change, and resolves `layer_surface->output` safely
+  in `layer_commit`.
+- **Race-free Wayland supervisor loop and non-blocking helper reaping**:
+  `cube-ca`'s multi-output supervisor now uses `wl_display_prepare_read` /
+  `wl_display_read_events` / `wl_display_cancel_read` so queued Wayland events
+  never stall behind timer wakeups, and `cube-settings` replaces the synchronous
+  `usleep(200)` spin in `job_read` with a short event-loop poll timeout while
+  EOF-drained jobs await `waitpid(WNOHANG)` reaping.
+- **Allocation safety, ALSA TLV 64-bit bounds, and strict config validation**:
+  `cube-settings` and `cube-status` guard against `strdup`/`realloc`/`calloc`
+  and `wl_shm_pool_create_buffer` failures; `cube-audio` validates ALSA TLV dB
+  ranges in 64-bit integer arithmetic (`db_scale_range`) and rejects duplicate
+  `fmt ` or zero-frame WAV files; `cube-player` persists transport-bar speed
+  changes and guards against empty-host stream URLs; and `whitecube-compositor`,
+  `cube-status`, `cube-preferences`, and `whitecube-session` enforce consistent
+  key/value trimming, overlong-line draining, `tab_h` clamping (`[20, 80]`), and
+  strict 6-digit hex color parsing.
+See [the release notes](docs/RELEASE-0.9.4.md).
 
 ## Improvements in 0.9.3
 
@@ -109,8 +136,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.3_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.3_amd64.deb
+sha256sum --check whitecube-desktop_0.9.4_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.4_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

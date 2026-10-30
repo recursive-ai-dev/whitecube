@@ -47,11 +47,17 @@ int main(void) {
 	// degenerate control
 	struct volume d = mk(5, 5, false, 0, 0, 0);
 	CHECK(pct_from_raw(&d, 5) == 100 && raw_from_pct(&d, 50) == 5);
+	CHECK(db_scale_range(-6525, 75, 0, 87).ok && db_scale_range(-6525, 75, 0, 87).max == 0);
+	CHECK(!db_scale_range(-6525, 75, 87, 0).ok);
+	CHECK(!db_scale_range(0, 100000, 0, 100000).ok);
 
 	// WAV decoding
 	char err[200];
 	struct wav w;
 	int16_t s16[4] = { 16384, -16384, 32767, -32768 };
+	write_wav("tempty.wav", 1, 2, 48000, 16, s16, 0);
+	CHECK(!wav_open(&w, "tempty.wav", err, sizeof err) && strstr(err, "empty"));
+	remove("tempty.wav");
 	write_wav("t16.wav", 1, 2, 48000, 16, s16, sizeof s16);
 	CHECK(wav_open(&w, "t16.wav", err, sizeof err));
 	CHECK(w.channels == 2 && w.rate == 48000 && w.data_left == 8);

@@ -82,6 +82,10 @@ static void test_numeric_settings(void) {
 	assert(g_repeat_rate == 0 && g_repeat_delay == 100);
 	load_fixture("tab_w= 240 \nrepeat_rate= 35\n");
 	assert(g_tab_w == 240 && g_repeat_rate == 35);
+	load_fixture("  # indented comment\n  tab_w = 210  \n  bg = #102030 \n");
+	assert(g_tab_w == 210 && fabsf(g_bg[0] - 0x10 / 255.0f) < 1e-4f);
+	load_fixture("bg=123\nbg=11223344\n");
+	assert(fabsf(g_bg[0] - 0x10 / 255.0f) < 1e-4f);
 }
 
 static void test_caps_lock_binding(void) {

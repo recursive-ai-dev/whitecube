@@ -1306,7 +1306,10 @@ static void status_update(struct st *s) {
 // Geometry and palette follow the compositor and shared accessibility settings.
 static void status_preference(const char *key, const char *value, void *data) {
 	struct st *s = data;
-	if (!strcmp(key, "tab_h")) s->tab_h = atoi(value);
+	if (!strcmp(key, "tab_h")) {
+		int v = atoi(value);
+		s->tab_h = v < 20 ? 20 : v > 80 ? 80 : v;
+	}
 	else if (!strcmp(key, "bg")) status_theme_color(theme.background, value);
 	else if (!strcmp(key, "tabbar")) status_theme_color(theme.bar, value);
 	else if (!strcmp(key, "privacy_hide_network")) s->privacy_hide_network = !strcmp(value, "1");
@@ -1327,17 +1330,25 @@ static void read_geometry(struct st *s) {
 		if (!f) continue;
 		char line[256];
 		while (fgets(line, sizeof(line), f)) {
-			line[strcspn(line, "\r\n")] = 0;
-			if (!strncmp(line, "bg=", 3)) status_theme_color(theme.background, line + 3);
-			else if (!strcmp(line, "privacy_hide_network=1")) s->privacy_hide_network = true;
-			else if (!strcmp(line, "privacy_hide_network=0")) s->privacy_hide_network = false;
-			else if (!strncmp(line, "clock_format=", 13)) s->clock_12h = !strcmp(line + 13, "12h");
-			else if (!strncmp(line, "clock_seconds=", 14)) s->clock_seconds = !strcmp(line + 14, "1") || !strcmp(line + 14, "true");
-			else if (!strncmp(line, "tabbar=", 7)) status_theme_color(theme.bar, line + 7);
-			else if (!strncmp(line, "tab_h=", 6)) {
+			if (!strchr(line, '\n') && !feof(f)) {
+				int ch; while ((ch = fgetc(f)) != EOF && ch != '\n') {}
+				continue;
+			}
+			char *k = line;
+			while (*k == ' ' || *k == '\t') k++;
+			k[strcspn(k, "\r\n")] = 0;
+			size_t kl = strlen(k);
+			while (kl > 0 && (k[kl - 1] == ' ' || k[kl - 1] == '\t')) k[--kl] = 0;
+			if (!strncmp(k, "bg=", 3)) status_theme_color(theme.background, k + 3);
+			else if (!strcmp(k, "privacy_hide_network=1")) s->privacy_hide_network = true;
+			else if (!strcmp(k, "privacy_hide_network=0")) s->privacy_hide_network = false;
+			else if (!strncmp(k, "clock_format=", 13)) s->clock_12h = !strcmp(k + 13, "12h");
+			else if (!strncmp(k, "clock_seconds=", 14)) s->clock_seconds = !strcmp(k + 14, "1") || !strcmp(k + 14, "true");
+			else if (!strncmp(k, "tabbar=", 7)) status_theme_color(theme.bar, k + 7);
+			else if (!strncmp(k, "tab_h=", 6)) {
 				char *end; errno = 0;
-				long value = strtol(line + 6, &end, 10);
-				if (end == line + 6 || errno) continue;
+				long value = strtol(k + 6, &end, 10);
+				if (end == k + 6 || errno) continue;
 				while (isspace((unsigned char)*end)) end++;
 				if (!*end) s->tab_h = value < 20 ? 20 : value > 80 ? 80 : (int)value;
 			}
@@ -1346,6 +1357,7 @@ static void read_geometry(struct st *s) {
 	}
 	wc_prefs_visit(status_preference, s);
 	if (s->tab_h < 20) s->tab_h = 20;
+	if (s->tab_h > 80) s->tab_h = 80;
 	if (xdg && xdg[0] == '/') snprintf(acc, sizeof(acc), "%s/whitecube/accessibility.json", xdg);
 	else if (home) snprintf(acc, sizeof(acc), "%s/.local/state/whitecube/accessibility.json", home);
 	struct wc_accessibility accessibility = {1, 1, false, false};
@@ -1403,13 +1415,15 @@ static void paint(struct st *s, struct panel *p, void (*fn)(struct st *, cairo_t
 	if (fd < 0 || ftruncate(fd, size) < 0) { if (fd >= 0) close(fd); return; }
 	void *px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (px == MAP_FAILED) { close(fd); return; }
-	struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, size);
 	struct buffer *b = calloc(1, sizeof(*b));
+	if (!b) { munmap(px, size); close(fd); return; }
+	struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, size);
 	b->data = px; b->size = size;
 	b->wl = wl_shm_pool_create_buffer(pool, 0, p->w, p->h, stride, WL_SHM_FORMAT_ARGB8888);
-	wl_buffer_add_listener(b->wl, &buffer_listener, b);
 	wl_shm_pool_destroy(pool);
 	close(fd);
+	if (!b->wl) { munmap(px, size); free(b); return; }
+	wl_buffer_add_listener(b->wl, &buffer_listener, b);
 	cairo_surface_t *cs = cairo_image_surface_create_for_data(px, CAIRO_FORMAT_ARGB32, p->w, p->h, stride);
 	cairo_t *cr = cairo_create(cs);
 	fn(s, cr, p->w, p->h);
@@ -2121,6 +2135,9 @@ static int status_selftest(void) {
 	panel_key(&s, XKB_KEY_ISO_Left_Tab); CHECK(s.focus == HIT_CHAT_OPEN);
 	s.chat_open = false; s.pwr_open = true; s.focus = HIT_PWR_ITEM;
 	panel_key(&s, XKB_KEY_Up); CHECK(s.focus == HIT_PWR_ITEM + PW_OFF);
+	status_preference("tab_h", "999", &s); CHECK(s.tab_h == 80);
+	status_preference("tab_h", "5", &s); CHECK(s.tab_h == 20);
+	status_preference("tab_h", "44", &s); CHECK(s.tab_h == 44);
 	puts("cube-status: network privacy, stale status, keyboard navigation and scaled scrolling passed");
 	return 0;
 #undef CHECK

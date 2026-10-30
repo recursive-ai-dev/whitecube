@@ -34,6 +34,8 @@ int main(void) {
     g_file_set_contents(access,"{\"ui_scale\": 1, \"contrast\": \"normal\"}",-1,NULL);
     theme_reload(&a);g_assert_cmpstr(a.theme.background,==,"142536");
     a.state.theme=1;theme_reload(&a);g_assert_cmpstr(a.theme.background,==,"fbfbfb");
+    act(&a,A_SPEED,0);
+    g_assert_cmpfloat(a.player.speed,==,1.25);g_assert_cmpfloat(a.state.speed,==,1.25);
     char *media=g_build_filename(root,"a ' strange; name.mp4",NULL);g_file_set_contents(media,"test",-1,NULL);
     char *list=g_build_filename(root,"list.m3u",NULL);g_file_set_contents(list,"#EXTM3U\na ' strange; name.mp4\n",-1,NULL);
     g_assert_cmpint(add_media(&a,list,0),==,1);g_assert_cmpstr(((Media *)g_ptr_array_index(a.queue,0))->path,==,media);

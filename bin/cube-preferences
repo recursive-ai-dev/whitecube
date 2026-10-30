@@ -86,10 +86,11 @@ def validate_keyboard(settings, values):
     config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'whitecube/config'
     for path in (Path('/etc/whitecube/config'), config):
         if path.is_file():
-            for line in path.read_text().splitlines():
-                if '=' in line and not line.startswith('#'):
-                    key, value = line.split('=', 1)
-                    inherited[key.replace('_', '-')] = value
+            for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+                stripped = line.strip()
+                if '=' in stripped and not stripped.startswith('#'):
+                    key, value = stripped.split('=', 1)
+                    inherited[key.strip().replace('_', '-')] = value.strip()
     names = []
     for key in ('xkb-model', 'xkb-layout', 'xkb-variant', 'xkb-options'):
         value = values[key] if key in values else settings.get_user_value(key)
@@ -259,38 +260,40 @@ def main():
                 if time.monotonic() >= deadline:
                     raise ValueError('Another Whitecube settings write is still running')
                 time.sleep(.02)
-    if args.command == 'import':
-        write_many(spec, pairs)
-    elif args.command == 'set-many':
-        if args.args:
-            parser.error('set-many takes values on stdin')
-        data = sys.stdin.read(16385)
-        if len(data) > 16384:
-            raise ValueError('Settings input is too large')
-        lines = [line.split('\t', 1) for line in data.splitlines()]
-        if any(len(line) != 2 for line in lines):
-            raise ValueError('Expected key, tab, value on each line')
-        write_many(spec, lines)
-    elif args.command == 'set':
-        if len(args.args) != 2:
-            parser.error('set requires KEY VALUE')
-        write_many(spec, [args.args])
-    elif args.command == 'reset':
-        if len(args.args) != 1:
-            parser.error('reset requires KEY')
-        key = args.args[0].replace('_', '-')
-        if not spec.has_key(key):
-            raise ValueError('Unknown Whitecube setting')
-        dconf('reset', PREFIX + key)
-        if dconf('read', PREFIX + key):
-            raise ValueError('Reset could not be verified')
-    else:
-        settings = Gio.Settings.new_full(spec, None, None)
-        for key in sorted(spec.list_keys()):
-            val = settings.get_user_value(key)
-            print(key, val.print_(False) if val else '(inherited)', sep='\t')
-    if lock is not None:
-        os.close(lock)
+    try:
+        if args.command == 'import':
+            write_many(spec, pairs)
+        elif args.command == 'set-many':
+            if args.args:
+                parser.error('set-many takes values on stdin')
+            data = sys.stdin.read(16385)
+            if len(data) > 16384:
+                raise ValueError('Settings input is too large')
+            lines = [line.split('\t', 1) for line in data.splitlines()]
+            if any(len(line) != 2 for line in lines):
+                raise ValueError('Expected key, tab, value on each line')
+            write_many(spec, lines)
+        elif args.command == 'set':
+            if len(args.args) != 2:
+                parser.error('set requires KEY VALUE')
+            write_many(spec, [args.args])
+        elif args.command == 'reset':
+            if len(args.args) != 1:
+                parser.error('reset requires KEY')
+            key = args.args[0].replace('_', '-')
+            if not spec.has_key(key):
+                raise ValueError('Unknown Whitecube setting')
+            dconf('reset', PREFIX + key)
+            if dconf('read', PREFIX + key):
+                raise ValueError('Reset could not be verified')
+        else:
+            settings = Gio.Settings.new_full(spec, None, None)
+            for key in sorted(spec.list_keys()):
+                val = settings.get_user_value(key)
+                print(key, val.print_(False) if val else '(inherited)', sep='\t')
+    finally:
+        if lock is not None:
+            os.close(lock)
 
 
 if __name__ == '__main__':

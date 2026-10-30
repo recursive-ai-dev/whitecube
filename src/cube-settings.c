@@ -77,12 +77,18 @@ static struct table tables[T_COUNT];
 static void table_set(struct table *t, const char *out) {
 	free(t->data); free(t->rows);
 	t->data = strdup(out ? out : ""); t->rows = NULL; t->n = 0;
+	if (!t->data) return;
 	int cap = 0;
 	for (char *line = t->data, *next; line && *line; line = next) {
 		next = strchr(line, '\n');
 		if (next) *next++ = 0;
 		if (!*line) continue;
-		if (t->n == cap) { cap = cap ? cap * 2 : 64; t->rows = realloc(t->rows, cap * sizeof(*t->rows)); }
+		if (t->n == cap) {
+			int ncap = cap ? cap * 2 : 64;
+			struct row *nr = realloc(t->rows, (size_t)ncap * sizeof(*t->rows));
+			if (!nr) break;
+			t->rows = nr; cap = ncap;
+		}
 		struct row *r = &t->rows[t->n++];
 		r->n = 0;
 		for (char *f = line, *tab; f && r->n < MAXF; f = tab) {
@@ -394,10 +400,7 @@ static void job_read(struct job *j) {
 		if (j->err >= 0) { close(j->err); j->err = -1; }
 	}
 	if (j->out < 0 && j->err < 0) {
-		for (int spin = 0; !j->reaped && spin < 10; spin++) {
-			job_reap(j);
-			if (!j->reaped) usleep(200);
-		}
+		job_reap(j);
 		if (j->reaped) job_finish(j, j->status);
 	}
 }
@@ -2349,6 +2352,7 @@ static int page_from_name(const char *n) {
 	for (int i = 0; i < PG_COUNT; i++) if (!strcasecmp(n, page_keys[i])) return i;
 	return -1;
 }
+static bool any_job(void) { for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) return true; return false; }
 static void pump_jobs(int timeout_ms) {
 	struct pollfd fds[MAXJOBS * 2]; struct job *owner[MAXJOBS * 2]; int n = 0;
 	for (int i = 0; i < MAXJOBS; i++) {
@@ -2356,11 +2360,13 @@ static void pump_jobs(int timeout_ms) {
 		if (jobs[i].out >= 0) { fds[n] = (struct pollfd){jobs[i].out, POLLIN, 0}; owner[n++] = &jobs[i]; }
 		if (jobs[i].err >= 0) { fds[n] = (struct pollfd){jobs[i].err, POLLIN, 0}; owner[n++] = &jobs[i]; }
 	}
-	if (n && poll(fds, n, timeout_ms) > 0)
+	if (n && poll(fds, n, timeout_ms) > 0) {
 		for (int i = 0; i < n; i++) if (fds[i].revents && owner[i]->used) job_read(owner[i]);
+	} else if (!n && any_job() && timeout_ms > 0) {
+		poll(NULL, 0, timeout_ms < 5 ? timeout_ms : 5);
+	}
 	for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) job_read(&jobs[i]);
 }
-static bool any_job(void) { for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) return true; return false; }
 
 // Draw one page to a PNG without a window: lets layouts be checked headless.
 static int render_png(int page, const char *path, int W, int H) {
@@ -2460,12 +2466,14 @@ int main(int argc, char **argv) {
 		fds[n++] = (struct pollfd){wl_display_get_fd(g.display), POLLIN, 0};
 		fds[n++] = (struct pollfd){tick_fd, POLLIN, 0};
 		fds[n++] = (struct pollfd){g.repeat_fd, POLLIN, 0};
+		int poll_ms = -1;
 		for (int i = 0; i < MAXJOBS; i++) {
 			if (!jobs[i].used) continue;
 			if (jobs[i].out >= 0) { fds[n] = (struct pollfd){jobs[i].out, POLLIN, 0}; owner[n++] = &jobs[i]; }
 			if (jobs[i].err >= 0) { fds[n] = (struct pollfd){jobs[i].err, POLLIN, 0}; owner[n++] = &jobs[i]; }
+			if (jobs[i].out < 0 && jobs[i].err < 0 && !jobs[i].reaped) poll_ms = 10;
 		}
-		if (poll(fds, n, -1) < 0 && errno != EINTR) { wl_display_cancel_read(g.display); break; }
+		if (poll(fds, n, poll_ms) < 0 && errno != EINTR) { wl_display_cancel_read(g.display); break; }
 		if (fds[0].revents & POLLIN) wl_display_read_events(g.display);
 		else wl_display_cancel_read(g.display);
 		if (fds[0].revents & (POLLERR | POLLHUP)) break;

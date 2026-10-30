@@ -120,6 +120,27 @@ class PreferenceValidation(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Duplicate setting'):
             api['write_many'](self.spec, [('tab-w', '180'), ('tab_w', '200')])
 
+    def test_session_audio_and_crash_log_tail_handling(self):
+        session_api = {}
+        source = (ROOT / 'bin' / 'whitecube-session').read_text()
+        exec(compile(source.split('\nif __name__')[0], 'whitecube-session', 'exec'), session_api)
+        with tempfile.TemporaryDirectory() as directory:
+            cfg_dir = Path(directory) / 'whitecube'
+            cfg_dir.mkdir(mode=0o700)
+            cfg = cfg_dir / 'config'
+            cfg.write_text('  # comment\n  audio = PipeWire # inline\n')
+            self.assertEqual(session_api['audio_setting']({'XDG_CONFIG_HOME': directory}), 'pipewire')
+            cfg.write_text('audio=invalid\n')
+            self.assertEqual(session_api['audio_setting']({'XDG_CONFIG_HOME': directory}), 'alsa')
+            log = cfg_dir / 'session.log'
+            log.write_bytes(b'x' * 20000 + b'\ncomplete-tail-line\n')
+            log.chmod(0o600)
+            err = io.StringIO()
+            with mock.patch.object(session_api['sys'], 'stderr', err):
+                session_api['crash_recovery'](log, [1, 2, 3])
+            self.assertIn('complete-tail-line', err.getvalue())
+            self.assertNotIn('xxxx', err.getvalue())
+
     @unittest.skipUnless(Path('/usr/bin/dconf').exists() and Path('/usr/bin/dbus-run-session').exists(),
                          'requires the packaged dconf writer dependencies')
     def test_real_profile_import_roundtrip_and_failed_import_leave_database_intact(self):

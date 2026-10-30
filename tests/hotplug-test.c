@@ -202,16 +202,28 @@ static void test_cycles(struct wc_server *s) {
 		else { wlr_output_destroy(b); wlr_output_destroy(a); }
 		spin(s, 10);
 		assert(count_outputs(s) == 0 && layout_outputs(s) == 0);
+		assert(wl_list_empty(&s->background->children) && wl_list_empty(&s->top->children));
 	}
 }
 
 static void test_unplug_while_dragging_and_retiling(struct wc_server *s) {
 	struct wlr_output *a = plug(s, 1280, 720), *b = plug(s, 1280, 720);
+	(void)a; (void)b;
+	struct wc_output *oa = server_first_output(s);
+	struct wlr_xdg_toplevel xdg = {.title = "Window", .app_id = "app"};
+	struct wc_toplevel win = {.server = s, .xdg_toplevel = &xdg, .mapped = true, .saved_index = -1};
+	win.scene_tree = wlr_scene_tree_create(s->windows);
+	wl_list_insert(&s->toplevels, &win.link);
 	wc_retile(s);
-	wlr_output_destroy(b); spin(s, 20);
-	wc_retile(s);                                  /* retiling after a removal must not touch the freed output */
-	wlr_output_destroy(a); spin(s, 20);
-	wc_retile(s);
+	assert(win.output == oa && win.tab_border && win.tab_cube && win.tab_label);
+	wlr_output_destroy(oa->wlr_output); spin(s, 20);
+	struct wc_output *ob = server_first_output(s);
+	assert(ob && ob != oa && win.output == ob && win.tab_border && win.tab_cube && win.tab_label);
+	wlr_output_destroy(ob->wlr_output); spin(s, 20);
+	wc_retile(s);                                  /* retiling after removal must not touch freed output */
+	assert(!win.output && !win.tab_border && !win.tab_cube && !win.tab_label);
+	wl_list_remove(&win.link);
+	wlr_scene_node_destroy(&win.scene_tree->node);
 	assert(count_outputs(s) == 0);
 }
 

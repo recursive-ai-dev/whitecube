@@ -829,12 +829,25 @@ static int supervisor_main(struct ca *c) {
 	supervise(c);
 	struct pollfd fds[2] = { { .fd = wl_display_get_fd(c->dpy), .events = POLLIN }, { .fd = sigfd, .events = POLLIN } };
 	for (;;) {
-		if (wl_display_dispatch_pending(c->dpy) < 0 || wl_display_flush(c->dpy) < 0) break;
-		if (poll(fds, 2, -1) < 0) { if (errno == EINTR) continue; break; }
+		while (wl_display_prepare_read(c->dpy) != 0)
+			if (wl_display_dispatch_pending(c->dpy) < 0) goto done;
+		if (wl_display_flush(c->dpy) < 0 && errno != EAGAIN) {
+			wl_display_cancel_read(c->dpy);
+			break;
+		}
+		if (poll(fds, 2, -1) < 0) {
+			wl_display_cancel_read(c->dpy);
+			if (errno == EINTR) continue;
+			break;
+		}
+		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+			if (wl_display_read_events(c->dpy) < 0) break;
+		} else wl_display_cancel_read(c->dpy);
+		if (wl_display_dispatch_pending(c->dpy) < 0) break;
 		if (fds[1].revents & POLLIN) reap(c, sigfd);
 		if (fds[0].revents & (POLLHUP | POLLERR)) break;
-		if ((fds[0].revents & POLLIN) && wl_display_dispatch(c->dpy) < 0) break;
 	}
+done:
 	for (int i = 0; i < c->nouts; i++) if (c->outs[i].pid > 0) kill(c->outs[i].pid, SIGTERM);
 	for (int spin = 0; spin < 25; spin++) {
 		int status;
@@ -849,18 +862,18 @@ static int supervisor_main(struct ca *c) {
 	return 0;
 }
 
+static void cosmos_offscreen_free(struct ca *c) { cos_free(c); free(c->b[0].px); free(c->stars); free(c->grid); free(c->next); free(c->age); free(c->state); }
 // Offscreen cosmos surface for tests and previews: a warmed-up field, star background, no Wayland.
 static bool cosmos_offscreen(struct ca *c, int w, int h, unsigned seed, int warm) {
 	memset(c, 0, sizeof(*c));
 	c->W = w; c->H = h; c->seed = seed; c->slice = -1; c->configured = true; c->cs.speed = 1; c->last_bi = -1;
-	if (!sim_alloc(c) || !make_stars(c)) return false;
-	c->b[0].px = malloc((size_t)w * h * 4); if (!c->b[0].px) return false;
+	if (!sim_alloc(c) || !make_stars(c)) { cosmos_offscreen_free(c); return false; }
+	c->b[0].px = malloc((size_t)w * h * 4); if (!c->b[0].px) { cosmos_offscreen_free(c); return false; }
 	reseed(c); c->cs.on = true; c->cs.auto_zoom = true; c->cs.dir = 1; c->cs.seed = seed;
 	for (int i = 0; i < warm; i++) { sim_step(c); cosmos_observe(c); }
 	cosmos_rebuild(c);
 	return true;
 }
-static void cosmos_offscreen_free(struct ca *c) { cos_free(c); free(c->b[0].px); free(c->stars); free(c->grid); free(c->next); free(c->age); free(c->state); }
 static size_t lit_pixels(const uint32_t *px, size_t n) { size_t k = 0; for (size_t i = 0; i < n; i++) if ((px[i] & 0xFFFFFF) > 0x202830) k++; return k; }
 static int cosmos_self_test(void) {
 	// Crossfade weights must always sum to one so brightness never dips mid-transition.
@@ -926,9 +939,9 @@ static int preview_zoom(const char *path, double zoom) {
 		uint64_t t0 = now_ms(); for (int i = 0; i < 20; i++) { c.cs.t += .05; memcpy(c.b[0].px, c.stars, (size_t)c.W * c.H * 4); render_cosmos(&c, c.b[0].px); }
 		fprintf(stderr, "zoom %.2f: %.1f ms/frame\n", zoom, (now_ms() - t0) / 20.0);
 	}
-	FILE *f = fopen(path, "wb"); if (!f) { perror(path); return 1; }
+	FILE *f = fopen(path, "wb"); if (!f) { perror(path); cosmos_offscreen_free(&c); return 1; }
 	fprintf(f, "P6\n%d %d\n255\n", c.W, c.H);
-	for (int i = 0; i < c.W * c.H; i++) { uint32_t v = ((uint32_t *)c.b[0].px)[i]; unsigned char rgb[3] = {v >> 16, v >> 8, v}; if (fwrite(rgb, 1, 3, f) != 3) { fclose(f); return 1; } }
+	for (int i = 0; i < c.W * c.H; i++) { uint32_t v = ((uint32_t *)c.b[0].px)[i]; unsigned char rgb[3] = {v >> 16, v >> 8, v}; if (fwrite(rgb, 1, 3, f) != 3) { fclose(f); cosmos_offscreen_free(&c); return 1; } }
 	int rc = fclose(f); cosmos_offscreen_free(&c); return rc != 0;
 }
 // Incremental frames must match a full repaint pixel for pixel, and the damage must cover every change.
@@ -1018,22 +1031,22 @@ static int self_test(void) {
 }
 static int preview(const char *path, bool volume) {
 	struct ca c = {.W=1440, .H=900, .seed=0x1234567, .volume=volume, .slice=-1, .yaw=.65};
-	if (!sim_alloc(&c) || !make_stars(&c)) return 1;
+	if (!sim_alloc(&c) || !make_stars(&c)) { cosmos_offscreen_free(&c); return 1; }
 	reseed(&c);
 	for (int i = 0; i < 18; i++) sim_step(&c);
 	c.b[0].px = malloc((size_t)c.W*c.H*4);
-	if (!c.b[0].px) return 1;
+	if (!c.b[0].px) { cosmos_offscreen_free(&c); return 1; }
 	render(&c, 0);
 	FILE *f = fopen(path, "wb");
-	if (!f) { perror(path); return 1; }
+	if (!f) { perror(path); cosmos_offscreen_free(&c); return 1; }
 	fprintf(f, "P6\n%d %d\n255\n", c.W, c.H);
 	for (int i = 0; i < c.W*c.H; i++) {
 		uint32_t v = ((uint32_t *)c.b[0].px)[i];
 		unsigned char rgb[3] = {v>>16, v>>8, v};
-		if (fwrite(rgb, 1, 3, f) != 3) { fclose(f); return 1; }
+		if (fwrite(rgb, 1, 3, f) != 3) { fclose(f); cosmos_offscreen_free(&c); return 1; }
 	}
 	int rc = fclose(f);
-	free(c.b[0].px); free(c.stars); free(c.grid); free(c.next); free(c.age);
+	cosmos_offscreen_free(&c);
 	return rc != 0;
 }
 int main(int argc, char **argv) {

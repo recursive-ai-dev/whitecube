@@ -108,6 +108,8 @@ int main(void) {
     path=media_path("javascript:alert(1)",&error);g_assert_null(path);g_assert_nonnull(error);g_clear_error(&error);
     path=media_path("/this-file-does-not-exist.mp4",&error);g_assert_null(path);g_assert_nonnull(error);g_clear_error(&error);
     char *title=media_title("https://example.com/film%20one.mp4?secret=not-a-title");g_assert_cmpstr(title,==,"film one.mp4");g_free(title);
+    title=media_title("http:///");g_assert_cmpstr(title,==,"Media stream");g_free(title);
+    title=media_title("https://example.com/");g_assert_cmpstr(title,==,"example.com");g_free(title);
     g_assert_true(media_supported("movie.MKV"));g_assert_false(media_supported("movie.txt"));g_assert_true(media_subtitle("sample.SRT"));
     state_remember(&s,file,42.5,120);g_assert_cmpfloat(state_position(&s,file),==,42.5);s.volume=38;s.speed=1.25;s.theme=2;
     g_assert_true(state_save(&s));struct stat st;g_assert_cmpint(stat(s.history_path,&st),==,0);g_assert_cmpint(st.st_mode & 0777,==,0600);

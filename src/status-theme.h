@@ -14,9 +14,12 @@ struct status_theme {
 };
 static inline bool status_theme_color(char out[7], const char *value) {
 	if (!value) return false;
+	while (isspace((unsigned char)*value)) value++;
 	if (*value == '#') value++;
-	if (strlen(value) != 6) return false;
 	for (unsigned i = 0; i < 6; i++) if (!isxdigit((unsigned char)value[i])) return false;
+	const char *rest = value + 6;
+	while (isspace((unsigned char)*rest)) rest++;
+	if (*rest != '\0') return false;
 	for (unsigned i = 0; i < 6; i++) out[i] = (char)tolower((unsigned char)value[i]);
 	out[6] = '\0';
 	return true;

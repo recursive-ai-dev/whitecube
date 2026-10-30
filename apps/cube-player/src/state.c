@@ -136,10 +136,11 @@ char *media_title(const char *path) {
     if (strstr(path, "://")) {
         GUri *u = g_uri_parse(path, G_URI_FLAGS_PARSE_RELAXED, NULL);
         const char *p = u ? g_uri_get_path(u) : NULL;
-        char *name = p && strlen(p) > 1 ? g_path_get_basename(p) : g_strdup(u ? g_uri_get_host(u) : "Media stream");
-        char *decoded = g_uri_unescape_string(name, NULL);
+        const char *h = u ? g_uri_get_host(u) : NULL;
+        char *name = p && strlen(p) > 1 ? g_path_get_basename(p) : g_strdup(h && *h ? h : "Media stream");
+        char *decoded = name ? g_uri_unescape_string(name, NULL) : NULL;
         g_free(name); if (u) g_uri_unref(u);
-        if (decoded && g_utf8_validate(decoded, -1, NULL)) return decoded;
+        if (decoded && *decoded && g_utf8_validate(decoded, -1, NULL)) return decoded;
         g_free(decoded); return g_strdup("Media stream");
     }
     return g_filename_display_basename(path);

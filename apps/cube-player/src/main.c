@@ -582,7 +582,10 @@ static void act(App *a,int action,int value) {
     case A_SIDEBAR:a->state.sidebar=!a->state.sidebar;break;
     case A_SHUFFLE:a->state.shuffle=!a->state.shuffle;toast(a,a->state.shuffle?"Shuffle on.":"Shuffle off.");break;
     case A_REPEAT:a->state.repeat=(a->state.repeat+1)%3;toast(a,a->state.repeat==0?"Repeat off.":a->state.repeat==1?"Repeat queue.":"Repeat current item.");break;
-    case A_SPEED:player_number(p,"speed",p->speed>=2?1:p->speed+.25);break;
+    case A_SPEED: {
+        double v=p->speed>=2?1:CLAMP(round((p->speed+.25)*4)/4,.25,3);
+        player_number(p,"speed",v);p->speed=v;a->state.speed=v;break;
+    }
     case A_SLOWER:speed(a,-.25);break;
     case A_FASTER:speed(a,.25);break;
     case A_TRACKS:show_panel(a,a->panel==TRACKS?NONE:TRACKS);break;
@@ -852,13 +855,13 @@ int main(int argc,char **argv) {
     App a={.current=-1,.selected=-1,.focus=-1,.scale=1,.ui_scale=1,.capture=capture,.report=report_path,.quit_after=quit_after,.software=software,.silent=silent};
     a.started=a.last_pointer=a.last_save=clock_now();
     state_init(&a.state);a.queue=g_ptr_array_new_with_free_func(media_free);a.entries=g_ptr_array_new_with_free_func(entry_free);
+    int result=0;
     if(theme) {
         if(!strcmp(theme,"whitecube")) a.state.theme=0;else if(!strcmp(theme,"light")) a.state.theme=1;else if(!strcmp(theme,"dark")) a.state.theme=2;
-        else {g_printerr("Unknown theme. Use whitecube, light, or dark.\n");return 2;}
+        else {g_printerr("Unknown theme. Use whitecube, light, or dark.\n");result=2;goto cleanup;}
     }
     theme_reload(&a);
     signal(SIGINT,interrupted);signal(SIGTERM,interrupted);signal(SIGPIPE,SIG_IGN);
-    int result=0;
     if(!player_init(&a.player,silent)) {g_printerr("Cube Player: could not initialize mpv: %s\n",a.player.error);result=1;goto cleanup;}
     if(preview) {
         cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1120,740);cairo_t *cr=cairo_create(surface);

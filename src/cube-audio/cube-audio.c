@@ -138,6 +138,17 @@ static int elem_write_all(const struct mixer *m, const struct ctl_elem *e, long 
 // The dB description of a volume control, if the driver publishes one (TLV).
 struct db_range { bool ok; int min, max, step; };   // centi-dB; step 0 = interpolate raw
 
+static struct db_range db_scale_range(int min_db, int step_db, long raw_min, long raw_max) {
+	struct db_range d = {0};
+	if (step_db <= 0 || raw_max <= raw_min) return d;
+	int64_t span = (int64_t)raw_max - (int64_t)raw_min;
+	if (span > 1000000) return d;
+	int64_t max_db = (int64_t)min_db + (int64_t)step_db * span;
+	if (max_db < -1000000 || max_db > 1000000 || max_db <= min_db) return d;
+	d.min = min_db; d.step = step_db; d.max = (int)max_db; d.ok = true;
+	return d;
+}
+
 static struct db_range elem_db(const struct mixer *m, const struct ctl_elem *e) {
 	struct db_range d = {0};
 	if (!(e->access & SNDRV_CTL_ELEM_ACCESS_TLV_READ)) return d;
@@ -148,13 +159,11 @@ static struct db_range elem_db(const struct mixer *m, const struct ctl_elem *e) 
 	if (ioctl(m->fd, SNDRV_CTL_IOCTL_TLV_READ, t) < 0 || t->length < 16) return d;
 	unsigned type = t->tlv[0];
 	if (type == SNDRV_CTL_TLVT_DB_SCALE) {
-		d.min = (int)t->tlv[2]; d.step = (int)(t->tlv[3] & 0xffff);
-		d.max = d.min + d.step * (int)(e->max - e->min);
-		d.ok = d.step > 0;
+		d = db_scale_range((int)t->tlv[2], (int)(t->tlv[3] & 0xffff), e->min, e->max);
 	} else if (type == SNDRV_CTL_TLVT_DB_MINMAX || type == SNDRV_CTL_TLVT_DB_MINMAX_MUTE ||
 	           type == SNDRV_CTL_TLVT_DB_LINEAR) {
 		d.min = (int)t->tlv[2]; d.max = (int)t->tlv[3];
-		d.ok = d.max > d.min;
+		d.ok = d.max > d.min && d.min >= -1000000 && d.max <= 1000000;
 	}
 	return d;
 }
@@ -479,11 +488,11 @@ static bool wav_open(struct wav *w, const char *path, char *err, size_t errn) {
 		uint32_t len = le32(ck + 4);
 		if (!memcmp(ck, "fmt ", 4)) {
 			uint8_t f[40];
-			if (len < 16 || len > sizeof f || fread(f, 1, len, w->f) != len) { snprintf(err, errn, "%s: bad fmt chunk", path); goto bad; }
+			if (have_fmt || len < 16 || len > sizeof f || fread(f, 1, len, w->f) != len) { snprintf(err, errn, "%s: bad fmt chunk", path); goto bad; }
 			w->fmt = le16(f); w->channels = le16(f + 2); w->rate = le32(f + 4); w->align = le16(f + 12); w->bits = le16(f + 14);
 			if (w->fmt == 0xFFFE && len >= 26) w->fmt = le16(f + 24);     // WAVE_FORMAT_EXTENSIBLE sub-format
 			have_fmt = true;
-			if (len & 1) fgetc(w->f);
+			if ((len & 1) && fgetc(w->f) == EOF) { snprintf(err, errn, "%s: truncated", path); goto bad; }
 		} else if (!memcmp(ck, "data", 4)) {
 			if (!have_fmt) { snprintf(err, errn, "%s: data before fmt", path); goto bad; }
 			w->data_left = len;
@@ -502,6 +511,9 @@ static bool wav_open(struct wav *w, const char *path, char *err, size_t errn) {
 	if (!pcm_ok && !flt_ok) { snprintf(err, errn, "%s: unsupported format %u/%u-bit (need PCM 8/16/24/32 or float32)", path, w->fmt, w->bits); goto bad; }
 	if (w->channels < 1 || w->channels > 8 || w->rate < 4000 || w->rate > 384000 || w->align != w->channels * (w->bits / 8)) {
 		snprintf(err, errn, "%s: unsupported layout (%u ch, %u Hz)", path, w->channels, w->rate); goto bad;
+	}
+	if (w->data_left < w->align) {
+		snprintf(err, errn, "%s: empty audio data", path); goto bad;
 	}
 	return true;
 bad:
