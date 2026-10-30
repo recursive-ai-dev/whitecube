@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.2_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.3_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,18 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.9.3
+
+Version 0.9.3 hardens the native compositor, settings UI, status bar, wallpaper
+supervisor, audio layer, and desktop utilities across 16 reliability and safety
+improvements: non-blocking helper reaping and output bounds in `cube-settings`,
+effective logical resolution on initial window commits for scaled/rotated HiDPI
+outputs, bounded resampler frames and 64-bit WAV chunk validation in `cube-audio`,
+wallpaper child cleanup on monitor unplug in `cube-ca`, strict token/line bounds
+in `desktop-state.h`, and hardened Desktop Entry / CLI / sysfs parsing across
+`cube-status`, `whitecube-doctor`, `whitecube-terminal`, and `cube-settings-helper`.
+See [the release notes](docs/RELEASE-0.9.3.md).
 
 ## Improvements in 0.9.2
 
@@ -97,8 +109,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.2_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.2_amd64.deb
+sha256sum --check whitecube-desktop_0.9.3_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.3_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.
