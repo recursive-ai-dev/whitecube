@@ -4,6 +4,10 @@
 #include <cairo.h>
 #include <stddef.h>
 
+/* UI scale (0.5–3) multiplies page zoom (0.5–3) before layout. */
+#define CB_MIN_EFFECTIVE_ZOOM 0.25
+#define CB_MAX_EFFECTIVE_ZOOM 9.0
+
 struct cb_page;
 
 enum cb_resource_kind { CB_RESOURCE_CSS = 1, CB_RESOURCE_IMAGE = 2, CB_RESOURCE_SCRIPT = 3 };

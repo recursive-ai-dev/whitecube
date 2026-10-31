@@ -184,6 +184,22 @@ def get_text(sock):
 
 
 class Workers(unittest.TestCase):
+    def test_combined_interface_scale_and_page_zoom_reaches_nine(self):
+        html = ('<body style="margin:0"><div style="width:10px;height:10px;'
+                'background:#2f8bba"></div></body>')
+        with worker() as (_, sock):
+            load(sock, html)
+            for zoom, expected in [(1, (0, 0, 9, 9)), (9, (0, 0, 89, 89)),
+                                   (1, (0, 0, 9, 9))]:
+                with self.subTest(zoom=zoom):
+                    pixels, _ = layout_pixels(sock, width=400, height=200, zoom=zoom)
+                    self.assertEqual(color_bounds(pixels, 400, [0x2f8bba])[0x2f8bba], expected,
+                                     '3x interface scale and 3x page zoom must produce 9x geometry')
+            for invalid_zoom in ('nan', 'inf', 10, 0):
+                with self.subTest(invalid_zoom=invalid_zoom):
+                    pixels, _ = layout_pixels(sock, width=400, height=200, zoom=invalid_zoom)
+                    self.assertEqual(color_bounds(pixels, 400, [0x2f8bba])[0x2f8bba], (0, 0, 9, 9))
+
     def test_media_width_changes_on_resize_and_zoom_in_css_pixels(self):
         html = ('<style>body{margin:0}.probe{min-height:100px;background:#123456}'
                 '@media (max-width:500px){.probe{background:#41825c}}'

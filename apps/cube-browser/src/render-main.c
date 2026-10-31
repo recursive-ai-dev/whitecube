@@ -25,7 +25,7 @@ static int frame(int socket,struct cb_page *page,const struct cb_message *reques
     int w=(int)request->a,h=(int)request->b;double scroll=request->c;
     char *end=NULL;double zoom=strtod(request->text,&end);
     /* Page zoom and interface scale are multiplied by the UI. */
-    if(!isfinite(zoom)||zoom<.25||zoom>6)zoom=1;
+    if(!isfinite(zoom)||zoom<CB_MIN_EFFECTIVE_ZOOM||zoom>CB_MAX_EFFECTIVE_ZOOM)zoom=1;
     unsigned flags=0;
     if(end&&*end=='\n'){
         if(end[1]<'0'||end[1]>'3'||end[2])return -1;

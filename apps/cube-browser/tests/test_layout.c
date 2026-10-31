@@ -17,6 +17,18 @@ static unsigned pixel(struct cb_page *p,int x,int y) {
     unsigned value=*(uint32_t *)(cairo_image_surface_get_data(surface)+y*cairo_image_surface_get_stride(surface)+x*4)&0xffffff;
     cairo_surface_destroy(surface);return value;
 }
+static void effective_zoom_limits(void) {
+    struct cb_page *p=page("<body style='margin:0'><div id=probe style='width:10px;height:10px;background:#2f8bba'></div></body>");
+    near(id(p->root,"probe")->w,10);near(id(p->root,"probe")->h,10);
+    cb_page_layout(p,640,9);
+    near(id(p->root,"probe")->w,90);near(id(p->root,"probe")->h,90);
+    assert(pixel(p,80,80)==0x2f8bba);assert(pixel(p,95,80)==0xffffff);
+    cb_page_layout(p,640,100);near(p->zoom,9);near(id(p->root,"probe")->w,90);
+    cb_page_layout(p,640,0);near(p->zoom,.25);near(id(p->root,"probe")->w,2.5);
+    cb_page_layout(p,640,NAN);near(p->zoom,1);near(id(p->root,"probe")->w,10);
+    cb_page_layout(p,640,INFINITY);near(p->zoom,1);near(id(p->root,"probe")->w,10);
+    cb_page_free(p);
+}
 static void variables_and_selectors(void) {
     struct cb_page *p=page("<html><style>:root{--a:var(--b);--b:#2468ac;--Case:40px}"
         "body{margin:0}.box{height:var(--Case);background:var(--a)}"
@@ -78,4 +90,4 @@ static void clipping_and_recovery(void) {
     assert(id(p->root,"d")->parent==id(p->root,"p")->parent);
     assert(id(p->root,"a")->parent==id(p->root,"b")->parent);cb_page_free(p);
 }
-int main(void){variables_and_selectors();flexible_rows();grid_and_position();clipping_and_recovery();puts("layout compatibility passed");}
+int main(void){effective_zoom_limits();variables_and_selectors();flexible_rows();grid_and_position();clipping_and_recovery();puts("layout compatibility passed");}

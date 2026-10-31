@@ -551,7 +551,7 @@ static void apply_clips(struct cb_page *p){
 void cb_page_layout(struct cb_page *p, int width, double zoom) {
     if(!p)return;
     cb_engine_clear_layout(p);cb_engine_clear_geometry(p->root);
-    p->width=CLAMP(width,1,32767);p->zoom=isfinite(zoom)?CLAMP(zoom,0.25,6):1;
+    p->width=CLAMP(width,1,32767);p->zoom=isfinite(zoom)?CLAMP(zoom,CB_MIN_EFFECTIVE_ZOOM,CB_MAX_EFFECTIVE_ZOOM):1;
     if(!p->context) {
         PangoFontMap *fontmap=pango_cairo_font_map_get_default();
         p->context=pango_font_map_create_context(fontmap);
