@@ -65,6 +65,7 @@ struct node {
     char tag[24];
     char *text, *id, *classes, *inline_css, *href, *alt;
     char *src, *rel, *media;
+    cairo_surface_t *inline_image;
     char *name, *value, *type, *action, *method, *placeholder, *external_form;
     char *submit_action, *submit_method;
     unsigned maxlength;
@@ -131,7 +132,7 @@ struct cb_page {
     size_t resource_count, image_pixels;
     struct stylesheet sheets[STYLESHEET_LIMIT];
     size_t sheet_count, css_bytes;
-    int parsing;
+    int parsing, images_enabled;
     struct item *items;
     size_t item_count;
     struct hit *hits;
@@ -222,6 +223,7 @@ void cb_engine_apply_declaration(struct style *s, const struct style *parent, ui
 void cb_engine_apply_declarations(struct style *s, const struct style *parent, uint64_t *scores,
                                const char *css, unsigned spec, unsigned order, const struct node *node);
 void cb_engine_compute_style(struct cb_page *p, struct node *n, const struct style *parent);
+void cb_engine_inline_images(struct cb_page *page);
 cairo_surface_t *cb_engine_node_image(const struct cb_page *p, const struct node *n);
 void cb_engine_image_size(const struct cb_page *p, const struct node *n, double available,
                        double *width, double *height);

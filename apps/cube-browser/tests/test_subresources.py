@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """HTTP document -> broker -> external CSS/images -> real browser pixels."""
+import base64
 import collections
 import contextlib
 import ctypes
@@ -111,6 +112,70 @@ class Subresources(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
         return target
+
+    def test_direct_png_jpeg_and_svg_image_urls_paint_without_refetching(self):
+        fixtures = [
+            ('/pixel.png', 'IMAGE/PNG; example=parameter', solid_png((33, 166, 119)), 0x21a677, 0),
+            ('/photo.jpg', 'image/jpeg', (ROOT/'tests/fixtures/sample.jpg').read_bytes(), 0xff0000, 2),
+            ('/vector.svg', 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="20"><rect width="32" height="20" fill="#7855ab"/></svg>', 0x7855ab, 0),
+        ]
+        for path, mime, body, color, tolerance in fixtures:
+            with self.subTest(path=path), server({path: (200, mime, body, 0)}) as (url, requests, _):
+                image = self.render(url+path)
+                self.assertGreater(color_count(image, color, tolerance=tolerance), 2)
+                self.assertEqual(requests, [path], 'image documents must paint the original response')
+
+    def test_local_image_files_render_and_symlinks_are_rejected(self):
+        fixtures = [
+            ('pixel.PNG', solid_png((33, 166, 119)), 0x21a677, 0),
+            ('signature-without-extension', solid_png((33, 166, 119)), 0x21a677, 0),
+            ('photo.jpg', (ROOT/'tests/fixtures/sample.jpg').read_bytes(), 0xff0000, 2),
+            ('vector.svg', b'<svg width="32" height="20"><rect width="32" height="20" fill="#7855ab"/></svg>', 0x7855ab, 0),
+        ]
+        for name, body, color, tolerance in fixtures:
+            with self.subTest(name=name):
+                path = self.root/name
+                path.write_bytes(body)
+                image = self.render(str(path))
+                self.assertGreater(color_count(image, color, tolerance=tolerance), 2)
+        linked = self.root/'linked.png'
+        linked.symlink_to(self.root/'pixel.PNG')
+        for path in (linked, self.root/'malformed.png'):
+            if not path.is_symlink(): path.write_bytes(b'<script>document.title="Wrong"</script>')
+            result = subprocess.run([str(BROWSER), '--dump', str(path)], env=self.env,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_inline_images_decode_without_network_and_obey_csp(self):
+        data = 'data:image/png;base64,'+base64.b64encode(solid_png((36, 147, 188))).decode()
+        svg = 'data:image/svg+xml,%3Csvg%20width=%228%22%20height=%224%22%3E%3Crect%20width=%228%22%20height=%224%22%20fill=%22%23b65f29%22/%3E%3C/svg%3E'
+        html = (f'<body><img src="{data}" width="160" height="80">'
+                f'<img src="{svg}" width="160" height="80"></body>').encode()
+        for policy, allowed in [('', True), ("img-src data:", True), ("img-src 'self'", False),
+                                ("default-src 'none'", False), ("img-src *", False)]:
+            with self.subTest(policy=policy), server({'/page': (200, 'text/html', html, 0,
+                 {'Content-Security-Policy': policy} if policy else {})}) as (url, requests, _):
+                image = self.render(url+'/page')
+                for color in (0x2493bc, 0xb65f29):
+                    if allowed: self.assertGreater(color_count(image, color), 10000)
+                    else: self.assertEqual(color_count(image, color), 0)
+                self.assertEqual(requests, ['/page'])
+        local = self.root/'inline.html'
+        local.write_bytes(html)
+        self.assertGreater(color_count(self.render(str(local)), 0x2493bc), 10000)
+
+    def test_invalid_inline_images_preserve_page_and_do_not_fetch(self):
+        png = base64.b64encode(solid_png((255, 0, 0))).decode()
+        sources = ['data:image/png;base64,@@@=', 'data:image/png;base64,'+png+'====',
+                   'data:image/png,%GG', 'data:text/html,%3Cscript%3E',
+                   'data:image/svg+xml,%3Csvg%3E%3Cscript%3Ebad%3C/script%3E%3C/svg%3E']
+        html = ('<body style="background:#29a784;min-height:700px"><p>Still visible</p>'+''.join(
+            f'<img src="{source}" width="160" height="80">' for source in sources)).encode()
+        with server({'/page': (200, 'text/html', html, 0)}) as (url, requests, _):
+            image = self.render(url+'/page')
+            self.assertGreater(color_count(image, 0x29a784), 100000)
+            self.assertEqual(color_count(image, 0xff0000), 0)
+            self.assertEqual(requests, ['/page'])
 
     def test_redirect_cookie_is_available_to_document_and_same_site_assets(self):
         routes = {

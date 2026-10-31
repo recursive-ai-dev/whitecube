@@ -50,6 +50,8 @@ struct browser {
     char console[128][2048];unsigned console_count;
     char network_log[128][1024];unsigned network_count;
     unsigned panel,panel_selected,panel_scroll;bool network_panel;
+    unsigned settings_category;bool settings_editing,settings_select_all;
+    char settings_text[4096],settings_error[256];size_t settings_cursor;
     struct worker download;unsigned download_state,download_received,download_total;
     char download_path[4096],download_status[256];
     struct cb_window *window;struct cb_config config;struct cb_accessibility acc;
@@ -72,6 +74,7 @@ struct browser {
     char policy[CB_POLICY_LIMIT];bool policy_received;
 };
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
+static void panel_open(struct browser *b,unsigned panel);
 static void utf8_copy(char *out,size_t capacity,const char *value){
     if(!capacity)return;
     size_t length=strlen(value);if(length>=capacity){length=capacity-1;
@@ -141,6 +144,7 @@ static int start_worker(struct browser*b,struct worker*w,const char*name){
 }
 static int network_start(struct browser *b,struct worker *w,struct cb_http_job *job){
     if(!job)return -1;
+    if(b->config.https_only&&!g_str_has_prefix(job->request.url,"https://")){free(job);return -1;}
     if(!job->started)job->started=now();
     if(start_worker(b,w,"cube-netd")){free(job);return -1;}w->job=job;
     if(cb_broker_send(job,b->session,w->socket)){stop_worker(w);return -1;}return 0;
@@ -198,23 +202,24 @@ static void anchor_pump(struct browser *b){
     if(cb_send(b->render.socket,&m)){renderer_failed(b,"Renderer disconnected while locating the anchor.");return;}
     b->anchor_pending=true;b->anchor_needed=false;
 }
-static int document(struct browser*b,int fd,const char*url){
+static int document_kind(struct browser*b,int fd,const char*url,unsigned kind){
     reset_resources(b);stop_worker(&b->render);b->layout_pending=false;b->ready=false;
     b->interaction_pending=0;b->page_focus=CB_FOCUS_NONE;b->anchor_pending=b->anchor_needed=false;
     if(start_worker(b,&b->render,"cube-renderd")){close(fd);return -1;}
     if(*b->policy){struct cb_message policy={.type=CB_POLICY,.fd=-1};snprintf(policy.text,sizeof policy.text,"%s",b->policy);if(cb_send(b->render.socket,&policy)){close(fd);return -1;}}
-    b->scripts_enabled=cb_site_scripts(b->session,url,b->config.javascript)&&strncmp(url,"cube:",5);
+    b->scripts_enabled=kind<CB_DOCUMENT_PNG&&cb_site_scripts(b->session,url,b->config.javascript)&&strncmp(url,"cube:",5);
     char *init=cb_broker_storage(b->session,url,b->policy,b->scripts_enabled&&!b->error);
-    struct cb_message setup={.type=CB_WEB_INIT,.a=b->scripts_enabled&&!b->error&&!cb_policy_opaque(b->policy),.b=cb_policy_eval_allowed(b->policy),.fd=cb_document_fd(init,strlen(init))};g_free(init);
+    struct cb_message setup={.type=CB_WEB_INIT,.a=b->scripts_enabled&&!b->error&&!cb_policy_opaque(b->policy),.b=cb_policy_eval_allowed(b->policy),.c=b->config.images?0:1,.fd=cb_document_fd(init,strlen(init))};g_free(init);
     if(setup.fd<0||cb_send(b->render.socket,&setup)){if(setup.fd>=0)close(setup.fd);close(fd);return -1;}close(setup.fd);
     b->script_loading=true;b->script_busy=false;b->script_settle=now()+1;
-    struct cb_message m={.type=CB_DOCUMENT,.fd=fd};snprintf(m.text,sizeof(m.text),"%s",url);
+    struct cb_message m={.type=CB_DOCUMENT,.b=kind,.fd=fd};snprintf(m.text,sizeof(m.text),"%s",url);
     int result=cb_send(b->render.socket,&m);close(fd);if(result)return -1;
     b->ready=true;b->desired_scroll=0;b->scroll=0;
     b->catalog_pending=true;b->resource_deadline=now()+20;
     if(!b->error&&strchr(url,'#'))b->anchor_needed=true;
     request_layout(b);return 0;
 }
+static int document(struct browser*b,int fd,const char*url){return document_kind(b,fd,url,CB_DOCUMENT_HTML);}
 static void fail_page(struct browser*b,const char*reason){
     stop_worker(&b->net);b->error=true;b->busy=false;
     snprintf(b->status,sizeof(b->status),"%s",reason);
@@ -241,10 +246,23 @@ static int read_local(int fd,char **html,size_t *size){
         offset+=(size_t)n;}
     (*html)[*size]=0;return 0;
 }
+static unsigned local_document_kind(const char *bytes,size_t size,const char *url){
+    if(size>=8&&!memcmp(bytes,"\211PNG\r\n\032\n",8))return CB_DOCUMENT_PNG;
+    if(size>=3&&(unsigned char)bytes[0]==0xff&&(unsigned char)bytes[1]==0xd8&&(unsigned char)bytes[2]==0xff)return CB_DOCUMENT_JPEG;
+    char *lower=g_ascii_strdown(url,-1);unsigned kind=CB_DOCUMENT_HTML;
+    if(g_str_has_suffix(lower,".png"))kind=CB_DOCUMENT_PNG;
+    else if(g_str_has_suffix(lower,".jpg")||g_str_has_suffix(lower,".jpeg"))kind=CB_DOCUMENT_JPEG;
+    else if(g_str_has_suffix(lower,".svg"))kind=CB_DOCUMENT_SVG;
+    g_free(lower);return kind;
+}
 static void navigate_request(struct browser*b,const char*input,bool history,bool from_page,const char *body,bool form){
     char url[4096];if(cb_url_input(input,b->config.search_engine,url,sizeof(url))){snprintf(b->status,sizeof(b->status),"Enter an HTTP(S) address, a local file, or a search.");dirty(b);return;}
     if(from_page&&cb_url_remote(b->url)&&!cb_url_remote(url)&&!(b->error&&!strcmp(url,"cube:home"))){
         snprintf(b->status,sizeof(b->status),"Web pages cannot open local files or browser pages.");dirty(b);return;}
+    if(!strcmp(url,"cube:settings")){
+        if(!*b->url)navigate_request(b,"cube:home",true,false,NULL,false);
+        panel_open(b,1);return;
+    }
     if(!strcmp(url,"cube:history-clear"))return;
     if(b->ready&&!b->error&&(strcmp(url,b->url)||(from_page&&strchr(url,'#')))&&cb_url_same_document(b->url,url)){
         blur_page(b);snprintf(b->url,sizeof(b->url),"%s",url);snprintf(b->address,sizeof(b->address),"%s",url);
@@ -262,7 +280,7 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
     b->address_focus=false;b->select_all=false;b->find_visible=false;b->find_focus=false;b->desired_scroll=0;b->find_y=-1;
     snprintf(b->status,sizeof(b->status),"Opening %.500s",url);snprintf(b->title,sizeof(b->title),"Loading…");
     if(history)remember_trail(b,url);
-    int fd=-1;
+    int fd=-1;unsigned document_type=CB_DOCUMENT_HTML;
     b->bookmarked=cb_bookmark_contains(url)==1;
     if(!strcmp(url,"cube:home"))fd=cb_document_fd(b->private_mode?cb_private_home:cb_home,strlen(b->private_mode?cb_private_home:cb_home));
     else if(!strcmp(url,"cube:about"))fd=cb_document_fd(cb_about,strlen(cb_about));
@@ -273,14 +291,15 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
         char *html=NULL;size_t size=0;
         if(file<0||read_local(file,&html,&size)){
             if(file>=0)close(file);
-            fail_page(b,"Cannot read this local HTML file (maximum 2 MiB; symlinks are not followed).");return;}
-        close(file);fd=cb_document_fd(html,size);free(html);
+            fail_page(b,"Cannot read this local document (maximum 2 MiB; symlinks are not followed).");return;}
+        close(file);document_type=local_document_kind(html,size,url);fd=cb_document_fd(html,size);free(html);
     }else if(cb_url_remote(url)){
+        if(b->config.https_only&&!g_str_has_prefix(url,"https://")){fail_page(b,"HTTPS-only mode blocked this HTTP address. Change it in Settings > Advanced to allow HTTP.");return;}
         struct cb_http_job *job=cb_broker_new(url,source,form?source:NULL,form_policy,form?CB_POLICY_FORM:0,true,body);
         if(network_start(b,&b->net,job)){fail_page(b,"Could not start the network request.");return;}
         dirty(b);return;
     }
-    if(fd<0||document(b,fd,url))fail_page(b,"Could not prepare this document.");
+    if(fd<0||document_kind(b,fd,url,document_type))fail_page(b,"Could not prepare this document.");
     dirty(b);
 }
 static void navigate(struct browser*b,const char*input,bool history,bool from_page){navigate_request(b,input,history,from_page,NULL,false);}
@@ -361,7 +380,7 @@ static void resource_catalog_entry(struct browser *b,const struct cb_message *m)
     struct resource *r=&b->resources[b->resource_count++];r->kind=m->b;r->worker.socket=-1;
     if(!cb_url_remote(b->url)||!cb_url_remote(m->text)||
        cb_url_input(m->text,b->config.search_engine,r->url,sizeof(r->url))||
-       (!b->scripts_enabled&&m->b==3)||!cb_policy_allows(b->policy,b->url,r->url,m->b,0))r->state=RESOURCE_FAILED;
+       (!b->scripts_enabled&&m->b==3)||(!b->config.images&&m->b==2)||!cb_policy_allows(b->policy,b->url,r->url,m->b,0))r->state=RESOURCE_FAILED;
     else r->state=RESOURCE_QUEUED;
 }
 static void resources_pump(struct browser *b){
@@ -471,28 +490,138 @@ static void download_pump(struct browser *b){
     if(!result){if(b->download.job){b->download_received=b->download.job->received;b->download_total=b->download.job->total;}dirty(b);return;}
     b->download_state=3;
     if(result==1&&m.type==CB_DOCUMENT&&m.fd>=0&&m.a>=200&&m.a<300&&b->download.job){
-        if(!cb_download_save(m.fd,b->download.job->request.url,b->download.job->meta.disposition,b->download_path,sizeof b->download_path,b->download_status,sizeof b->download_status)){
+        if(!cb_download_save_to(m.fd,b->download.job->request.url,b->download.job->meta.disposition,b->config.download_directory,b->download_path,sizeof b->download_path,b->download_status,sizeof b->download_status)){
             b->download_state=2;strcpy(b->download_status,"Download saved");}
     }else snprintf(b->download_status,sizeof b->download_status,"%.255s",result==1&&m.type==CB_ERROR?m.text:"Download failed");
     if(m.fd>=0)close(m.fd);
     stop_worker(&b->download);dirty(b);
 }
-static void panel_open(struct browser *b,unsigned panel){blur_page(b);b->address_focus=b->find_focus=false;b->panel=panel;b->panel_selected=b->panel_scroll=0;dirty(b);}
-static void save_preferences(struct browser *b){if(!b->private_mode){char error[256];if(cb_config_save(&b->config,error,sizeof error))notice(b,error);}}
+enum setting {
+    SET_HOME,SET_SEARCH,SET_ZOOM,SET_USE_HOME,SET_HISTORY,SET_BOOKMARKS,SET_PRIVATE,
+    SET_IMAGES,SET_JS,SET_SITE_JS,
+    SET_COOKIES,SET_STORAGE,SET_CACHE,SET_SAVE_HISTORY,SET_CLEAR_EXIT,SET_CLEAR,
+    SET_DOWNLOAD_DIRECTORY,SET_DOWNLOADS,
+    SET_HTTPS_ONLY,SET_RELOAD,SET_RESET,SET_DIAGNOSTICS
+};
+static const struct {const char *name;unsigned first,count;} settings_categories[]={
+    {"General",SET_HOME,7},{"Content",SET_IMAGES,3},{"Privacy",SET_COOKIES,6},
+    {"Downloads",SET_DOWNLOAD_DIRECTORY,2},{"Advanced",SET_HTTPS_ONLY,4}
+};
+static const struct {const char *name,*help;} settings_info[]={
+    {"Home page","Enter an HTTP(S), file:/// or cube: address."},
+    {"Search engine","Use an HTTP(S) search URL containing exactly one %s."},
+    {"Default page zoom","Enter a percentage from 50 to 300. Ctrl+0 resets to 100%."},
+    {"Use this page as home","Set the home button and startup page to the current address."},
+    {"Browsing history","Open history saved on this device."},
+    {"Bookmarks","Open saved bookmarks. Ctrl+D bookmarks the current page."},
+    {"New private window","Start a separate window with temporary browsing data."},
+    {"Load images","Allow PNG, JPEG and static SVG, including inline images."},
+    {"JavaScript by default","Site exceptions take precedence over this default."},
+    {"JavaScript for this site","Save a script exception for the current HTTP(S) origin."},
+    {"Allow cookies","Third-party cookies are always blocked. Off blocks all cookies."},
+    {"Allow site storage","Allow localStorage and sessionStorage. Off retains saved data."},
+    {"Use HTTP cache","Keep validated responses in memory. Off discards this cache."},
+    {"Save browsing history","Off stops new saved visits; existing history remains."},
+    {"Clear browsing data on exit","Clear saved history, cookies, storage and site choices when this window closes."},
+    {"Clear browsing data now","Clear history, cookies, storage and site choices; keep bookmarks and downloads."},
+    {"Download folder","Enter an absolute folder path, or leave empty for the default Downloads folder."},
+    {"Download activity","View progress, cancel a download or copy its saved path."},
+    {"HTTPS-only mode","Block HTTP pages, resources, redirects, fetch and downloads."},
+    {"Reload configuration from disk","Read your cube-browser/config file and apply validated settings."},
+    {"Restore default settings","Reset browser preferences; keep bookmarks and site choices."},
+    {"Console and network","Inspect script messages and network requests for this window."}
+};
+static unsigned setting_id(const struct browser *b){return settings_categories[b->settings_category].first+b->panel_selected;}
+static unsigned setting_count(const struct browser *b){return settings_categories[b->settings_category].count;}
+static void panel_open(struct browser *b,unsigned panel){
+    blur_page(b);b->address_focus=b->find_focus=false;b->panel=panel;
+    b->panel_selected=b->panel_scroll=b->settings_category=0;b->settings_editing=false;b->settings_error[0]=0;dirty(b);
+}
+static void settings_reload_page(struct browser *b){
+    unsigned category=b->settings_category,selected=b->panel_selected;
+    char url[4096];snprintf(url,sizeof url,"%s",b->url);navigate(b,url,false,false);
+    b->panel=1;b->settings_category=category;b->panel_selected=selected;
+}
+static bool apply_preferences(struct browser *b,const struct cb_config *config,bool reload){
+    char error[256];
+    if(cb_config_validate(config,error,sizeof error)||(!b->private_mode&&cb_config_save(config,error,sizeof error))){
+        snprintf(b->settings_error,sizeof b->settings_error,"%s",error);notice(b,error);return false;
+    }
+    b->config=*config;b->zoom=config->zoom;cb_session_configure(b->session,config);b->settings_error[0]=0;
+    if(config->https_only&&b->download.job&&!g_str_has_prefix(b->download.job->request.url,"https://"))download_cancel(b);
+    if(reload)settings_reload_page(b);else request_layout(b);
+    notice(b,b->private_mode?"Settings applied to this private window":"Settings saved");return true;
+}
+static void setting_value(struct browser *b,unsigned id,char *value,size_t capacity){
+    const char *v="";bool enabled=false,is_bool=true;
+    switch(id){
+    case SET_HOME:v=b->config.homepage;is_bool=false;break;
+    case SET_SEARCH:v=b->config.search_engine;is_bool=false;break;
+    case SET_ZOOM:snprintf(value,capacity,"%.0f%%",b->zoom*100);return;
+    case SET_DOWNLOAD_DIRECTORY:v=*b->config.download_directory?b->config.download_directory:"Default Downloads folder";is_bool=false;break;
+    case SET_IMAGES:enabled=b->config.images;break;case SET_JS:enabled=b->config.javascript;break;
+    case SET_SITE_JS:if(!cb_url_remote(b->url)){v="Open a website first";is_bool=false;}else enabled=cb_site_scripts(b->session,b->url,b->config.javascript);break;
+    case SET_COOKIES:enabled=b->config.cookies;break;case SET_STORAGE:enabled=b->config.site_storage;break;
+    case SET_CACHE:enabled=b->config.cache;break;case SET_SAVE_HISTORY:enabled=b->config.save_history;break;
+    case SET_CLEAR_EXIT:enabled=b->config.clear_on_exit;break;case SET_HTTPS_ONLY:enabled=b->config.https_only;break;
+    default:v="Enter to open";is_bool=false;break;
+    }
+    snprintf(value,capacity,"%s",is_bool?(enabled?"On":"Off"):v);
+}
+static void settings_edit_commit(struct browser *b){
+    struct cb_config next=b->config;unsigned id=setting_id(b);
+    char *destination=NULL;size_t capacity=0;
+    if(id==SET_HOME){destination=next.homepage;capacity=sizeof next.homepage;}
+    else if(id==SET_SEARCH){destination=next.search_engine;capacity=sizeof next.search_engine;}
+    else if(id==SET_DOWNLOAD_DIRECTORY){destination=next.download_directory;capacity=sizeof next.download_directory;}
+    else if(id==SET_ZOOM){
+        char *end;double percent=strtod(b->settings_text,&end);if(*end=='%')end++;
+        if(end==b->settings_text||*end||!isfinite(percent)||percent<50||percent>300){snprintf(b->settings_error,sizeof b->settings_error,"Zoom must be a percentage from 50 to 300.");return;}
+        next.zoom=percent/100.;
+    }
+    if(destination){
+        if(strlen(b->settings_text)>=capacity){snprintf(b->settings_error,sizeof b->settings_error,"This value is too long.");return;}
+        strcpy(destination,b->settings_text);
+    }
+    if(apply_preferences(b,&next,false))b->settings_editing=false;
+}
 static void panel_activate(struct browser *b){
-    unsigned action=b->panel_selected;
-    if(action==0){b->config.javascript=!b->config.javascript;save_preferences(b);navigate(b,b->url,false,false);}
-    else if(action==1){if(cb_url_remote(b->url)){int enabled=cb_site_scripts(b->session,b->url,b->config.javascript);if(cb_site_scripts_set(b->session,b->url,!enabled))notice(b,"Could not save site setting");else navigate(b,b->url,false,false);}else notice(b,"Site settings require an HTTP(S) page.");}
-    else if(action==2){snprintf(b->config.homepage,sizeof b->config.homepage,"%s",b->url);save_preferences(b);notice(b,"Home page updated");}
-    else if(action>=3&&action<=5){b->zoom=action==5?1:fmax(.5,fmin(2,b->zoom+(action==3?-.1:.1)));b->config.zoom=b->zoom;save_preferences(b);request_layout(b);}
-    else if(action==6){download_cancel(b);cb_session_clear(b->session);if(!b->private_mode)cb_history_clear();for(int i=0;i<b->trail_count;i++)free(b->trail[i]);b->trail_count=0;b->trail_at=-1;b->console_count=b->network_count=0;navigate(b,b->url,true,false);notice(b,"Browsing data cleared");}
-    else if(action==7){b->panel=0;navigate(b,"cube:history",true,false);}
-    else if(action==8)panel_open(b,3);
-    else if(action==9)panel_open(b,2);
-    else if(action==10)navigate(b,"cube:bookmarks",true,false);
-    else if(action==11)bookmark_toggle(b);
-    else if(action==12)new_window(b,true);
-    else b->panel=0;
+    unsigned id=setting_id(b);struct cb_config next=b->config;bool reload=true;
+    b->settings_error[0]=0;
+    if(id==SET_HOME||id==SET_SEARCH||id==SET_ZOOM||id==SET_DOWNLOAD_DIRECTORY){
+        if(id==SET_DOWNLOAD_DIRECTORY)snprintf(b->settings_text,sizeof b->settings_text,"%s",b->config.download_directory);
+        else setting_value(b,id,b->settings_text,sizeof b->settings_text);
+        b->settings_editing=b->settings_select_all=true;b->settings_cursor=strlen(b->settings_text);
+    }else if(id==SET_USE_HOME){snprintf(next.homepage,sizeof next.homepage,"%s",b->url);apply_preferences(b,&next,false);}
+    else if(id==SET_HISTORY)navigate(b,"cube:history",true,false);
+    else if(id==SET_BOOKMARKS)navigate(b,"cube:bookmarks",true,false);
+    else if(id==SET_PRIVATE)new_window(b,true);
+    else if(id==SET_SITE_JS){
+        if(!cb_url_remote(b->url))snprintf(b->settings_error,sizeof b->settings_error,"Site settings require an HTTP(S) page.");
+        else if(cb_site_scripts_set(b->session,b->url,!cb_site_scripts(b->session,b->url,b->config.javascript)))snprintf(b->settings_error,sizeof b->settings_error,"Could not save site setting.");
+        else settings_reload_page(b);
+    }else if(id==SET_CLEAR){
+        download_cancel(b);cb_session_clear(b->session);int failed=!b->private_mode&&cb_history_clear();
+        for(int i=0;i<b->trail_count;i++)free(b->trail[i]);
+        b->trail_count=0;b->trail_at=-1;b->console_count=b->network_count=0;
+        /* Return to a local page so clearing cannot immediately recreate site data. */
+        navigate(b,"cube:home",true,false);notice(b,failed?"Site data cleared, but history could not be cleared":"Browsing data cleared");
+    }else if(id==SET_DOWNLOADS)panel_open(b,3);
+    else if(id==SET_DIAGNOSTICS)panel_open(b,2);
+    else if(id==SET_RELOAD){
+        char error[256];if(cb_config_load(&next,error,sizeof error))snprintf(b->settings_error,sizeof b->settings_error,"%s",error);
+        else apply_preferences(b,&next,true);
+    }else if(id==SET_RESET){cb_config_defaults(&next);apply_preferences(b,&next,true);}
+    else{
+        switch(id){
+        case SET_IMAGES:next.images=!next.images;break;case SET_JS:next.javascript=!next.javascript;break;
+        case SET_COOKIES:next.cookies=!next.cookies;break;case SET_STORAGE:next.site_storage=!next.site_storage;break;
+        case SET_CACHE:next.cache=!next.cache;break;case SET_SAVE_HISTORY:next.save_history=!next.save_history;break;
+        case SET_CLEAR_EXIT:next.clear_on_exit=!next.clear_on_exit;reload=false;break;
+        case SET_HTTPS_ONLY:next.https_only=!next.https_only;break;default:return;
+        }
+        apply_preferences(b,&next,reload);
+    }
     dirty(b);
 }
 static void check_worker(struct browser*b,bool network){
@@ -509,15 +638,15 @@ static void check_worker(struct browser*b,bool network){
     if(network){
         stop_worker(w);
         if(m.type==CB_ERROR)fail_page(b,m.text);
-        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.a>=200&&m.a<=599&&m.b<=1&&cb_url_remote(m.text)){
+        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.a>=200&&m.a<=599&&m.b<=CB_DOCUMENT_SVG&&cb_url_remote(m.text)){
             char checked[4096];if(cb_url_input(m.text,b->config.search_engine,checked,sizeof checked)){close(m.fd);fail_page(b,"Invalid response URL.");return;}
             b->http_status=m.a;
-            if(m.b){char *text=NULL;size_t size;if(cb_read_document(m.fd,&text,&size)==0){char *escaped=cb_html_escape(text);char *html=g_strdup_printf("<html><body><pre>%s</pre></body></html>",escaped);free(text);free(escaped);close(m.fd);m.fd=cb_document_fd(html,strlen(html));g_free(html);}}
+            if(m.b==CB_DOCUMENT_TEXT){char *text=NULL;size_t size;if(cb_read_document(m.fd,&text,&size)==0){char *escaped=cb_html_escape(text);char *html=g_strdup_printf("<html><body><pre>%s</pre></body></html>",escaped);free(text);free(escaped);close(m.fd);m.fd=cb_document_fd(html,strlen(html));g_free(html);}}
             snprintf(b->url,sizeof(b->url),"%.4095s",m.text);
             b->bookmarked=cb_bookmark_contains(b->url)==1;
             if(!b->address_focus)snprintf(b->address,sizeof(b->address),"%s",b->url);
             if(b->trail_at>=0){free(b->trail[b->trail_at]);b->trail[b->trail_at]=strdup(b->url);}
-            int fd=m.fd;m.fd=-1;if(fd<0||document(b,fd,b->url))fail_page(b,"Could not send the response to the renderer.");
+            int fd=m.fd;m.fd=-1;if(fd<0||document_kind(b,fd,b->url,m.b))fail_page(b,"Could not send the response to the renderer.");
         }else fail_page(b,"Invalid response from network worker.");
     }else if(m.type==CB_WEB_REQUEST){web_request(b,&m);}
     else if(m.type==CB_STORAGE_WRITE){storage_write(b,&m);}
@@ -553,7 +682,7 @@ static void check_worker(struct browser*b,bool network){
                 b->page_h=m.c;b->scroll=fmin(frame_scroll,maximum);
                 utf8_copy(b->title,sizeof(b->title),end+1);
                 cb_window_title(b->window,b->title);
-                if(!b->history_saved&&!b->error&&!b->private_mode&&cb_url_remote(b->url)){cb_history_visit(b->url,b->title);b->history_saved=true;}
+                if(!b->history_saved&&!b->error&&!b->private_mode&&b->config.save_history&&cb_url_remote(b->url)){cb_history_visit(b->url,b->title);b->history_saved=true;}
                 page_status(b);
             }else renderer_failed(b,"Could not map the rendered page.");
         }
@@ -598,20 +727,49 @@ static void text(cairo_t*c,double x,double y,const char*t,double size,unsigned r
     color(c,rgb);cairo_move_to(c,x,y);pango_cairo_show_layout(c,l);g_object_unref(l);pango_font_description_free(f);
 }
 static void cube(cairo_t*c,double x,double y,double s,unsigned rgb){color(c,rgb);cairo_set_line_width(c,1.4);cairo_move_to(c,x,y+s*.25);cairo_line_to(c,x+s*.5,y);cairo_line_to(c,x+s,y+s*.25);cairo_line_to(c,x+s,y+s*.8);cairo_line_to(c,x+s*.5,y+s);cairo_line_to(c,x,y+s*.8);cairo_close_path(c);cairo_move_to(c,x,y+s*.25);cairo_line_to(c,x+s*.5,y+s*.48);cairo_line_to(c,x+s,y+s*.25);cairo_move_to(c,x+s*.5,y+s*.48);cairo_line_to(c,x+s*.5,y+s);cairo_stroke(c);}
-static void panel_geometry(struct browser *b,double *x,double *y,double *w,double *h){double s=b->scale;*w=fmax(220,fmin(580*s,b->w-32*s));*h=fmax(150,fmin(500*s,b->view_h-16*s));*x=fmax(0,b->w-*w-16*s);*y=b->view_y+8*s;}
+/* Fit settings editing and its help text even with large desktop scaling. */
+static double panel_scale(struct browser *b){return fmin(b->scale,fmax(.5,(b->view_h-16)/320.));}
+static void panel_geometry(struct browser *b,double *x,double *y,double *w,double *h){double s=panel_scale(b);*w=fmax(220,fmin(680*s,b->w-32*s));*h=fmax(150,fmin(520*s,b->view_h-16*s));*x=fmax(0,b->w-*w-16*s);*y=b->view_y+8*s;}
+static unsigned settings_visible(double height,double scale){return (unsigned)fmax(1,floor((height-160*scale)/(44*scale)));}
 static void draw_panel(struct browser *b,cairo_t *c){
     if(!b->panel)return;
-    double x,y,w,h,s=b->scale;panel_geometry(b,&x,&y,&w,&h);
+    double x,y,w,h,s=panel_scale(b);panel_geometry(b,&x,&y,&w,&h);
     box(c,x+4*s,y+4*s,w,h,0x555555);box(c,x,y,w,h,0xf0f0f0);
     const char *title=b->panel==1?"Browser settings":b->panel==2?b->network_panel?"Network activity":"Page console":"Downloads";
     text(c,x+18*s,y+16*s,title,18*s,0x111111,w-36*s,true);
     if(b->panel==1){
-        char script[96],site[128],zoom[64];snprintf(script,sizeof script,"JavaScript by default: %s",b->config.javascript?"On":"Off");
-        snprintf(site,sizeof site,"JavaScript for this site: %s",cb_site_scripts(b->session,b->url,b->config.javascript)?"On":"Off");snprintf(zoom,sizeof zoom,"Reset zoom (currently %.0f%%)",b->zoom*100);
-        const char *labels[]={script,site,"Use this page as home","Zoom out","Zoom in",zoom,b->private_mode?"Clear this private window's data":"Clear history, cookies and site data","History","Downloads","Console and network","Bookmarks",b->bookmarked?"Remove this bookmark":"Bookmark this page","New private window","Close settings"};
-        unsigned visible=(unsigned)fmax(1,floor((h-94*s)/(28*s))),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;
-        for(unsigned i=start;i<14&&i<start+visible;i++){double row=y+50*s+(i-start)*28*s;if(i==b->panel_selected)box(c,x+10*s,row,w-20*s,27*s,0xc9c9c9);text(c,x+18*s,row+6*s,labels[i],12*s,0x111111,w-36*s,false);}
-        text(c,x+18*s,y+h-26*s,"↑ ↓ choose · Enter apply · Esc close",11*s,0x4a4a4a,w-36*s,false);
+        double tab=(w-20*s)/5;
+        for(unsigned i=0;i<5;i++){
+            if(i==b->settings_category)box(c,x+10*s+i*tab,y+47*s,tab,28*s,0xd5e4db);
+            text(c,x+15*s+i*tab,y+55*s,settings_categories[i].name,11*s,0x111111,tab-10*s,i==b->settings_category);
+        }
+        if(b->settings_editing){
+            text(c,x+18*s,y+100*s,settings_info[setting_id(b)].name,14*s,0x111111,w-36*s,true);
+            double ix=x+18*s,iy=y+134*s,iw=w-36*s;
+            box(c,ix,iy,iw,38*s,0xffffff);
+            PangoLayout *layout=pango_cairo_create_layout(c);PangoFontDescription *font=pango_font_description_new();
+            pango_font_description_set_family(font,"sans-serif");pango_font_description_set_absolute_size(font,13*s*PANGO_SCALE);
+            pango_layout_set_font_description(layout,font);pango_layout_set_text(layout,b->settings_text,-1);
+            PangoRectangle caret;pango_layout_get_cursor_pos(layout,(int)b->settings_cursor,&caret,NULL);
+            double cx=caret.x/(double)PANGO_SCALE,offset=fmax(0,cx-(iw-24*s));
+            cairo_save(c);cairo_rectangle(c,ix+6*s,iy+5*s,iw-12*s,28*s);cairo_clip(c);
+            if(b->settings_select_all)box(c,ix+6*s,iy+6*s,iw-12*s,26*s,0xd5e4db);
+            color(c,0x111111);cairo_move_to(c,ix+8*s-offset,iy+11*s);pango_cairo_show_layout(c,layout);
+            if(!b->settings_select_all)box(c,ix+8*s+cx-offset,iy+9*s,1.2,20*s,0x111111);
+            cairo_restore(c);pango_font_description_free(font);g_object_unref(layout);
+            text(c,x+18*s,y+188*s,"Ctrl+A select all · Ctrl+V paste · Enter save · Esc cancel",11*s,0x4a4a4a,w-36*s,false);
+        }else{
+            unsigned visible=settings_visible(h,s),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;
+            for(unsigned i=start;i<setting_count(b)&&i<start+visible;i++){
+                unsigned id=settings_categories[b->settings_category].first+i;double row=y+84*s+(i-start)*44*s;
+                if(i==b->panel_selected)box(c,x+10*s,row,w-20*s,43*s,0xd5e4db);
+                text(c,x+18*s,row+5*s,settings_info[id].name,12*s,0x111111,w-36*s,true);
+                char value[4096];setting_value(b,id,value,sizeof value);text(c,x+18*s,row+25*s,value,11*s,0x4a4a4a,w-36*s,false);
+            }
+        }
+        if(*b->settings_error)text(c,x+18*s,y+h-78*s,b->settings_error,11*s,0xc8102e,w-36*s,false);
+        text(c,x+18*s,y+h-54*s,settings_info[setting_id(b)].help,11*s,0x4a4a4a,w-36*s,false);
+        text(c,x+18*s,y+h-26*s,b->private_mode?"This private window only · ← → sections · ↑ ↓ choose · Esc close":"← → sections · ↑ ↓ choose · Enter edit/toggle · Esc close",11*s,0x4a4a4a,w-36*s,false);
     }else if(b->panel==2){
         unsigned count=b->network_panel?b->network_count:b->console_count,rows=(unsigned)fmax(1,floor((h-100*s)/(27*s))),available=count<128?count:128;
         if(!available)text(c,x+18*s,y+62*s,"No messages for this page.",12*s,0x4a4a4a,w-36*s,false);
@@ -621,7 +779,7 @@ static void draw_panel(struct browser *b,cairo_t *c){
         text(c,x+18*s,y+60*s,b->download_state?b->download_status:"No downloads yet. Ctrl+S saves the current URL.",13*s,0x111111,w-36*s,false);
         if(b->download_state==1){char progress[128];snprintf(progress,sizeof progress,"%.1f KiB received%s",b->download_received/1024.,b->download_total?" (known size)":"");text(c,x+18*s,y+91*s,progress,12*s,0x4a4a4a,w-36*s,false);box(c,x+18*s,y+122*s,w-36*s,8*s,0xffffff);box(c,x+18*s,y+122*s,(w-36*s)*(b->download_total?fmin(1,b->download_received/(double)b->download_total):.08),8*s,0x1a1a1a);text(c,x+18*s,y+155*s,"Cancel download (Esc)",13*s,0xc8102e,w-36*s,true);}
         else if(*b->download_path){text(c,x+18*s,y+96*s,b->download_path,11*s,0x4a4a4a,w-36*s,false);text(c,x+18*s,y+130*s,"Ctrl+C copies the saved path",11*s,0x4a4a4a,w-36*s,false);}
-        text(c,x+18*s,y+h-26*s,"Files are saved to Downloads · Esc close",11*s,0x4a4a4a,w-36*s,false);
+        text(c,x+18*s,y+h-26*s,"Change the download folder in Settings > Downloads · Esc close",11*s,0x4a4a4a,w-36*s,false);
     }
 }
 static void draw(void*data,cairo_t*c,int w,int h){struct browser*b=data;bool changed=b->w!=w||b->h!=h;geometry(b,w,h);if(changed)request_layout(b);
@@ -660,12 +818,15 @@ static void draw(void*data,cairo_t*c,int w,int h){struct browser*b=data;bool cha
     if(b->find_visible){box(c,w-360*s,b->view_y,360*s,50*s,0xefefef);text(c,w-345*s,b->view_y+8*s,"Find in page · Enter for next · Esc to close",10*s,0x4a4a4a,335*s,false);text(c,w-345*s,b->view_y+25*s,*b->find?b->find:"Type to find…",13*s,ink,335*s,false);}
     draw_panel(b,c);
 }
-static void scroll(void*data,double amount){struct browser*b=data;if(b->panel==2){b->panel_scroll=(unsigned)fmax(0,fmin(127,(double)b->panel_scroll+(amount>0?1:-1)));dirty(b);return;}b->desired_scroll=fmax(0,fmin(b->desired_scroll+amount,fmax(0,(double)b->page_h-b->view_h)));request_layout(b);}
+static void scroll(void*data,double amount){struct browser*b=data;if(b->panel==1){if(!b->settings_editing)b->panel_selected=(b->panel_selected+setting_count(b)+(amount>0?1:-1))%setting_count(b);dirty(b);return;}if(b->panel==2){b->panel_scroll=(unsigned)fmax(0,fmin(127,(double)b->panel_scroll+(amount>0?1:-1)));dirty(b);return;}b->desired_scroll=fmax(0,fmin(b->desired_scroll+amount,fmax(0,(double)b->page_h-b->view_h)));request_layout(b);}
 static void click(void*data,double x,double y,uint32_t button){struct browser*b=data;double s=b->scale;
     if(button==BTN_SIDE){go(b,-1);return;}if(button==BTN_EXTRA){go(b,1);return;}
     if(button!=BTN_LEFT)return;
-    if(b->panel){double px,py,pw,ph;panel_geometry(b,&px,&py,&pw,&ph);if(x>=px&&x<px+pw&&y>=py&&y<py+ph){
-            if(b->panel==1&&y>=py+50*s&&y<py+ph-40*s){unsigned visible=(unsigned)fmax(1,floor((ph-94*s)/(28*s))),start=b->panel_selected>=visible?b->panel_selected-visible+1:0;b->panel_selected=start+(unsigned)((y-py-50*s)/(28*s));if(b->panel_selected<14)panel_activate(b);}
+    if(b->panel){s=panel_scale(b);double px,py,pw,ph;panel_geometry(b,&px,&py,&pw,&ph);if(x>=px&&x<px+pw&&y>=py&&y<py+ph){
+            if(b->panel==1&&!b->settings_editing){
+                if(y>=py+47*s&&y<py+75*s){unsigned category=(unsigned)fmax(0,(x-px-10*s)/((pw-20*s)/5));if(category<5){b->settings_category=category;b->panel_selected=0;b->settings_error[0]=0;dirty(b);}}
+                else if(y>=py+84*s&&y<py+ph-76*s){unsigned visible=settings_visible(ph,s),start=b->panel_selected>=visible?b->panel_selected-visible+1:0,selected=start+(unsigned)((y-py-84*s)/(44*s));if(selected<setting_count(b)&&selected<start+visible){b->panel_selected=selected;panel_activate(b);}}
+            }
             else if(b->panel==3&&b->download_state==1&&y>=py+140*s&&y<py+190*s)download_cancel(b);
             return;}
         b->panel=0;dirty(b);return;
@@ -695,9 +856,44 @@ static void insert(struct browser*b,const char*utf8){
     if(b->find_focus){b->find_y=-1;b->find_wrapping=false;}
     dirty(b);
 }
-static void paste(void*data,const char*t){struct browser*b=data;if(b->address_focus||b->find_focus)insert(b,t);else interact(b,CB_INTERACT_TEXT,0,0,t);}
+static void settings_insert(struct browser *b,const char *value){
+    if(!g_utf8_validate(value,-1,NULL))return;
+    for(const unsigned char *p=(const unsigned char *)value;*p;p++)if(*p<32||*p==127)return;
+    size_t length=strlen(b->settings_text),count=strlen(value),pos=b->settings_cursor;
+    if(b->settings_select_all){length=pos=0;}
+    if(length+count>=sizeof b->settings_text)return;
+    if(b->settings_select_all){b->settings_text[0]=0;b->settings_select_all=false;}
+    memmove(b->settings_text+pos+count,b->settings_text+pos,length-pos+1);
+    memcpy(b->settings_text+pos,value,count);b->settings_cursor=pos+count;b->settings_error[0]=0;dirty(b);
+}
+static void settings_edit_key(struct browser *b,xkb_keysym_t sym,const char *utf8,bool ctrl,bool alt){
+    xkb_keysym_t lower=xkb_keysym_to_lower(sym);size_t length=strlen(b->settings_text),pos=b->settings_cursor;
+    if(ctrl&&lower==XKB_KEY_w)cb_window_close(b->window);
+    else if(sym==XKB_KEY_Escape){b->settings_editing=false;b->settings_error[0]=0;}
+    else if(sym==XKB_KEY_Return||sym==XKB_KEY_KP_Enter)settings_edit_commit(b);
+    else if(ctrl&&lower==XKB_KEY_a)b->settings_select_all=true;
+    else if(ctrl&&(lower==XKB_KEY_c||lower==XKB_KEY_x)){
+        cb_window_copy(b->window,b->settings_text);
+        if(lower==XKB_KEY_x){b->settings_text[0]=0;b->settings_cursor=0;b->settings_select_all=false;}
+    }else if(ctrl&&lower==XKB_KEY_v)cb_window_paste(b->window);
+    else if(sym==XKB_KEY_BackSpace||sym==XKB_KEY_Delete){
+        if(b->settings_select_all){b->settings_text[0]=0;b->settings_cursor=0;b->settings_select_all=false;}
+        else if(sym==XKB_KEY_BackSpace&&pos){size_t previous=pos-1;while(previous&&((unsigned char)b->settings_text[previous]&0xc0)==0x80)previous--;memmove(b->settings_text+previous,b->settings_text+pos,length-pos+1);b->settings_cursor=previous;}
+        else if(sym==XKB_KEY_Delete&&pos<length){size_t next=pos+1;while(next<length&&((unsigned char)b->settings_text[next]&0xc0)==0x80)next++;memmove(b->settings_text+pos,b->settings_text+next,length-next+1);}
+        b->settings_error[0]=0;
+    }else if(sym==XKB_KEY_Left||sym==XKB_KEY_Right||sym==XKB_KEY_Home||sym==XKB_KEY_End){
+        b->settings_select_all=false;
+        if(sym==XKB_KEY_Home)pos=0;else if(sym==XKB_KEY_End)pos=length;
+        else if(sym==XKB_KEY_Left&&pos){pos--;while(pos&&((unsigned char)b->settings_text[pos]&0xc0)==0x80)pos--;}
+        else if(sym==XKB_KEY_Right&&pos<length){pos++;while(pos<length&&((unsigned char)b->settings_text[pos]&0xc0)==0x80)pos++;}
+        b->settings_cursor=pos;
+    }else if(!ctrl&&!alt&&*utf8)settings_insert(b,utf8);
+    dirty(b);
+}
+static void paste(void*data,const char*t){struct browser*b=data;if(b->panel==1){if(b->settings_editing)settings_insert(b,t);return;}if(b->address_focus||b->find_focus)insert(b,t);else interact(b,CB_INTERACT_TEXT,0,0,t);}
 static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,bool alt){struct browser*b=data;
     xkb_keysym_t lower=xkb_keysym_to_lower(sym);
+    if(b->panel==1&&b->settings_editing){settings_edit_key(b,sym,utf8,ctrl,alt);return;}
     if(ctrl&&shift&&lower==XKB_KEY_p){new_window(b,true);return;}
     if(ctrl&&shift&&lower==XKB_KEY_b){navigate(b,"cube:bookmarks",true,false);return;}
     if(ctrl&&lower==XKB_KEY_d){bookmark_toggle(b);return;}
@@ -707,7 +903,12 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     if(ctrl&&lower==XKB_KEY_s){download_start(b);return;}
     if(b->panel&&!(ctrl&&(lower==XKB_KEY_l||lower==XKB_KEY_w||lower==XKB_KEY_r))){
         if(sym==XKB_KEY_Escape){if(b->panel==3&&b->download_state==1)download_cancel(b);else b->panel=0;}
-        else if(b->panel==1){if(sym==XKB_KEY_Down||sym==XKB_KEY_Tab)b->panel_selected=(b->panel_selected+1)%14;else if(sym==XKB_KEY_Up)b->panel_selected=(b->panel_selected+13)%14;else if(sym==XKB_KEY_Return||sym==XKB_KEY_KP_Enter)panel_activate(b);}
+        else if(b->panel==1){
+            if(sym==XKB_KEY_Left||sym==XKB_KEY_Right){b->settings_category=(b->settings_category+(sym==XKB_KEY_Right?1:4))%5;b->panel_selected=0;b->settings_error[0]=0;}
+            else if(sym==XKB_KEY_Up||sym==XKB_KEY_ISO_Left_Tab||(sym==XKB_KEY_Tab&&shift))b->panel_selected=(b->panel_selected+setting_count(b)-1)%setting_count(b);
+            else if(sym==XKB_KEY_Down||sym==XKB_KEY_Tab)b->panel_selected=(b->panel_selected+1)%setting_count(b);
+            else if(sym==XKB_KEY_Return||sym==XKB_KEY_KP_Enter||sym==XKB_KEY_space)panel_activate(b);
+        }
         else if(b->panel==2){if(sym==XKB_KEY_Tab){b->network_panel=!b->network_panel;b->panel_scroll=0;}else if(sym==XKB_KEY_Down)b->panel_scroll=(unsigned)fmin(127,b->panel_scroll+1);else if(sym==XKB_KEY_Up&&b->panel_scroll)b->panel_scroll--;}
         else if(b->panel==3&&ctrl&&lower==XKB_KEY_c&&*b->download_path)cb_window_copy(b->window,b->download_path);
         dirty(b);return;
@@ -722,8 +923,8 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     else if(alt&&sym==XKB_KEY_Left)go(b,-1);
     else if(alt&&sym==XKB_KEY_Right)go(b,1);
     else if(ctrl&&(sym==XKB_KEY_plus||sym==XKB_KEY_equal||sym==XKB_KEY_minus||sym==XKB_KEY_0)){
-        b->zoom=sym==XKB_KEY_0?1:fmax(.5,fmin(2,b->zoom+(sym==XKB_KEY_minus?-.1:.1)));
-        b->config.zoom=b->zoom;if(!b->private_mode){char e[256];cb_config_save(&b->config,e,sizeof(e));}request_layout(b);
+        struct cb_config next=b->config;next.zoom=sym==XKB_KEY_0?1:fmax(.5,fmin(3,b->zoom+(sym==XKB_KEY_minus?-.1:.1)));
+        apply_preferences(b,&next,false);
     }else if(sym==XKB_KEY_Escape){blur_page(b);b->address_focus=b->find_focus=b->find_visible=false;snprintf(b->address,sizeof(b->address),"%s",b->url);}
     else if(!ctrl&&!alt&&(sym==XKB_KEY_Tab||sym==XKB_KEY_ISO_Left_Tab)){
         b->address_focus=b->find_focus=b->select_all=false;
@@ -764,8 +965,12 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     else if(!ctrl&&!alt&&*utf8)interact(b,CB_INTERACT_TEXT,0,0,utf8);
     dirty(b);
 }
-static void cleanup(struct browser*b){stop_worker(&b->download);cb_session_close(b->session);reset_resources(b);stop_worker(&b->net);stop_worker(&b->render);free_frame(b);for(int i=0;i<b->trail_count;i++)free(b->trail[i]);cb_window_free(b->window);}
-static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [--] [URL | HTML-file]\n       cube-browser --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser --dump URL\n       cube-browser --check\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L address, Ctrl+T desktop tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+D bookmark, Ctrl+Shift+B bookmarks, Ctrl+Shift+P private window.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
+static void cleanup(struct browser*b){
+    stop_worker(&b->download);reset_resources(b);stop_worker(&b->net);stop_worker(&b->render);
+    if(b->config.clear_on_exit&&!b->private_mode){cb_session_clear(b->session);if(cb_history_clear())fprintf(stderr,"cube-browser: could not clear history on exit\n");}
+    cb_session_close(b->session);free_frame(b);for(int i=0;i<b->trail_count;i++)free(b->trail[i]);cb_window_free(b->window);
+}
+static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [--settings] [--] [URL | HTML-or-image-file]\n       cube-browser --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser --dump URL\n       cube-browser --check\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L address, Ctrl+T desktop tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+D bookmark, Ctrl+Shift+B bookmarks, Ctrl+Shift+P private window.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
 static int health_check(const char *directory){
     int failures=0;char path[PATH_MAX];struct stat st;
     puts("Cube Browser " CB_VERSION " · installation check");
@@ -797,8 +1002,8 @@ int main(int argc,char**argv){
     if(argc==2&&!strcmp(argv[1],"--version")){puts("cube-browser " CB_VERSION " (interactive-web preview)");return 0;}
     if(argc==2&&!strcmp(argv[1],"--check"))return health_check(b.directory);
     char error[256];cb_config_defaults(&b.config);if(cb_config_load(&b.config,error,sizeof(error)))fprintf(stderr,"cube-browser: %s\n",error);
-    cb_accessibility_load(&b.acc);b.scale=b.acc.ui_scale;b.zoom=fmax(.5,fmin(2,b.config.zoom));
-    const char *url=b.config.homepage,*output=NULL;bool dump=false,positional=false,explicit_url=false;double seconds=0;int width=1120,height=800;
+    cb_accessibility_load(&b.acc);b.scale=b.acc.ui_scale;b.zoom=b.config.zoom;
+    const char *url=b.config.homepage,*output=NULL;bool dump=false,positional=false,explicit_url=false,open_settings=false;double seconds=0;int width=1120,height=800;
     for(int i=1;i<argc;i++){
         if(positional){if(explicit_url){usage();return 2;}url=argv[i];explicit_url=true;continue;}
         if(!strcmp(argv[i],"--")){positional=true;continue;}
@@ -806,6 +1011,7 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--version")){puts("cube-browser " CB_VERSION " (interactive-web preview)");return 0;}
         else if(!strcmp(argv[i],"--console"))b.print_console=true;
         else if(!strcmp(argv[i],"--private"))b.private_mode=true;
+        else if(!strcmp(argv[i],"--settings"))open_settings=true;
         else if(!strcmp(argv[i],"--render")&&i+2<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];output=argv[++i];b.private_mode=true;if(i+1<argc&&argv[i+1][0]!='-'){char tail;if(sscanf(argv[++i],"%dx%d%c",&width,&height,&tail)!=2){usage();return 2;}}}
         else if(!strcmp(argv[i],"--dump")&&i+1<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];dump=true;b.private_mode=true;}
         else if(!strcmp(argv[i],"--quit-after")&&i+1<argc){char*end;seconds=strtod(argv[++i],&end);if(*end||!isfinite(seconds)||seconds<=0||seconds>3600)return 2;}
@@ -820,7 +1026,9 @@ int main(int argc,char**argv){
     if(width<640||height<400||width>4096||height>4096){fprintf(stderr,"Render size must be 640x400 through 4096x4096.\n");return 2;}
     geometry(&b,width,height);
     b.session=cb_session_open(b.private_mode);if(!b.session){fprintf(stderr,"Cannot open browser site storage\n");return 1;}
+    cb_session_configure(b.session,&b.config);
     if(output||dump){
+        if(open_settings){fprintf(stderr,"--settings requires a browser window.\n");cleanup(&b);return 2;}
         navigate(&b,url,true,false);double deadline=now()+45;
         while((loading(&b)||b.layout_pending||b.relayout||b.anchor_needed||b.anchor_pending||(b.script_busy&&now()<b.script_settle))&&now()<deadline){tick(&b);poll(NULL,0,10);}
         if(!b.frame||loading(&b)||b.layout_pending||b.relayout||b.anchor_needed||b.anchor_pending){fprintf(stderr,"cube-browser: %s (no completed frame)\n",b.status);cleanup(&b);return 1;}
@@ -836,5 +1044,5 @@ int main(int argc,char**argv){
     }
     b.window=cb_window_new((struct cb_callbacks){draw,key,click,scroll,tick,paste},&b);
     if(!b.window){fprintf(stderr,"cube-browser: cannot connect to Wayland; run inside a Wayland desktop (including Whitecube), or use --render/--dump. Run --check for installation diagnostics.\n");return 1;}
-    navigate(&b,url,true,false);int result=cb_window_run(b.window,seconds);cleanup(&b);return result;
+    navigate(&b,url,true,false);if(open_settings)panel_open(&b,1);int result=cb_window_run(b.window,seconds);cleanup(&b);return result;
 }

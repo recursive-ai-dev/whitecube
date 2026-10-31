@@ -10,14 +10,22 @@
 #include <sys/stat.h>
 #include <unistd.h>
 static int fail(char *out,size_t n,const char *message){snprintf(out,n,"%s",message);return -1;}
-int cb_download_save(int fd,const char *url,const char *disposition,char *path,size_t path_size,char *error,size_t error_size){
+int cb_download_save_to(int fd,const char *url,const char *disposition,const char *custom_directory,char *path,size_t path_size,char *error,size_t error_size){
     struct stat st;int required=F_SEAL_SHRINK|F_SEAL_GROW|F_SEAL_WRITE|F_SEAL_SEAL,seals=fcntl(fd,F_GET_SEALS);
     if(fstat(fd,&st)||!S_ISREG(st.st_mode)||st.st_size<0||st.st_size>CB_DOWNLOAD_LIMIT||seals<0||(seals&required)!=required)return fail(error,error_size,"Invalid completed download");
     char directory[4096],name[160],raw[512];const char *dest=getenv("XDG_DOWNLOAD_DIR"),*home=getenv("HOME");
+    if(custom_directory&&*custom_directory){
+        if(custom_directory[0]!='/')return fail(error,error_size,"Downloads folder must be an absolute path");
+        for(const unsigned char *p=(const unsigned char *)custom_directory;*p;p++)
+            if(*p<32||*p==127)return fail(error,error_size,"Downloads folder contains invalid characters");
+        dest=custom_directory;
+    }
     if((dest&&strlen(dest)>=sizeof directory)||(home&&strlen(home)>sizeof directory-12))return fail(error,error_size,"Downloads path is too long");
     if(dest&&dest[0]=='/')snprintf(directory,sizeof directory,"%s",dest);
     else if(home&&home[0]=='/')snprintf(directory,sizeof directory,"%s/Downloads",home);
     else return fail(error,error_size,"No downloads directory is available");
+    size_t directory_length=strlen(directory);
+    while(directory_length>1&&directory[directory_length-1]=='/')directory[--directory_length]=0;
     const char *file=disposition?strcasestr(disposition,"filename="):NULL;
     if(file){file+=9;if(*file=='"')file++;snprintf(raw,sizeof raw,"%.*s",(int)strcspn(file,"\";\r\n"),file);}
     else{snprintf(raw,sizeof raw,"%s",url);raw[strcspn(raw,"?#")]=0;file=strrchr(raw,'/');if(file)memmove(raw,file+1,strlen(file+1)+1);}
@@ -36,4 +44,7 @@ int cb_download_save(int fd,const char *url,const char *disposition,char *path,s
     if(close(output))failed=1;
     if(failed){unlinkat(dir,chosen,0);close(dir);return fail(error,error_size,"Could not save the complete download");}
     close(dir);snprintf(path,path_size,"%s/%s",directory,chosen);return 0;
+}
+int cb_download_save(int fd,const char *url,const char *disposition,char *path,size_t path_size,char *error,size_t error_size){
+    return cb_download_save_to(fd,url,disposition,NULL,path,path_size,error,error_size);
 }

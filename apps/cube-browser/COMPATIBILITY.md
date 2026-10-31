@@ -233,6 +233,26 @@ fall back to document flow. Intrinsic automatic column sizing, column styling an
 full collapsed-border conflict resolution are not implemented; `border-collapse`
 currently removes spacing while keeping individual cell borders.
 
+## Image documents and inline images
+
+HTTP(S) PNG, JPEG and restricted static SVG image URLs open directly as image
+pages. The original sealed response is decoded once by the renderer, without a
+second fetch or an HTML interpretation of its bytes. Image pages run no scripts.
+Local PNG/JPEG files are recognized by signature or extension; local SVG files
+use the `.svg` extension. Additional formats (including GIF, WebP and AVIF) remain
+unsupported. Local files retain the 2 MiB cap and symlink refusal.
+
+`<img src="data:...">` supports explicit `image/png`, `image/jpeg` and
+`image/svg+xml` MIME types, either with `;base64` or percent-encoded bytes. These
+images use no network or file access and also work in local HTML documents.
+The existing 8192-byte attribute limit bounds each data URL; at most 32 inline
+images are decoded and they share the document's 16-million-pixel budget with
+external images. Invalid encoding or decoder failures retain the alt-text
+fallback. Dynamic fragment resource URLs remain inert. CSP image/default source
+lists require an explicit `data:` source; `*` and `'self'` do not permit data URLs.
+Disabling images in browser settings suppresses both inline and external images.
+Responsive `srcset` and `<picture>` selection remain unsupported.
+
 ## Static SVG images
 
 External `<img>` resources served as `image/svg+xml` can contain paths (including
@@ -244,8 +264,7 @@ downloads or filesystem reads are permitted by the decoder.
 
 Scripts, event handlers, text, embedded images, external references, DTDs, filters,
 masks, clipping, animation and unsupported CSS are rejected with the normal
-alt-text fallback. This does not support inline SVG markup or SVG documents as
-top-level pages. Vector images are rasterized at their intrinsic size when loaded,
+alt-text fallback. Inline SVG markup remains unsupported; top-level SVG URLs use this same restricted decoder. Vector images are rasterized at their intrinsic size when loaded,
 then scaled with the page. XML elements, depth, shapes, coordinates, gradient
 stops and estimated painting work have separate limits, alongside the existing
 2 MiB/4096-dimension/8-million-pixel image budgets. Full SVG compatibility is still

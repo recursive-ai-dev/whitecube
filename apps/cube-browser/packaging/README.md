@@ -5,7 +5,7 @@ in the main README, then run:
 
 ```sh
 python3 packaging/build-deb.py
-python3 tests/test_package.py dist/cube-browser_0.10.0_amd64.deb
+python3 tests/test_package.py dist/cube-browser_0.10.1_amd64.deb
 ```
 
 The builder uses Debian system development tools and libraries, the pinned
@@ -22,7 +22,7 @@ parallelism. No system files or running desktop session are changed by building.
 Install the built archive with:
 
 ```sh
-sudo apt install ./dist/cube-browser_0.10.0_amd64.deb
+sudo apt install ./dist/cube-browser_0.10.1_amd64.deb
 ```
 
 Start **Cube Browser** from the application menu or run `cube-browser`. The menu

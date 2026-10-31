@@ -1,4 +1,18 @@
-# Cube Browser 0.10.0
+# Cube Browser 0.10.1
+
+This update adds direct PNG/JPEG/static SVG viewing for URLs and local files,
+bounded inline data images, and categorized native settings. Settings now edit
+home/search URLs, zoom and download folders, and control images, scripts,
+cookies, origin storage, cache, saved history, clearing on exit and HTTPS-only
+requests. Private edits stay temporary. See README.md for controls and configuration
+and COMPATIBILITY.md for image limits.
+
+Regression coverage checks rendered pixels, CSP, malformed images, image request
+blocking and actual native settings workflows, including restart persistence,
+custom downloads and history clearing. The bundled Whitecube release is 0.9.6;
+standalone packages can be built with `python3 packaging/build-deb.py`.
+
+## Previous release: 0.10.0
 
 Built locally on 2026-10-27. The standalone Debian package is
 `dist/cube-browser_0.10.0_amd64.deb`; install with

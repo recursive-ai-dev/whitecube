@@ -67,11 +67,13 @@ int cb_broker_receive(struct cb_http_job *j,struct cb_session *s,struct cb_messa
     if(!j->request.download&&!revalidated&&cb_cache_finish(s,&j->request,&j->meta,&m->fd))return failure(j,"Invalid cache revalidation response");
     status=j->meta.status;const char *mime=j->meta.mime;
     if(!j->top&&j->request.kind!=4&&(status<200||status>299))return failure(j,"Subresource returned an unsuccessful HTTP status");
-    if(j->top&&!j->request.download&&*mime&&!mime_is(mime,"text/html")&&!mime_is(mime,"application/xhtml+xml")&&!mime_is(mime,"text/plain"))return failure(j,"This content type cannot be displayed. Press Ctrl+S to download it.");
+    if(j->top&&!j->request.download&&*mime&&!mime_is(mime,"text/html")&&!mime_is(mime,"application/xhtml+xml")&&!mime_is(mime,"text/plain")&&!mime_is(mime,"image/png")&&!mime_is(mime,"image/jpeg")&&!mime_is(mime,"image/svg+xml"))return failure(j,"This content type cannot be displayed. Press Ctrl+S to download it.");
     if(!j->top&&j->request.kind==1&&!mime_is(mime,"text/css"))return failure(j,"Stylesheet MIME type refused");
     if(!j->top&&j->request.kind==2&&!mime_is(mime,"image/png")&&!mime_is(mime,"image/jpeg")&&!mime_is(mime,"image/svg+xml"))return failure(j,"Image MIME type refused");
     if(!j->top&&j->request.kind==3&&!mime_is(mime,"text/javascript")&&!mime_is(mime,"application/javascript"))return failure(j,"Script MIME type refused");
-    m->a=status;m->b=j->top?(unsigned)mime_is(mime,"text/plain"):j->request.kind;
+    m->a=status;m->b=j->top?(mime_is(mime,"image/png")?CB_DOCUMENT_PNG:
+        mime_is(mime,"image/jpeg")?CB_DOCUMENT_JPEG:mime_is(mime,"image/svg+xml")?CB_DOCUMENT_SVG:
+        mime_is(mime,"text/plain")?CB_DOCUMENT_TEXT:CB_DOCUMENT_HTML):j->request.kind;
     if(j->top)snprintf(m->text,sizeof m->text,"%s",j->request.url);
     else snprintf(m->text,sizeof m->text,"%s\n%s",j->request.url,mime);
     return 1;

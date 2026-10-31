@@ -2,6 +2,9 @@
 #define CB_IPC_H
 #include <stddef.h>
 #include <stdint.h>
+/* DOCUMENT.b identifies the body without interpreting image bytes as HTML. */
+enum cb_document_kind { CB_DOCUMENT_HTML, CB_DOCUMENT_TEXT, CB_DOCUMENT_PNG,
+    CB_DOCUMENT_JPEG, CB_DOCUMENT_SVG };
 /* A length-prefixed CBOR array [type, a, b, c, text], one per seqpacket.
  * Optional SCM_RIGHTS carries an anonymous, bounded document or frame. */
 enum { CB_FETCH=1, CB_DOCUMENT, CB_ERROR, CB_LAYOUT, CB_FRAME, CB_LINK,

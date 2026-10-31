@@ -5,4 +5,6 @@
 /* Save a sealed completed transfer into the user's downloads directory without
  * following target symlinks or overwriting an existing file. No automatic open. */
 int cb_download_save(int fd,const char *url,const char *disposition,char *path,size_t path_size,char *error,size_t error_size);
+/* An empty/NULL directory uses the default above; custom paths must be absolute. */
+int cb_download_save_to(int fd,const char *url,const char *disposition,const char *directory,char *path,size_t path_size,char *error,size_t error_size);
 #endif

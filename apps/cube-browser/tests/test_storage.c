@@ -46,12 +46,17 @@ static void config_tests(void)
     assert(strcmp(config.homepage, "cube:home") == 0);
     assert(strcmp(config.search_engine, "https://duckduckgo.com/html/?q=%s") == 0);
     assert(config.zoom == 1.0);
+    assert(config.javascript && config.images && config.cookies && config.site_storage && config.cache && config.save_history);
+    assert(!config.clear_on_exit && !config.https_only && !*config.download_directory);
     char untouched[8192];
     path_for(untouched, sizeof(untouched), "config");
     assert(access(untouched, F_OK) == -1 && errno == ENOENT);
     strcpy(config.homepage, "https://example.com/?a=1&b=2");
     strcpy(config.search_engine, "https://example.com/search?q=%s&from=cube%20browser");
     config.zoom = 1.25;
+    config.javascript = config.images = config.cookies = config.site_storage = config.cache = config.save_history = false;
+    config.clear_on_exit = config.https_only = true;
+    strcpy(config.download_directory, "/tmp/Cube Downloads");
     assert(cb_config_save(&config, error, sizeof(error)) == 0);
     permissions("config/cube-browser", 0700);
     permissions("config/cube-browser/config", 0600);
@@ -59,6 +64,37 @@ static void config_tests(void)
     assert(cb_config_load(&config, error, sizeof(error)) == 0);
     assert(strcmp(config.homepage, "https://example.com/?a=1&b=2") == 0);
     assert(config.zoom == 1.25);
+    assert(!config.javascript && !config.images && !config.cookies && !config.site_storage && !config.cache && !config.save_history);
+    assert(config.clear_on_exit && config.https_only && !strcmp(config.download_directory, "/tmp/Cube Downloads"));
+
+    strcpy(config.download_directory, "relative/path");
+    assert(cb_config_validate(&config, error, sizeof(error)) == -1);
+    assert(cb_config_save(&config, error, sizeof(error)) == -1);
+    strcpy(config.download_directory, "/tmp/path\nimages=true");
+    assert(cb_config_save(&config, error, sizeof(error)) == -1);
+    memset(config.download_directory, '/', sizeof(config.download_directory));
+    assert(cb_config_save(&config, error, sizeof(error)) == -1);
+    config.download_directory[0] = 0;
+
+    const char *bad_homepages[] = {"javascript:alert(1)", "https://", "https://user:pass@example.org/",
+        "https://example.org:0/", "https://example.org:999999/", "cube:unknown", "relative.html", "file://remote/tmp/page.html"};
+    for (size_t i = 0; i < sizeof(bad_homepages) / sizeof(bad_homepages[0]); i++) {
+        strcpy(config.homepage, bad_homepages[i]);
+        assert(cb_config_validate(&config, error, sizeof(error)) == -1);
+    }
+    const char *good_homepages[] = {"cube:home", "cube:settings", "https://example.org:8443/home",
+        "file:///tmp/Cube%20Home.html", "/tmp/Cube Home.html"};
+    for (size_t i = 0; i < sizeof(good_homepages) / sizeof(good_homepages[0]); i++) {
+        strcpy(config.homepage, good_homepages[i]);
+        assert(cb_config_validate(&config, error, sizeof(error)) == 0);
+    }
+    const char *bad_searches[] = {"https:///?q=%s", "https://user@example.org/?q=%s", "https://example.org:0/?q=%s",
+        "javascript:%s", "https://example.org/?q=%s&again=%s", "https://example.org/?q=missing"};
+    for (size_t i = 0; i < sizeof(bad_searches) / sizeof(bad_searches[0]); i++) {
+        strcpy(config.search_engine, bad_searches[i]);
+        assert(cb_config_validate(&config, error, sizeof(error)) == -1);
+    }
+    strcpy(config.search_engine, "https://example.org/?q=%s");
 
     strcpy(config.homepage, "cube:start\nzoom=3");
     assert(cb_config_save(&config, error, sizeof(error)) == -1);
@@ -69,6 +105,22 @@ static void config_tests(void)
     write_file("config/cube-browser/config", " # comment\n zoom = 1.5\n future_setting = yes\n");
     assert(cb_config_load(&config, error, sizeof(error)) == 0);
     assert(config.zoom == 1.5);
+    assert(config.images && config.cookies && config.site_storage && config.cache && config.save_history);
+    assert(!config.clear_on_exit && !config.https_only && !*config.download_directory);
+
+    const char *booleans[] = {"javascript", "images", "cookies", "site_storage", "cache", "save_history", "clear_on_exit", "https_only"};
+    for (size_t i = 0; i < sizeof(booleans) / sizeof(booleans[0]); i++) {
+        char invalid[128];
+        snprintf(invalid, sizeof(invalid), "homepage=https://example.org/\n%s=1\n", booleans[i]);
+        write_file("config/cube-browser/config", invalid);
+        assert(cb_config_load(&config, error, sizeof(error)) == -1);
+        assert(!strcmp(config.homepage, "cube:home") && config.images && config.cookies);
+    }
+    write_file("config/cube-browser/config", "download_directory=~/Downloads\n");
+    assert(cb_config_load(&config, error, sizeof(error)) == -1);
+    write_file("config/cube-browser/config", "javascript=false\nzoom=3\ndownload_directory=\n");
+    assert(cb_config_load(&config, error, sizeof(error)) == 0);
+    assert(!config.javascript && config.images && config.cookies && config.zoom == 3.0);
 
     char path[8192];
     path_for(path, sizeof(path), "config/cube-browser/config");

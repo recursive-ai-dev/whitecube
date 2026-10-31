@@ -5,7 +5,10 @@
 #include <time.h>
 #include "http.h"
 struct cb_session;
+struct cb_config;
 struct cb_session *cb_session_open(bool private_mode);
+/* Applies the current window's preferences without deleting saved site data. */
+void cb_session_configure(struct cb_session *s,const struct cb_config *config);
 void cb_session_close(struct cb_session *s);
 void cb_session_clear(struct cb_session *s);
 /* Cookie evaluation always uses trusted request/top-level URLs, never renderer headers. */

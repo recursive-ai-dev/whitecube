@@ -17,7 +17,7 @@
 #define CACHE_BYTES (16u*1024u*1024u)
 struct cookie {char name[256],value[3840],domain[254],path[1024];time_t expires,created;bool host,secure,http_only;unsigned same;};
 struct cache {char url[4096];char *body;size_t size;struct cb_http_metadata meta;unsigned age;};
-struct cb_session {struct cookie cookies[COOKIE_LIMIT];size_t count;sqlite3 *db;bool private_mode;struct cache cache[CACHE_LIMIT];unsigned age;size_t bytes;};
+struct cb_session {struct cookie cookies[COOKIE_LIMIT];size_t count;sqlite3 *db;bool private_mode,cookies_enabled,storage_enabled,cache_enabled;struct cache cache[CACHE_LIMIT];unsigned age;size_t bytes;};
 static int rule(const char *value){
     size_t low=0,high=G_N_ELEMENTS(suffix_rules);
     while(low<high){size_t m=low+(high-low)/2;int c=strcmp(value,suffix_rules[m]);if(!c)return 1;if(c<0)high=m;else low=m+1;}return 0;
@@ -53,6 +53,7 @@ static void persist(struct cb_session *s,const struct cookie *c){
 }
 struct cb_session *cb_session_open(bool private_mode){
     struct cb_session *s=calloc(1,sizeof *s);if(!s)return NULL;s->private_mode=private_mode;
+    s->cookies_enabled=s->storage_enabled=s->cache_enabled=true;
     if(private_mode){if(sqlite3_open(":memory:",&s->db)!=SQLITE_OK){cb_session_close(s);return NULL;}}
     else s->db=cb_storage_open("sites.sqlite3");
     if(!s->db){cb_session_close(s);return NULL;}
@@ -76,9 +77,19 @@ struct cb_session *cb_session_open(bool private_mode){
     }sqlite3_finalize(q);return s;
 }
 void cb_session_close(struct cb_session *s){if(!s)return;for(unsigned i=0;i<CACHE_LIMIT;i++)free(s->cache[i].body);if(s->db)sqlite3_close(s->db);free(s);}
-void cb_session_clear(struct cb_session *s){if(!s)return;s->count=0;for(unsigned i=0;i<CACHE_LIMIT;i++){free(s->cache[i].body);memset(&s->cache[i],0,sizeof s->cache[i]);}s->bytes=0;sqlite3_exec(s->db,"DELETE FROM cookies;DELETE FROM local;DELETE FROM session;DELETE FROM permissions;VACUUM;",NULL,NULL,NULL);}
+static void cache_clear(struct cb_session *s){
+    for(unsigned i=0;i<CACHE_LIMIT;i++){free(s->cache[i].body);memset(&s->cache[i],0,sizeof s->cache[i]);}
+    s->bytes=0;s->age=0;
+}
+void cb_session_configure(struct cb_session *s,const struct cb_config *config){
+    if(!s||!config)return;
+    s->cookies_enabled=config->cookies;s->storage_enabled=config->site_storage;
+    if(!config->cache)cache_clear(s);
+    s->cache_enabled=config->cache;
+}
+void cb_session_clear(struct cb_session *s){if(!s)return;s->count=0;cache_clear(s);sqlite3_exec(s->db,"DELETE FROM cookies;DELETE FROM local;DELETE FROM session;DELETE FROM permissions;VACUUM;",NULL,NULL,NULL);}
 int cb_cookie_set(struct cb_session *s,const char *url,const char *line,time_t now){
-    if(!s||!line||strlen(line)>=4096||!clean(line))return -1;
+    if(!s||!s->cookies_enabled||!line||strlen(line)>=4096||!clean(line))return -1;
     struct cb_http_url u;if(cb_http_parse(url,&u))return -1;
     char input[4096];strcpy(input,line);char *save=NULL,*pair=strtok_r(input,";",&save);if(!pair)return -1;
     char *eq=strchr(pair,'=');if(!eq)return -1;*eq++=0;char *name=g_strstrip(pair),*value=g_strstrip(eq);
@@ -120,7 +131,7 @@ int cb_cookie_set(struct cb_session *s,const char *url,const char *line,time_t n
     s->cookies[match]=c;persist(s,&c);return 0;
 }
 void cb_cookie_header(struct cb_session *s,const char *url,const char *site,bool top,bool post,time_t now,char out[CB_COOKIE_HEADER]){
-    out[0]=0;struct cb_http_url u;if(!s||cb_http_parse(url,&u))return;
+    out[0]=0;struct cb_http_url u;if(!s||!s->cookies_enabled||cb_http_parse(url,&u))return;
     bool same=cb_same_site(url,site);if(!top&&!same)return; /* Third-party cookies disabled. */
     size_t indices[COOKIE_LIMIT],count=0;
     for(size_t i=0;i<s->count;i++){struct cookie *c=&s->cookies[i];
@@ -131,7 +142,7 @@ void cb_cookie_header(struct cb_session *s,const char *url,const char *site,bool
     size_t used=0;for(size_t i=0;i<count;i++){struct cookie *c=&s->cookies[indices[i]];size_t n=strlen(c->name)+strlen(c->value)+1+(used?2:0);if(n>=CB_COOKIE_HEADER-used)continue;used+=(size_t)snprintf(out+used,CB_COOKIE_HEADER-used,"%s%s=%s",used?"; ":"",c->name,c->value);}
 }
 static sqlite3_stmt *site_query(struct cb_session *s,const char *url,bool local,const char *sql,const char *key,const char *value){
-    char origin[320],query[512];if(!s||cb_origin(url,origin))return NULL;
+    char origin[320],query[512];if(!s||!s->storage_enabled||cb_origin(url,origin))return NULL;
     snprintf(query,sizeof query,sql,local?"local":"session");sqlite3_stmt *q=NULL;
     if(sqlite3_prepare_v2(s->db,query,-1,&q,NULL)!=SQLITE_OK)return NULL;
     sqlite3_bind_text(q,1,origin,-1,SQLITE_TRANSIENT);if(key)sqlite3_bind_text(q,2,key,-1,SQLITE_TRANSIENT);if(value)sqlite3_bind_text(q,3,value,-1,SQLITE_TRANSIENT);return q;
@@ -159,11 +170,12 @@ char *cb_site_snapshot(struct cb_session *s,const char *url,bool local){
     sqlite3_finalize(q);g_string_append_c(out,'}');return g_string_free(out,FALSE);
 }
 void cb_cache_prepare(struct cb_session *s,struct cb_http_request *r){
-    r->etag[0]=r->modified[0]=0;if(!s||r->post||*r->cookie)return;
+    r->etag[0]=r->modified[0]=0;if(!s||!s->cache_enabled||r->post||*r->cookie)return;
     for(unsigned i=0;i<CACHE_LIMIT;i++)if(s->cache[i].body&&!strcmp(s->cache[i].url,r->url)){strcpy(r->etag,s->cache[i].meta.etag);strcpy(r->modified,s->cache[i].meta.modified);return;}
 }
 int cb_cache_finish(struct cb_session *s,const struct cb_http_request *r,struct cb_http_metadata *m,int *fd){
     if(!s)return -1;
+    if(!s->cache_enabled)return m->status==304?-1:0;
     struct cache *found=NULL,*oldest=&s->cache[0];
     for(unsigned i=0;i<CACHE_LIMIT;i++){struct cache *c=&s->cache[i];if(!strcmp(c->url,r->url))found=c;if(!c->body||c->age<oldest->age)oldest=c;}
     if(m->status==304){

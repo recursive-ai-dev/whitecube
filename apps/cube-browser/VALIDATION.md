@@ -1,4 +1,19 @@
-# Cube Browser 0.10.0 validation
+# Cube Browser validation
+
+## 0.10.1 image and configuration checks
+
+The prepared Debian 13 builder runs all 23 browser suites, including real
+Wayland presentation against Whitecube. Added coverage checks direct remote and
+local PNG/JPEG/SVG, inline data images, CSP allow/block behavior, malformed image
+refusal, settings editing and validation, image request blocking and repaint,
+custom download folders, restart persistence, reload/reset, disabled history,
+clear-on-exit preserving bookmarks and private settings nonpersistence. Component
+image-engine and policy checks also passed under ASan/UBSan.
+
+This records deterministic local checks, not full web compatibility. No 0.10.1
+standalone archive or real-hardware browser compatibility results are claimed.
+
+## Previous release: 0.10.0
 
 Validated locally on Ubuntu 26.04.1 amd64, Linux 7.0.0-38, 2026-10-27.
 The UI, renderer and network worker are built against system desktop libraries,

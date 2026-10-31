@@ -90,10 +90,12 @@ int main(int argc,char **argv){
     struct cb_message reply={.fd=-1,.type=ok?CB_ERROR:CB_DOCUMENT,.a=r.status};
     if(ok)snprintf(reply.text,sizeof(reply.text),"%s",r.error);
     else {
-        if(!req.a&&r.content_type[0]&&!mime_is(r.content_type,"text/html")&&!mime_is(r.content_type,"text/plain")&&!mime_is(r.content_type,"application/xhtml+xml")){
-            reply.type=CB_ERROR;snprintf(reply.text,sizeof(reply.text),"This build cannot display %s. Only HTML and plain text are supported.",r.content_type);
+        if(!req.a&&r.content_type[0]&&!mime_is(r.content_type,"text/html")&&!mime_is(r.content_type,"text/plain")&&!mime_is(r.content_type,"application/xhtml+xml")&&!mime_is(r.content_type,"image/png")&&!mime_is(r.content_type,"image/jpeg")&&!mime_is(r.content_type,"image/svg+xml")){
+            reply.type=CB_ERROR;snprintf(reply.text,sizeof(reply.text),"This build cannot display %s. Supported content is HTML, plain text, PNG, JPEG and static SVG.",r.content_type);
         }else{
-            reply.b=req.a?req.a:(unsigned)mime_is(r.content_type,"text/plain");
+            reply.b=req.a?req.a:(mime_is(r.content_type,"image/png")?CB_DOCUMENT_PNG:
+                mime_is(r.content_type,"image/jpeg")?CB_DOCUMENT_JPEG:mime_is(r.content_type,"image/svg+xml")?CB_DOCUMENT_SVG:
+                mime_is(r.content_type,"text/plain")?CB_DOCUMENT_TEXT:CB_DOCUMENT_HTML);
             reply.fd=cb_document_fd(r.body,r.length);
             if(req.a)snprintf(reply.text,sizeof(reply.text),"%s\n%s",r.url,r.content_type);
             else snprintf(reply.text,sizeof(reply.text),"%s",r.url);

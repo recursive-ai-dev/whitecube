@@ -90,7 +90,7 @@ int main(int argc,char **argv){
     if(argc!=3||strcmp(argv[1],"--ipc"))return 2;
     int socket=cb_ipc_fd(argv[2]);if(socket<0)return 2;
     if(cb_renderer_restrict()) {close(socket);return 1;}
-    struct cb_page *page=NULL;struct cb_dom *dom=NULL;struct cb_message m;int received=0;char policy[4096]="";char *storage=NULL;int web=0,allow_eval=0,configured=0;
+    struct cb_page *page=NULL;struct cb_dom *dom=NULL;struct cb_message m;int received=0;char policy[4096]="";char *storage=NULL;int web=0,allow_eval=0,configured=0,images_enabled=1;
     for(;;){
         if(dom){alarm(15);cb_dom_tick(dom);alarm(0);}
         struct pollfd wait={socket,POLLIN,0};int event=poll(&wait,1,dom?15:-1);if(event<0&&errno==EINTR)continue;if(event<0)break;if(!event)continue;
@@ -98,16 +98,17 @@ int main(int argc,char **argv){
         alarm(15);int ok=0;
         if(m.fd>=0&&m.type!=CB_DOCUMENT&&m.type!=CB_RESOURCE_DATA&&m.type!=CB_WEB_INIT&&m.type!=CB_WEB_RESPONSE)ok=-1;
         else if(m.type==CB_RESOURCE_DATA&&m.fd<0&&m.c!=1)ok=-1;
-        else if(m.type==CB_WEB_INIT&&m.a<=1&&m.b<=1&&!m.c){
+        else if(m.type==CB_WEB_INIT&&m.a<=1&&m.b<=1&&m.c<=1){
             char *next=NULL;size_t length=0;if(m.fd<0||cb_read_document(m.fd,&next,&length)||length>600000)ok=-1;
-            else{free(storage);storage=next;web=m.a;allow_eval=m.b;configured=1;}
+            else{free(storage);storage=next;web=m.a;allow_eval=m.b;images_enabled=!m.c;configured=1;}
         }
         else if(m.type==CB_WEB_RESPONSE&&dom){cb_dom_response(dom,&m);}
         else if(m.type==CB_POLICY&&m.fd<0&&!m.a&&!m.b&&!m.c&&strlen(m.text)<sizeof policy){strcpy(policy,m.text);}
-        else if(m.type==CB_DOCUMENT&&m.fd>=0){
+        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.b<=CB_DOCUMENT_SVG){
             char *html=NULL;size_t size=0;ok=cb_read_document(m.fd,&html,&size);
-            if(!ok){struct cb_page *next=cb_page_parse(html,size,m.text);free(html);if(!next)ok=-1;else{cb_dom_free(dom);dom=NULL;cb_page_free(page);page=next;cb_page_set_policy(page,policy);policy[0]=0;ok=resource_catalog(socket,page);
-                if(!ok&&web)dom=cb_dom_new(page,socket,storage,allow_eval);
+            if(!ok){const char *mime=m.b==CB_DOCUMENT_PNG?"image/png":m.b==CB_DOCUMENT_JPEG?"image/jpeg":m.b==CB_DOCUMENT_SVG?"image/svg+xml":NULL;
+                struct cb_page *next=mime?cb_page_from_image(html,size,mime,m.text):cb_page_parse(html,size,m.text);free(html);if(!next)ok=-1;else{cb_dom_free(dom);dom=NULL;cb_page_free(page);page=next;cb_page_set_images_enabled(page,images_enabled);cb_page_set_policy(page,policy);policy[0]=0;ok=resource_catalog(socket,page);
+                if(!ok&&web&&!mime)dom=cb_dom_new(page,socket,storage,allow_eval);
                 if(configured&&!dom){struct cb_message state={.type=CB_WEB_STATE,.b=1,.fd=-1};ok=cb_send(socket,&state);}
             }}
         }else if(m.type==CB_RESOURCE_DATA&&page){

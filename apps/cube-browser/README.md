@@ -1,6 +1,6 @@
 # Cube Browser
 
-Cube Browser **0.10.0** is a native Wayland interactive-web preview for Whitecube.
+Cube Browser **0.10.1** is a native Wayland interactive-web preview for Whitecube.
 It has its own HTML/CSS engine, Pango/Cairo software rendering, mbedTLS and a
 bounded QuickJS interpreter behind the replaceable `cube-js` interface. It uses
 no Chromium, Firefox, WebKit, Electron, GTK, X11, XWayland or D-Bus.
@@ -13,10 +13,10 @@ See [compatibility](COMPATIBILITY.md), [validation](VALIDATION.md) and
 
 ## Install a standalone Debian package
 
-The built archive is `dist/cube-browser_0.10.0_amd64.deb`:
+The built archive is `dist/cube-browser_0.10.1_amd64.deb`:
 
 ```sh
-sudo apt install ./dist/cube-browser_0.10.0_amd64.deb
+sudo apt install ./dist/cube-browser_0.10.1_amd64.deb
 cube-browser --check
 cube-browser
 ```
@@ -33,7 +33,7 @@ Build and verify another package after bootstrapping the dependencies below:
 
 ```sh
 python3 packaging/build-deb.py
-python3 tests/test_package.py dist/cube-browser_0.10.0_amd64.deb
+python3 tests/test_package.py dist/cube-browser_0.10.1_amd64.deb
 ```
 
 See [packaging details](packaging/README.md) for dependencies, repeatable builds,
@@ -90,12 +90,15 @@ also intended for this machine, rather than as a portable binary distribution.
 - Bounded HTML recovery, selectors, cascade, CSS variables, responsive media,
   block/inline/flex, equal-column grids, tables, positioned blocks and clipping.
 - External CSS and PNG/JPEG/static SVG images, loaded through isolated workers.
+  Image URLs and local image files also open directly; bounded `data:` images
+  render inline, subject to image settings and Content Security Policy.
 - GET/POST forms, editable masked passwords, cookie sessions, origin storage,
   conditional HTTP cache, private windows and data clearing.
 - Classic/deferred scripts, DOM text/tree/attribute changes, events and cancelled
   defaults, bounded HTML fragment insertion, promises, timers, text/JSON fetch
   and localStorage/sessionStorage.
-- Native settings, persistent per-site script choices, console/network diagnostics
+- Categorized native settings with editable preferences, persistent per-site script
+  choices, console/network diagnostics
   and downloads with progress and cancellation.
 - Whitecube scaling, strong contrast and reduced-motion preferences; headless PNG
   and text export using the same browser workers.
@@ -131,8 +134,8 @@ Password fields refuse copy/cut and require POST submission. POST bodies never
 appear in the address or history. Reload/back use GET without replaying a POST.
 Fields survive relayout; ordinary navigation creates a fresh document.
 
-Downloads save completed files with mode 0600 to an absolute `XDG_DOWNLOAD_DIR`
-environment setting, or `~/Downloads`. They never overwrite, execute or open a
+Downloads save completed files with mode 0600 to the folder selected in settings,
+an absolute `XDG_DOWNLOAD_DIR` environment setting, or `~/Downloads`. They never overwrite, execute or open a
 file automatically. One transfer can run at a time, up to 64 MiB. Data clearing
 retains downloaded files.
 
@@ -145,11 +148,43 @@ homepage=cube:home
 search_engine=https://duckduckgo.com/html/?q=%s
 zoom=1.0
 javascript=true
+images=true
+cookies=true
+site_storage=true
+cache=true
+save_history=true
+clear_on_exit=false
+https_only=false
+download_directory=
 ```
 
-The native settings panel edits these choices. `%s` in the search URL is replaced
-with percent-encoded input and is never evaluated as a shell command. Per-site
-script choices override the default. Settings and SQLite files are owner-only.
+Open Menu, press Ctrl+comma, enter `cube:settings`, or launch with `--settings`.
+Left/Right selects General, Content, Privacy, Downloads or Advanced; Up/Down
+selects a preference. Enter edits a text field or toggles a switch. Text fields
+support Ctrl+A/C/X/V, cursor movement, Enter to validate/save and Escape to cancel.
+Zoom accepts percentages from 50 to 300 in the panel and ratios from 0.5 to 3.0
+in the config file. Invalid values leave the current settings in place.
+
+`%s` in the search URL is replaced with percent-encoded input and is never
+evaluated as a shell command. Home/search URLs refuse embedded credentials.
+The download folder must be an absolute path; empty uses the default directory.
+Advanced provides reload from disk and restore defaults. Settings and SQLite
+files are owner-only. Missing keys retain their defaults, including existing
+four-setting profiles.
+
+Turning off images prevents external image requests and hides inline/direct
+images. Cookies off blocks both sending and accepting cookies; third-party
+cookies are always blocked. Site storage off hides saved origin data and refuses
+new writes without deleting it. Cache off discards the in-memory HTTP cache and
+bypasses future caching. History off stops new saved visits. Clear-on-exit clears
+saved history, cookies, site storage and script choices when that normal window
+closes; bookmarks and downloaded files remain. Clearing now returns home so the
+current site cannot immediately recreate its data. HTTPS-only blocks HTTP pages,
+resources, redirects, fetch and downloads, including an active HTTP download when
+the mode is enabled. Per-site script choices override the default.
+
+Private settings changes apply only to the current window and are never saved.
+Clear-on-exit in a private window never clears the normal profile.
 
 History has 90-day retention in `$XDG_DATA_HOME/cube-browser/history.sqlite3`.
 Cookies, local storage and site script choices use `sites.sqlite3` in that folder.
@@ -178,7 +213,7 @@ build/cube-browser --render https://example.com build/example.png
 build/cube-browser --console --dump https://example.com
 ```
 
-Relative HTML paths and `file:///` URLs are supported on the command line. `--`
+Relative HTML/image paths and `file:///` URLs are supported on the command line. `--`
 ends option parsing for desktop URL handlers. `--help`, `--version` and `--check`
 do not create profile files.
 

@@ -16,6 +16,14 @@ int main(void){
     assert(cb_origin("http://example.org\\evil/",origin));
     assert(cb_policy_allows("",doc,doc,CB_POLICY_IMAGE,0));
     assert(!cb_policy_allows("img-src *",doc,"http://example.org/p.png",CB_POLICY_IMAGE,0));
+    const char *data="data:image/png;base64,aGVsbG8=";
+    assert(cb_policy_allows("",doc,data,CB_POLICY_IMAGE,0));
+    assert(cb_policy_allows("img-src data:",doc,data,CB_POLICY_IMAGE,0));
+    assert(!cb_policy_allows("img-src *",doc,data,CB_POLICY_IMAGE,0));
+    assert(!cb_policy_allows("img-src 'self'",doc,data,CB_POLICY_IMAGE,0));
+    assert(!cb_policy_allows("default-src 'none'",doc,data,CB_POLICY_IMAGE,0));
+    assert(!cb_policy_allows("img-src data:\nimg-src 'self'",doc,data,CB_POLICY_IMAGE,0));
+    assert(!cb_policy_allows("script-src data:",doc,data,CB_POLICY_SCRIPT,0));
     assert(!cb_policy_allows("default-src 'none'",doc,doc,CB_POLICY_STYLE,0));
     assert(cb_policy_allows("default-src 'none'",doc,doc,CB_POLICY_FORM,0));
     assert(!cb_policy_allows("form-action 'none'",doc,doc,CB_POLICY_FORM,0));

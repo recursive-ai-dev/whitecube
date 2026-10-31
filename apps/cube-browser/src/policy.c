@@ -50,6 +50,7 @@ int cb_same_origin(const char *a,const char *b){char left[320],right[320];return
 static char *trim(char *s){while(isspace((unsigned char)*s))s++;char *end=s+strlen(s);while(end>s&&isspace((unsigned char)end[-1]))*--end=0;return s;}
 static int source_matches(const char *source,const char *document,const char *target){
     if(!strcmp(source,"'self'"))return cb_same_origin(document,target);
+    if(!strncasecmp(target,"data:",5))return !strcmp(source,"data:");
     struct cb_http_url d,t;if(cb_http_parse(document,&d)||cb_http_parse(target,&t))return 0;
     if(!strcmp(source,"*"))return 1;
     if(!strcmp(source,"https:"))return t.tls;
@@ -108,8 +109,9 @@ static int one_policy(char *policy,const char *document,const char *target,unsig
 }
 int cb_policy_allows(const char *policy,const char *document,const char *target,unsigned kind,int inline_code){
     struct cb_http_url d,t;
-    if(kind<1||kind>6||cb_http_parse(document,&d)||(!inline_code&&cb_http_parse(target,&t)))return 0;
-    if(!inline_code&&d.tls&&!t.tls)return 0;
+    int data_image=kind==CB_POLICY_IMAGE&&target&&!strncasecmp(target,"data:",5);
+    if(kind<1||kind>6||cb_http_parse(document,&d)||(!inline_code&&!data_image&&cb_http_parse(target,&t)))return 0;
+    if(!inline_code&&!data_image&&d.tls&&!t.tls)return 0;
     if(!policy||!*policy)return 1;
     if((kind==CB_POLICY_SCRIPT||kind==CB_POLICY_FORM||kind==CB_POLICY_CONNECT)&&cb_policy_opaque(policy))return 0;
     if(strlen(policy)>=CB_POLICY_LIMIT)return 0;

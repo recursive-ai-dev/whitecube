@@ -19,10 +19,14 @@ class AppTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='cube-app-test-')
         self.home = Path(self.temporary.name)
+        runtime = self.home/'runtime'
+        runtime.mkdir(mode=0o700)
         self.env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home/'config'),
-                        XDG_DATA_HOME=str(self.home/'data'), XDG_STATE_HOME=str(self.home/'state'))
+                        XDG_DATA_HOME=str(self.home/'data'), XDG_STATE_HOME=str(self.home/'state'),
+                        XDG_RUNTIME_DIR=str(runtime))
         self.env.pop('DISPLAY', None)
         self.env.pop('WAYLAND_DISPLAY', None)
+        self.env.pop('WAYLAND_SOCKET', None)
     def tearDown(self):
         self.temporary.cleanup()
     def run_browser(self, *args):
@@ -61,6 +65,21 @@ class AppTests(unittest.TestCase):
                 self.assertFalse((self.home/'data').exists())
                 self.assertFalse((self.home/'config').exists())
         self.assertIn('No Wayland socket', self.run_browser('--check').stdout)
+
+    def test_https_only_preference_blocks_http_before_any_request(self):
+        config = self.home/'config/cube-browser/config'
+        config.parent.mkdir(parents=True, mode=0o700)
+        config.write_text('https_only=true\n')
+        config.chmod(0o600)
+        document = b'<title>Unreachable HTTP page</title><p>Must never be fetched</p>'
+        response = (f'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {len(document)}\r\n\r\n'.encode() + document)
+        with serve({'/page': response}) as (server, url):
+            result = self.run_browser('--dump', url+'/page')
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn('HTTPS-only mode blocked', result.stdout + result.stderr)
+            self.assertEqual(server.requests, [], 'HTTPS-only must block before sending an HTTP request')
+        self.assertEqual(config.read_text(), 'https_only=true\n')
+        self.assertFalse((self.home/'data').exists())
 
     def test_check_reports_missing_workers(self):
         app = self.home/'incomplete-install'

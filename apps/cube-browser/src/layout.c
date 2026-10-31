@@ -1,6 +1,8 @@
 #include "engine-internal.h"
 
 cairo_surface_t *cb_engine_node_image(const struct cb_page *p, const struct node *n) {
+    if(!p->images_enabled)return NULL;
+    if(n->inline_image)return n->inline_image;
     return n->resource<p->resource_count?p->resources[n->resource].image:NULL;
 }
 void cb_engine_image_size(const struct cb_page *p, const struct node *n, double available,

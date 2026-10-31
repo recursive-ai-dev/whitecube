@@ -547,13 +547,13 @@ def exercise_workflows(proxy, origin, requests, root, download_started, cancel_s
     proxy.key(38, proxy.control);proxy.type(origin + '/scripted');proxy.key(28)
     wait_for(lambda: proxy.title.startswith('Cube E2E scripted'), 'scripted page before site settings')
     proxy.key(51, proxy.control)  # Ctrl+, browser settings.
-    wait_for(lambda: proxy.has_color(0xc9c9c9), 'native settings panel')
+    wait_for(lambda: proxy.has_color(0xd5e4db), 'native settings panel')
     save_frame(proxy, artifacts, 'wayland-settings.png')
-    proxy.key(108);proxy.key(28)  # Site JavaScript toggle.
+    proxy.key(106);proxy.key(108);proxy.key(108);proxy.key(28)  # Content, site JavaScript.
     wait_for(lambda: proxy.title == 'Cube E2E script source', 'site scripts disabled and page reloaded')
     proxy.key(19, proxy.control)
     wait_for(lambda: proxy.title == 'Cube E2E script source', 'site script choice retained')
-    proxy.key(51, proxy.control);proxy.key(108);proxy.key(28)
+    proxy.key(51, proxy.control);proxy.key(106);proxy.key(108);proxy.key(108);proxy.key(28)
     wait_for(lambda: proxy.title.startswith('Cube E2E scripted'), 'site scripts reenabled')
     proxy.key(88)  # F12, page console.
     wait_for(lambda: proxy.has_color(0xf0f0f0), 'native console panel')
@@ -587,8 +587,11 @@ def exercise_workflows(proxy, origin, requests, root, download_started, cancel_s
     proxy.key(38, proxy.control);proxy.type(origin + '/scripted');proxy.key(28)
     wait_for(lambda: proxy.title.startswith('Cube E2E scripted'), 'page before clearing private data')
     proxy.key(51, proxy.control)
-    for _ in range(6): proxy.key(108)
+    proxy.key(106);proxy.key(106)  # Privacy category.
+    for _ in range(5): proxy.key(108)
     proxy.key(28)
+    wait_for(lambda: proxy.title == 'Private browsing — Cube Browser', 'clearing data returned to the private home page')
+    proxy.key(38, proxy.control);proxy.type(origin + '/scripted');proxy.key(28)
     wait_for(lambda: proxy.title == 'Cube E2E scripted 1 1', 'clearing private origin storage resets script state')
     settings=root/'state/whitecube/accessibility.json';settings.parent.mkdir(parents=True,exist_ok=True)
     before=hashlib.sha256(proxy.snapshot()[0]).digest()
@@ -727,6 +730,176 @@ def exercise_bookmarks(browser, browser_env, upstream, root, origin, log, artifa
     print("e2e: Ctrl+D bookmark persistence/removal, Ctrl+Shift+B library, private read and nonwrite passed")
 
 
+def exercise_settings(browser, browser_env, upstream, root, origin, requests, log, artifacts, test_seat):
+    """Edit real settings, restart the browser, and observe content/network changes."""
+    config = root / 'config/cube-browser/config'
+    homepage = origin + '/settings-home'
+    search = origin + '/lookup?q=%s'
+    downloads = root / 'home/custom-downloads'
+
+    def values():
+        if not config.exists():
+            return {}
+        return dict(line.split('=', 1) for line in config.read_text().splitlines()
+                    if line and not line.startswith('#') and '=' in line)
+
+    def visits(url):
+        database = root / 'data/cube-browser/history.sqlite3'
+        if not database.exists():
+            return 0
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+            return db.execute('SELECT count(*) FROM history WHERE url=?', (url,)).fetchone()[0]
+
+    def bookmarked(url):
+        database = root / 'data/cube-browser/bookmarks.sqlite3'
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+            return db.execute('SELECT count(*) FROM bookmarks WHERE url=?', (url,)).fetchone()[0] == 1
+
+    def launch(name, arguments, title=None):
+        proxy = WaylandProxy(root / 'runtime' / name, upstream, test_seat=test_seat)
+        try:
+            process = subprocess.Popen([str(browser), '--quit-after', '35', *arguments],
+                env=dict(browser_env, WAYLAND_DISPLAY=name), stdout=log, stderr=log, start_new_session=True)
+            wait_for(lambda: proxy.commits >= 2 and (title is None or proxy.title == title), name + ' frame')
+            proxy.keyboard_ready()
+            return process, proxy
+        except BaseException:
+            if 'process' in locals():
+                stop_process(process)
+            proxy.close()
+            raise
+
+    def close(process, proxy):
+        try:
+            proxy.key(17, proxy.control)
+            assert process.wait(timeout=5) == 0, 'settings window failed to close'
+            assert proxy.error is None, f'settings protocol proxy failed: {proxy.error}'
+        finally:
+            stop_process(process)
+            proxy.close()
+
+    def row(proxy, category, index):
+        # Escape also cancels an unfinished edit before reopening at General.
+        proxy.key(1)
+        commits = proxy.commits
+        proxy.key(51, proxy.control)
+        for _ in range(category):
+            proxy.key(106)
+        for _ in range(index):
+            proxy.key(108)
+        wait_for(lambda: proxy.commits > commits and proxy.has_color(0xd5e4db), 'settings selection')
+
+    def edit(proxy, category, index, text, key, expected):
+        row(proxy, category, index)
+        proxy.key(28)
+        proxy.key(30, proxy.control)
+        proxy.type(text)
+        proxy.key(28)
+        wait_for(lambda: values().get(key) == expected, key + ' saved from native editor')
+
+    def navigate(proxy, url, title):
+        proxy.key(38, proxy.control)
+        proxy.type(url)
+        proxy.key(28)
+        wait_for(lambda: proxy.title == title, 'settings test navigation: ' + url)
+
+    process, proxy = launch('settings-edit', ['--settings', 'cube:home'], 'Start here — Cube Browser')
+    try:
+        wait_for(lambda: proxy.has_color(0xd5e4db), '--settings opened the native settings panel')
+        edit(proxy, 0, 0, homepage, 'homepage', homepage)
+        edit(proxy, 0, 1, search, 'search_engine', search)
+        edit(proxy, 0, 2, '125%', 'zoom', '1.250')
+        edit(proxy, 3, 0, str(downloads), 'download_directory', str(downloads))
+        assert config.stat().st_mode & 0o777 == 0o600
+        save_frame(proxy, artifacts, 'wayland-settings-downloads.png')
+
+        before = config.read_bytes()
+        row(proxy, 0, 1)
+        proxy.key(28); proxy.key(30, proxy.control); proxy.type('javascript:bad'); proxy.key(28)
+        commits = proxy.commits
+        proxy.key(30, proxy.control); proxy.type(search); proxy.key(1)
+        wait_for(lambda: proxy.commits > commits, 'invalid edit corrected then cancelled')
+        assert config.read_bytes() == before, 'invalid or cancelled search edit changed saved config'
+
+        # Image policy must prevent network requests, then restore actual pixels.
+        row(proxy, 1, 0); proxy.key(28)
+        wait_for(lambda: values().get('images') == 'false', 'image loading disabled')
+        image_count = requests.count('/assets/image.png')
+        navigate(proxy, origin + '/page', 'Cube E2E navigation')
+        wait_for(lambda: '/assets/layout.css' in requests and proxy.has_color(0xa1b2c3), 'page settled with images disabled')
+        assert requests.count('/assets/image.png') == image_count, 'disabled images still fetched a network resource'
+        assert not proxy.has_color(0xd85723), 'disabled image remained visible'
+        save_frame(proxy, artifacts, 'wayland-settings-images-disabled.png')
+        row(proxy, 1, 0); proxy.key(28)
+        wait_for(lambda: values().get('images') == 'true', 'image loading enabled')
+        proxy.key(38, proxy.control); proxy.type(origin + '/page'); proxy.key(28)
+        wait_for(lambda: requests.count('/assets/image.png') > image_count and proxy.has_color(0xd85723),
+                 'reenabled images fetched and painted')
+        save_frame(proxy, artifacts, 'wayland-settings-images-enabled.png')
+
+        # The configured folder must drive the actual completed transfer.
+        navigate(proxy, origin + '/download.bin', 'Unable to open page')
+        proxy.key(31, proxy.control)
+        target = downloads / 'download.bin'
+        wait_for(lambda: target.exists() and target.stat().st_size == 4 * 1024 * 1024,
+                 'download saved in the folder chosen in settings')
+        assert target.read_bytes() == b'd' * (4 * 1024 * 1024)
+        assert target.stat().st_mode & 0o777 == 0o600
+    except BaseException:
+        save_frame(proxy, artifacts, 'wayland-settings-failure.png')
+        print(f'settings edit failure: title={proxy.title!r}, preferences={values()!r}')
+        raise
+    finally:
+        close(process, proxy)
+
+    expected = values()
+    process, proxy = launch('settings-restart', [], 'Cube E2E navigation')
+    try:
+        assert values() == expected, 'saved settings changed on browser startup'
+        proxy.key(38, proxy.control); proxy.type('a search'); proxy.key(28)
+        wait_for(lambda: '/lookup?q=a%20search' in requests, 'saved search engine used after restart')
+        navigate(proxy, 'cube:settings', 'Cube E2E navigation')
+        wait_for(lambda: proxy.has_color(0xd5e4db), 'cube:settings opened native settings')
+        save_frame(proxy, artifacts, 'wayland-settings-general.png')
+
+        # Reload config applies an external change to the running browser.
+        updated = config.read_text().replace('homepage=' + homepage, 'homepage=cube:home')
+        config.write_text(updated)
+        row(proxy, 4, 1); proxy.key(28)
+        row(proxy, 0, 0); proxy.key(28); proxy.key(28)
+        wait_for(lambda: values().get('homepage') == 'cube:home', 'reload config adopted external homepage')
+        row(proxy, 4, 2); proxy.key(28)
+        wait_for(lambda: values().get('search_engine') == 'https://duckduckgo.com/html/?q=%s' and
+                 values().get('zoom') == '1.000' and values().get('download_directory') == '',
+                 'restore defaults reset edited preferences')
+
+        row(proxy, 2, 3); proxy.key(28)
+        wait_for(lambda: values().get('save_history') == 'false', 'history saving disabled')
+        disabled_url = origin + '/settings-history-disabled'
+        navigate(proxy, disabled_url, 'Cube E2E history disabled')
+        assert visits(disabled_url) == 0, 'disabled history recorded a new visit'
+        row(proxy, 2, 3); proxy.key(28)
+        wait_for(lambda: values().get('save_history') == 'true', 'history saving reenabled')
+        retained_url = origin + '/settings-history-enabled'
+        navigate(proxy, retained_url, 'Cube E2E history enabled')
+        wait_for(lambda: visits(retained_url) == 1, 'reenabled history recorded the visit')
+        proxy.key(32, proxy.control)
+        wait_for(lambda: bookmarked(retained_url), 'bookmark saved before clearing data on exit')
+        row(proxy, 2, 4); proxy.key(28)
+        wait_for(lambda: values().get('clear_on_exit') == 'true', 'clear browsing data on exit enabled')
+    except BaseException:
+        save_frame(proxy, artifacts, 'wayland-settings-failure.png')
+        print(f'settings restart failure: title={proxy.title!r}, preferences={values()!r}')
+        raise
+    finally:
+        close(process, proxy)
+    assert visits(retained_url) == 0, 'clear-on-exit retained saved browsing history'
+    assert bookmarked(retained_url), 'clear-on-exit removed a saved bookmark'
+    print('e2e: categorized settings editing/validation/cancel, image request blocking/repaint, custom downloads, '
+          'startup/search persistence, --settings, cube:settings, reload config, restore defaults, '
+          'disabled/reenabled history and clearing history on exit while retaining bookmarks passed')
+
+
 def run(options):
     browser = options.browser.resolve()
     compositor = options.compositor.resolve()
@@ -834,6 +1007,10 @@ def run(options):
                         self.end_headers()
                         return
                     body, mime = b'<title>Cube E2E cached</title><p>Validated cached body</p>', 'text/html'
+                elif self.path == '/settings-history-disabled':
+                    body, mime = b'<title>Cube E2E history disabled</title><p>Do not save this visit.</p>', 'text/html'
+                elif self.path == '/settings-history-enabled':
+                    body, mime = b'<title>Cube E2E history enabled</title><p>Save this visit, then clear it on exit.</p>', 'text/html'
                 elif self.path == '/assets/layout.css':
                     body, mime = css, 'text/css'
                 elif self.path == '/assets/image.png':
@@ -980,6 +1157,7 @@ def run(options):
                          'reload recovers after renderer crash')
                 assert compositor_process.poll() is None, "compositor stopped during browser navigation"
                 assert not [path for path in (root / "data").rglob("*") if path.is_file()], "private window persisted data"
+                assert not (root / 'config/cube-browser/config').exists(), 'private settings wrote persistent configuration'
                 proxy.key(17, proxy.control)  # Ctrl+W
                 assert browser_process.wait(timeout=5) == 0, "browser failed on keyboard close"
                 assert proxy.error is None, f"protocol proxy failed: {proxy.error}"
@@ -990,6 +1168,8 @@ def run(options):
                 print("Input source: isolated standard wl_keyboard events; real headless Wayland compositor handled all presentation.")
                 exercise_bookmarks(browser, browser_env, upstream, root, f'http://127.0.0.1:{server.server_port}',
                                    browser_log, options.artifacts, bool(options.weston_dir))
+                exercise_settings(browser, browser_env, upstream, root, f'http://127.0.0.1:{server.server_port}',
+                                  requests, browser_log, options.artifacts, bool(options.weston_dir))
                 return 0
             except BaseException:
                 for name, log in (("compositor", compositor_log), ("browser", browser_log)):

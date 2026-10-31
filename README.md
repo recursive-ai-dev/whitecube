@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.5_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.9.6_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,15 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.9.6
+
+Cube Browser now opens PNG, JPEG and static SVG image URLs and local image files,
+and displays bounded inline data images. Its native settings have General,
+Content, Privacy, Downloads and Advanced sections, including editable home/search
+URLs, 50–300% zoom, image and script controls, cookies/storage/cache/history
+preferences, custom download folders and HTTPS-only mode. Open Menu, press
+Ctrl+comma, or enter `cube:settings`. See [the release notes](docs/RELEASE-0.9.6.md).
 
 ## Improvements in 0.9.5
 
@@ -142,8 +151,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.5_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.5_amd64.deb
+sha256sum --check whitecube-desktop_0.9.6_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.9.6_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

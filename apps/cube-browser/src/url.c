@@ -64,7 +64,7 @@ int cb_url_input(const char *input,const char *search,char *out,size_t cap){
     for(char *p=t;*p;p++)if((unsigned char)*p<32||(unsigned char)*p==127){g_free(t);return -1;}
     char *url=NULL;
     if(!strcmp(t,"cube:start"))url=g_strdup("cube:home");
-    else if(!strcmp(t,"cube:bookmarks")||!strcmp(t,"cube:home")||!strcmp(t,"cube:history")||!strcmp(t,"cube:about"))url=g_strdup(t);
+    else if(!strcmp(t,"cube:bookmarks")||!strcmp(t,"cube:home")||!strcmp(t,"cube:history")||!strcmp(t,"cube:about")||!strcmp(t,"cube:settings"))url=g_strdup(t);
     else if(cb_url_remote(t)||g_str_has_prefix(t,"file:///"))url=g_strdup(t);
     else if(*t=='/')url=g_filename_to_uri(t,NULL,NULL);
     else if(!strchr(t,' ')&&(strchr(t,'.')||g_str_has_prefix(t,"localhost")||g_str_has_prefix(t,"127."))&&!strstr(t,"://"))

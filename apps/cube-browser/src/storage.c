@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "storage.h"
+#include "policy.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -110,7 +111,9 @@ void cb_config_defaults(struct cb_config *config)
     snprintf(config->homepage, sizeof(config->homepage), "cube:home");
     snprintf(config->search_engine, sizeof(config->search_engine),
              "https://duckduckgo.com/html/?q=%%s");
-    config->zoom = 1.0;config->javascript=true;
+    config->zoom = 1.0;
+    config->javascript = config->images = config->cookies = true;
+    config->site_storage = config->cache = config->save_history = true;
 }
 
 static bool clean_text(const char *text, size_t capacity)
@@ -122,18 +125,45 @@ static bool clean_text(const char *text, size_t capacity)
     return true;
 }
 
+static bool bookmark_text(const char *text);
+
+static bool homepage_url(const char *url)
+{
+    if (!strcmp(url,"cube:home") || !strcmp(url,"cube:start") ||
+        !strcmp(url,"cube:history") || !strcmp(url,"cube:bookmarks") ||
+        !strcmp(url,"cube:about") || !strcmp(url,"cube:settings")) return true;
+    if (url[0] == '/' || !strncmp(url,"file:///",8)) return !strchr(url,'\\');
+    struct cb_http_url parsed;
+    return !cb_http_parse(url,&parsed);
+}
+
 static bool valid_config(const struct cb_config *config)
 {
     if (!clean_text(config->homepage, sizeof(config->homepage)) ||
         !clean_text(config->search_engine, sizeof(config->search_engine)) ||
         !isfinite(config->zoom) || config->zoom < .5 || config->zoom > 3.0)
         return false;
-    if (strncmp(config->search_engine, "https://", 8) &&
-        strncmp(config->search_engine, "http://", 7)) return false;
+    if (!bookmark_text(config->homepage) || !homepage_url(config->homepage) ||
+        !bookmark_text(config->search_engine)) return false;
+    size_t directory_length = strnlen(config->download_directory, sizeof(config->download_directory));
+    if (directory_length == sizeof(config->download_directory) ||
+        (directory_length && (config->download_directory[0] != '/' ||
+         !bookmark_text(config->download_directory))))
+        return false;
+    struct cb_http_url search_url;
+    if (cb_http_parse(config->search_engine,&search_url)) return false;
     const char *slot = strstr(config->search_engine, "%s");
     if (!slot || strstr(slot + 2, "%s")) return false;
     /* The caller substitutes the placeholder, never treats this as printf. */
     return true;
+}
+
+int cb_config_validate(const struct cb_config *config, char *error, size_t error_size)
+{
+    if (error && error_size) error[0] = '\0';
+    if (!config || !valid_config(config))
+        return errorf(error, error_size, "Invalid homepage, search URL, zoom (50–300%), or absolute downloads folder");
+    return 0;
 }
 
 static char *trim(char *text)
@@ -172,24 +202,38 @@ int cb_config_load(struct cb_config *config, char *error, size_t error_size)
         } else if (!strcmp(key, "search_engine")) {
             if (strlen(value) >= sizeof(parsed.search_engine)) return errorf(error, error_size, "Search engine is too long");
             strcpy(parsed.search_engine, value);
-        } else if (!strcmp(key,"javascript")) {
-            if(strcmp(value,"true")&&strcmp(value,"false"))return errorf(error,error_size,"JavaScript expects true or false");
-            parsed.javascript=!strcmp(value,"true");
+        } else if (!strcmp(key, "download_directory")) {
+            if (strlen(value) >= sizeof(parsed.download_directory)) return errorf(error, error_size, "Downloads folder is too long");
+            strcpy(parsed.download_directory, value);
+        } else if (!strcmp(key,"javascript") || !strcmp(key,"images") ||
+                   !strcmp(key,"cookies") || !strcmp(key,"site_storage") ||
+                   !strcmp(key,"cache") || !strcmp(key,"save_history") ||
+                   !strcmp(key,"clear_on_exit") || !strcmp(key,"https_only")) {
+            if (strcmp(value,"true") && strcmp(value,"false"))
+                return errorf(error,error_size,"Boolean settings expect true or false");
+            bool enabled = !strcmp(value,"true");
+            if (!strcmp(key,"javascript")) parsed.javascript=enabled;
+            else if (!strcmp(key,"images")) parsed.images=enabled;
+            else if (!strcmp(key,"cookies")) parsed.cookies=enabled;
+            else if (!strcmp(key,"site_storage")) parsed.site_storage=enabled;
+            else if (!strcmp(key,"cache")) parsed.cache=enabled;
+            else if (!strcmp(key,"save_history")) parsed.save_history=enabled;
+            else if (!strcmp(key,"clear_on_exit")) parsed.clear_on_exit=enabled;
+            else parsed.https_only=enabled;
         } else if (!strcmp(key, "zoom")) {
             char *end;
             parsed.zoom = strtod(value, &end);
             if (end == value || *end) return errorf(error, error_size, "Invalid zoom setting");
         }
     }
-    if (!valid_config(&parsed)) return errorf(error, error_size, "Invalid homepage, search engine, or zoom setting");
+    if (cb_config_validate(&parsed, error, error_size)) return -1;
     *config = parsed;
     return 0;
 }
 
 int cb_config_save(const struct cb_config *config, char *error, size_t error_size)
 {
-    if (error && error_size) error[0] = '\0';
-    if (!valid_config(config)) return errorf(error, error_size, "Invalid config values");
+    if (cb_config_validate(config, error, error_size)) return -1;
     char path[CB_PATH_MAX], temporary[CB_PATH_MAX];
     if (profile_path(path, sizeof(path), true, "config"))
         return errorf(error, error_size, "Cannot access the private config directory");
@@ -198,8 +242,16 @@ int cb_config_save(const struct cb_config *config, char *error, size_t error_siz
     int fd = mkstemp(temporary);
     if (fd < 0) return errorf(error, error_size, "Cannot create config file");
     int result = fchmod(fd, 0600);
-    if (result == 0 && dprintf(fd, "# cube-browser\nhomepage=%s\nsearch_engine=%s\nzoom=%.3f\njavascript=%s\n",
-                               config->homepage, config->search_engine, config->zoom,config->javascript?"true":"false") < 0) result = -1;
+    if (result == 0 && dprintf(fd,
+            "# cube-browser\nhomepage=%s\nsearch_engine=%s\nzoom=%.3f\n"
+            "javascript=%s\nimages=%s\ncookies=%s\nsite_storage=%s\ncache=%s\n"
+            "save_history=%s\nclear_on_exit=%s\nhttps_only=%s\ndownload_directory=%s\n",
+            config->homepage, config->search_engine, config->zoom,
+            config->javascript?"true":"false", config->images?"true":"false",
+            config->cookies?"true":"false", config->site_storage?"true":"false",
+            config->cache?"true":"false", config->save_history?"true":"false",
+            config->clear_on_exit?"true":"false", config->https_only?"true":"false",
+            config->download_directory) < 0) result = -1;
     if (result == 0 && fsync(fd)) result = -1;
     if (close(fd)) result = -1;
     if (result == 0 && rename(temporary, path)) result = -1;

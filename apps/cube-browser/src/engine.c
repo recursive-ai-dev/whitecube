@@ -197,7 +197,7 @@ struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url
     struct cb_page *p = g_new0(struct cb_page, 1);
     p->base = g_strdup(base_url && *base_url ? base_url : "about:blank");
     p->title = g_strdup("Untitled");
-    p->zoom = 1;p->width=1024;p->viewport_height=800;
+    p->images_enabled=1;p->zoom = 1;p->width=1024;p->viewport_height=800;
     p->parsing = 1;
     p->parse_incomplete=len>HTML_LIMIT || memchr(html,0,MIN(len,HTML_LIMIT))!=NULL;
     p->root = cb_engine_new_node(p, NULL, "#document");
@@ -362,7 +362,10 @@ struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url
                 n->submit_method=scratch.submit_method;scratch.submit_method=NULL;
                 n->image_width=scratch.image_width;n->image_height=scratch.image_height;
                 n->colspan=scratch.colspan;n->rowspan=scratch.rowspan;
-                if(!strcmp(tag,"img"))n->resource=cb_engine_discover_resource(p,CB_RESOURCE_IMAGE,scratch.src);
+                if(!strcmp(tag,"img")){
+                    if(scratch.src&&!g_ascii_strncasecmp(scratch.src,"data:",5)){n->src=scratch.src;scratch.src=NULL;}
+                    else n->resource=cb_engine_discover_resource(p,CB_RESOURCE_IMAGE,scratch.src);
+                }
                 if(!strcmp(tag,"link") && scratch.rel && !scratch.disabled && p->sheet_count<STYLESHEET_LIMIT) {
                     char *rel=g_ascii_strdown(scratch.rel,-1);
                     int screen=cb_engine_screen_media(scratch.media);
@@ -395,7 +398,7 @@ struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url
     }
     if(*s && p->node_count>=NODE_LIMIT)p->parse_incomplete=1;
     g_free(input);
-    p->parsing=0;cb_engine_rebuild_rules(p);cb_engine_init_controls(p,p->root);
+    p->parsing=0;cb_engine_rebuild_rules(p);cb_engine_init_controls(p,p->root);cb_engine_inline_images(p);
     return p;
 }
 
@@ -406,6 +409,8 @@ void cb_engine_free_node(struct node *n) {
     if(n->custom)g_hash_table_unref(n->custom);
     g_free(n->name);g_free(n->value);g_free(n->type);g_free(n->action);g_free(n->method);
     g_free(n->placeholder);g_free(n->external_form);g_free(n->submit_action);g_free(n->submit_method);
+    if(n->inline_image)cairo_surface_destroy(n->inline_image);
+    g_free(n->src);
     g_free(n->text);g_free(n->id);g_free(n->classes);g_free(n->inline_css);g_free(n->href);g_free(n->alt);g_free(n);
 }
 void cb_page_free(struct cb_page *p) {
@@ -442,4 +447,4 @@ int cb_page_set_url(struct cb_page *p,const char *url) {
     g_free(p->base);p->base=g_strdup(url);return 0;
 }
 
-void cb_page_set_policy(struct cb_page *p,const char *policy){if(!p)return;g_free(p->policy);p->policy=g_strndup(policy?policy:"",CB_POLICY_LIMIT-1);cb_engine_rebuild_rules(p);}
+void cb_page_set_policy(struct cb_page *p,const char *policy){if(!p)return;g_free(p->policy);p->policy=g_strndup(policy?policy:"",CB_POLICY_LIMIT-1);cb_engine_rebuild_rules(p);cb_engine_inline_images(p);}

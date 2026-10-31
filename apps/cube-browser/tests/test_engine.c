@@ -2,6 +2,7 @@
 #include "engine.h"
 #include <assert.h>
 #include <cairo.h>
+#include <glib.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -167,6 +168,23 @@ static struct png_bytes image_fixture_size(int width,int height) {
     cairo_t *cr=cairo_create(surface);cairo_set_source_rgb(cr,0xd1/255.,0x3a/255.,0x2f/255.);cairo_paint(cr);cairo_destroy(cr);
     assert(cairo_surface_write_to_png_stream(surface,png_write,&result)==CAIRO_STATUS_SUCCESS);
     cairo_surface_destroy(surface);return result;
+}
+static void image_documents(void) {
+    struct png_bytes png=image_fixture_size(40,20);
+    struct cb_page *p=cb_page_from_image(png.data,png.length,"image/png","https://example.org/image.png");
+    assert(p && cb_page_resource_count(p)==0);cb_page_layout(p,640,1);
+    assert(pixel(p,20,10)==0xd13a2f);
+    cb_page_set_images_enabled(p,0);cb_page_layout(p,640,1);assert(pixel(p,20,10)!=0xd13a2f);
+    cb_page_free(p);
+    assert(!cb_page_from_image("<script>bad</script>",20,"image/png","https://example.org/image.png"));
+    char *encoded=g_base64_encode(png.data,png.length);
+    char *html=g_strdup_printf("<body style='margin:0'><img src='data:image/png;base64,%s' width=80 height=40></body>",encoded);
+    p=page(html);assert(cb_page_resource_count(p)==0);assert(pixel(p,20,10)==0xd13a2f);
+    cb_page_set_policy(p,"img-src 'self'");cb_page_layout(p,640,1);assert(pixel(p,20,10)!=0xd13a2f);
+    cb_page_set_policy(p,"img-src data:");cb_page_layout(p,640,1);assert(pixel(p,20,10)==0xd13a2f);
+    cb_page_set_images_enabled(p,0);cb_page_layout(p,640,1);assert(pixel(p,20,10)!=0xd13a2f);
+    cb_page_set_images_enabled(p,1);cb_page_layout(p,640,1);assert(pixel(p,20,10)==0xd13a2f);
+    cb_page_free(p);g_free(encoded);g_free(html);free(png.data);
 }
 static void images(void) {
     struct png_bytes png=image_fixture_size(40,20);
@@ -461,6 +479,6 @@ static void svg_resource(void) {
 }
 
 int main(void) {
-    parser();cascade();layout_and_links();flex();limits();resources();external_cascade();images();resource_budgets();form_editing();form_controls();form_unsupported_and_anchors();form_submission_regressions();responsive_css();tables();svg_resource();
+    parser();cascade();layout_and_links();flex();limits();resources();external_cascade();images();image_documents();resource_budgets();form_editing();form_controls();form_unsupported_and_anchors();form_submission_regressions();responsive_css();tables();svg_resource();
     puts("engine: parser, entities, cascade, wrapping, links, flex, search, bounds, resource order, images, forms, focus, anchors, responsive CSS and tables passed");return 0;
 }

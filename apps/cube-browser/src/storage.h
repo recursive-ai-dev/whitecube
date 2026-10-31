@@ -13,6 +13,14 @@ struct cb_config {
     char search_engine[1024]; /* Exactly one %s placeholder for an encoded query. */
     double zoom;
     bool javascript;
+    bool images;
+    bool cookies; /* Third-party cookies remain blocked when enabled. */
+    bool site_storage;
+    bool cache;
+    bool save_history;
+    bool clear_on_exit;
+    bool https_only;
+    char download_directory[4096]; /* Empty selects XDG_DOWNLOAD_DIR or ~/Downloads. */
 };
 
 struct cb_accessibility {
@@ -22,6 +30,7 @@ struct cb_accessibility {
 };
 
 void cb_config_defaults(struct cb_config *config);
+int cb_config_validate(const struct cb_config *config, char *error, size_t error_size);
 /* Missing config is success with defaults. Errors leave defaults in place. */
 int cb_config_load(struct cb_config *config, char *error, size_t error_size);
 int cb_config_save(const struct cb_config *config, char *error, size_t error_size);

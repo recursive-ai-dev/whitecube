@@ -18,6 +18,10 @@ struct cb_interaction { unsigned kind, focus; double y; char text[4096], body[16
 /* Input is bounded to 4 MiB; DOM integration runs retained scripts separately.
  * All coordinates are pixels. */
 struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url);
+/* Construct a static image document; bytes are never parsed as markup. */
+struct cb_page *cb_page_from_image(const void *bytes, size_t length,
+                                    const char *mime, const char *url);
+void cb_page_set_images_enabled(struct cb_page *page, int enabled);
 void cb_page_set_policy(struct cb_page *page,const char *policy);
 void cb_page_add_css(struct cb_page *page, const char *css, size_t len);
 /* Immutable discovery list: at most 32 unique HTTP(S) resources. No I/O here. */

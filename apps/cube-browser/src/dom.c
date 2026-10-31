@@ -54,6 +54,9 @@ static int insert_html(struct cb_dom *d,struct node *target,const char *position
     for(guint i=1;i<fragment->nodes->len;i++){
         struct node *child=g_ptr_array_index(fragment->nodes,i);
         child->page=p;child->uid=(unsigned)++p->node_count;child->control=NULL;child->resource=SIZE_MAX;
+        /* Fragment resource URLs remain inert, including inline data images. */
+        g_clear_pointer(&child->src,g_free);
+        if(child->inline_image){cairo_surface_destroy(child->inline_image);child->inline_image=NULL;}
         g_ptr_array_add(p->nodes,child);
     }
     while(fragment->root->first)append(parent,fragment->root->first,before);

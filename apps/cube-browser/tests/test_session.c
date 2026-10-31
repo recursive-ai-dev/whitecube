@@ -2,6 +2,7 @@
 #include "session.h"
 #include "ipc.h"
 #include "broker.h"
+#include "storage.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -82,6 +83,37 @@ static void cache(void){
     strcpy(m->cache_control,"no-store");fd=cb_document_fd("fresh",5);assert(!cb_cache_finish(s,&q,m,&fd));close(fd);cb_cache_prepare(s,&q);assert(!*q.etag);
     free(m);cb_session_close(s);
 }
+static void preferences(void){
+    const char *url="https://example.org/";time_t now=time(NULL);char header[CB_COOKIE_HEADER];
+    struct cb_session *s=cb_session_open(true);assert(s);struct cb_config config;cb_config_defaults(&config);
+    assert(!cb_cookie_set(s,url,"saved=yes; Secure; Path=/",now));
+    assert(!cb_site_set(s,url,true,"key","local"));assert(!cb_site_set(s,url,false,"key","session"));
+    struct cb_http_request request={.version=1};strcpy(request.url,url);
+    struct cb_http_metadata *meta=calloc(1,sizeof *meta);assert(meta);meta->version=1;meta->status=200;strcpy(meta->etag,"\"saved\"");
+    int fd=cb_document_fd("cached",6);assert(fd>=0&&!cb_cache_finish(s,&request,meta,&fd));close(fd);
+    cb_cache_prepare(s,&request);assert(*request.etag);
+
+    config.cookies=config.site_storage=config.cache=false;cb_session_configure(s,&config);
+    cb_cookie_header(s,url,url,true,false,now,header);assert(!*header);
+    assert(cb_cookie_set(s,url,"blocked=yes; Secure; Path=/",now));
+    for(unsigned local=0;local<2;local++){
+        assert(!cb_site_get(s,url,local,"key"));
+        assert(cb_site_set(s,url,local,"key","blocked"));assert(cb_site_clear(s,url,local));
+        char *snapshot=cb_site_snapshot(s,url,local);assert(snapshot&&!strcmp(snapshot,"{}"));free(snapshot);
+    }
+    char *snapshot=cb_broker_storage(s,url,"",true);assert(snapshot&&!strcmp(snapshot,"[{},{}]"));free(snapshot);
+    cb_cache_prepare(s,&request);assert(!*request.etag&&!*request.modified);
+    fd=cb_document_fd("fresh",5);assert(fd>=0&&!cb_cache_finish(s,&request,meta,&fd));close(fd);
+    meta->status=304;fd=cb_document_fd("",0);assert(fd>=0&&cb_cache_finish(s,&request,meta,&fd));close(fd);
+
+    config.cookies=config.site_storage=config.cache=true;cb_session_configure(s,&config);
+    cb_cookie_header(s,url,url,true,false,now,header);assert(strstr(header,"saved=yes")&&!strstr(header,"blocked="));
+    cb_cookie_header(s,url,"https://foreign.org/",false,false,now,header);assert(!*header);
+    snapshot=cb_site_get(s,url,true,"key");assert(snapshot&&!strcmp(snapshot,"local"));free(snapshot);
+    snapshot=cb_site_get(s,url,false,"key");assert(snapshot&&!strcmp(snapshot,"session"));free(snapshot);
+    cb_cache_prepare(s,&request);assert(!*request.etag); /* Disabling drops cache; no stale data returns. */
+    free(meta);cb_session_close(s);
+}
 static void cors_revalidation(void){
     struct cb_session *s=cb_session_open(true);assert(s);
     struct cb_http_job *j=cb_broker_new("https://api.example.net/data","https://example.org/","https://example.org/","",CB_POLICY_CONNECT,false,NULL);assert(j);
@@ -101,4 +133,4 @@ static void cors_revalidation(void){
     }
     free(j);cb_session_close(s);
 }
-int main(void){cookies();storage();encoded_quota();storage_disclosure();cache();cors_revalidation();puts("PSL, cookie policy, persistence/private storage, quotas and cache validation passed");}
+int main(void){cookies();storage();encoded_quota();storage_disclosure();cache();preferences();cors_revalidation();puts("PSL, cookie policy, persistence/private storage, quotas, preferences and cache validation passed");}
