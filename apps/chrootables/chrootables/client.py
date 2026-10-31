@@ -370,8 +370,11 @@ class Client(QObject):
         # these transports at shutdown. Root filesystem tasks live in the sudo
         # helper and finish after transport EOF, even if the relay must stop.
         process.finished.connect(lambda *_: self._release_process(process))
-        process.readyReadStandardOutput.connect(process.readAllStandardOutput)
-        process.readyReadStandardError.connect(process.readAllStandardError)
+        # PySide 6.10 can crash while introspecting a native return-valued
+        # method as a slot when another QProcess method is mocked. Plain Python
+        # callbacks also avoid relying on native slot-overload resolution here.
+        process.readyReadStandardOutput.connect(lambda: process.readAllStandardOutput())
+        process.readyReadStandardError.connect(lambda: process.readAllStandardError())
         process.closeWriteChannel()
         if process.state() == QProcess.ProcessState.NotRunning:
             self._release_process(process)
