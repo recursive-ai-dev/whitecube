@@ -117,10 +117,11 @@ def session_environment(env, runtime, script):
     return result
 
 
-def audio_setting(env):
+def config_setting(env, name):
+    """Return the last value of a config key, the account file overriding /etc, or None."""
     home = Path(env.get('HOME') or Path.home())
     config = Path(env.get('XDG_CONFIG_HOME') or home / '.config') / 'whitecube/config'
-    audio = 'alsa'
+    found = None
     for path in (Path('/etc/whitecube/config'), config):
         try:
             for line in path.read_text(encoding='utf-8').splitlines():
@@ -128,12 +129,49 @@ def audio_setting(env):
                 if stripped.startswith('#'):
                     continue
                 key, separator, value = stripped.partition('=')
-                if separator and key.strip() == 'audio':
-                    candidate = value.partition('#')[0].strip().lower()
-                    audio = candidate if candidate in ('alsa', 'pipewire') else 'alsa'
+                if separator and key.strip() == name:
+                    found = value.partition('#')[0].strip().lower()
         except (OSError, UnicodeError):
             pass
-    return audio
+    return found
+
+
+def audio_setting(env):
+    audio = config_setting(env, 'audio')
+    return audio if audio in ('alsa', 'pipewire') else 'alsa'
+
+
+def quiet_gpu_devices(drm=Path('/sys/class/drm')):
+    """Return WLR_DRM_DEVICES that leave an NVIDIA GPU with no display closed so it can power down.
+
+    wlroots otherwise opens every GPU, which holds the discrete one awake.
+    None means every GPU is needed, or the layout is not a laptop-style hybrid.
+    """
+    cards = {}
+    for entry in sorted(drm.glob('card[0-9]*')):
+        card, connector, _ = entry.name.partition('-')
+        record = cards.setdefault(card, {'driver': '', 'connected': False})
+        try:
+            if connector:
+                record['connected'] |= (entry / 'status').read_text().strip() == 'connected'
+            else:
+                record['driver'] = (entry / 'device/driver').resolve().name
+        except OSError:
+            return None
+    discrete = [record for record in cards.values() if record['driver'] in ('nvidia', 'nouveau')]
+    others = {card: record for card, record in cards.items() if record['driver'] not in ('nvidia', 'nouveau')}
+    if (not discrete or any(record['connected'] for record in discrete)
+            or not any(record['connected'] for record in others.values())):
+        return None
+    return ':'.join(f'/dev/dri/{card}' for card in others)
+
+
+def apply_gpu_power_save(env):
+    if 'WLR_DRM_DEVICES' in env or env.get('WLR_BACKENDS') or config_setting(env, 'gpu_power_save') == '0':
+        return
+    devices = quiet_gpu_devices()
+    if devices:
+        env['WLR_DRM_DEVICES'] = devices
 
 
 def startup_command(audio):
@@ -232,10 +270,13 @@ def main(argv=None):
             print('Whitecube startup failure counter cleared.')
             return 0
         audio = audio_setting(env)
+        if not args.safe_mode:
+            apply_gpu_power_save(env)
         if args.check:
             compositor = find_compositor(__file__)
             print(json.dumps({'compositor': str(compositor), 'runtime': str(runtime),
                               'state': str(state), 'audio': audio,
+                              'drm_devices': env.get('WLR_DRM_DEVICES'),
                               'recent_failures': len(recent_failures(failures, int(time.time())))}, indent=2))
             return 0
         # The lock is account-wide even if callers choose different runtime dirs.

@@ -112,7 +112,8 @@ struct ca {
 	bool configured, running, dirty, waiting_frame, parked;
 	int tfd, control_fd;
 	char control_path[108];
-	bool volume, paused, edit, manual, pressure, reduced_motion, on_battery, spin;
+	bool volume, paused, edit, manual, pressure, reduced_motion, on_battery, spin, idle;
+	int thermal;
 	int depth, slice, draw_button, effective_fps;
 	double yaw, pointer_x, pointer_y;
 	uint64_t last_pressure_ms;
@@ -566,15 +567,27 @@ static void maybe_advance(struct ca *c) {
 	if (live == 0 || c->still_count >= 2) { start_fade(c); if (c->volume) reseed(c); else advance_rule(c); }
 }
 
-static bool thermal_pressure(void) {
-	glob_t paths = {0}; bool hot = false;
+static long hottest_zone(void) {
+	glob_t paths = {0}; long hottest = 0;
 	if (!glob("/sys/class/thermal/thermal_zone*/temp", 0, NULL, &paths)) {
 		for (size_t i = 0; i < paths.gl_pathc; i++) {
 			FILE *f = fopen(paths.gl_pathv[i], "r"); long temp = 0;
-			if (f) { if (fscanf(f, "%ld", &temp) == 1 && temp >= 75000 && temp < 150000) hot = true; fclose(f); }
+			if (f) { if (fscanf(f, "%ld", &temp) == 1 && temp > hottest && temp < 150000) hottest = temp; fclose(f); }
 		}
 	}
-	globfree(&paths); return hot;
+	globfree(&paths); return hottest;
+}
+// 0 cool, 1 warm (half speed), 2 hot (2 ticks/s). Stepping down takes 5 C of cooling, so the speed does not flutter.
+static int thermal_level(long millidegrees, int previous) {
+	int level = millidegrees >= 75000 ? 2 : millidegrees >= 65000 ? 1 : 0;
+	if (level < previous && millidegrees >= (previous == 2 ? 70000 : 60000)) level = previous;
+	return level;
+}
+static bool runtime_hint_set(const char *runtime, const char *name) {
+	char path[512]; snprintf(path, sizeof(path), "%s/%s", runtime, name);
+	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); char v = 0; bool set = false;
+	if (fd >= 0) { set = read(fd, &v, 1) == 1 && v == '1'; close(fd); }
+	return set;
 }
 static bool read_line(const char *dir, const char *name, char *out, size_t size) {
 	char path[PATH_MAX];
@@ -599,7 +612,8 @@ static bool on_battery(void) {
 static int adaptive_fps(struct ca *c) {
 	uint64_t now = now_ms();
 	if (now - c->last_pressure_ms > 2000 || !c->last_pressure_ms) {
-		c->last_pressure_ms = now; c->pressure = thermal_pressure(); c->on_battery = on_battery();
+		c->last_pressure_ms = now; c->thermal = thermal_level(hottest_zone(), c->thermal);
+		c->pressure = c->thermal == 2; c->on_battery = on_battery();
 		char directory[512];
 		if (wc_state_directory(directory, sizeof(directory))) {
 			char path[600]; snprintf(path, sizeof(path), "%s/accessibility.json", directory);
@@ -608,12 +622,12 @@ static int adaptive_fps(struct ca *c) {
 		}
 		const char *runtime = getenv("XDG_RUNTIME_DIR");
 		if (runtime) {
-			char path[512]; snprintf(path, sizeof(path), "%s/whitecube-fullscreen", runtime);
-			int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); char v = 0;
-			if (fd >= 0) { if (read(fd, &v, 1) == 1 && v == '1') c->pressure = true; close(fd); }
+			if (runtime_hint_set(runtime, "whitecube-fullscreen")) c->pressure = true;
+			c->idle = runtime_hint_set(runtime, "whitecube-idle");
 		}
 	}
-	int fps = c->reduced_motion ? 1 : c->pressure ? 2 : c->paused ? (c->edit ? 8 : 2) : c->cs.on ? 20 : c->volume ? 8 : rule_of(c)->fps;
+	int fps = c->reduced_motion || (c->idle && !c->edit) ? 1 : c->pressure ? 2 : c->paused ? (c->edit ? 8 : 2) : c->cs.on ? 20 : c->volume ? 8 : rule_of(c)->fps;
+	if (c->thermal == 1 && fps > 2) fps = fps / 2 > 2 ? fps / 2 : 2;
 	if (c->on_battery && fps > 2) fps = fps * 2 / 3 > 2 ? fps * 2 / 3 : 2;
 	return fps;
 }
@@ -660,7 +674,7 @@ static void on_tick(struct ca *c) {
 	}
 	uint64_t now = now_ms(), gap = c->last_tick_ms ? now - c->last_tick_ms : 0;
 	c->last_tick_ms = now;
-	bool moving = !c->paused && !c->reduced_motion;
+	bool moving = !c->paused && !c->reduced_motion && (!c->idle || c->edit);
 	if (c->cs.on && moving) { cosmos_advance(c, c->cs.last_ms ? (now - c->cs.last_ms) / 1000.0 : 0.05); c->cs.last_ms = now; c->dirty = true; }
 	else c->cs.last_ms = 0;
 	if (moving) {
@@ -668,7 +682,7 @@ static void on_tick(struct ca *c) {
 		c->active_ms += gap < 1000 ? gap : 1000; c->dirty = true;
 		if (c->volume && c->slice < 0 && c->spin && !c->edit) c->yaw += .004;
 	}
-	if (!c->reduced_motion) maybe_advance(c);
+	if (moving) maybe_advance(c);
 	if (!c->running) return;
 	if (c->fade_px) c->dirty = true;
 	arm_timer(c);
@@ -1022,6 +1036,9 @@ static int self_test(void) {
 	live = 0; for (size_t i = 0; i < sim_count(&c); i++) live += c.grid[i];
 	if (!live) return 22;
 	c.volume = false; c.manual = false;
+	// Heat slows the field in steps, and only 5 C of cooling speeds it back up.
+	if (thermal_level(60000, 0) || thermal_level(65000, 0) != 1 || thermal_level(75000, 0) != 2 || thermal_level(149000, 1) != 2) return 23;
+	if (thermal_level(72000, 2) != 2 || thermal_level(69000, 2) != 1 || thermal_level(62000, 1) != 1 || thermal_level(59000, 1) || thermal_level(40000, 2)) return 24;
 	free(c.grid); free(c.next); free(c.age);
 	if (field_self_test()) return 7;
 	{ int rc = render_self_test(); if (rc) { fprintf(stderr, "cube-ca: render self-test failed (%d)\n", rc); return 30 + rc; } }

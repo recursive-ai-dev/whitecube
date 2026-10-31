@@ -294,6 +294,7 @@ struct wc_server {
 	struct wl_list lock_surfaces;
 	bool locked;
 	struct timespec last_activity, last_lock_attempt;
+	bool idle_hinted;
 	bool desktop_visible;
 	unsigned workspace;
 	struct wc_toplevel *saved_focus[WORKSPACES], *saved_normal[WORKSPACES];
@@ -400,6 +401,11 @@ static void wc_lock_maybe_ack(struct wc_server *s);
 static bool wc_lock_surface_allowed(struct wc_server *s, struct wlr_surface *surface);
 static void wc_lock_focus(struct wc_server *s);
 static void wc_activity(struct wc_server *s) { clock_gettime(CLOCK_MONOTONIC, &s->last_activity); }
+#define WC_WALLPAPER_IDLE_MS 120000
+static bool wc_wallpaper_idle(struct wc_server *s, struct timespec now) {
+	return (int64_t)(now.tv_sec - s->last_activity.tv_sec) * 1000 +
+		(now.tv_nsec - s->last_activity.tv_nsec) / 1000000 >= WC_WALLPAPER_IDLE_MS;
+}
 static bool wc_idle_lock_due(struct wc_server *s, struct timespec now) {
 	int64_t idle_ms = (int64_t)(now.tv_sec - s->last_activity.tv_sec) * 1000 +
 		(now.tv_nsec - s->last_activity.tv_nsec) / 1000000;
@@ -516,15 +522,16 @@ static struct wc_toplevel *wc_find_app(struct wc_server *s, const char *app_id) 
 	}
 	return NULL;
 }
-// The wallpaper samples this private runtime hint to reduce work behind fullscreen apps.
-static void fullscreen_hint(bool active) {
+// The wallpaper samples these private runtime hints to reduce work behind fullscreen apps and while idle.
+static void runtime_hint(const char *name, bool active) {
 	const char *runtime = getenv("XDG_RUNTIME_DIR");
 	struct stat st;
 	if (!runtime || stat(runtime, &st) || st.st_uid != getuid() || (st.st_mode & 0022)) return;
-	char path[512]; snprintf(path, sizeof(path), "%s/whitecube-fullscreen", runtime);
+	char path[512]; snprintf(path, sizeof(path), "%s/%s", runtime, name);
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd >= 0) { char value = active ? '1' : '0'; ssize_t n = write(fd, &value, 1); (void)n; close(fd); }
 }
+static void fullscreen_hint(bool active) { runtime_hint("whitecube-fullscreen", active); }
 static void wc_toplevel_drop_tab(struct wc_toplevel *t) {
 	if (t->tab_label) { wlr_scene_node_destroy(&t->tab_label->node); t->tab_label = NULL; }
 	if (t->tab_cube) { wlr_scene_node_destroy(&t->tab_cube->node); t->tab_cube = NULL; }
@@ -1204,6 +1211,8 @@ static int accessibility_tick(void *data) {
 	if (s->state_directory[0]) wc_names_load(path, &s->layout);
 	if (wc_idle_inhibited(s)) wc_activity(s);
 	struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+	bool idle = wc_wallpaper_idle(s, now);
+	if (idle != s->idle_hinted) { s->idle_hinted = idle; runtime_hint("whitecube-idle", idle); }
 	if (wc_idle_lock_due(s, now)) {
 		s->last_lock_attempt = now;
 		spawn("swaylock -f -c 111827");
@@ -2360,6 +2369,7 @@ int main(int argc, char *argv[]) {
 	if (server.settings_timer) wl_event_source_remove(server.settings_timer);
 	stop_startup(startup_group);
 	fullscreen_hint(false);
+	runtime_hint("whitecube-idle", false);
 	if (sigterm) wl_event_source_remove(sigterm);
 	if (sigint) wl_event_source_remove(sigint);
 	if (sighup) wl_event_source_remove(sighup);

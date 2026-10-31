@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import signal
 import subprocess
 import sys
@@ -59,6 +60,53 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
             time.sleep(.02)
         self.assertTrue(self.capture.exists(), 'fake compositor did not start')
         return json.loads(self.capture.read_text())
+
+    def drm_tree(self, *cards):
+        drm = self.root / 'drm'
+        for card, driver, status in cards:
+            target = self.root / 'drivers' / driver
+            target.mkdir(parents=True, exist_ok=True)
+            (drm / card / 'device').mkdir(parents=True)
+            (drm / card / 'device/driver').symlink_to(target)
+            connector = drm / f'{card}-eDP-1'
+            connector.mkdir()
+            (connector / 'status').write_text(status + '\n')
+        return drm
+
+    def test_idle_nvidia_gpu_is_left_closed_only_when_it_drives_nothing(self):
+        quiet = SESSION['quiet_gpu_devices']
+        self.assertEqual(quiet(self.drm_tree(('card1', 'nvidia', 'disconnected'), ('card2', 'i915', 'connected'))),
+                         '/dev/dri/card2')
+        cases = {
+            'external display on nvidia': (('card1', 'nvidia', 'connected'), ('card2', 'i915', 'connected')),
+            'only the nvidia panel': (('card1', 'nvidia', 'connected'), ('card2', 'i915', 'disconnected')),
+            'nothing connected yet': (('card1', 'nvidia', 'disconnected'), ('card2', 'i915', 'disconnected')),
+            'no nvidia gpu': (('card1', 'amdgpu', 'disconnected'), ('card2', 'i915', 'connected')),
+        }
+        for label, cards in cases.items():
+            with self.subTest(label):
+                shutil.rmtree(self.root / 'drm', ignore_errors=True)
+                self.assertIsNone(quiet(self.drm_tree(*cards)))
+
+    def test_gpu_power_save_respects_overrides_and_safe_mode(self):
+        apply = SESSION['apply_gpu_power_save']
+        base = {'HOME': str(self.home), 'XDG_CONFIG_HOME': str(self.root / 'config')}
+        globals_ = apply.__globals__
+        with mock.patch.dict(globals_, quiet_gpu_devices=lambda: '/dev/dri/card2'):
+            env = dict(base); apply(env)
+            self.assertEqual(env['WLR_DRM_DEVICES'], '/dev/dri/card2')
+            env = dict(base, WLR_DRM_DEVICES='/dev/dri/card9'); apply(env)
+            self.assertEqual(env['WLR_DRM_DEVICES'], '/dev/dri/card9')
+            env = dict(base, WLR_BACKENDS='headless'); apply(env)
+            self.assertNotIn('WLR_DRM_DEVICES', env)
+            config = self.root / 'config/whitecube'
+            config.mkdir(parents=True)
+            (config / 'config').write_text('gpu_power_save=0\n')
+            env = dict(base); apply(env)
+            self.assertNotIn('WLR_DRM_DEVICES', env)
+        recovery = self.launch('--safe-mode')
+        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+        self.assertNotIn('WLR_DRM_DEVICES', self.wait_capture()['env'])
 
     def test_launch_sets_wayland_environment_and_rotates_private_logs(self):
         result = self.launch()

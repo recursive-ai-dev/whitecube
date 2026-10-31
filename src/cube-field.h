@@ -201,7 +201,7 @@ static void field_status(struct ca *c, char *out, size_t size) {
 	const char *rule = c->volume ? "3D B5/S4,5" : rule_of(c)->name;
 	if (c->cs.on) snprintf(out, size, "OK cosmos %s z=%.2f / %s / %s / rule %s / seed %u / generation %llu", COS_NAMES[(int)lround(c->cs.zoom) < COS_PHASES ? (int)lround(c->cs.zoom) : COS_PHASES - 1], c->cs.zoom, c->cs.auto_zoom ? "auto" : "hold", c->paused ? "paused" : "running", rule, c->base_seed, (unsigned long long)c->tick);
 	else snprintf(out, size, "OK %s / %s / generation %llu / %s / seed %u / slice %d%s / %d fps%s", rule, c->manual ? "manual" : "loop", (unsigned long long)c->tick, c->paused ? "paused" : "running", c->base_seed, c->slice,
-		c->volume ? (c->spin ? " / spin" : " / still") : "", c->effective_fps, c->on_battery ? " (battery)" : "");
+		c->volume ? (c->spin ? " / spin" : " / still") : "", c->effective_fps, c->idle && !c->edit ? " (idle)" : c->on_battery ? " (battery)" : "");
 }
 static bool apply_control(struct ca *c, const char *command) {
 	char verb[32], arg[64] = {0}, extra;
@@ -277,7 +277,8 @@ static int control_menu(void) {
 		"Scroll changes 3D layers. Alt+V returns here; 'edit' again runs the field.\n"
 		"Painted/saved worlds stay on their rule. 'loop' toggles automatic reseeding.\n"
 		"Fullscreen applications or temperatures >=75 C limit the field to 2 ticks/s;\n"
-		"on battery it runs at two thirds speed, and a hidden field does not run at all.\n");
+		"from 65 C it runs at half speed, on battery at two thirds, and a hidden field\n"
+		"does not run at all. It freezes after 2 idle minutes and resumes on input.\n");
 	char line[256]; while (fputs("cube> ", stdout), fflush(stdout), fgets(line, sizeof(line), stdin)) {
 		line[strcspn(line, "\r\n")] = 0; if (!strcmp(line, "quit")) break;
 		if (*line == '@') { char *space = strchr(line, ' '); if (!space) { puts("Usage: @OUTPUT command"); continue; } *space = 0; send_control(line + 1, space + 1); }

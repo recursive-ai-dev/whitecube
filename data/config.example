@@ -26,5 +26,9 @@ privacy_clear_clipboard_on_lock=1
 privacy_lock_minutes=0
 settings_cmd=cube-settings
 
+# 1 leaves an NVIDIA GPU closed at login when it has no display, so it can power down and run cool.
+# A display plugged into that GPU later appears after the next login. 0 opens every GPU.
+gpu_power_save=1
+
 # Wallpaper: 1 starts the cosmic zoom (cells > ... > expanding universe) instead of the plain cube field.
 cosmos=0

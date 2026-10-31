@@ -40,10 +40,10 @@ After building, run the complete verification outside the builder:
 
 ```sh
 python3 -I tools/verify-release.py \
-  --deb packaging/out/whitecube-desktop_0.9.4_amd64.deb \
+  --deb packaging/out/whitecube-desktop_0.9.5_amd64.deb \
   --rootfs build/debian-builder/rootfs \
-  --previous-deb packaging/out/whitecube-desktop_0.9.3_amd64.deb \
-  --output build/release-0.9.4
+  --previous-deb packaging/out/whitecube-desktop_0.9.4_amd64.deb \
+  --output build/release-0.9.5
 ```
 
 The output directory must be absent or empty. Add `--list` to inspect commands.
@@ -79,7 +79,7 @@ Never replace an already published version with different binaries.
 
 ```sh
 cd packaging/out
-sha256sum --check whitecube-desktop_0.9.4_amd64.deb.sha256
+sha256sum --check whitecube-desktop_0.9.5_amd64.deb.sha256
 ```
 
 Keep the previous archive for upgrade testing and rollback. Installing never
