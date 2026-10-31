@@ -3,6 +3,13 @@
 # The package manager resolves versions from this build environment's metadata.
 set -euo pipefail
 player_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+# Without apt (Arch), build against the system libmpv at the paths meson.build expects.
+if ! command -v apt-get >/dev/null; then
+  mkdir -p "$player_root/.deps/usr/lib/x86_64-linux-gnu" "$player_root/.deps/usr/include"
+  ln -sfn /usr/lib/libmpv.so "$player_root/.deps/usr/lib/x86_64-linux-gnu/libmpv.so"
+  ln -sfn /usr/include/mpv "$player_root/.deps/usr/include/mpv"
+  exit 0
+fi
 downloads=$player_root/.deps/downloads
 mkdir -p "$downloads"
 work=$(mktemp -d "$downloads/mpv-XXXXXX")

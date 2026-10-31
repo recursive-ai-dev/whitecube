@@ -156,6 +156,7 @@ python3 -I tests/test-install.py
 python3 -I tests/test-preferences.py
 python3 -I tests/test-migrate.py
 python3 -I tests/test-packaging.py
+python3 -I tests/test-arch-packaging.py
 python3 -I tests/test-installed-conflicts.py
 python3 -I -m unittest discover -s apps/cube-apps/tests -v
 python3 -I tests/test-desktop-improvements.py

@@ -1,0 +1,15 @@
+# Added to archiso's baseline profile. Never list xorg-server or xorg-server-xwayland here:
+# audit-no-x.sh fails the build if an X server lands in the image.
+whitecube-desktop
+amd-ucode
+intel-ucode
+linux-firmware
+mesa
+vulkan-intel
+vulkan-radeon
+fnott
+pipewire
+pipewire-pulse
+wireplumber
+ttf-dejavu
+noto-fonts

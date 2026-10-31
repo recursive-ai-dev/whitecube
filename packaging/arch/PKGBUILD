@@ -1,0 +1,49 @@
+# Packages a tree already built by packaging/arch/build-in-container.sh. BUILD.sh runs there, not here.
+pkgname=whitecube-desktop
+pkgver=$(tr -d '[:space:]' < "${WHITECUBE_SRC:?set WHITECUBE_SRC}/packaging/VERSION")
+pkgrel=1
+pkgdesc='Pure-Wayland tabbed cube desktop (no X server, no XWayland)'
+arch=(x86_64)
+url='https://github.com/recursive-ai-dev/whitecube'
+license=(custom)
+options=(!strip !debug !lto)
+depends=(alsa-lib at-spi2-core cairo coreutils dbus dconf debootstrap dhcpcd dosfstools e2fsprogs expat fontconfig
+  foot freetype2 fuzzel gcc-libs glib2 glibc gptfdisk gtk3 gtk4 iproute2 lcms2 less libadwaita libcups libdrm libglvnd
+  libinput libisoburn libliftoff libpng libseat libxcomposite libxdamage libxext libxfixes libxkbcommon libxrandr
+  mesa mpv nftables nspr nss pango parted pixman procps-ng python python-cairo python-gobject python-numpy
+  python-pikepdf python-requests python-yaml seatd squashfs-tools sudo swaybg swaylock systemd util-linux wayland
+  xz zlib)
+optdepends=('fnott: desktop notifications' 'pipewire: audio services' 'wireplumber: audio services'
+  'pipewire-pulse: audio services' 'qemu-desktop: Cube Lab virtual machines' 'edk2-ovmf: Cube Lab UEFI')
+conflicts=(xorg-server xorg-server-xwayland)
+
+package() {
+  cd "$WHITECUBE_SRC"
+  bash packaging/install-tree.sh "$pkgdir"
+  for native in whitecube-compositor cube-status cube-settings cube-ca; do
+    patchelf --set-rpath /usr/lib/whitecube "$pkgdir/usr/bin/$native"
+  done
+  local priv=$pkgdir/usr/lib/whitecube wlroots display_info cairo library real
+  install -d -m 0755 "$priv"
+  wlroots=$(ldd build/whitecube | awk '/libwlroots/ {print $3}')
+  display_info=$(ldd "$wlroots" | awk '$1 ~ /^libdisplay-info\.so\./ {print $3}')
+  cairo=$(ldd build/cube-settings | awk '$1 == "libcairo.so.2" {print $3}')
+  for library in "$wlroots" "$display_info" "$cairo"; do
+    [[ -f $library ]] || { echo "PKGBUILD: private library not found: $library" >&2; return 1; }
+    real=$(readlink -f "$library")
+    install -m 0644 "$real" "$priv/$(basename "$real")"
+    [[ $(basename "$library") == "$(basename "$real")" ]] || ln -s "$(basename "$real")" "$priv/$(basename "$library")"
+    patchelf --set-rpath '$ORIGIN' "$priv/$(basename "$real")"
+  done
+  if ldd "$priv/$(basename "$(readlink -f "$wlroots")")" "$priv/$(basename "$(readlink -f "$cairo")")" | grep -qiE 'libX11|libxcb'; then
+    echo 'PKGBUILD: a private library still reaches X11' >&2; return 1
+  fi
+  strip --strip-unneeded "$pkgdir"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player} \
+    "$pkgdir"/usr/libexec/whitecube/cube-browser/cube-{browser,renderd,netd} "$priv"/*.so* 2>/dev/null || true
+  # cube-settings-helper and the sudoers example use Debian's group names.
+  install -D -m 0644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/whitecube.conf" <<'CONF'
+g sudo - -
+g netdev - -
+g plugdev - -
+CONF
+}

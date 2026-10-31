@@ -1,0 +1,7 @@
+# Live session: start the desktop on the first console. A failed start leaves this shell usable.
+if [[ -z ${WAYLAND_DISPLAY:-} && $(tty) == /dev/tty1 ]]; then
+  [[ -e /dev/dri/card0 || -e /dev/dri/card1 ]] || echo 'whitecube: no display GPU found'
+  # Virtual machines often only have software rendering.
+  if systemd-detect-virt -q; then export WLR_RENDERER_ALLOW_SOFTWARE=1 WLR_NO_HARDWARE_CURSORS=1; fi
+  whitecube-session || echo 'Whitecube did not start. Try: whitecube-session --safe-mode, or see: whitecube-doctor'
+fi

@@ -23,7 +23,10 @@ HELP
   *) echo "prepare-native-deps.sh: unknown argument: $1" >&2; exit 2 ;;
 esac
 [[ $jobs =~ ^[1-9][0-9]*$ ]] || { echo 'JOBS must be a positive integer' >&2; exit 2; }
-for command in apt-cache apt-get dpkg-source meson ninja cc pkg-config curl unzip make ar; do
+# WLROOTS_SOURCE_DIR supplies an already verified wlroots tree on distributions without deb-src.
+source_tools=(apt-cache apt-get dpkg-source)
+[[ -z ${WLROOTS_SOURCE_DIR:-} ]] || source_tools=()
+for command in "${source_tools[@]}" meson ninja cc pkg-config curl unzip make ar; do
   command -v "$command" >/dev/null || { echo "prepare-native-deps.sh: missing $command" >&2; exit 1; }
 done
 mkdir -p "$deps_root/src" "$prefix/lib/pkgconfig"
@@ -60,18 +63,22 @@ export LD_LIBRARY_PATH="$prefix/lib:$browser/.deps/prefix/lib${LD_LIBRARY_PATH:+
 # apt validates source hashes against the configured signed Release metadata.
 # Select this API explicitly rather than silently building a newer wlroots ABI.
 version=${WLROOTS_SOURCE_VERSION:-}
-if [[ -z $version ]]; then
+if [[ -z $version && -z ${WLROOTS_SOURCE_DIR:-} ]]; then
   version=$(apt-cache showsrc wlroots | awk '$1 == "Version:" && $2 ~ /^0\.18\./ {print $2}' | sort -V | tail -1)
 fi
-[[ $version == 0.18.* ]] || {
+[[ -n ${WLROOTS_SOURCE_DIR:-} || $version == 0.18.* ]] || {
   echo 'prepare-native-deps.sh: Debian deb-src metadata must provide wlroots 0.18 (run apt-get update in the build environment)' >&2
   exit 1
 }
-(
-  cd "$deps_root/src"
-  apt-get source "wlroots=$version"
-)
-source_dir=$deps_root/src/wlroots-${version%%-*}
+if [[ -n ${WLROOTS_SOURCE_DIR:-} ]]; then
+  source_dir=$WLROOTS_SOURCE_DIR
+else
+  (
+    cd "$deps_root/src"
+    apt-get source "wlroots=$version"
+  )
+  source_dir=$deps_root/src/wlroots-${version%%-*}
+fi
 [[ -f $source_dir/meson.build ]] || {
   echo "prepare-native-deps.sh: source extraction missing: $source_dir" >&2; exit 1;
 }
