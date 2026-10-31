@@ -8,7 +8,8 @@ from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QProcess, QTimer
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QProcess, QTimer, qInstallMessageHandler
+from shiboken6 import isValid
 from chrootables.client import Client, valid_result, MAX_MESSAGES_PER_TICK, MAX_JSON_DEPTH
 
 
@@ -259,6 +260,46 @@ class ClientTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(.005)
         self.assertFalse(self.client.retiring)
+
+    def test_retirement_callbacks_tolerate_deleted_process_and_client_owners(self):
+        import sys
+        for delete_client in (False, True):
+            with self.subTest(delete_client=delete_client):
+                owner = QObject()
+                client = Client('/tmp/retirement-deletion-test', parent=owner if delete_client else None)
+                process = QProcess(client if delete_client else owner)
+                client.process = process
+                process.start(sys.executable, ['-I', '-S', '-c', 'import time; time.sleep(30)'])
+                deadline = time.monotonic() + 3
+                while process.state() == QProcess.ProcessState.Starting and time.monotonic() < deadline:
+                    self.app.processEvents()
+                self.assertEqual(process.state(), QProcess.ProcessState.Running)
+                client.stop()
+                self.assertTrue(client.retiring)
+                errors, messages = [], []
+                old_handler = qInstallMessageHandler(lambda *args: messages.append(args[-1]))
+                try:
+                    with patch.object(sys, 'excepthook', side_effect=lambda *args: errors.append(args)):
+                        owner.deleteLater()
+                        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                        self.assertFalse(isValid(process))
+                        self.assertEqual(isValid(client), not delete_client)
+                        # Exercise queued stdout/finish notifications as well as
+                        # the real 1.5-second retirement timer after forced owner
+                        # destruction. None may access an invalid C++ wrapper.
+                        QTimer.singleShot(0, lambda: client._discard_retired_output(process))
+                        QTimer.singleShot(0, lambda: client._release_process(process))
+                        QTimer.singleShot(0, lambda: client._kill_retired(process))
+                        QTimer.singleShot(0, lambda: client._process_finished(process, False))
+                        deadline = time.monotonic() + 1.7
+                        while time.monotonic() < deadline:
+                            self.app.processEvents()
+                            time.sleep(.005)
+                    self.assertEqual(errors, [])
+                    self.assertFalse(client.retiring)
+                finally:
+                    qInstallMessageHandler(old_handler)
+                    client.stop()
 
     def test_deep_json_is_rejected_once_and_a_new_connection_can_succeed(self):
         callback = Mock()

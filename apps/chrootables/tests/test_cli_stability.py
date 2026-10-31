@@ -128,7 +128,7 @@ stat() {
 
     def test_package_mapping_prefers_pacman_and_zypper_over_generic_fallback(self):
         for name, expected in (
-            ("pacman", ["newt", "gnupg", "inetutils", "gawk"]),
+            ("pacman", ["libnewt", "gnupg", "inetutils", "gawk"]),
             ("zypper", ["newt", "gpg2", "hostname", "gawk"]),
         ):
             with self.subTest(manager=name):

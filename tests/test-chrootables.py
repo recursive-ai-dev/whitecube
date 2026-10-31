@@ -614,7 +614,9 @@ if __name__ == '__main__':
     parser.add_argument('--verbose', action='store_true', help='Print each test name')
     parser.add_argument('--failfast', action='store_true', help='Stop on the first failure for useful CI diagnostics')
     args = parser.parse_args()
-    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    # Unit interactions and clipboard checks must never share the user's
+    # Wayland/X11 desktop, including when its environment selects a platform.
+    os.environ['QT_QPA_PLATFORM'] = 'offscreen'
     loader = unittest.defaultTestLoader
     suite = unittest.TestSuite(loader.loadTestsFromTestCase(case) for case in (
         BackendRules, ManagerContract, SudoFlow, CopiedApplicationContract))

@@ -911,7 +911,7 @@ main "$@"
         (self.path / "images/lab.img").write_bytes(b"image")
         return wrapper
 
-    def run_clone_and_cancel(self, overrides, *, wait_for_stage, wait_for_file=None):
+    def run_clone_and_cancel(self, overrides, *, wait_for_stage, wait_for_file=None, after_cancel=None):
         wrapper = self.manager_wrapper(overrides)
         store = Store(self.path)
         outcome = {}
@@ -936,6 +936,8 @@ main "$@"
                 self.assertLess(time.monotonic() - begin, 10, "child never became ready")
                 time.sleep(0.01)
             cancel = store.cancel_operation()
+            if after_cancel:
+                after_cancel()
             worker.join(15)
         self.assertFalse(worker.is_alive())
         self.assertTrue(cancel["cancelled"])
@@ -980,8 +982,28 @@ main "$@"
     def test_cancel_loses_the_race_against_publication_and_reports_success(self):
         # The desktop saw "copying", but the manager is already past the point of no
         # return: the signal is ignored and the work really finishes.
+        ready = self.path / 'publication-protected'
+        release = self.path / 'publication-release'
+        os.mkfifo(release)
+
+        def release_publication():
+            # A nonblocking writer fails promptly if a regression killed the
+            # protected reader, rather than hanging this test during cleanup.
+            descriptor = os.open(release, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(descriptor, b'continue\n')
+            finally:
+                os.close(descriptor)
+
         outcome, _ = self.run_clone_and_cancel(
-            "cp() { protect_from_signals; command sleep 1; }", wait_for_stage="copying")
+            f'''cp() {{
+                local publication_fd
+                protect_from_signals
+                exec {{publication_fd}}<> {shlex.quote(str(release))}
+                : > {shlex.quote(str(ready))}
+                IFS= read -r _ <&"$publication_fd"
+                exec {{publication_fd}}>&-
+            }}''', wait_for_stage="copying", wait_for_file=ready, after_cancel=release_publication)
         self.assertEqual(outcome.get("code"), 0, outcome)
         self.assertTrue((self.path / "images/copy.img").exists())
         self.assertEqual(list((self.path / "images").glob(".copy.*")), [])

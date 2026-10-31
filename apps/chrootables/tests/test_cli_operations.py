@@ -379,6 +379,9 @@ import_image tooSmall "$1" 512 persistent minimal
     def test_import_without_a_size_fits_the_archive_with_headroom(self):
         archive = self.write_archive()
         result = self.bash(self.IMPORT_STUBS + """
+# The archive size is synthetic and allocation is sparse. Give the capacity
+# check an explicit 64 GiB budget instead of depending on /tmp's actual size.
+df() { printf 'Filesystem 1-blocks Used Available Capacity Mounted on\\n/dev/fixture 68719476736 0 68719476736 0%% /store\\n'; }
 tar() { printf -- '-rw-r--r-- 0/0 %s 2026-10-30 12:00 ./big\\n' 5368709120; }
 gzip() { :; }
 run_worker() { :; }

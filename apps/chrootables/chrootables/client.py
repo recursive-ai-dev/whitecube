@@ -6,6 +6,7 @@ from collections import deque
 import json
 import sys
 from PySide6.QtCore import QObject, QProcess, QTimer, Signal
+from shiboken6 import isValid
 from .backend import ROOT
 from .paths import store_path
 
@@ -177,7 +178,11 @@ class Client(QObject):
         self._retiring = set()
 
     def start(self, writable=False):
+        if not isValid(self):
+            return
         self.stop()
+        if not isValid(self):
+            return
         self.buffer = b""
         self._lines.clear()
         self._queued_bytes = 0
@@ -200,7 +205,7 @@ class Client(QObject):
         process.start(program, args)
 
     def failure(self, message):
-        if self._failed:
+        if self._failed or not isValid(self):
             return
         self._failed = True
         self.buffer = b""
@@ -210,14 +215,17 @@ class Client(QObject):
         process = self.process
         callbacks, self.callbacks = self.callbacks, {}
         for callback in callbacks.values():
+            if not isValid(self):
+                break
             callback(False, message)
-        if process is self.process:
+        if process is self.process and isValid(self):
             if process is not None:
                 self._retire_process(process)
-            self.disconnected.emit(message)
+            if isValid(self):
+                self.disconnected.emit(message)
 
     def read(self, process):
-        if process is not self.process or self._failed:
+        if not self._connection_valid(process):
             return
         # Split once per chunk rather than once per line. Pending lines live on the
         # client because a callback may open a dialog whose event loop re-enters
@@ -236,7 +244,7 @@ class Client(QObject):
         self._drain_lines(process)
 
     def _process_finished(self, process, writable):
-        if process is not self.process or self._failed:
+        if not self._connection_valid(process):
             return
         self._exit_error = ("Terminal authentication was cancelled or the helper closed. Unlock store to try again."
                             if writable else "The workspace helper stopped.")
@@ -250,7 +258,7 @@ class Client(QObject):
         def resume():
             if self._drain_process is process:
                 self._drain_process = None
-            if process is self.process and not self._failed:
+            if self._connection_valid(process):
                 self._drain_lines(process)
         QTimer.singleShot(0, resume)
 
@@ -265,10 +273,10 @@ class Client(QObject):
                 identifier, value = pending_id, "".join(pending_chunks)
                 pending_id = None
                 pending_chunks = []
-                if process is self.process and not self._failed:
+                if self._connection_valid(process):
                     self.output.emit(identifier, value)
 
-        while (process is self.process and not self._failed and self._lines
+        while (self._connection_valid(process) and self._lines
                and messages < MAX_MESSAGES_PER_TICK and decoded_bytes < MAX_DECODE_BYTES_PER_TICK):
             line = self._lines.popleft()
             self._queued_bytes -= len(line) + 1
@@ -290,13 +298,13 @@ class Client(QObject):
                 msg_id = message.get("id")
                 if pending_chunks and pending_id != msg_id:
                     flush_output()
-                    if process is not self.process or self._failed:
+                    if not self._connection_valid(process):
                         return
                 pending_id = msg_id
                 pending_chunks.append(message.get("text", ""))
                 continue
             flush_output()
-            if process is not self.process or self._failed:
+            if not self._connection_valid(process):
                 return
             if event == "ready":
                 self.writable = message["writable"]
@@ -312,7 +320,7 @@ class Client(QObject):
                 self.failure(message["error"])
                 return
         flush_output()
-        if process is not self.process or self._failed:
+        if not self._connection_valid(process):
             return
         if self._lines:
             self._schedule_drain(process)
@@ -352,16 +360,26 @@ class Client(QObject):
             process, self.process = self.process, None
             self._retire_process(process)
         callbacks, self.callbacks = self.callbacks, {}
-        for callback in callbacks.values():
-            callback(False, "Connection changed. Refresh and try again.")
-        if not self._retiring:
+        if isValid(self):
+            for callback in callbacks.values():
+                if not isValid(self):
+                    break
+                callback(False, "Connection changed. Refresh and try again.")
+        if not self._retiring and isValid(self):
             self.stopped.emit()
+
+    def _connection_valid(self, process):
+        return (isValid(self) and process is not None and process is self.process
+                and isValid(process) and not self._failed)
 
     @property
     def retiring(self):
         return bool(self._retiring)
 
     def _retire_process(self, process):
+        if not isValid(self) or not isValid(process):
+            self._forget_process(process)
+            return
         if process in self._retiring:
             return
         self._retiring.add(process)
@@ -370,19 +388,22 @@ class Client(QObject):
         # these transports at shutdown. Root filesystem tasks live in the sudo
         # helper and finish after transport EOF, even if the relay must stop.
         process.finished.connect(lambda *_: self._release_process(process))
+        process.destroyed.connect(lambda *_: self._forget_process(process))
         # PySide 6.10 can crash while introspecting a native return-valued
         # method as a slot when another QProcess method is mocked. Plain Python
         # callbacks also avoid relying on native slot-overload resolution here.
-        process.readyReadStandardOutput.connect(lambda: process.readAllStandardOutput())
-        process.readyReadStandardError.connect(lambda: process.readAllStandardError())
+        process.readyReadStandardOutput.connect(lambda: self._discard_retired_output(process))
+        process.readyReadStandardError.connect(lambda: self._discard_retired_output(process))
         process.closeWriteChannel()
+        if not self._retirement_valid(process):
+            return
         if process.state() == QProcess.ProcessState.NotRunning:
             self._release_process(process)
         else:
             QTimer.singleShot(1500, lambda: self._terminate_retired(process))
 
     def _terminate_retired(self, process):
-        if process not in self._retiring:
+        if not self._retirement_valid(process):
             return
         if process.state() != QProcess.ProcessState.NotRunning:
             process.terminate()
@@ -391,18 +412,37 @@ class Client(QObject):
             self._release_process(process)
 
     def _kill_retired(self, process):
-        if process in self._retiring:
+        if self._retirement_valid(process):
             if process.state() != QProcess.ProcessState.NotRunning:
                 process.kill()
             else:
                 self._release_process(process)
 
     def _release_process(self, process):
-        if process not in self._retiring or process.state() != QProcess.ProcessState.NotRunning:
+        if not self._retirement_valid(process) or process.state() != QProcess.ProcessState.NotRunning:
+            return
+        self._forget_process(process, delete=True)
+
+    def _retirement_valid(self, process):
+        if process not in self._retiring:
+            return False
+        if not isValid(self) or not isValid(process):
+            self._forget_process(process)
+            return False
+        return True
+
+    def _discard_retired_output(self, process):
+        if self._retirement_valid(process):
+            process.readAllStandardOutput()
+            process.readAllStandardError()
+
+    def _forget_process(self, process, *, delete=False):
+        if process not in self._retiring:
             return
         self._retiring.remove(process)
         if self.process is process:
             self.process = None
-        process.deleteLater()
-        if self.process is None and not self._retiring:
+        if delete and isValid(process):
+            process.deleteLater()
+        if self.process is None and not self._retiring and isValid(self):
             self.stopped.emit()
