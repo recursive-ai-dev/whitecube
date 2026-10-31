@@ -611,6 +611,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--screenshots', type=Path, default=ROOT / 'build')
     parser.add_argument('--no-gui', action='store_true', help='Only backend, manager, and helper checks')
+    parser.add_argument('--verbose', action='store_true', help='Print each test name')
+    parser.add_argument('--failfast', action='store_true', help='Stop on the first failure for useful CI diagnostics')
     args = parser.parse_args()
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     loader = unittest.defaultTestLoader
@@ -629,7 +631,7 @@ if __name__ == '__main__':
             patterns += ['test_desktop.py', 'test_terminal.py']
     for pattern in patterns:
         suite.addTests(loader.discover(str(APP / 'tests'), pattern=pattern))
-    outcome = unittest.TextTestRunner(verbosity=1).run(suite)
+    outcome = unittest.TextTestRunner(verbosity=2 if args.verbose else 1, failfast=args.failfast).run(suite)
     if not outcome.wasSuccessful():
         raise SystemExit(1)
     if not args.no_gui:

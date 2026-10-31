@@ -49,7 +49,7 @@ jobs:
         run: |
           bash -n apps/chrootables/chrootable-manager apps/chrootables/tests/integration.sh apps/cube-strap/cube-strap-build apps/cube-strap/deb-strap.sh
           python3 -m compileall -q apps/chrootables apps/cube-strap
-          python3 -I tests/test-chrootables.py --screenshots /tmp/cube-previews
+          python3 -X faulthandler -I tests/test-chrootables.py --verbose --failfast --screenshots /tmp/cube-previews
           python3 -I -m unittest discover -s apps/cube-strap/tests -v
       - name: Fetch checksum-pinned AppImage tools
         run: python3 apps/chrootables/packaging/fetch-build-tools.py --output /tmp/cube-tools
