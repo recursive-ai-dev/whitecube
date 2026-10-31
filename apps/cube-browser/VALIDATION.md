@@ -6,6 +6,8 @@ The Debian 13 amd64 release build passes all 24 non-Wayland suites, including
 real resource timeout/recovery, cancellation, event/quota, observer records,
 image-interface, computed-style, WebP and C-compiler round-trip checks. The final
 inline-image percentage-width path also passes the native DOM regression.
+Adversarial prototype-key lookups return empty unsupported style values and
+zero unknown DOMException codes; web/DOM and instrumented DOM checks pass.
 
 All 13 browser component suites pass ASan/UBSan with the QuickJS core rebuilt
 with instrumentation in the Debian builder. The three affected compositor,

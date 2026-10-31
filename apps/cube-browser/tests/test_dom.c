@@ -46,6 +46,7 @@ static void scrolling_images(void){
         "if(e.isIntersecting&&e.target===far){"
         "if(innerWidth!==320||innerHeight!==200||pageYOffset!==1000||far.getBoundingClientRect().top!==100)throw Error('CSS pixel geometry');"
         "far.style.width='50%';if(getComputedStyle(far).width!=='160px'||far.getBoundingClientRect().width!==160)throw Error('resolved replaced width');"
+        "for(const key of ['constructor','__proto__','toString'])if(getComputedStyle(far).getPropertyValue(key)!==''||new DOMException('',key).code!==0)throw Error('prototype lookup');"
         "far.src=far.dataset.src;owner.unobserve(far);out.textContent=seen.join(',')+' '+changes.join(',');"
         "}}},{threshold:[0,0.5,1]});"
         "observer.observe(document.getElementById('near'));observer.observe(far);"

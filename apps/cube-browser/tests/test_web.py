@@ -36,7 +36,9 @@ class Web(unittest.TestCase):
         for(let i=0;i<2;i++){try{target.addEventListener('x',callback)}catch(e){denied++;}}
         targets[0].removeEventListener('x',callback);target.addEventListener('x',callback);target.removeEventListener('x',callback);
         for(const t of targets)t.removeEventListener('x',callback);
-        if(denied!==3)throw Error('quota');document.getElementById('out').textContent='EVENT_LIFECYCLE_OK';
+        if(denied!==3)throw Error('quota');
+        for(const name of ['unknown','constructor','__proto__','toString'])if(new DOMException('',name).code!==0)throw Error('exception code '+name);
+        document.getElementById('out').textContent='EVENT_LIFECYCLE_OK';
         </script>'''
         with server({'/page':(200,'text/html',html,0)}) as (url,_,__):
             r=self.dump(url+'/page');self.assertIn('EVENT_LIFECYCLE_OK',r.stdout);self.assertNotIn('console:',r.stderr)
@@ -77,7 +79,8 @@ class Web(unittest.TestCase):
         <div id="box">box</div><p id="out">initial</p><script>
         const box=document.getElementById('box'),style=getComputedStyle(box);
         if(!(style instanceof CSSStyleDeclaration)||style.color!=='rgb(18, 52, 86)'||style.width!=='42px'||style.paddingLeft!=='40px')throw Error('cascade '+style.width+' '+style.paddingLeft);
-        if(style.getPropertyValue('unknown')!==''||![...style].includes('display')||style[0]!==style.item(0))throw Error('enumeration');
+        for(const name of ['unknown','constructor','__proto__','toString'])if(style.getPropertyValue(name)!=='')throw Error('unsupported style '+name);
+        if(![...style].includes('display')||style[0]!==style.item(0))throw Error('enumeration');
         box.style.width='67px';if(style.width!=='67px')throw Error('not live');
         let denied=0;for(const mutate of [()=>style.width='1px',()=>style.setProperty('color','red'),()=>delete style.color,()=>Object.defineProperty(style,'width',{value:'1px'})]){try{mutate()}catch(e){if(e.name==='NoModificationAllowedError'&&e.code===7)denied++;}}
         if(denied!==4||style.width!=='67px'||getComputedStyle(document.createElement('div')).length!==0)throw Error('read only');

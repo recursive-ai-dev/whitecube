@@ -69,7 +69,7 @@
   }
   class DOMException extends Error {
     constructor(message='',name='Error'){super(String(message));this.name=String(name);}
-    get code(){return ({AbortError:20,TimeoutError:23,InvalidStateError:11,NotSupportedError:9,NoModificationAllowedError:7})[this.name]||0;}
+    get code(){const codes={AbortError:20,TimeoutError:23,InvalidStateError:11,NotSupportedError:9,NoModificationAllowedError:7};return Object.hasOwn(codes,this.name)?codes[this.name]:0;}
   }
   const abortStates=new WeakMap(),controllers=new WeakMap();let abortAlgorithmCount=0;
   function makeSignal(){const signal=Object.create(AbortSignal.prototype);abortStates.set(signal,{aborted:false,reason:undefined,algorithms:new Set()});return signal;}
@@ -254,7 +254,7 @@
   const readonlyStyle=()=>{throw new DOMException('Computed styles are read-only','NoModificationAllowedError');};
   class CSSStyleDeclaration {
     constructor(){throw new TypeError('Illegal constructor');}
-    getPropertyValue(name){const values=computedValues(this);return values[String(name)]??'';}
+    getPropertyValue(name){const values=computedValues(this);name=String(name);return Object.hasOwn(values,name)?values[name]:'';}
     getPropertyPriority(){return '';}
     get length(){return Object.keys(computedValues(this)).length;}
     item(index){return Object.keys(computedValues(this))[Number(index)]??'';}

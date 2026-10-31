@@ -154,3 +154,8 @@ claim of full web-platform compatibility.
 - **16:** Code, regression, sanitizer, corpus and native-presentation gates are
   complete. Final clean-source archives, installed-runtime verification and
   publication remain pending; this checkbox is updated only after publication.
+
+- **6, 9:** Final adversarial checks cover `constructor`, `__proto__` and
+  `toString`. Computed property reads use own-property checks and return empty
+  strings for unsupported names; unknown DOMException names retain numeric code
+  zero. Web-API, DOM and ASan/UBSan DOM regressions pass.
