@@ -23,12 +23,14 @@ def check(prefix):
             raise RuntimeError(f"Studio executable escapes its private application: {path}")
     if desktop.read_text().splitlines()[0] != "#!/usr/bin/python3 -I":
         raise RuntimeError("Studio launcher does not select isolated distribution Python.")
-    docs = prefix / "share/doc" / PACKAGE
-    provenance = json.loads((docs / "build-provenance.json").read_text())
+    provenance = json.loads((application / "build-provenance.json").read_text())
     for relative, expected in provenance["files_sha256"].items():
         path = prefix.parent / relative
         if not path.resolve().is_relative_to(prefix):
             raise RuntimeError("Invalid provenance path.")
+        # Native package managers may intentionally omit optional documentation.
+        if not path.exists() and relative.startswith(("usr/share/doc/", "usr/share/man/")):
+            continue
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Payload checksum differs: {relative}")
     with tempfile.TemporaryDirectory(prefix="cube-studio-check-") as temporary:

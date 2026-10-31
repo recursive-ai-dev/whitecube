@@ -35,7 +35,7 @@ RPM_DEPENDS = ("python3 >= 3.10", "python3-pyside6 >= 6.8", "qt6-qtwayland", "fo
                "gawk", "tar", "wget", "newt", "xz")
 ARCH_DEPENDS = ("python>=3.10", "pyside6>=6.8", "qt6-wayland", "foot", "sudo", "bash", "coreutils",
                 "util-linux", "e2fsprogs", "debootstrap", "debian-archive-keyring", "ca-certificates",
-                "dpkg", "findutils", "gnupg", "gzip", "inetutils", "iproute2", "gawk", "tar", "wget", "newt", "xz")
+                "dpkg", "findutils", "gnupg", "gzip", "inetutils", "iproute2", "gawk", "tar", "wget", "libnewt", "xz")
 APPRUN = '''#!/bin/bash
 set -eu
 APPDIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -125,7 +125,6 @@ cp -a usr "%{{buildroot}}/"
 %dir /usr/share/doc/{PACKAGE}
 %license /usr/share/doc/{PACKAGE}/copyright
 %doc /usr/share/doc/{PACKAGE}/*.gz
-/usr/share/doc/{PACKAGE}/build-provenance.json
 /usr/share/man/man1/{PACKAGE}.1.gz
 /usr/share/man/man1/{MANAGER_ALIAS}.1.gz
 """
@@ -286,6 +285,10 @@ def verify_artifact(kind, artifact, directory):
         owners = run_tool([rpm, "-qp", "--qf", "[%{FILEUSERNAME} %{FILEGROUPNAME}\n]", str(artifact)]).stdout.splitlines()
         if any(owner != "root root" for owner in owners):
             raise ValueError("RPM archive ownership is not normalized to root.")
+        flags = run_tool([rpm, "-qp", "--qf", "[%{FILENAMES}\t%{FILEFLAGS}\n]", str(artifact)]).stdout.splitlines()
+        runtime_flags = dict(line.split("\t", 1) for line in flags)
+        if int(runtime_flags[f"/{PRIVATE}/build-provenance.json"]) & 2:
+            raise ValueError("Required runtime provenance was marked optional RPM documentation.")
         converter, cpio = require_tool("rpm2cpio"), require_tool("cpio")
         converted = subprocess.run([converter, str(artifact)], capture_output=True, check=True)
         extracted = subprocess.run([cpio, "-idm", "--quiet", "--no-absolute-filenames"], cwd=directory,

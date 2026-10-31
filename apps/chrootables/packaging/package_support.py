@@ -79,7 +79,8 @@ def stage_payload(stage, epoch, root=ROOT):
                   "files_sha256": {path.relative_to(stage).as_posix(): file_digest(path)
                                    for path in sorted(stage.rglob("*"))
                                    if path.is_file() and not path.is_symlink()}}
-    (docs / "build-provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
+    # This is runtime metadata; Fedora's tsflags=nodocs must not remove it.
+    (application / "build-provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n")
     normalize_tree(stage, epoch)
     return stage
 

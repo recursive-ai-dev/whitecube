@@ -29,4 +29,6 @@ def store_path(value):
         raise ValueError("The workspace store path could not be resolved.") from error
     if resolved == Path("/"):
         raise ValueError("Store must be an absolute directory other than /.")
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("The workspace store must be a directory.")
     return resolved

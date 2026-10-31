@@ -77,7 +77,7 @@ release polish. Each checkbox requires working code and relevant verification.
 Implementation and release results will be recorded here as the work completes.
 
 - Desktop items 5–7 and 11–14: focused client (20), desktop (50), and terminal
-  (76) tests passed, followed by the combined 355-test suite and real-launcher
+  (76) tests passed, followed by the combined 356-test suite and real-launcher
   demo/empty-store screenshots. Python compilation and whitespace checks passed.
 - Protocol limits allow 8 MiB inventory frames and 16 MiB of queued wire data.
   Decoding yields after 100 messages or 64 KiB per turn; one larger inventory
@@ -85,8 +85,8 @@ Implementation and release results will be recorded here as the work completes.
   Terminal cells retain 32 characters, and the operation console retains at most
   256 Ki UTF-16 units as well as its existing 4,000-block limit.
 
-Local release verification: 355 combined application/engine tests, 26 Cube Strap
-checks and five packaging tests passed. The DEB, RPM, Arch and AppImage artifacts
+Local release verification: 356 combined application/engine tests, 26 Cube Strap
+checks and seven packaging tests passed. The DEB, RPM, Arch and AppImage artifacts
 passed extracted CLI, helper, checksum and desktop smoke checks, and each format
 rebuilt byte-for-byte across output paths and umasks. Real desktop screenshots
 were rendered without creating an image store. Native installation/upgrade/removal

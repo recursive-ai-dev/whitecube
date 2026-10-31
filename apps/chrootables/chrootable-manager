@@ -185,7 +185,7 @@ package_for_command() {
         esac
     elif command -v pacman >/dev/null 2>&1; then
         case $1 in
-            whiptail) printf newt; return ;;
+            whiptail) printf libnewt; return ;;
             ip) printf iproute2; return ;;
             awk) printf gawk; return ;;
             gpgv) printf gnupg; return ;;

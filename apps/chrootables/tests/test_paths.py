@@ -36,6 +36,14 @@ class StorePathTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store_path(alias / "tmp/..")
 
+    def test_existing_regular_file_is_rejected_without_changing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "store"
+            path.write_bytes(b"existing user file")
+            with self.assertRaisesRegex(ValueError, "directory"):
+                Store(path)
+            self.assertEqual(path.read_bytes(), b"existing user file")
+
 
 if __name__ == "__main__":
     unittest.main()

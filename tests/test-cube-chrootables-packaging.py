@@ -23,6 +23,24 @@ spec.loader.exec_module(builder)
 
 
 class StudioPayloadTests(unittest.TestCase):
+    def test_distribution_whiptail_providers_match_the_native_repositories(self):
+        manager = support.ROOT / "chrootable-manager"
+        script = '''
+source "$1"
+command() {
+    if [[ ${1:-} == -v ]]; then [[ ${2:-} == "$CUBE_TEST_DISTRIBUTION" ]]; return; fi
+    builtin command "$@"
+}
+package_for_command whiptail
+'''
+        for distribution, provider in (("pacman", "libnewt"), ("dnf", "newt")):
+            with self.subTest(distribution=distribution):
+                result = subprocess.run(["bash", "-c", script, "provider-check", str(manager)],
+                                        env={**os.environ, "CUBE_TEST_DISTRIBUTION": distribution},
+                                        capture_output=True, text=True, check=True)
+                self.assertEqual(result.stdout, provider)
+                self.assertIn(provider, builder.ARCH_DEPENDS if distribution == "pacman" else builder.RPM_DEPENDS)
+
     def test_allowlist_identity_modes_and_private_engine(self):
         with tempfile.TemporaryDirectory() as temporary:
             stage = support.stage_payload(Path(temporary) / "payload", support.DEFAULT_EPOCH)
@@ -47,10 +65,21 @@ class StudioPayloadTests(unittest.TestCase):
                 expected = 0o755 if path.is_dir() or relative in support.EXECUTABLES else 0o644
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected, relative)
                 self.assertEqual(path.stat().st_mtime, support.DEFAULT_EPOCH, relative)
-            provenance = json.loads((stage / f"usr/share/doc/{support.PACKAGE}/build-provenance.json").read_text())
+            provenance = json.loads((app / "build-provenance.json").read_text())
             self.assertEqual(provenance["application_version"], support.upstream_version())
             self.assertEqual(provenance["engine_version"], support.engine_version())
             self.assertNotEqual(provenance["application_version"], provenance["engine_version"])
+
+    def test_installed_checks_allow_documentation_exclusion(self):
+        scratch = ROOT / "build"
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="cube-nodocs-", dir=scratch) as temporary:
+            stage = support.stage_payload(Path(temporary) / "payload", support.DEFAULT_EPOCH)
+            shutil.rmtree(stage / "usr/share/doc")
+            shutil.rmtree(stage / "usr/share/man")
+            result = subprocess.run(["/usr/bin/python3", str(PACKAGING / "check-installed.py"),
+                                     "--prefix", str(stage / "usr")], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     @unittest.skipUnless(shutil.which("desktop-file-validate"), "desktop validator is unavailable")
     def test_desktop_file_is_valid(self):
@@ -127,7 +156,7 @@ class StudioArtifactTests(unittest.TestCase):
                             extracted = builder.verify_artifact(kind, artifact, work / "extracted")
                             self.assertFalse((extracted / "usr/bin/cube-chrootables").exists())
                             self.assertFalse((extracted / "var/lib/chrootable-manager").exists())
-                            sources.append(json.loads((extracted / f"usr/share/doc/{support.PACKAGE}/build-provenance.json").read_text()))
+                            sources.append(json.loads((extracted / support.PRIVATE / "build-provenance.json").read_text()))
                             built.append(hashlib.sha256(artifact.read_bytes()).hexdigest())
                         finally:
                             os.umask(previous)
