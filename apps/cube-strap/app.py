@@ -1,8 +1,8 @@
 #!/usr/bin/python3 -I
-"""Cube Strap: build Debian whitecubes — Chrootables workspaces or bootable VMs — with deb-strap.
+"""Cube Strap: build Debian whitecubes — Cube Chrootables workspaces or bootable VMs — with deb-strap.
 
 The window runs as the desktop user. The build is one sudo call (cube-strap-build); a
-password typed here goes to `sudo -S -v` once through the Chrootables backend and is
+password typed here goes to `sudo -S` once through Cube Strap's compatibility helper and is
 never kept. Chroot cubes are imported with chrootable-manager, VM cubes with `whitecube import`.
 """
 import argparse
@@ -25,7 +25,7 @@ from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 VERSION = '1.0.0'
 APP_ID = 'org.whitecube.CubeStrap'
 KIND_TEXT = {
-    'chroot': ('Chroot workspace', 'Shares this kernel. Opens in Chrootables; enter it in a terminal.'),
+    'chroot': ('Chroot workspace', 'Shares this kernel. Opens in Cube Chrootables; enter it in a terminal.'),
     'vm': ('Virtual machine', 'Its own kernel and UEFI disk. Boots in QEMU through whitecube.'),
 }
 
@@ -130,7 +130,7 @@ class StrapWindow(Adw.ApplicationWindow):
 
     # --- layout -----------------------------------------------------------------
     def build_rail(self):
-        """Black navigation rail with the cube mark, as in Chrootables and the Trainer."""
+        """Black navigation rail with the desktop's cube mark."""
         mark = Gtk.DrawingArea(content_width=40, content_height=40, halign=Gtk.Align.START)
         mark.set_draw_func(lambda _, context, *__: draw_cube(context, 2, 2, 36))
         self.rail.append(mark)
@@ -249,7 +249,7 @@ class StrapWindow(Adw.ApplicationWindow):
 
     def cubes_page(self):
         page = self.page('cubes', 'Cubes')
-        page.append(label('Cubes built here. Chroot cubes live in Chrootables; VM cubes in the whitecube store.',
+        page.append(label('Cubes built here. Chroot cubes live in Cube Chrootables; VM cubes in the whitecube store.',
                           'dim-label'))
         self.cube_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.cube_list.add_css_class('boxed-list')
@@ -298,7 +298,7 @@ class StrapWindow(Adw.ApplicationWindow):
         self.recipe.set_selected(self.recipe_keys.index(recipe) if recipe in self.recipe_keys else 0)
         self.size.set_range(strap.MIN_SIZE_GIB[kind], strap.MAX_SIZE_GIB)
         self.size.set_value(size or strap.DEFAULT_SIZE_GIB[kind])
-        self.size_hint.set_text('Room for the workspace files; Chrootables can grow it later.' if kind == 'chroot'
+        self.size_hint.set_text('Room for the workspace files; Cube Chrootables can grow it later.' if kind == 'chroot'
                                 else 'Virtual disk size. Stored sparse: only used blocks take space.')
         self.lifecycle_row.set_visible(kind == 'chroot')
         self.vm_row.set_visible(kind == 'vm')
@@ -337,7 +337,7 @@ class StrapWindow(Adw.ApplicationWindow):
         self.problem.set_text(found[0] if found else '')
         self.problem.set_visible(bool(found) and bool(plan.name))
         self.build_button.set_sensitive(not found and not self.building)
-        where = ('imported into Chrootables' if plan.kind == 'chroot'
+        where = ('imported into Cube Chrootables' if plan.kind == 'chroot'
                  else 'added to the whitecube store as a UEFI disk')
         self.summary.set_text(f'{plan.name or "This cube"}: {strap.RECIPES.get(plan.recipe, ("?",))[0]} '
                               f'{plan.suite}, {plan.size_gib} GiB, {where}.')
@@ -378,7 +378,7 @@ class StrapWindow(Adw.ApplicationWindow):
                 row.add_suffix(self.row_button('Boot', lambda n=name, i=item: self.boot(n, i.get('recipe') == 'server')))
             if state == 'built' and kind == 'chroot':
                 row.add_suffix(self.row_button('Shell', lambda n=name: self.shell(n)))
-                row.add_suffix(self.row_button('Chrootables', self.open_chrootables))
+                row.add_suffix(self.row_button('Cube Chrootables', self.open_chrootables))
             row.add_suffix(self.row_button('Forget', lambda n=name, k=kind: self.forget(n, k)))
             self.cube_list.append(row)
 
@@ -404,7 +404,7 @@ class StrapWindow(Adw.ApplicationWindow):
         self.spawn(backend.terminal_argv(name, 'enter'))
 
     def open_chrootables(self):
-        self.spawn([shutil.which('chrootables') or 'chrootables'])
+        self.spawn([shutil.which('cube-chrootables') or 'cube-chrootables'])
 
     def spawn(self, argv):
         try:
@@ -478,18 +478,18 @@ class StrapWindow(Adw.ApplicationWindow):
         status, detail = 'failed', ''
         try:
             workdir = strap.new_workdir()
-            config = strap.write_config(plan, workdir)
+            strap.write_config(plan, workdir)
             self.say(f'Cube Strap {VERSION}: {plan.kind} cube {plan.name} ({plan.suite}, {plan.recipe})')
-            code = self.stream(strap.build_argv(plan, config, workdir, self.manager.sudo))
+            result = self.manager.build(strap.build_params(plan, workdir), on_line=self.build_line)
             if self.cancelled:
                 status, detail = 'cancelled', 'Cancelled'
                 return
-            if code != 0:
-                detail = f'The build failed (status {code}). See the log.'
+            if not result.ok:
+                detail = f'The build failed (status {result.status}). See the log.'
                 return
             self.step(0.93, 'Importing')
             if plan.kind == 'chroot':
-                archive = workdir / f'{plan.name}.tar.xz'
+                archive = workdir / f'{plan.name}.tar.gz'
                 self.manager.change(strap.import_args(plan, archive), on_line=self.say)
             else:
                 image = workdir / f'{plan.name}.img'
@@ -504,13 +504,28 @@ class StrapWindow(Adw.ApplicationWindow):
         except backend.AuthRequired:
             detail = 'sudo asked for a password again. Build once more to unlock.'
         except (backend.ManagerError, OSError, ValueError) as error:
-            detail = str(error)
+            if self.cancelled:
+                status, detail = 'cancelled', 'Cancelled; the build helper has finished cleaning up.'
+            else:
+                detail = str(error)
         finally:
-            self.save_log(plan)
-            if workdir:
-                shutil.rmtree(workdir, ignore_errors=True)
-            strap.record(plan, status, time.monotonic() - started, detail)
-            GLib.idle_add(self.finished, plan, status, detail)
+            try:
+                self.save_log(plan)
+                if workdir:
+                    shutil.rmtree(workdir, ignore_errors=True)
+                try:
+                    strap.record(plan, status, time.monotonic() - started, detail)
+                except (OSError, ValueError) as error:
+                    detail = (detail + ' ' if detail else '') + f'Could not save build history: {error}'
+            finally:
+                GLib.idle_add(self.finished, plan, status, detail)
+
+    def build_line(self, line):
+        line = strap.clean_line(line)
+        fraction = strap.stage_fraction(line)
+        if fraction is not None:
+            self.step(fraction, line.strip('═ ').strip())
+        self.say(line)
 
     def stream(self, argv):
         """Run argv, feeding each output line to the log; returns the exit status."""
@@ -533,13 +548,20 @@ class StrapWindow(Adw.ApplicationWindow):
 
     def cancel(self):
         process = self.process
+        if not self.building:
+            return
+        self.cancelled = True
         if process and process.poll() is None:
-            self.cancelled = True
             try:
                 process.terminate()
             except OSError:
                 pass
-            self.status.set_text('Cancelling: deb-strap is unmounting and cleaning up...')
+        else:
+            # Bootstrap and import use the same persistent root helper. Its
+            # request ID identifies the actual running job, even without sudo's
+            # timestamp cache or a local subprocess in this window.
+            threading.Thread(target=self.manager.cancel, daemon=True).start()
+        self.status.set_text('Cancelling: the helper is finishing cleanup...')
 
     def finished(self, plan, status, detail):
         self.set_building(False)

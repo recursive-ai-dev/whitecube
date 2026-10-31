@@ -16,9 +16,9 @@ Description: Whitecube - Wayland desktop with native image and model training st
  Cube Editor adds a GTK4 workspace for inspecting, extracting, customizing and
  rebuilding Linux ISO images, with project recipes, build reports and optional
  QEMU testing. System image changes run through an explicit privileged worker.
- Chrootables manages Debian chroot workspaces: debootstrap images with profiles,
+ Cube Chrootables manages Debian chroot workspaces: debootstrap images with profiles,
  persistent or disposable sessions, snapshots, clones, exports and imports, from a
- GTK4 window or the chrootable-manager command line.
+ Qt window or the whitecube-chrootable-manager command line.
  The wc-* command suite (start with wc-help) opens apps and reports or changes audio,
  network, power and system state from a terminal, with shell completions.
  Cube Strap builds Debian whitecubes with a bundled deb-strap: chroot workspaces

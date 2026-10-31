@@ -1,0 +1,163 @@
+name: Cube Chrootables
+
+on:
+  push:
+    branches: [main]
+    tags: ['cube-chrootables-v*']
+    paths:
+      - 'apps/chrootables/**'
+      - 'apps/cube-strap/**'
+      - 'bin/cube-chrootables'
+      - 'tests/test-chrootables.py'
+      - 'tests/test-cube-chrootables-packaging.py'
+      - 'tests/test-cube-strap-ui.py'
+      - '.github/workflows/cube-chrootables.yml'
+  pull_request:
+    paths:
+      - 'apps/chrootables/**'
+      - 'apps/cube-strap/**'
+      - 'tests/test-chrootables.py'
+      - 'tests/test-cube-chrootables-packaging.py'
+      - '.github/workflows/cube-chrootables.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks-and-packages:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: ubuntu:26.04
+    env:
+      QT_QPA_PLATFORM: offscreen
+      APPIMAGETOOL: /tmp/cube-tools/appimagetool-1.9.1-x86_64.AppImage
+      APPIMAGE_RUNTIME_FILE: /tmp/cube-tools/runtime-x86_64
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - name: Install runtime and build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3 python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets python3-pyside6.qttest python3-gi python3-cairo python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 desktop-file-utils rpm rpm2cpio cpio zstd squashfs-tools file sudo util-linux e2fsprogs xz-utils
+      - uses: actions/checkout@v4
+      - name: Check application tag version
+        if: startsWith(github.ref, 'refs/tags/cube-chrootables-v')
+        run: |
+          version=$(python3 -c 'import ast; from pathlib import Path; tree=ast.parse(Path("apps/chrootables/chrootables/__init__.py").read_text()); print(next(ast.literal_eval(node.value) for node in tree.body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)))')
+          test "$GITHUB_REF_NAME" = "cube-chrootables-v$version"
+      - name: Syntax and application regressions
+        run: |
+          bash -n apps/chrootables/chrootable-manager apps/chrootables/tests/integration.sh apps/cube-strap/cube-strap-build apps/cube-strap/deb-strap.sh
+          python3 -m compileall -q apps/chrootables apps/cube-strap
+          python3 -I tests/test-chrootables.py --screenshots /tmp/cube-previews
+          python3 -I -m unittest discover -s apps/cube-strap/tests -v
+      - name: Fetch checksum-pinned AppImage tools
+        run: python3 apps/chrootables/packaging/fetch-build-tools.py --output /tmp/cube-tools
+      - name: Verify distribution contracts
+        run: python3 -I tests/test-cube-chrootables-packaging.py
+      - name: Build every distribution twice
+        run: |
+          python3 apps/chrootables/packaging/build-packages.py --all --output /tmp/cube-artifacts
+          python3 apps/chrootables/packaging/build-packages.py --all --output /tmp/cube-rebuild
+          diff -r /tmp/cube-artifacts /tmp/cube-rebuild
+          cd /tmp/cube-artifacts
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cube-chrootables-distributions
+          path: /tmp/cube-artifacts/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cube-chrootables-previews
+          path: /tmp/cube-previews/*.png
+
+  native-installation:
+    needs: checks-and-packages
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:trixie
+            format: deb
+          - image: fedora:latest
+            format: rpm
+          - image: archlinux:base
+            format: arch
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    container: ${{ matrix.image }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Install distribution test tooling
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3
+          elif command -v dnf >/dev/null; then
+            dnf install -y --setopt=install_weak_deps=False git python3 rpm-build rpm2cpio cpio
+          else
+            pacman -Syu --noconfirm --needed git python zstd
+          fi
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cube-chrootables-distributions
+          path: /tmp/cube-artifacts
+      - name: Install, upgrade and remove without changing workspace data
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: |
+          install_package() {
+            case "$FORMAT" in
+              deb) apt-get install -y --no-install-recommends "$1" ;;
+              rpm) dnf install -y --setopt=install_weak_deps=False "$1" ;;
+              arch) pacman -U --noconfirm "$1" ;;
+            esac
+          }
+          case "$FORMAT" in
+            deb) set -- /tmp/cube-artifacts/*.deb ;;
+            rpm) set -- /tmp/cube-artifacts/*.rpm ;;
+            arch) set -- /tmp/cube-artifacts/*.pkg.tar.zst ;;
+          esac
+          test "$#" -eq 1
+          install_package "$1"
+          python3 apps/chrootables/packaging/check-installed.py
+          install -d -m 0700 /var/lib/chrootable-manager
+          printf retained > /var/lib/chrootable-manager/.cube-studio-package-test
+          python3 apps/chrootables/packaging/build-packages.py --format "$FORMAT" --revision 2 --output /tmp/cube-upgrade
+          case "$FORMAT" in
+            deb) set -- /tmp/cube-upgrade/*.deb ;;
+            rpm) set -- /tmp/cube-upgrade/*.rpm ;;
+            arch) set -- /tmp/cube-upgrade/*.pkg.tar.zst ;;
+          esac
+          test "$#" -eq 1
+          install_package "$1"
+          python3 apps/chrootables/packaging/check-installed.py
+          case "$FORMAT" in
+            deb) apt-get remove -y cube-chrootables-studio ;;
+            rpm) dnf remove -y cube-chrootables-studio ;;
+            arch) pacman -R --noconfirm cube-chrootables-studio ;;
+          esac
+          test "$(cat /var/lib/chrootable-manager/.cube-studio-package-test)" = retained
+
+  privileged-engine-integration:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/cube-chrootables-v')
+    needs: [checks-and-packages, native-installation]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: debian:trixie
+      options: --privileged
+    steps:
+      - name: Install integration prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends git ca-certificates python3
+      - uses: actions/checkout@v4
+      - name: Verify signed Debian bootstrap, sessions, recovery and cleanup
+        run: |
+          apps/chrootables/chrootable-manager --setup
+          apps/chrootables/tests/integration.sh
+          apps/chrootables/tests/integration.sh python

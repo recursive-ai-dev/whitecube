@@ -3345,7 +3345,7 @@ export_tar_archive() {
     banner "Exporting Rootfs to $TAR_OUTPUT"
     # The chroot's /dev, /proc, /sys, /run and /tmp are still mounted from the host:
     # unmount them first, and never let tar cross into another filesystem.
-    local _i _m
+    local _i _m _compression=J
     for (( _i=${#CLEANUP_MOUNTS[@]}-1; _i>=0; _i-- )); do
       _m="${CLEANUP_MOUNTS[_i]}"
       if mountpoint -q "$_m" 2>/dev/null; then
@@ -3353,7 +3353,9 @@ export_tar_archive() {
       fi
     done
     log "Creating compressed tar archive..."
-    run tar --one-file-system -cpJf "$TAR_OUTPUT" -C "$MNT" .
+    # Cube Chrootables imports gzip archives; preserve xz for deb-strap's default output.
+    case "$TAR_OUTPUT" in *.tar.gz|*.tgz) _compression=z ;; esac
+    run tar --one-file-system "-cp${_compression}f" "$TAR_OUTPUT" -C "$MNT" .
     log "Archive created: $TAR_OUTPUT ($(du -h "$TAR_OUTPUT" 2>/dev/null | cut -f1 || true))"
   fi
   # If we partitioned a temporary raw image backing a qcow2 output, convert the

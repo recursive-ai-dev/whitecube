@@ -1,0 +1,41 @@
+.TH CUBE-CHROOTABLES-STUDIO 1 "2026-10-31" "Cube Chrootables" "User Commands"
+.SH NAME
+cube-chrootables-studio, cube-chrootables-manager \- Debian image workspace desktop and CLI
+.SH SYNOPSIS
+.B cube-chrootables-studio
+.RI [ --store " directory" ]
+.RB [ --demo ]
+.RB [ --version ]
+.br
+.B cube-chrootables-manager
+.RB [ --help ]
+.RB [ --doctor ]
+.SH DESCRIPTION
+Create Debian workspaces, open embedded terminals, save recovery points,
+clone, import and export images. Studio coexists with Whitecube's
+cube-chrootables and the standalone chrootables-desktop.
+.PP
+Run the desktop as your normal user. Unlock store opens a terminal running
+sudo; no graphical authentication agent is required. The administrator helper
+ends when the store is locked or the window closes, after active work finishes.
+.SH OPTIONS
+.TP
+.BI --store " directory"
+Select an absolute workspace store other than the host root.
+.TP
+.B --demo
+Explore sample data without changing a workspace store or saving preferences.
+.TP
+.B --version
+Print the Cube application version. The CLI prints the upstream engine version.
+.SH FILES
+.TP
+.I /var/lib/chrootable-manager
+Default shared image, snapshot, export and operation store. Package removal
+does not remove this directory.
+.TP
+.I ~/.config/whitecube/cube-chrootables.conf
+Preferences shared intentionally by Studio and the bundled Whitecube edition.
+.SH SEE ALSO
+.BR sudo (8),
+.BR debootstrap (8)

@@ -114,10 +114,16 @@ chat_packages=$(python3 -I packaging/library-dependencies.py "$stage" --chat-run
 while read -r package; do [[ -z $package ]] || pkgs[$package]=1; done <<< "$chat_packages"
 runtime=(python3-numpy apt less procps systemd foot fuzzel swaylock swaybg dbus dconf-cli python3 python3-gi python3-cairo python3-gi-cairo python3-yaml python3-requests python3-pikepdf
   gir1.2-gtk-4.0 gir1.2-adw-1 xorriso squashfs-tools sudo util-linux mount coreutils debootstrap e2fsprogs
-  gdisk parted dosfstools xz-utils
+  gdisk parted dosfstools xz-utils qt6-wayland
+  debian-archive-keyring ca-certificates dpkg findutils gpgv gzip hostname mawk tar wget whiptail
   dhcpcd-base iproute2 nftables seatd
   libmpv2 libwayland-egl1)   # cube-player: libmpv is not bundled (it reaches X11 and gets security updates from Debian)
 for p in "${runtime[@]}"; do pkgs[$p]=1; done
+# Cube Chrootables uses the distribution Qt runtime in both the window and
+# terminal pane. Qt's native Wayland plugin is needed by the Whitecube session.
+pkgs['python3-pyside6.qtcore (>= 6.8)']=1
+pkgs['python3-pyside6.qtgui (>= 6.8)']=1
+pkgs['python3-pyside6.qtwidgets (>= 6.8)']=1
 # Debian13 uses the private CP313 decoder; newer Python distros can provide
 # their own PyArrow without requiring an unavailable older interpreter.
 pkgs['python3.13 | python3-pyarrow']=1

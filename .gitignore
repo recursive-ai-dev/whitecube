@@ -10,4 +10,5 @@ packaging/out/
 packaging/out.build.log
 apps/cube-editor/upstream/cubic-*/
 apps/*/.deps/
+apps/chrootables/dist/
 apps/cube-train/parquet-runtime/

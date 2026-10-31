@@ -111,10 +111,14 @@ while IFS= read -r -d '' source; do
 done < <(find apps/cube-editor -mindepth 1 \( -type d \( -name upstream -o -name tests -o -name packaging -o -name __pycache__ \) -prune \) -o \( -type d -o -type f \) -print0)
 rm -rf "$share/desktop-chat/test" "$share/desktop-chat/node_modules" "$share/desktop-chat/dist" "$share/desktop-chat/packaging" "$share/cube-apps/tests" "$share/cube-apps/shot.sh" "$share/cube-train/tests"
 # Keep the bundled manager separate from the standalone chrootables package.
-# The window uses the private root helper; the public alias is namespaced.
-install -d -m 0755 "$share/chrootables"
-for f in app.py backend.py broker.py style.css README.md MANAGER.md; do install -m 0644 "apps/chrootables/$f" "$share/chrootables/$f"; done
+# Cube Chrootables vendors the standalone Qt desktop. The top-level backend and
+# broker remain Cube Strap's compatibility API; the Qt app uses its own package.
+install -d -m 0755 "$share/chrootables/chrootables" "$share/chrootables/assets"
+for f in app.py backend.py broker.py README.md MANAGER.md LICENSE UPSTREAM.md; do install -m 0644 "apps/chrootables/$f" "$share/chrootables/$f"; done
+for f in apps/chrootables/chrootables/*.py; do install -m 0644 "$f" "$share/chrootables/chrootables/$(basename "$f")"; done
+for f in apps/chrootables/assets/*; do install -m 0644 "$f" "$share/chrootables/assets/$(basename "$f")"; done
 install -m 0755 apps/chrootables/chrootable-manager "$lib/chrootable-manager"
+ln -s ../../../libexec/whitecube/chrootable-manager "$share/chrootables/chrootable-manager"
 ln -s ../libexec/whitecube/chrootable-manager "$bin/whitecube-chrootable-manager"
 # Cube Strap: the window runs from /usr/share and imports cube-apps and chrootables beside it;
 # its one privileged step, cube-strap-build, lives with the other root helpers.
@@ -152,7 +156,7 @@ install -m 0644 data/applications/*.desktop "$dest/usr/share/applications/"
 install -m 0644 data/wayland-sessions/whitecube.desktop "$dest/usr/share/wayland-sessions/whitecube.desktop"
 install -d -m 0755 "$dest/usr/share/icons/hicolor/scalable/apps"
 install -m 0644 data/icons/cube-editor.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-editor.svg"
-install -m 0644 data/icons/chrootables.svg "$dest/usr/share/icons/hicolor/scalable/apps/chrootables.svg"
+install -m 0644 data/icons/cube-chrootables.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-chrootables.svg"
 install -m 0644 data/icons/cube-train.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-train.svg"
 install -m 0644 data/icons/cube-strap.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-strap.svg"
 install -m 0644 data/icons/cube-prompts.svg "$dest/usr/share/icons/hicolor/scalable/apps/cube-prompts.svg"

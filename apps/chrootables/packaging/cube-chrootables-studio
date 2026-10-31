@@ -1,0 +1,14 @@
+#!/usr/bin/python3 -I
+"""Launch the coexisting Studio edition using distribution Python and Qt."""
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from chrootables.app import main
+except (ImportError, RuntimeError) as error:
+    print(f"Could not start Cube Chrootables Studio: {error}\n"
+          "Install your distribution Python/PySide6 packages and run cube-chrootables-manager --doctor.",
+          file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(main(desktop_id="cube-chrootables-studio", application_name="Cube Chrootables Studio"))

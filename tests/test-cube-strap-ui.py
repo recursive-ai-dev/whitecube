@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,9 +20,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 FAKES = {
     'sudo': r'''#!/bin/sh
-# Without --, (-n|-S -p '') -v and -k succeed. With --, -S reads the password line and
-# CMD runs as this user (Chrootables starts its root helper as sudo -S -k -p '' -- broker.py).
-case " $* " in *" -- "*) ;; *) exit 0 ;; esac
+# No timestamp cache: only the initial -S authentication can start a helper.
+case " $* " in *" -S "*) ;; *) echo 'sudo: a password is required' >&2; exit 1 ;; esac
 while [ $# -gt 0 ]; do case $1 in --) shift; exec "$@" ;; -S) read -r _ || exit 1; shift ;; *) shift ;; esac; done
 ''',
     'cube-strap-build': r'''#!/bin/bash
@@ -33,15 +33,24 @@ cp "$config" "$FIXTURE/last.conf"; rm -f "$config"
 printf '\e[1;36m═══ Executing Debian Bootstrap (debootstrap -> trixie on amd64) ═══\e[0m\n'
 [[ $name != failbox ]] || { echo "[x] debootstrap failed"; exit 3; }
 echo '═══ Configuring System Inside Target Chroot ═══'
-if [[ $kind == vm ]]; then truncate -s 64M "$work/$name.img"; else echo rootfs > "$work/$name.tar.xz"; fi
+if [[ $kind == vm ]]; then truncate -s 64M "$work/$name.img"; else tar -czf "$work/$name.tar.gz" --files-from /dev/null; fi
 echo '═══ Debian Installation Complete! ═══'
 ''',
     'chrootable-manager': r'''#!/bin/sh
 case $1 in
   --list) echo '[{"name": "existing"}]' ;;
-  --import) printf '%s\n' "$@" > "$FIXTURE/import.args"; echo "Importing $2" >&2 ;;
+  --import) case $3 in *.tar.gz) ;; *) echo 'expected gzip archive' >&2; exit 3 ;; esac
+            gzip -t -- "$3" || exit 3
+            printf '%s\n' "$@" > "$FIXTURE/import.args"; echo "Importing $2" >&2 ;;
   *) echo "unexpected $*" >&2; exit 2 ;;
 esac
+''',
+    'cube-chrootables': '''#!/bin/sh
+printf '%s\\n' cube-chrootables > "$FIXTURE/chrootables.launch"
+''',
+    'chrootables': '''#!/bin/sh
+printf '%s\\n' old-launcher > "$FIXTURE/chrootables.launch"
+exit 99
 ''',
     'whitecube': r'''#!/bin/sh
 case $1 in
@@ -58,6 +67,9 @@ def inside(fixture, screenshots):
     import app
     import strap
     fixture, screenshots = Path(fixture), Path(screenshots)
+    # The broker's fixed adjacent builder path points at a disposable fixture;
+    # production helpers never accept an executable path from the desktop.
+    app.backend.HERE = fixture / 'apps/chrootables'
     options = argparse.Namespace(page=None, screenshot=None)
 
     class SmokeApp(app.StrapApp):
@@ -90,6 +102,13 @@ def inside(fixture, screenshots):
 
         def script(self):
             w = self.window
+            assert self.manager.authenticate('secret'), 'initial helper authentication failed'
+            w.open_chrootables()
+            deadline = time.monotonic() + 3
+            while not (fixture / 'chrootables.launch').exists():
+                assert time.monotonic() < deadline, 'Cube Chrootables did not launch'
+                yield 20
+            assert (fixture / 'chrootables.launch').read_text().strip() == 'cube-chrootables'
             w.name.set_text('')
             assert not w.build_button.get_sensitive()
             yield 50
@@ -108,6 +127,7 @@ def inside(fixture, screenshots):
             assert (fixture / 'import.args').exists(), w.log_text()[-1500:]
             args = (fixture / 'import.args').read_text().split()
             assert args[0:2] == ['--import', 'devbox'] and args[3:] == ['4096', 'persistent'], args
+            assert args[2].endswith('/devbox.tar.gz'), args
             assert not Path(args[2]).exists(), 'the build directory is removed after import'
             conf = (fixture / 'last.conf').read_text()
             assert 'target_mode = "tar"' in conf and 'kernel = "7"' in conf
@@ -170,16 +190,22 @@ def run(screenshots):
             (fixture / name).mkdir(mode=0o700)
         for name, text in FAKES.items():
             # chrootable-manager runs under the Chrootables root helper, which clears the environment.
-            if name == 'chrootable-manager':
+            if name in ('chrootable-manager', 'cube-strap-build'):
                 text = text.replace('$FIXTURE', str(fixture))
             (fixture / 'bin' / name).write_text(text)
             (fixture / 'bin' / name).chmod(0o755)
+        (fixture / 'apps/chrootables').mkdir(parents=True)
+        (fixture / 'apps/cube-strap').mkdir()
+        shutil.copyfile(ROOT / 'apps/chrootables/broker.py', fixture / 'apps/chrootables/broker.py')
+        shutil.copyfile(fixture / 'bin/cube-strap-build', fixture / 'apps/cube-strap/cube-strap-build')
+        (fixture / 'apps/cube-strap/cube-strap-build').chmod(0o755)
+        (fixture / 'apps/cube-strap/deb-strap.sh').write_text('# fixture bootstrap\n')
         env = dict(os.environ, HOME=str(fixture / 'home'), XDG_RUNTIME_DIR=str(fixture / 'runtime'),
                    XDG_CONFIG_HOME=str(fixture / 'home/.config'), XDG_STATE_HOME=str(fixture / 'state'),
                    XDG_CACHE_HOME=str(fixture / 'cache'), FIXTURE=str(fixture),
                    PATH=f'{fixture / "bin"}:{os.environ.get("PATH", "/usr/bin:/bin")}',
                    CHROOTABLES_SUDO=str(fixture / 'bin/sudo'), CHROOTABLES_MANAGER=str(fixture / 'bin/chrootable-manager'),
-                   CUBE_STRAP_HELPER=str(fixture / 'bin/cube-strap-build'), WHITECUBE_HOME=str(fixture / 'store'),
+                   WHITECUBE_HOME=str(fixture / 'store'),
                    WLR_BACKENDS='headless', WLR_RENDERER='pixman', WLR_HEADLESS_OUTPUTS='1',
                    GDK_BACKEND='wayland', GSK_RENDERER='cairo', NO_AT_BRIDGE='1', GSETTINGS_BACKEND='memory')
         for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DBUS_SESSION_BUS_ADDRESS'):

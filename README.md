@@ -53,7 +53,7 @@ building in Debian 13 provides the supported release baseline.
 
 Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `cube-browser`
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
-CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
+desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
 
 ## Improvements in 0.9.6
@@ -270,9 +270,11 @@ runtime, then stage its `dist/` as `build/desktop-chat-runtime` or set `ELECTRON
 set `NODE` to a Node executable when it is outside PATH. See `docs/PANEL-CHAT-IMPROVEMENTS.txt` for the
 22 changes and validation. Log out and back in after installing to activate compositor changes.
 
-`chrootables` manages Debian chroot workspaces: debootstrap images with profiles, persistent or disposable
-sessions, snapshots, clones, exports and imports. The window runs as you and reaches root through sudo (a
-password typed into it goes to `sudo -S -v` once and is never stored); shells open in `whitecube-terminal`.
+`cube-chrootables` is the Qt workspace desktop, based on the standalone Chrootables app. It manages
+Debian images with profiles, persistent or disposable sessions, snapshots, recovery points, clones,
+exports and imports. The window runs as your normal user; unlocking opens a terminal for `sudo` to
+start a separate administrator helper. Shells open in its embedded terminal or an external terminal. Use `cube-chrootables --demo`
+for a read-only tour. The old GTK `chrootables` launcher is replaced by the namespaced command and menu entry.
 The same engine is the `whitecube-chrootable-manager` command, with its own menu and JSON output. See
 [the app notes](apps/chrootables/README.md).
 

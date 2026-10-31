@@ -1,0 +1,18 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Cube Chrootables Studio
+Comment=Build, snapshot and explore Debian workspaces
+Exec=cube-chrootables-studio
+TryExec=cube-chrootables-studio
+Icon=cube-chrootables-studio
+Terminal=false
+Categories=Development;
+Keywords=Linux;Debian;chroot;workspace;snapshot;container;
+StartupNotify=true
+StartupWMClass=cube-chrootables-studio
+Actions=Tour;
+
+[Desktop Action Tour]
+Name=Explore the workspace tour
+Exec=cube-chrootables-studio --demo

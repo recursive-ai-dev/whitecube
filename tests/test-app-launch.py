@@ -18,7 +18,7 @@ APPS = (
     ('dev.woez.CubeRename', ['/usr/bin/python3', str(ROOT / 'apps/cube-apps/cube_rename.py')]),
     ('org.whitecube.Trainer', [str(ROOT / 'bin/cube-train'), '--no-probe']),
     ('org.whitecube.CubeEditor', [str(ROOT / 'bin/cube-editor')]),
-    ('org.whitecube.Chrootables', [str(ROOT / 'bin/chrootables')]),
+    ('cube-chrootables', [str(ROOT / 'bin/cube-chrootables'), '--demo']),
 )
 
 
@@ -50,7 +50,8 @@ class AppLaunch(unittest.TestCase):
                                XDG_CONFIG_HOME=str(home / 'config'), XDG_STATE_HOME=str(home / 'state'),
                                XDG_DATA_HOME=str(home / 'data'), WLR_BACKENDS='headless',
                                WLR_HEADLESS_OUTPUTS='1', WLR_RENDERER='pixman',
-                               GDK_BACKEND='wayland', GTK_A11Y='none', GSETTINGS_BACKEND='memory')
+                               GDK_BACKEND='wayland', QT_QPA_PLATFORM='wayland',
+                               GTK_A11Y='none', GSETTINGS_BACKEND='memory')
             for variable in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS', 'CUBE_SHOT'):
                 environment.pop(variable, None)
             with (home / 'compositor.log').open('w+') as log:
@@ -79,7 +80,14 @@ class AppLaunch(unittest.TestCase):
                                                 and r[1] == '2' and r[2] == '0'), None)
                                     if row:
                                         self.assertEqual(lines[0], 'WC_LAYOUT_1 2 0')
-                                        self.assertEqual(row[5:9], ['60', '40', '800', '700'])
+                                        self.assertEqual(row[5:7], ['60', '40'])
+                                        if identity == 'cube-chrootables':
+                                            # Qt honours the workspace window's minimum
+                                            # size when an old placement was smaller.
+                                            self.assertGreaterEqual(int(row[7]), 800)
+                                            self.assertGreaterEqual(int(row[8]), 700)
+                                        else:
+                                            self.assertEqual(row[7:9], ['800', '700'])
                                         if identity == 'foot':
                                             # A terminal mapping alone is insufficient: the
                                             # actual file manager must survive startup in its PTY.

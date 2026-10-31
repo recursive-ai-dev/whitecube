@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -63,7 +64,7 @@ class Config(unittest.TestCase):
         self.assertEqual(values['kernel'], '7')
         self.assertEqual(values['bootloader'], '5')
         self.assertEqual(values['target_dir'], '/var/lib/cube-strap/build-abc_123/rootfs')
-        self.assertEqual(values['tar_output'], str(self.workdir / 'devbox.tar.xz'))
+        self.assertEqual(values['tar_output'], str(self.workdir / 'devbox.tar.gz'))
         self.assertEqual(values['opt_packages'], 'cli,dev')
         self.assertNotIn('root_password', values)
 
@@ -115,21 +116,45 @@ class Config(unittest.TestCase):
                                   env=dict(os.environ, TMPDIR=directory), timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr[-2000:])
             self.assertIn('Kernel:          none', done.stdout + done.stderr)
-            self.assertIn('tar --one-file-system', done.stdout + done.stderr)
+            self.assertIn('tar --one-file-system -cpzf', done.stdout + done.stderr)
+
+    def test_export_compression_matches_the_workspace_import_format(self):
+        source = DEBSTRAP.read_text()
+        exporter = source[source.index('export_tar_archive() {'):source.index('\nprint_summary() {')]
+        # Exercise the real exporter without bootstrapping, mounting or running
+        # the rest of deb-strap. A tiny rootfs is sufficient to verify its format.
+        script = '''
+set -eu
+banner() { :; }
+log() { :; }
+run() { "$@"; }
+TARGET_MODE=tar
+TAR_OUTPUT=$1
+MNT=$2
+CLEANUP_MOUNTS=()
+''' + exporter + '\nexport_tar_archive\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            filesystem = root / 'rootfs'
+            filesystem.mkdir()
+            (filesystem / 'hello').write_text('workspace payload')
+            for suffix, mode in (('.tar.gz', 'r:gz'), ('.tgz', 'r:gz'), ('.tar.xz', 'r:xz')):
+                with self.subTest(suffix=suffix):
+                    archive = root / ('rootfs' + suffix)
+                    subprocess.run(['bash', '-s', '--', str(archive), str(filesystem)],
+                                   input=script, text=True, capture_output=True, check=True, timeout=10)
+                    with tarfile.open(archive, mode) as packed:
+                        self.assertEqual(packed.extractfile('./hello').read(), b'workspace payload')
 
 
 class Commands(unittest.TestCase):
-    def test_build_argv_is_one_noninteractive_sudo(self):
+    def test_build_request_does_not_rely_on_a_sudo_timestamp(self):
         workdir = Path('/c/build-x')
-        argv = strap.build_argv(plan(kind='vm'), workdir / 'cube.conf', workdir)
-        self.assertEqual(argv[:3], ['sudo', '-n', '--'])
-        self.assertIn('--kind', argv)
-        self.assertEqual(argv[argv.index('--kind') + 1], 'vm')
-        self.assertEqual(argv[argv.index('--owner') + 1], f'{os.getuid()}:{os.getgid()}')
+        self.assertEqual(strap.build_params(plan(kind='vm'), workdir), {'workdir': str(workdir), 'kind': 'vm'})
 
     def test_import_and_run(self):
-        self.assertEqual(strap.import_args(plan(size_gib=3, lifecycle='ephemeral'), Path('/a/devbox.tar.xz')),
-                         ['--import', 'devbox', '/a/devbox.tar.xz', '3072', 'ephemeral'])
+        self.assertEqual(strap.import_args(plan(size_gib=3, lifecycle='ephemeral'), Path('/a/devbox.tar.gz')),
+                         ['--import', 'devbox', '/a/devbox.tar.gz', '3072', 'ephemeral'])
         with mock.patch.object(strap, 'whitecube_command', return_value='/usr/bin/whitecube'):
             self.assertEqual(strap.vm_import_argv(plan(), Path('/a/devbox.img'))[1:],
                              ['import', '--type', 'ext4', '/a/devbox.img', 'devbox'])

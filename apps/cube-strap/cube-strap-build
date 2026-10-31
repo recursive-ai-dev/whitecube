@@ -5,7 +5,7 @@
 #
 # Runs deb-strap unattended with the configuration Cube Strap wrote into DIR (the user's
 # build directory), bootstrapping under /var/lib/cube-strap/<build id> because debootstrap
-# needs a filesystem with device nodes. The finished artifact (DIR/NAME.tar.xz or DIR/NAME.img)
+# needs a filesystem with device nodes. The finished artifact (DIR/NAME.tar.gz or DIR/NAME.img)
 # is handed to UID:GID. The configuration holds a password and is always deleted; the root
 # work directory is always removed, but never while anything is still mounted inside it.
 set -euo pipefail
@@ -75,7 +75,7 @@ trap 'exit 130' INT TERM HUP
 cp -f -- "$work/deb-strap.log" "$workdir/deb-strap.log" 2>/dev/null || true
 (( status == 0 )) || { printf 'Error: deb-strap failed with status %s\n' "$status" >&2; exit "$status"; }
 
-pattern='*.img'; [[ $kind == vm ]] || pattern='*.tar.xz'
+pattern='*.img'; [[ $kind == vm ]] || pattern='*.tar.gz'
 artifact=$(find "$workdir" -maxdepth 1 -type f -name "$pattern" -print -quit)
 [[ -n $artifact ]] || fail 'deb-strap finished but produced no archive or image.'
 chown "$uid:$gid" -- "$artifact"

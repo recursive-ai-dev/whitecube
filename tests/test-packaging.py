@@ -48,7 +48,7 @@ class Tree(unittest.TestCase):
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
-                     'chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'net-off', 'net-on'):
+                     'cube-chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
@@ -121,20 +121,57 @@ class Tree(unittest.TestCase):
 
     def test_chrootables_window_manager_and_desktop_integration_are_shipped(self):
         app = self.stage / 'usr/share/whitecube/chrootables'
-        for name in ('app.py', 'backend.py', 'style.css'):
+        for name in ('app.py', 'backend.py', 'broker.py', 'LICENSE', 'UPSTREAM.md', 'assets/demo.json',
+                     'chrootables/__init__.py', 'chrootables/app.py', 'chrootables/backend.py',
+                     'chrootables/authenticate.py',
+                     'chrootables/broker.py', 'chrootables/client.py', 'chrootables/style.py', 'chrootables/terminal.py'):
             self.assertTrue((app / name).is_file(), name)
             self.assertTrue(os.access(app / name, os.R_OK), name)
-        # The window must run the root-owned command, never a copy beside it.
-        self.assertFalse((app / 'chrootable-manager').exists())
+        # The Qt app's relative manager path resolves to the private helper,
+        # including in an extracted package rather than the installed host.
         helper = self.stage / 'usr/libexec/whitecube/chrootable-manager'
         self.assertTrue(helper.read_text().startswith('#!/usr/bin/env bash'))
+        self.assertTrue((app / 'chrootable-manager').is_symlink())
+        self.assertEqual((app / 'chrootable-manager').resolve(), helper.resolve())
         self.assertEqual((self.stage / 'usr/bin/whitecube-chrootable-manager').resolve(), helper.resolve())
         self.assertIn("Path('/usr/libexec/whitecube/chrootable-manager')", (app / 'backend.py').read_text())
-        self.assertFalse((self.stage / 'usr/bin/chrootable-manager').exists())
-        entry = (self.stage / 'usr/share/applications/chrootables.desktop').read_text()
-        self.assertIn('Exec=/usr/bin/chrootables', entry)
-        self.assertIn('Icon=chrootables', entry)
-        self.assertTrue((self.stage / 'usr/share/icons/hicolor/scalable/apps/chrootables.svg').is_file())
+        for name in ('usr/bin/chrootables', 'usr/bin/chrootable-manager', 'usr/bin/chrootables-desktop',
+                     'usr/share/applications/chrootables.desktop', 'usr/share/icons/hicolor/scalable/apps/chrootables.svg'):
+            self.assertFalse((self.stage / name).exists(), name)
+        entry = (self.stage / 'usr/share/applications/cube-chrootables.desktop').read_text()
+        self.assertIn('Name=Cube Chrootables', entry)
+        self.assertIn('Exec=/usr/bin/cube-chrootables', entry)
+        self.assertIn('Icon=cube-chrootables', entry)
+        self.assertTrue((self.stage / 'usr/share/icons/hicolor/scalable/apps/cube-chrootables.svg').is_file())
+
+    def test_cube_chrootables_runs_its_bundled_manager_helper_and_qt_window(self):
+        executable = self.stage / 'usr/bin/cube-chrootables'
+        app = self.stage / 'usr/share/whitecube/chrootables'
+        with tempfile.TemporaryDirectory(prefix='cube-chrootables-package-') as temporary:
+            directory = Path(temporary)
+            store = directory / 'absent-store'
+            environment = dict(os.environ, QT_QPA_PLATFORM='offscreen', CHROOTABLE_AUTO_INSTALL='0',
+                               XDG_CONFIG_HOME=str(directory / 'config'))
+            version = subprocess.run([str(executable), '--version'], env=environment,
+                                     text=True, capture_output=True, timeout=15)
+            self.assertEqual(version.returncode, 0, version.stdout + version.stderr)
+            self.assertTrue(version.stdout.strip())
+            broker = subprocess.run(['/usr/bin/python3', '-I', '-S', str(app / 'chrootables/broker.py'),
+                                     '--store', str(store)],
+                                    input='{"id":1,"action":"inventory"}\n', env=environment,
+                                    text=True, capture_output=True, timeout=15)
+            self.assertEqual(broker.returncode, 0, broker.stdout + broker.stderr)
+            messages = [json.loads(line) for line in broker.stdout.splitlines()]
+            result = next(message for message in messages if message.get('id') == 1)
+            self.assertTrue(result['ok'], result)
+            self.assertEqual(result['data']['images'], [])
+            screenshot = directory / 'desktop.png'
+            desktop = subprocess.run([str(executable), '--demo', '--store', str(store),
+                                      '--screenshot', str(screenshot)],
+                                     env=environment, text=True, capture_output=True, timeout=20)
+            self.assertEqual(desktop.returncode, 0, desktop.stdout + desktop.stderr)
+            self.assertGreater(screenshot.stat().st_size, 0)
+            self.assertFalse(store.exists())
 
     def test_bundled_browser_leaves_standalone_package_files_unowned(self):
         for name in ('usr/bin/cube-browser', 'usr/share/applications/cube-browser.desktop',

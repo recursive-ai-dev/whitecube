@@ -2,7 +2,7 @@
 
 Two kinds of cube:
   chroot  deb-strap exports a rootfs tarball (no kernel, no bootloader), which
-          chrootable-manager imports as a workspace; it then shows in Chrootables.
+          chrootable-manager imports as a workspace; it then shows in Cube Chrootables.
   vm      deb-strap builds a raw UEFI disk image (EFI + ext4 root, GRUB, cloud kernel),
           which `whitecube import` adds to the image store; `whitecube run` boots it.
 
@@ -53,7 +53,6 @@ MIN_SIZE_GIB = {'chroot': 1, 'vm': 4}
 MAX_SIZE_GIB = 1024
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'cube-strap'
 CACHE = Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'cube-strap'
-INSTALLED_HELPER = Path('/usr/libexec/whitecube/cube-strap-build')
 # debootstrap needs a filesystem that allows device nodes; /home is often nodev.
 # cube-strap-build bootstraps under ROOT_WORK/<build id> and removes it afterwards.
 ROOT_WORK = Path('/var/lib/cube-strap')
@@ -142,7 +141,7 @@ def config_text(plan: Plan, workdir: Path) -> str:
     if plan.kind == 'chroot':
         # A workspace shares the host kernel and network: no kernel, bootloader or network daemon.
         values.update({'target_mode': 'tar', 'target_dir': str(root_workdir(workdir) / 'rootfs'),
-                       'tar_output': str(workdir / f'{plan.name}.tar.xz'),
+                       'tar_output': str(workdir / f'{plan.name}.tar.gz'),
                        'kernel': '7', 'bootloader': '5', 'network_manager': '2'})
     else:
         values.update({'target_mode': 'image', 'image_file': str(workdir / f'{plan.name}.img'),
@@ -167,23 +166,9 @@ def root_workdir(workdir: Path) -> Path:
     return ROOT_WORK / workdir.name
 
 
-def helper_path() -> Path:
-    """The checkout copy beside this file wins over the installed helper."""
-    override = os.environ.get('CUBE_STRAP_HELPER')
-    if override:
-        return Path(override)
-    local = HERE / 'cube-strap-build'
-    return local if local.is_file() else INSTALLED_HELPER
-
-
-def debstrap_path() -> Path:
-    return Path(os.environ.get('CUBE_STRAP_DEBSTRAP') or HERE / 'deb-strap.sh')
-
-
-def build_argv(plan: Plan, config: Path, workdir: Path, sudo: str = 'sudo') -> list[str]:
-    """The single privileged command: run deb-strap, then hand the output to this user."""
-    return [sudo, '-n', '--', str(helper_path()), '--debstrap', str(debstrap_path()), '--config', str(config),
-            '--workdir', str(workdir), '--kind', plan.kind, '--owner', f'{os.getuid()}:{os.getgid()}']
+def build_params(plan: Plan, workdir: Path) -> dict:
+    """The root broker derives trusted executables, configuration and owner itself."""
+    return {'workdir': str(workdir), 'kind': plan.kind}
 
 
 def import_args(plan: Plan, archive: Path) -> list[str]:

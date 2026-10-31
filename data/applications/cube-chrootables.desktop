@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Cube Chrootables
+GenericName=Debian Workspaces
+Comment=Create, enter, snapshot and share Debian chroot workspaces
+Exec=/usr/bin/cube-chrootables
+TryExec=/usr/bin/cube-chrootables
+Icon=cube-chrootables
+Terminal=false
+Categories=Development;
+Keywords=chroot;Debian;debootstrap;workspace;snapshot;sandbox;container;
+StartupNotify=true
+StartupWMClass=cube-chrootables
+X-Wayland-Native=true
+
+Actions=Tour;
+
+[Desktop Action Tour]
+Name=Explore the workspace tour
+Exec=/usr/bin/cube-chrootables --demo

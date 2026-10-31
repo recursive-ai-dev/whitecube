@@ -515,18 +515,12 @@ class Manager:
         """Run one command. on_line receives each stderr line as it arrives
         (progress messages; with merge, stdout lines too); stdout is returned whole."""
         if privileged:
-            broker = self._broker()
-            started = []
             message = {'run': list(args)}
             if merge:
                 message['merge'] = True
             if passive:
                 message['passive'] = True
-            result = broker.request(message, on_line,
-                                    on_start=lambda i: (started.append(i), self.running.add(i)))
-            for request_id in started:
-                self.running.discard(request_id)
-            return result
+            return self._privileged_request(message, on_line)
         argv = self.argv(args, privileged)
         if on_line is None:
             try:
@@ -552,6 +546,25 @@ class Manager:
         process.wait()
         reader.join()
         return Result(process.returncode, ''.join(stdout_parts), ''.join(errors))
+
+    def _privileged_request(self, message, on_line=None):
+        broker = self._broker()
+        started = []
+        try:
+            return broker.request(message, on_line,
+                                  on_start=lambda i: (started.append(i), self.running.add(i)))
+        finally:
+            for request_id in started:
+                self.running.discard(request_id)
+
+    def build(self, params, on_line=None):
+        """Run only the broker's fixed Cube Strap helper using this unlock."""
+        result = self._privileged_request({'build': params, 'merge': True}, on_line)
+        if not result.ok:
+            detail = Result(result.status, '', result.stderr + result.stdout).message()
+            raise ManagerError(f'Cube build failed (status {result.status}): {detail}',
+                               result.status, result.stderr + result.stdout)
+        return result
 
     # --- authentication -------------------------------------------------
     def _broker(self) -> Broker:

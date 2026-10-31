@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""Launch the installed or checkout copy of Chrootables."""
+"""Launch Whitecube's Qt workspace manager from an installation or checkout."""
 import os
 from pathlib import Path
 import sys
@@ -9,5 +9,5 @@ locations = [root / 'apps/chrootables', root / 'share/whitecube/chrootables']
 for directory in locations:
     if (directory / 'app.py').is_file():
         os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])
-print('chrootables: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
+print('cube-chrootables: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
 raise SystemExit(1)

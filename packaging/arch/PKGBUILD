@@ -11,8 +11,8 @@ depends=(alsa-lib at-spi2-core cairo coreutils dbus dconf debootstrap dhcpcd dos
   foot freetype2 fuzzel gcc-libs glib2 glibc gptfdisk gtk3 gtk4 iproute2 lcms2 less libadwaita libcups libdrm libglvnd
   libinput libisoburn libliftoff libpng libxcomposite libxdamage libxext libxfixes libxkbcommon libxrandr
   mesa mpv nftables nspr nss pango parted pixman procps-ng python python-cairo python-gobject python-numpy
-  python-pikepdf python-pyarrow python-requests python-yaml seatd squashfs-tools sudo swaybg swaylock systemd util-linux wayland
-  xz zlib)
+  python-pikepdf python-pyarrow python-requests python-yaml 'pyside6>=6.8' qt6-wayland seatd squashfs-tools sudo swaybg swaylock systemd util-linux wayland
+  debian-archive-keyring ca-certificates dpkg findutils gawk gnupg gzip inetutils newt tar wget xz zlib)
 optdepends=('fnott: desktop notifications' 'pipewire: audio services' 'wireplumber: audio services'
   'pipewire-pulse: audio services' 'qemu-desktop: Cube Lab virtual machines' 'edk2-ovmf: Cube Lab UEFI')
 conflicts=(xorg-server xorg-server-xwayland)

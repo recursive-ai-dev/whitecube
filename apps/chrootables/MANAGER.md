@@ -1,105 +1,101 @@
-# Chrootable Manager
+# Cube Chrootables manager
 
-`chrootable-manager` is a single Bash script that manages Debian workspaces
-stored as ext4 image files. Each workspace is bootstrapped with
-`debootstrap --variant=minbase` plus an optional profile, and opened as a root
-shell inside private mount, UTS, IPC and PID namespaces. It has a terminal menu
-(whiptail) and a scriptable command line with JSON output.
+Whitecube bundles Chrootables 1.2.1's Bash image engine privately at
+`/usr/libexec/whitecube/chrootable-manager`. The public Whitecube command is
+`whitecube-chrootable-manager`. It manages the existing
+`/var/lib/chrootable-manager` store; setting `CHROOTABLE_HOME` selects another
+store. The standalone package's command is independent.
 
-```bash
-sudo ./chrootable-manager                      # menu
-sudo ./chrootable-manager --create compiler 4096 persistent build
-sudo ./chrootable-manager --enter compiler
-./chrootable-manager --demo                    # sample workspaces, no root
-```
-
-## Workspaces
-
-**Profiles** add a focused package set to minbase: `minimal`, `build`
-(C/C++ toolchain, Git), `python` (Python 3, venv, pip) and `network` (DNS,
-ping, curl, SSH client). `--profiles` lists suggested and minimum sizes; an
-image below the minimum is refused before anything is downloaded.
-
-**Lifecycles.** *Persistent* sessions write to the image. *Ephemeral* sessions
-mount it read-only under an OverlayFS whose writes live in memory and vanish on
-exit (`CHROOTABLE_EPHEMERAL_SIZE` caps that memory). `--try` runs a disposable
-session of any workspace.
-
-**Sessions** get `/proc`, `/dev`, a private `/run`, the host's DNS servers
-(loopback stubs such as systemd-resolved's are replaced by fallbacks), and a
-`TERM`/`LANG` the guest can actually use. `--isolated` adds an empty network
-namespace. `--exec NAME -- COMMAND` runs one command; its exit status is
-returned as-is.
-
-**Recovery and maintenance:** snapshots (`--snapshot`, `--restore` saves the
-current state first, so a restore can be undone), clones and renames (reflinks
-when the filesystem supports them; free space is checked otherwise), capacity
-expansion (preallocated, never shrinking), forced ext4 repair, exports
-(`.tar.gz` plus a `.sha256` file) and imports of exports or any root
-filesystem tarball (`--import`, checksum verified when present). `--cleanup`
-finds files left behind by operations that were killed, and removes them with
-`--yes`.
-
-**Bootable exports** (amd64): `--export-iso` writes an EFI-only hybrid ISO
-(squashfs root under live-boot, writes stay in RAM) and `--export-disk` a GPT
-disk image (ESP plus the workspace as a persistent ext4 root). Both work on a
-copy grown by 2 GiB that gets `linux-image-amd64`, systemd, networkd/resolved
-and a UKI built with `ukify`; the workspace itself is untouched. The ESP holds
-Debian's Microsoft-signed shim as `BOOTX64.EFI` and the UKI as `grubx64.efi`,
-signed with a Machine Owner Key generated once in `STORE/secureboot/`. With
-Secure Boot on, enroll `MOK.cer` per machine (`mokutil --import`, or *Enroll key
-from disk* in MokManager, which shim opens on first boot; the ESP carries a
-copy). Consoles (tty1, ttyS0) log in as root automatically. A kernel upgrade
-inside a booted disk image does not rebuild its UKI.
-
-Every image keeps adjacent metadata: suite, release, architecture, profile,
-size, description, creation and last-use times, clone or import origin.
-
-## Command line
-
-Read-only commands work without root when the store is readable:
+Run `cube-chrootables` for the Qt desktop. Its **Unlock store** action opens a
+terminal for `sudo`; no graphical password prompt is needed. Run read-only
+manager commands as your normal user when permissions allow, and use `sudo`
+for image changes. For example:
 
 ```bash
-chrootable-manager --dashboard
-chrootable-manager --list --json
-chrootable-manager --inspect compiler --json
-chrootable-manager --snapshots compiler --json
-chrootable-manager --exports --json
-chrootable-manager --activity 50 --json
-chrootable-manager --doctor
+whitecube-chrootable-manager --doctor --json
+sudo whitecube-chrootable-manager --list --json
 ```
 
-Everything else needs root. `--help` lists every command; an invalid call
-prints the usage line of the command that was meant.
+The engine's command reference follows. This documentation and the help's shared
+folder example are adapted for Whitecube; see `UPSTREAM.md` for provenance.
 
-## Storage and configuration
+```text
+Chrootable Manager 1.2.1 - Debian environment workbench
 
-The store defaults to `/var/lib/chrootable-manager` (`images/`, `snapshots/`,
-`exports/`, `logs/`, plus an `activity.tsv` journal). New directories are
-private; existing ones keep their mode as long as they are owned by the user and
-not writable by group or others, so an administrator can make the store
-readable for root-free browsing.
+Usage: whitecube-chrootable-manager [COMMAND]
+No command opens the terminal dashboard (root required).
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `CHROOTABLE_HOME` | `/var/lib/chrootable-manager` | Store location (absolute path) |
-| `CHROOTABLE_DEBIAN_SUITE` | `stable` | Suite passed to debootstrap |
-| `CHROOTABLE_DEBIAN_MIRROR` | `http://deb.debian.org/debian` | `http(s)://`, `file://` or `ssh://` mirror |
-| `CHROOTABLE_AUTO_INSTALL` | `1` | `0` fails instead of installing missing host packages |
-| `CHROOTABLE_FALLBACK_DNS` | `1.1.1.1 8.8.8.8` | Resolvers when the host only has a local stub |
-| `CHROOTABLE_EPHEMERAL_SIZE` | kernel default (50% of RAM) | tmpfs size for ephemeral writes, e.g. `4G` |
+Explore (no root required when the store is readable)
+  --dashboard                      Workspace overview and storage usage
+  --list [--json]                   Inventory; TSV by default
+  --inspect NAME [--json]           Image details and metadata
+  --profiles                       Available creation profiles
+  --capabilities --json             Versioned profiles, releases and limits
+  --operations [--json]             Operation IDs, stages and interrupted work
+  --snapshots NAME                  List recovery points, even after deletion
+  --activity                       Recent operation history
+  --logs NAME                      Last completed operation log (200 lines)
+  --doctor [--json]                Read-only host readiness and storage checks
+  --demo [--dashboard]              Explore sample workspaces without root
+  --help | --version
 
-Write operations install missing host tools with `apt-get` (log:
-`/var/log/chrootable-manager-dependencies.log`); `--setup` does only that.
+Create and use (root required)
+  --create NAME SIZE_MIB persistent|ephemeral [PROFILE]
+  --import NAME ARCHIVE.tar.gz [SIZE_MIB] [persistent|ephemeral] [PROFILE]
+                                   Rehydrate a .tar.gz export into a workspace.
+                                   An empty SIZE_MIB fits capacity to the archive
+  --archive-sync SUITE [PROFILE...]
+                                   Download everything creates of SUITE need
+                                   (all profiles by default) so they work
+                                   offline; rerun to refresh
+  --enter NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
+                                   Open a root shell
+  --enter-isolated NAME [--share HOST_DIR] [--read-only] [--restricted-dev]
+                                   Open a shell without host network access
+  --exec NAME [--isolated] [--share HOST_DIR] [--read-only] [--restricted-dev] -- COMMAND [ARG...]
+  --try NAME [--isolated] [--share HOST_DIR] [--read-only] [--restricted-dev] [-- COMMAND [ARG...]]
+                                   Disposable session, regardless of image mode
+  --clone NAME NEW_NAME             Independent copy (reflink when available)
+  --mode NAME persistent|ephemeral  Change the default session lifecycle
+  --resize NAME SIZE_MIB            Expand only; no shrinking
+  --export NAME                    Export a .tar.gz; print its path
 
-## Isolation
+Recovery and maintenance (root required)
+  --snapshot NAME LABEL            Save an offline recovery point
+  --restore NAME LABEL --yes        Save current state, then restore snapshot
+  --drop-snapshot NAME LABEL --yes  Permanently delete one snapshot
+  --repair NAME --yes              Forced ext4 repair
+  --delete NAME --yes              Delete image; keep snapshots and exports
+  --delete-export FILENAME --yes   Delete a retained .tar.gz export archive
+  --prune-logs [KEEP_COUNT] --yes  Remove old completed logs (default: keep 20)
+  --setup                          Install missing host dependencies
+  --recover-operation ID --yes      Finish an interrupted staged publication
+  --discard-operation ID --yes      Abandon interrupted work and remove its staged
+                                   files, or set aside a damaged operation record
 
-Sessions run as host root and expose host devices through `/dev`; `/sys` is
-not mounted. This is a convenient development environment, not a security
-sandbox.
+Profiles: minimal (default), build, python, network, rust, go, web.
+Sizes are MiB, from 512 to 1048576 (1 TiB). Images are sparse; capacity is not
+reserved. Create, expansion and copies check free space before starting.
+Shared folders appear at /shared for that session. HOST_DIR must be an existing
+absolute directory other than /. Add --read-only to prevent ordinary writes.
+Host folder changes persist, including in disposable sessions.
 
-## Tests
+Examples
+  sudo whitecube-chrootable-manager --create compiler 4096 persistent build
+  sudo whitecube-chrootable-manager --snapshot compiler clean
+  sudo whitecube-chrootable-manager --try compiler -- bash -lc "apt-get update"
+  sudo whitecube-chrootable-manager --exec compiler -- gcc --version
+  sudo whitecube-chrootable-manager --enter compiler --share /path/to/project
+  sudo whitecube-chrootable-manager --restore compiler clean --yes
 
-`tests/integration.sh` is an opt-in end-to-end test. It downloads two minimal
-Debian roots, so run it only as root on a machine where loop mounts and
-temporary 1 GiB images are acceptable.
+Configuration
+  sudo CHROOTABLE_HOME=/srv/chrootables whitecube-chrootable-manager
+  CHROOTABLE_DEBIAN_SUITE=stable
+  CHROOTABLE_DEBIAN_MIRROR=https://deb.debian.org/debian
+  CHROOTABLE_AUTO_INSTALL=0         Fail instead of installing missing tools
+
+These are host-root development environments, not security sandboxes.
+Ephemeral sessions discard image writes but still expose host devices and any
+writable shared folder. Guest root can undo read-only mounts. Add
+--restricted-dev to give a session a minimal /dev without host device nodes.
+```
