@@ -21,6 +21,8 @@ import tempfile
 import threading
 import time
 
+# Helpers also run independently of the desktop entry point.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chrootables.paths import store_path
 

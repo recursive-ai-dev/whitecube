@@ -1,6 +1,6 @@
 # Whitecube
 
-A pure-Wayland tabbed "cube" desktop: compositor, top bar, settings, living-cube wallpaper, a native Wi-Fi
+A pure-Wayland floating stacking "cube" desktop: compositor, top bar, settings, living-cube wallpaper, a native Wi-Fi
 controller, a workspace suite and a few small apps. No X server or D-Bus session required. Installed system-wide as a Debian package;
 each account keeps only its own settings in `~/.config/whitecube` and the usual dotfiles.
 
@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.9.6_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.10.0_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,18 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.10.0
+
+Ordinary windows float and stack together. New windows cascade, click raises the
+selected family, and client move/resize requests work with validated pointer
+grabs. Alt+left-drag moves windows and Alt+right-drag resizes them. Fullscreen,
+maximized restoration, workspaces and locking retain their existing controls.
+See [floating-window controls](docs/FLOATING-WINDOWS.md).
+
+The bundled Cube Browser 0.11.0 adds scroll-triggered lazy images, static WebP,
+computed styles, abortable fetches, safer DOM operations and improved runtime
+compatibility. See [the browser release notes](apps/cube-browser/RELEASE.md).
 
 ## Improvements in 0.9.6
 
@@ -151,8 +163,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.9.6_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.9.6_amd64.deb
+sha256sum --check whitecube-desktop_0.10.0_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.10.0_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.
@@ -236,10 +248,10 @@ package recipes, file overlays, Whitecube desktop injection, boot-preserving exp
 testing. See [the editor guide](apps/cube-editor/README.md). The original extracted Cubic AppImage is
 retained locally under `apps/cube-editor/upstream/` and excluded from the Debian package.
 
-The panel groups windows under one **N tabs** button (Alt+G opens its list), and **Chat** sits beside networking.
+The panel groups floating windows under one **N windows** button (Alt+G opens its list), and **Chat** sits beside networking.
 New windows open visibly on the active workspace, keeping their saved size and position.
 Previously hidden windows and placements from other workspaces cannot hide a fresh launch.
-Opening or selecting a window brings it and its dialogs to the front without changing tab order.
+Opening or selecting a window brings it and its dialogs to the front without changing window-list order.
 Dialogs stay above fullscreen apps, and closing a window returns to the last-used app on the current workspace.
 Desktop Chat includes a private Electron runtime, its sandbox helper and required library dependencies.
 **Whitecube Trainer** (`cube-train`) is a native GTK4 app for local 1M, 2M, 5M and 10M models.

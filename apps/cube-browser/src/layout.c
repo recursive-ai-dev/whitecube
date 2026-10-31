@@ -8,13 +8,15 @@ cairo_surface_t *cb_engine_node_image(const struct cb_page *p, const struct node
 void cb_engine_image_size(const struct cb_page *p, const struct node *n, double available,
                        double *width, double *height) {
     cairo_surface_t *image=cb_engine_node_image(p,n);
-    double iw=image?cairo_image_surface_get_width(image):1;
-    double ih=image?cairo_image_surface_get_height(image):1;
+    double iw=image?cairo_image_surface_get_width(image):n->image_width?n->image_width:MAX(16,n->style.font_size*8);
+    double ih=image?cairo_image_surface_get_height(image):n->image_height?n->image_height:MAX(16,n->style.font_size*1.4);
     const struct style *s=&n->style;
+    double ratio=s->aspect_ratio>0?s->aspect_ratio:iw/ih;
+    if(!image&&s->aspect_ratio>0)ih=iw/ratio;
     double w=s->width.kind==L_AUTO?iw*p->zoom:MAX(0,cb_engine_length_value(s->width,available,s->font_size,p->zoom));
     double h=s->height.kind==L_AUTO?ih*p->zoom:MAX(0,cb_engine_length_value(s->height,available,s->font_size,p->zoom));
-    if(s->width.kind!=L_AUTO && s->height.kind==L_AUTO)h=w*ih/iw;
-    if(s->height.kind!=L_AUTO && s->width.kind==L_AUTO)w=h*iw/ih;
+    if(s->width.kind!=L_AUTO && s->height.kind==L_AUTO)h=w/ratio;
+    if(s->height.kind!=L_AUTO && s->width.kind==L_AUTO)w=h*ratio;
     double max_width=MAX(0,available);
     if(s->max_width.kind!=L_AUTO)max_width=MIN(max_width,MAX(0,cb_engine_length_value(s->max_width,available,s->font_size,p->zoom)));
     if(w>max_width) {
@@ -86,14 +88,13 @@ void cb_engine_collect_inline(struct cb_page *p, struct inline_flow *f, const st
         struct style pre=n->style;pre.pre=1;cb_engine_flow_append(f,"\n",&pre,link,n);return;
     }
     if(cb_engine_tag_is(n,"img")) {
-        if(cb_engine_node_image(p,n)) {
+        {
             guint spans=f->spans->len;
             cb_engine_flow_append(f,"\357\277\274",&n->style,link,n);
             if(f->spans->len>spans)g_array_index(f->spans,struct span,f->spans->len-1).image=n;
             return;
         }
-        char *label=g_strdup_printf("[Image: %s]",n->alt && *n->alt?n->alt:"image");
-        cb_engine_flow_append(f,label,&n->style,link,n);g_free(label);return;
+
     }
     if(cb_engine_tag_is(n,"input") || cb_engine_tag_is(n,"select") || cb_engine_tag_is(n,"textarea")) {
         cb_engine_flow_append(f,"[Control limit]",&n->style,link,n);return;
@@ -172,6 +173,22 @@ void cb_engine_add_hits(struct cb_page *p, PangoLayout *layout, struct inline_fl
     } while(p->hit_count<ITEM_LIMIT && pango_layout_iter_next_line(iter));
     pango_layout_iter_free(iter);
 }
+static void image_item(struct cb_page *p,struct item *item,const struct node *n,double x,double y,double w,double h){
+    item->x=x;item->y=y;item->w=w;item->h=h;item->owner=n;
+    cairo_surface_t *surface=cb_engine_node_image(p,n);
+    if(surface)item->image=cairo_surface_reference(surface);
+    else {
+        item->layout=pango_layout_new(p->context);
+        char *label=g_strdup_printf("[Image: %s]",n->alt&&*n->alt?n->alt:"image");
+        pango_layout_set_text(item->layout,label,-1);g_free(label);
+        PangoFontDescription *font=pango_font_description_new();
+        pango_font_description_set_family(font,"sans-serif");pango_font_description_set_absolute_size(font,n->style.font_size*p->zoom*PANGO_SCALE);
+        pango_layout_set_font_description(item->layout,font);pango_font_description_free(font);
+        pango_layout_set_width(item->layout,(int)(w*PANGO_SCALE));pango_layout_set_height(item->layout,(int)(h*PANGO_SCALE));
+        pango_layout_set_ellipsize(item->layout,PANGO_ELLIPSIZE_END);
+        item->clipped=1;item->clip_x=x;item->clip_y=y;item->clip_w=w;item->clip_h=h;
+    }
+}
 void cb_engine_add_inline_images(struct cb_page *p, PangoLayout *layout, const struct inline_flow *f,
                               double x, double y, double width) {
     PangoLayoutIter *iter=pango_layout_get_iter(layout);
@@ -192,9 +209,8 @@ void cb_engine_add_inline_images(struct cb_page *p, PangoLayout *layout, const s
             double item_y=y+pango_layout_iter_get_baseline(iter)/(double)PANGO_SCALE-h;
             if(span->control){cb_engine_control_item(p,span->control,item_x,item_y,w,h);continue;}
             struct item *item=cb_engine_add_item(p);if(!item)break;
-            item->x=item_x;
-            item->y=y+pango_layout_iter_get_baseline(iter)/(double)PANGO_SCALE-h;
-            item->w=w;item->h=h;item->image=cairo_surface_reference(cb_engine_node_image(p,span->image));
+            image_item(p,item,span->image,item_x,item_y,w,h);
+            cb_engine_node_box((struct node *)span->image,item_x,item_y,w,h);
         }
     }while(pango_layout_iter_next_line(iter));
     pango_layout_iter_free(iter);
@@ -266,7 +282,7 @@ static double layout_core(struct cb_page *p, struct node *n, double x, double y,
         double w,h;cb_engine_control_size(p,n->control,MAX(1,available-m[1]-m[3]),&w,&h);
         cb_engine_control_item(p,n->control,x+m[3],y+m[0],w,h);return MAX(0,m[0]+h+m[2]);
     }
-    if(cb_engine_tag_is(n,"img") && cb_engine_node_image(p,n)) {
+    if(cb_engine_tag_is(n,"img")) {
         double iw,ih;cb_engine_image_size(p,n,MAX(0,available-m[1]-m[3]-pad[1]-pad[3]-2*border),&iw,&ih);
         double outer_w=iw+pad[1]+pad[3]+2*border,outer_h=ih+pad[0]+pad[2]+2*border;
         double remaining=MAX(0,available-outer_w-m[1]-m[3]);
@@ -279,7 +295,7 @@ static double layout_core(struct cb_page *p, struct node *n, double x, double y,
         }
         if(iw>0 && ih>0) {
             struct item *image=cb_engine_add_item(p);
-            if(image)*image=(struct item){.x=x+pad[3]+border,.y=y+pad[0]+border,.w=iw,.h=ih,.image=cairo_surface_reference(cb_engine_node_image(p,n))};
+            if(image)image_item(p,image,n,x+pad[3]+border,y+pad[0]+border,iw,ih);
             const struct node *ancestor=n;while(ancestor && !ancestor->href)ancestor=ancestor->parent;
             if(ancestor && p->hit_count<ITEM_LIMIT) {
                 p->hits=g_realloc_n(p->hits,p->hit_count+1,sizeof *p->hits);
@@ -541,7 +557,8 @@ static void apply_clips(struct cb_page *p){
     for(size_t i=0;i<p->item_count;i++){
         struct item *item=&p->items[i];
         item->clip_x=item->x;item->clip_y=item->y;item->clip_w=item->w;item->clip_h=item->h;
-        item->clipped=clip_bounds(item->owner,&item->clip_x,&item->clip_y,&item->clip_w,&item->clip_h,item->layout||item->image||item->control);
+        int ancestor_clip=clip_bounds(item->owner,&item->clip_x,&item->clip_y,&item->clip_w,&item->clip_h,item->layout||item->image||item->control);
+        item->clipped|=ancestor_clip;
     }
     for(size_t i=0;i<p->hit_count;i++){
         struct hit *hit=&p->hits[i];clip_bounds(hit->node,&hit->x,&hit->y,&hit->w,&hit->h,1);

@@ -14,7 +14,7 @@ static cairo_surface_t *data_image(const char *url)
         if (!strcmp(parameters, "base64")) base64 = 1;
         else { g_free(header); return NULL; }
     }
-    if (strcmp(header, "image/png") && strcmp(header, "image/jpeg") &&
+    if (strcmp(header, "image/png") && strcmp(header, "image/jpeg") && strcmp(header,"image/webp") &&
         strcmp(header, "image/svg+xml")) { g_free(header); return NULL; }
     const char *body = comma + 1;
     size_t length = strcspn(body, "#"), decoded_length = 0;
@@ -57,6 +57,7 @@ void cb_engine_inline_images(struct cb_page *page)
     for (guint i = 0; page->nodes && i < page->nodes->len; i++) {
         struct node *node = g_ptr_array_index(page->nodes, i);
         if (!node->src || g_ascii_strncasecmp(node->src, "data:", 5)) continue;
+        node->image_pending=1;
         if (node->inline_image) {
             page->image_pixels -= (size_t)cairo_image_surface_get_width(node->inline_image) *
                                           cairo_image_surface_get_height(node->inline_image);

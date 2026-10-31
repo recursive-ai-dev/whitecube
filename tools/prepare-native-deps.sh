@@ -46,6 +46,7 @@ fi
 rm -f -- "$browser/.deps/sqlite3.o" "$browser/.deps/prefix/lib/libsqlite3.a"
 JOBS="$jobs" bash "$browser/scripts/bootstrap-cairo.sh"
 JOBS="$jobs" bash "$browser/scripts/bootstrap-jpeg.sh"
+JOBS="$jobs" bash "$browser/scripts/bootstrap-webp.sh"
 # Force a clean rebuild of cached source objects when moving from another libc.
 if [[ -d $browser/.deps/src/quickjs-2026-06-04 ]]; then
   make -C "$browser/.deps/src/quickjs-2026-06-04" clean

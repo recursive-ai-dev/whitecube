@@ -6,6 +6,7 @@
 #undef main
 #include <wlr/backend/headless.h>
 #include <wlr/interfaces/wlr_output.h>
+#include <sys/socket.h>
 
 static int count_outputs(struct wc_server *s) {
 	int n = 0; struct wc_output *o;
@@ -210,13 +211,23 @@ static void test_unplug_while_dragging_and_retiling(struct wc_server *s) {
 	struct wlr_output *a = plug(s, 1280, 720), *b = plug(s, 1280, 720);
 	(void)a; (void)b;
 	struct wc_output *oa = server_first_output(s);
-	struct wlr_xdg_toplevel xdg = {.title = "Window", .app_id = "app"};
+	/* A visible floating window schedules a real configure. This fixture owns
+	 * no xdg protocol resources, so discard its idle before dispatching output
+	 * events, just as compositor-test.c's scene-only window fixture does. */
+	int pair[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+	struct wlr_xdg_client client = {.client = wl_client_create(s->wl_display, pair[0])}; assert(client.client);
+	struct wlr_xdg_surface base = {.client = &client, .initialized = true};
+	struct wlr_xdg_toplevel xdg = {.title = "Window", .app_id = "app", .base = &base};
 	struct wc_toplevel win = {.server = s, .xdg_toplevel = &xdg, .mapped = true, .saved_index = -1};
 	win.scene_tree = wlr_scene_tree_create(s->windows);
 	wl_list_insert(&s->toplevels, &win.link);
 	wc_retile(s);
+	assert(win.scene_tree->node.enabled && win.configured_w > 0 && win.configured_w < 1280);
+	if (base.configure_idle) { wl_event_source_remove(base.configure_idle); base.configure_idle = NULL; }
 	assert(win.output == oa && win.tab_border && win.tab_cube && win.tab_label);
-	wlr_output_destroy(oa->wlr_output); spin(s, 20);
+	wlr_output_destroy(oa->wlr_output);
+	if (base.configure_idle) { wl_event_source_remove(base.configure_idle); base.configure_idle = NULL; }
+	spin(s, 20);
 	struct wc_output *ob = server_first_output(s);
 	assert(ob && ob != oa && win.output == ob && win.tab_border && win.tab_cube && win.tab_label);
 	wlr_output_destroy(ob->wlr_output); spin(s, 20);
@@ -224,6 +235,8 @@ static void test_unplug_while_dragging_and_retiling(struct wc_server *s) {
 	assert(!win.output && !win.tab_border && !win.tab_cube && !win.tab_label);
 	wl_list_remove(&win.link);
 	wlr_scene_node_destroy(&win.scene_tree->node);
+	if (base.configure_idle) wl_event_source_remove(base.configure_idle);
+	wl_client_destroy(client.client); close(pair[1]);
 	assert(count_outputs(s) == 0);
 }
 

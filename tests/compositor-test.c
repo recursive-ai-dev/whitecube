@@ -528,7 +528,141 @@ static void test_close_restores_recent_focus(void) {
 	test_window_init(&f, &hidpi, "hidpi-app", NULL);
 	hidpi.base.initial_commit = true;
 	t_commit(&hidpi.window.commit, NULL);
-	assert(hidpi.xdg.scheduled.width == 1080 && hidpi.xdg.scheduled.height == 1920 - g_tab_h);
+	assert(hidpi.xdg.scheduled.width == 0);
+	assert(hidpi.xdg.scheduled.bounds.width == 1080);
+	assert(hidpi.xdg.scheduled.height == 0);
+	assert(hidpi.xdg.scheduled.bounds.height == 1920 - g_tab_h);
+	window_fixture_finish(&f);
+}
+
+static void test_floating_visibility_and_geometry(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window a, b, c;
+	test_window_init(&f, &a, "one", NULL); t_map(&a.window.map, NULL);
+	test_window_init(&f, &b, "two", NULL); t_map(&b.window.map, NULL);
+	test_window_init(&f, &c, "three", NULL); t_map(&c.window.map, NULL);
+	assert(a.window.scene_tree->node.enabled && b.window.scene_tree->node.enabled && c.window.scene_tree->node.enabled);
+	assert(a.window.configured_w < 1280 && a.window.configured_h < 760);
+	assert(a.window.configured_w >= 600 && a.window.configured_w <= 602);
+	assert(a.window.configured_h >= 400 && a.window.configured_h <= 402);
+	assert(a.window.scene_tree->node.x != b.window.scene_tree->node.x);
+	assert(b.window.scene_tree->node.x != c.window.scene_tree->node.x);
+	wc_focus(&a.window);
+	assert(top_visible_window(&f.server) == &a.window);
+	assert(b.window.scene_tree->node.enabled && c.window.scene_tree->node.enabled);
+	int x = a.window.scene_tree->node.x, y = a.window.scene_tree->node.y;
+	int w = a.window.configured_w, h = a.window.configured_h;
+	a.xdg.requested.maximized = true; t_req_max(&a.window.request_maximize, NULL);
+	assert(a.window.configured_w == 1280 && a.window.configured_h == 760);
+	assert(b.window.scene_tree->node.enabled && c.window.scene_tree->node.enabled);
+	a.xdg.requested.maximized = false; t_req_max(&a.window.request_maximize, NULL);
+	assert(a.window.configured_w == w && a.window.configured_h == h);
+	assert(a.window.scene_tree->node.x == x && a.window.scene_tree->node.y == y);
+	a.xdg.requested.fullscreen = true; t_req_full(&a.window.request_fullscreen, NULL);
+	assert(a.window.configured_w == 1280 && a.window.configured_h == 800);
+	assert(!b.window.scene_tree->node.enabled && !c.window.scene_tree->node.enabled);
+	a.xdg.requested.fullscreen = false; t_req_full(&a.window.request_fullscreen, NULL);
+	assert(b.window.scene_tree->node.enabled && c.window.scene_tree->node.enabled);
+	assert(a.window.configured_w == w && a.window.configured_h == h);
+	c.window.layout_w = c.window.layout_h = 900;
+	c.xdg.current.min_width = 600; c.xdg.current.max_width = 700;
+	c.xdg.current.min_height = 300; c.xdg.current.max_height = 400;
+	wc_retile(&f.server);
+	assert(c.window.configured_w == 700 && c.window.configured_h == 400);
+	c.window.workspace = 1; wc_workspace(&f.server, 1, false);
+	assert(c.window.scene_tree->node.enabled && !a.window.scene_tree->node.enabled && !b.window.scene_tree->node.enabled);
+	wc_workspace(&f.server, 0, false);
+	assert(a.window.scene_tree->node.enabled && b.window.scene_tree->node.enabled && !c.window.scene_tree->node.enabled);
+	f.server.desktop_visible = true; wc_retile(&f.server);
+	assert(!a.window.scene_tree->node.enabled && !b.window.scene_tree->node.enabled);
+	wc_focus(&b.window);
+	assert(a.window.scene_tree->node.enabled && b.window.scene_tree->node.enabled);
+	struct test_window large; test_window_init(&f, &large, "large", NULL);
+	large.surface.current.width = 5000; large.surface.current.height = 4000;
+	t_map(&large.window.map, NULL);
+	assert(large.window.configured_w == 1280 * 940 / 1000);
+	assert(large.window.configured_h == 760 * 900 / 1000);
+	assert(large.window.scene_tree->node.x + large.window.configured_w <= 1280);
+	assert(large.window.scene_tree->node.y + large.window.configured_h <= 800);
+	window_fixture_finish(&f);
+}
+
+static void test_client_drag_validation_and_edges(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window window;
+	test_window_init(&f, &window, "drag", NULL); t_map(&window.window.map, NULL);
+	struct wlr_seat_client seat = {.seat = f.server.seat};
+	struct wlr_seat_pointer_state *pointer = &f.server.seat->pointer_state;
+	pointer->focused_client = &seat; pointer->focused_surface = &window.surface;
+	pointer->grab_serial = 42; pointer->button_count = 1; pointer->buttons[0] = BTN_LEFT; pointer->grab_button = BTN_LEFT;
+	assert(wc_client_drag_allowed(&window.window, &seat, 42));
+	assert(!wc_client_drag_allowed(&window.window, &seat, 41));
+	assert(!wc_client_drag_allowed(&window.window, NULL, 42));
+	f.server.locked = true; assert(!wc_client_drag_allowed(&window.window, &seat, 42)); f.server.locked = false;
+	pointer->button_count = 2; assert(!wc_client_drag_allowed(&window.window, &seat, 42)); pointer->button_count = 1;
+	struct wlr_xdg_toplevel_resize_event invalid = {.toplevel = &window.xdg, .seat = &seat, .serial = 42,
+		.edges = WLR_EDGE_LEFT | WLR_EDGE_RIGHT};
+	t_req_resize(&window.window.request_resize, &invalid); assert(!f.server.drag.toplevel);
+	pointer->focused_client = NULL; pointer->focused_surface = NULL;
+	window.xdg.current.min_width = 250; window.xdg.current.min_height = 160;
+	window.xdg.current.max_width = 500; window.xdg.current.max_height = 400;
+	f.server.drag = (struct wc_drag){.toplevel = &window.window, .button = BTN_LEFT, .resize = true, .client_grab = true,
+		.edges = WLR_EDGE_LEFT | WLR_EDGE_TOP, .work_w = 1000, .work_h = 800, .x = 200, .y = 200, .w = 400, .h = 400};
+	wc_update_drag(&f.server, 200, 160);
+	assert(window.window.layout_x == 350 && window.window.layout_y == 400);
+	assert(window.window.layout_w == 250 && window.window.layout_h == 200);
+	assert(window.window.layout_x + window.window.layout_w == 600);
+	assert(window.window.layout_y + window.window.layout_h == 600);
+	wc_update_drag(&f.server, -1e300, -1e300);
+	assert(window.window.layout_x == 100 && window.window.layout_y == 100);
+	assert(window.window.layout_w == 500 && window.window.layout_h == 500);
+	wc_update_drag(&f.server, NAN, INFINITY);
+	assert(window.window.layout_x == 100 && window.window.layout_y == 100);
+	assert(wc_normalized_extent(UINT32_MAX, 1, true) == 1000);
+	const uint32_t edges[] = {WLR_EDGE_LEFT, WLR_EDGE_RIGHT, WLR_EDGE_TOP, WLR_EDGE_BOTTOM,
+		WLR_EDGE_TOP | WLR_EDGE_LEFT, WLR_EDGE_TOP | WLR_EDGE_RIGHT,
+		WLR_EDGE_BOTTOM | WLR_EDGE_LEFT, WLR_EDGE_BOTTOM | WLR_EDGE_RIGHT};
+	const double deltas[] = {-1e300, -700, -1, 0, 1, 700, 1e300, NAN, INFINITY};
+	for (size_t e = 0; e < sizeof(edges) / sizeof(*edges); e++)
+		for (size_t a = 0; a < sizeof(deltas) / sizeof(*deltas); a++)
+			for (size_t b = 0; b < sizeof(deltas) / sizeof(*deltas); b++) {
+				f.server.drag.edges = edges[e];
+				window.window.layout_x = window.window.layout_y = 200;
+				window.window.layout_w = window.window.layout_h = 400;
+				wc_update_drag(&f.server, deltas[a], deltas[b]);
+				assert(window.window.layout_x >= 0 && window.window.layout_y >= 0);
+				assert(window.window.layout_w >= 250 && window.window.layout_w <= 500);
+				assert(window.window.layout_h >= 200 && window.window.layout_h <= 500);
+				assert(window.window.layout_x + window.window.layout_w <= 1000);
+				assert(window.window.layout_y + window.window.layout_h <= 1000);
+				if (edges[e] & WLR_EDGE_LEFT) assert(window.window.layout_x + window.window.layout_w == 600);
+				else assert(window.window.layout_x == 200);
+				if (edges[e] & WLR_EDGE_TOP) assert(window.window.layout_y + window.window.layout_h == 600);
+				else assert(window.window.layout_y == 200);
+			}
+	wc_cancel_drag(&f.server);
+	assert(!pointer->button_count && !f.server.drag.toplevel && f.server.drag.button == BTN_LEFT);
+	f.server.drag = (struct wc_drag){0};
+	f.server.cursor = wlr_cursor_create(); assert(f.server.cursor);
+	f.server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24); assert(f.server.cursor_mgr);
+	pointer->focused_client = &seat; pointer->focused_surface = &window.surface;
+	pointer->button_count = 1; pointer->buttons[0] = BTN_LEFT;
+	struct wlr_xdg_toplevel_move_event move = {.toplevel = &window.xdg, .seat = &seat, .serial = 42};
+	t_req_move(&window.window.request_move, &move);
+	assert(f.server.drag.toplevel == &window.window && f.server.drag.client_grab && !f.server.drag.resize);
+	pointer->focused_client = NULL; pointer->focused_surface = NULL; wc_cancel_drag(&f.server);
+	assert(!pointer->button_count);
+	f.server.drag = (struct wc_drag){0};
+	pointer->focused_client = &seat; pointer->focused_surface = &window.surface;
+	pointer->button_count = 1; pointer->buttons[0] = BTN_LEFT;
+	invalid.edges = WLR_EDGE_TOP | WLR_EDGE_LEFT;
+	t_req_resize(&window.window.request_resize, &invalid);
+	assert(f.server.drag.toplevel == &window.window && f.server.drag.resize);
+	assert(f.server.drag.edges == invalid.edges && window.xdg.scheduled.resizing);
+	pointer->focused_client = NULL; pointer->focused_surface = NULL; wc_cancel_drag(&f.server);
+	assert(!pointer->button_count && !window.xdg.scheduled.resizing);
+	wlr_cursor_destroy(f.server.cursor); wlr_xcursor_manager_destroy(f.server.cursor_mgr);
+	f.server.cursor = NULL; f.server.cursor_mgr = NULL;
 	window_fixture_finish(&f);
 }
 
@@ -543,6 +677,8 @@ int main(void) {
 	test_new_window_is_raised();
 	test_nested_dialog_stacking();
 	test_close_restores_recent_focus();
+	test_floating_visibility_and_geometry();
+	test_client_drag_validation_and_edges();
 	test_lock_isolation();
 	test_idle_lock();
 	test_lock_output_geometry();

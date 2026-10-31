@@ -3,8 +3,8 @@ set -euo pipefail
 browser_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 cd "$browser_root"
 python3 scripts/version.py
-if [[ ! -f .deps/prefix/lib/pkgconfig/cairo.pc || ! -f .deps/prefix/lib/pkgconfig/sqlite3.pc || ! -f .deps/prefix/lib/pkgconfig/libjpeg.pc || ! -f .deps/lib/libquickjs-core.a || ! -f .deps/lib/libmbedtls.a ]]; then
-  echo 'Local dependencies are missing. Run scripts/bootstrap-cairo.sh, scripts/bootstrap-mbedtls.sh scripts/bootstrap-jpeg.sh and scripts/bootstrap-quickjs.sh first.' >&2
+if [[ ! -f .deps/prefix/lib/pkgconfig/cairo.pc || ! -f .deps/prefix/lib/pkgconfig/sqlite3.pc || ! -f .deps/prefix/lib/pkgconfig/libjpeg.pc || ! -f .deps/prefix/lib/pkgconfig/libwebpdecoder.pc || ! -f .deps/lib/libquickjs-core.a || ! -f .deps/lib/libmbedtls.a ]]; then
+  echo 'Local dependencies are missing. Run the Cairo, mbedTLS, JPEG, WebP and QuickJS scripts/bootstrap-*.sh scripts first.' >&2
   exit 1
 fi
 export PKG_CONFIG_PATH="$browser_root/.deps/prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"

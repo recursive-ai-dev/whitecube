@@ -14,6 +14,7 @@ glib = dependency('glib-2.0')
 sqlite = dependency('sqlite3', static: true)
 png = dependency('libpng')
 jpeg = dependency('libjpeg', static: true)
+webp = dependency('libwebpdecoder', static: true)
 expat = dependency('expat')
 math = cc.find_library('m')
 protocols = dependency('wayland-protocols')
@@ -27,7 +28,7 @@ python = find_program('python3')
 suffix_data = custom_target('suffix-data', input: 'data/public_suffix_list.dat', output: 'suffix-data.h', command: [python, files('scripts/suffix-data.py'), '@INPUT@', '@OUTPUT@'])
 session = static_library('cube-session', ['src/session.c','src/broker.c', suffix_data], dependencies: [sqlite, glib], include_directories: inc)
 storage = static_library('cube-storage', 'src/storage.c', link_with: policy, dependencies: [sqlite, math], include_directories: inc)
-image = static_library('cube-image', ['src/image.c', 'src/svg.c'], dependencies: [cairo, png, jpeg, glib, expat, math], include_directories: inc)
+image = static_library('cube-image', ['src/image.c', 'src/svg.c'], dependencies: [cairo, png, jpeg, webp, glib, expat, math], include_directories: inc)
 forms = static_library('cube-forms', 'src/forms.c', dependencies: glib, include_directories: inc)
 media = static_library('cube-media', 'src/media.c', dependencies: [glib, math], include_directories: inc)
 quickjs_name = get_option('b_sanitize') == 'address,undefined' ? 'quickjs-core-sanitize' : 'quickjs-core'
@@ -39,7 +40,7 @@ engine = static_library('cube-engine', ['src/engine.c', 'src/image-document.c', 
 browser = executable('cube-browser', ['src/main.c','src/download.c', 'src/platform.c', 'src/url.c', xdg_h, xdg_c],
     dependencies: [wayland, cursor, xkb, cairo, pango, glib, sqlite, math], link_with: [ipc, storage, policy, session],
     include_directories: inc, build_rpath: local_lib, install_rpath: install_libdir, install: true)
-renderer = executable('cube-renderd', 'src/render-main.c', dependencies: [quickjs, cairo, pango, glib, math, png, jpeg, expat],
+renderer = executable('cube-renderd', 'src/render-main.c', dependencies: [quickjs, cairo, pango, glib, math, png, jpeg, webp, expat],
     link_with: [engine, image, forms, media, ipc, policy, dom, js], include_directories: inc, build_rpath: local_lib, install_rpath: install_libdir, install: true)
 tls = cc.find_library('mbedtls', dirs: root / '.deps/lib', static: true)
 x509 = cc.find_library('mbedx509', dirs: root / '.deps/lib', static: true)
@@ -47,15 +48,15 @@ crypto = cc.find_library('mbedcrypto', dirs: root / '.deps/lib', static: true)
 net = executable('cube-netd', ['src/net-main.c', 'src/net.c'], dependencies: [tls, x509, crypto],
     link_with: [ipc, policy], include_directories: inc, install: true)
 engine_test = executable('test-engine', 'tests/test_engine.c', link_with: [engine, image, forms, media, policy], include_directories: inc,
-    dependencies: [cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
+    dependencies: [cairo, pango, glib, math, png, jpeg, webp, expat], build_rpath: local_lib)
 image_test = executable('test-image', 'tests/test_image.c', link_with: image, include_directories: inc,
-    dependencies: [cairo, png, jpeg, glib, expat, math], build_rpath: local_lib)
+    dependencies: [cairo, png, jpeg, webp, glib, expat, math], build_rpath: local_lib)
 storage_test = executable('test-storage', 'tests/test_storage.c', link_with: storage, include_directories: inc,
     dependencies: [sqlite, math])
 core_test = executable('test-core', ['tests/test_core.c', 'src/url.c'], link_with: ipc, include_directories: inc, dependencies: glib)
 test('engine', engine_test, workdir: root)
 layout_test = executable('test-layout', 'tests/test_layout.c', link_with: [engine, image, forms, media, policy], include_directories: inc,
-    dependencies: [cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
+    dependencies: [cairo, pango, glib, math, png, jpeg, webp, expat], build_rpath: local_lib)
 test('layout-compatibility', layout_test)
 test('images', image_test, workdir: root)
 test('storage', storage_test)
@@ -89,14 +90,17 @@ js_test = executable('test-js', 'tests/test_js.c', link_with: [js, ipc], include
 test('javascript-runtime', js_test, is_parallel: false)
 
 test('web-apis', python, args: [files('tests/test_web.py')], timeout: 60, is_parallel: false)
+test('resource-deadlines', python, args: [files('tests/test_resource_deadlines.py')], timeout: 40, is_parallel: false)
 
 download_test = executable('test-download', ['tests/test_download.c','src/download.c'], link_with: ipc, include_directories: inc)
 test('downloads', download_test)
 
 dom_test = executable('test-dom', 'tests/test_dom.c', link_with: [dom, js, engine, image, forms, media, policy, ipc], include_directories: inc,
-    dependencies: [quickjs, cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
+    dependencies: [quickjs, cairo, pango, glib, math, png, jpeg, webp, expat], build_rpath: local_lib)
 test('dom-lifecycle', dom_test, is_parallel: false)
 fuzz_test = executable('test-fuzz', 'tests/test_fuzz.c', link_with: [engine, image, forms, media, policy, ipc], include_directories: inc,
-    dependencies: [cairo, pango, glib, math, png, jpeg, expat], build_rpath: local_lib)
+    dependencies: [cairo, pango, glib, math, png, jpeg, webp, expat], build_rpath: local_lib)
 test('mutation-smoke', fuzz_test, timeout: 120)
 add_test_setup('default', env: {'CUBE_BROWSER_BUILD': meson.current_build_dir()}, is_default: true)
+
+test('javascript-embedding', python, args: [files('tests/test_embed.py')])

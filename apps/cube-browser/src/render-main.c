@@ -20,7 +20,7 @@
 
 /* Raster runs on a copy-on-write snapshot. Only the parent renderer owns the
  * mutable DOM; only the raster child maps the new frame writable. */
-static int frame(int socket,struct cb_page *page,const struct cb_message *request){
+static int frame(int socket,struct cb_page *page,struct cb_dom *dom,const struct cb_message *request){
     if(request->a<1||request->b<1||request->a>4096||request->b>4096)return -1;
     int w=(int)request->a,h=(int)request->b;double scroll=request->c;
     char *end=NULL;double zoom=strtod(request->text,&end);
@@ -34,6 +34,8 @@ static int frame(int socket,struct cb_page *page,const struct cb_message *reques
     cb_page_set_environment(page,h,flags&1,flags&2);
     cb_page_layout(page,w,zoom);
     double height=cb_page_height(page);scroll=fmax(0,fmin(scroll,fmax(0,height-h)));
+    if(cb_dom_viewport(dom,scroll))cb_page_layout(page,w,zoom);
+    height=cb_page_height(page);scroll=fmin(scroll,fmax(0,height-h));
     size_t size=(size_t)w*h*4;int fd=cb_memfd("cube-frame",size);if(fd<0)return -1;
     pid_t parent=getpid(),pid=fork();
     if(pid==0){
@@ -104,9 +106,9 @@ int main(int argc,char **argv){
         }
         else if(m.type==CB_WEB_RESPONSE&&dom){cb_dom_response(dom,&m);}
         else if(m.type==CB_POLICY&&m.fd<0&&!m.a&&!m.b&&!m.c&&strlen(m.text)<sizeof policy){strcpy(policy,m.text);}
-        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.b<=CB_DOCUMENT_SVG){
+        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.b<=CB_DOCUMENT_WEBP){
             char *html=NULL;size_t size=0;ok=cb_read_document(m.fd,&html,&size);
-            if(!ok){const char *mime=m.b==CB_DOCUMENT_PNG?"image/png":m.b==CB_DOCUMENT_JPEG?"image/jpeg":m.b==CB_DOCUMENT_SVG?"image/svg+xml":NULL;
+            if(!ok){const char *mime=m.b==CB_DOCUMENT_PNG?"image/png":m.b==CB_DOCUMENT_JPEG?"image/jpeg":m.b==CB_DOCUMENT_SVG?"image/svg+xml":m.b==CB_DOCUMENT_WEBP?"image/webp":NULL;
                 struct cb_page *next=mime?cb_page_from_image(html,size,mime,m.text):cb_page_parse(html,size,m.text);free(html);if(!next)ok=-1;else{cb_dom_free(dom);dom=NULL;cb_page_free(page);page=next;cb_page_set_images_enabled(page,images_enabled);cb_page_set_policy(page,policy);policy[0]=0;ok=resource_catalog(socket,page);
                 if(!ok&&web&&!mime)dom=cb_dom_new(page,socket,storage,allow_eval);
                 if(configured&&!dom){struct cb_message state={.type=CB_WEB_STATE,.b=1,.fd=-1};ok=cb_send(socket,&state);}
@@ -120,7 +122,8 @@ int main(int argc,char **argv){
                 result.b=cb_page_set_resource(page,m.a,bytes,length,m.text)==0;
             }
             free(bytes);if(m.a<page->resource_count&&!result.b)page->resources[m.a].failed=1;ok=cb_send(socket,&result);cb_dom_resource(dom);
-        }else if(m.type==CB_LAYOUT&&page)ok=frame(socket,page,&m);
+            if(m.a<page->resource_count&&page->resources[m.a].kind==CB_RESOURCE_IMAGE)cb_dom_image_event(dom,m.a,result.b);
+        }else if(m.type==CB_LAYOUT&&page)ok=frame(socket,page,dom,&m);
         else if(m.type==CB_LINK&&page){
             const char *url=cb_page_link_at(page,m.a,m.b);
             struct cb_message r={.type=CB_LINK_RESULT,.fd=-1};if(url)snprintf(r.text,sizeof(r.text),"%s",url);ok=cb_send(socket,&r);

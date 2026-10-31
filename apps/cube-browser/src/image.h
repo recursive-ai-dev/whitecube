@@ -8,7 +8,7 @@
 #define CB_IMAGE_MAX_DIMENSION 4096U
 #define CB_IMAGE_MAX_PIXELS 8000000U
 
-/* Decode PNG/JPEG or restricted static SVG from memory, checking MIME and budgets.
+/* Decode PNG/JPEG/static WebP or restricted static SVG, checking MIME and budgets.
  * No files or network are accessed. Caller destroys the returned image surface.
  * Intrinsic dimensions use cairo_image_surface_get_width/height().
  * NULL indicates failure; an optional bounded error message describes it.

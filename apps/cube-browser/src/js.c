@@ -11,13 +11,26 @@
 #include <time.h>
 #define SOURCE_LIMIT (1024u*1024u)
 #define MEMORY_LIMIT (32u*1024u*1024u)
-struct cb_js {JSRuntime *runtime;JSContext *context;struct cb_js_host host;double deadline,total;int failed,interrupted;unsigned logs,calls;};
+struct rejection {JSValue promise,reason;};
+struct cb_js {JSRuntime *runtime;JSContext *context;struct cb_js_host host;double deadline,total;int failed,interrupted;unsigned logs,calls,rejection_count;int rejection_overflow;struct rejection rejections[128];};
 static double clock_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static void log_text(struct cb_js *j,unsigned level,const char *message){if(j->logs++<128&&j->host.log)j->host.log(j->host.data,level,message);}
 static int interrupt(JSRuntime *runtime,void *opaque){(void)runtime;struct cb_js *j=opaque;if(j->failed||clock_now()>j->deadline){j->interrupted=1;return 1;}return 0;}
+static void append_stack(JSContext *ctx,JSValueConst error,char *out,size_t size){
+    if(!JS_IsError(ctx,error))return;
+    JSValue stack=JS_GetPropertyStr(ctx,error,"stack");
+    if(JS_IsException(stack)){JS_FreeValue(ctx,JS_GetException(ctx));return;}
+    if(JS_IsString(stack)){
+        const char *text=JS_ToCString(ctx,stack);size_t used=strlen(out);
+        if(text){if(*text&&used+1<size)snprintf(out+used,size-used,"\n%s",text);JS_FreeCString(ctx,text);}
+        else JS_FreeValue(ctx,JS_GetException(ctx));
+    }
+    JS_FreeValue(ctx,stack);
+}
 static void report(struct cb_js *j){
     JSValue value=JS_GetException(j->context);const char *text=JS_ToCString(j->context,value);char out[2048];
     snprintf(out,sizeof out,"%.2047s",j->interrupted?"JavaScript execution budget exceeded":text?text:"JavaScript exception (conversion or allocation failed)");
+    if(!j->interrupted)append_stack(j->context,value,out,sizeof out);
     log_text(j,2,out);if(text)JS_FreeCString(j->context,text);JS_FreeValue(j->context,value);
 }
 static JSValue console_call(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv,int level){
@@ -25,6 +38,7 @@ static JSValue console_call(JSContext *ctx,JSValueConst self,int argc,JSValueCon
     for(int i=0;i<argc&&i<16;i++){const char *text=JS_ToCString(ctx,argv[i]);if(!text)return JS_EXCEPTION;size_t n=strlen(text);if(n>sizeof message-used-2)n=sizeof message-used-2;
         if(i&&used<sizeof message-1)message[used++]=' ';
         memcpy(message+used,text,n);used+=n;message[used]=0;JS_FreeCString(ctx,text);if(used>=sizeof message-2)break;}
+    if(level==2&&argc==1)append_stack(ctx,argv[0],message,sizeof message);
     log_text(j,(unsigned)level,message);return JS_UNDEFINED;
 }
 static JSValue host_call(JSContext *ctx,JSValueConst self,int argc,JSValueConst *argv){
@@ -39,7 +53,29 @@ static JSValue host_call(JSContext *ctx,JSValueConst self,int argc,JSValueConst 
 }
 static JSModuleDef *no_module(JSContext *ctx,const char *name,void *opaque){(void)opaque;JS_ThrowReferenceError(ctx,"Modules are unsupported: %.256s",name);return NULL;}
 static void rejected(JSContext *ctx,JSValueConst promise,JSValueConst reason,JS_BOOL handled,void *opaque){
-    (void)promise;if(handled)return;struct cb_js *j=opaque;const char *text=JS_ToCString(ctx,reason);if(text){char out[2048];snprintf(out,sizeof out,"Unhandled promise rejection: %.2000s",text);log_text(j,2,out);JS_FreeCString(ctx,text);}
+    struct cb_js *j=opaque;
+    for(unsigned i=0;i<j->rejection_count;i++)if(JS_VALUE_GET_PTR(j->rejections[i].promise)==JS_VALUE_GET_PTR(promise)){
+        if(handled){JS_FreeValue(ctx,j->rejections[i].promise);JS_FreeValue(ctx,j->rejections[i].reason);memmove(&j->rejections[i],&j->rejections[i+1],(j->rejection_count-i-1)*sizeof *j->rejections);j->rejection_count--;}
+        return;
+    }
+    if(handled)return;
+    if(j->rejection_count==128){j->rejection_overflow=1;return;}
+    j->rejections[j->rejection_count++]=(struct rejection){JS_DupValue(ctx,promise),JS_DupValue(ctx,reason)};
+}
+static void rejection_checkpoint(struct cb_js *j,int report_reasons){
+    struct rejection pending[128];unsigned count=j->rejection_count;
+    memcpy(pending,j->rejections,count*sizeof *pending);j->rejection_count=0;
+    int overflow=j->rejection_overflow;j->rejection_overflow=0;
+    for(unsigned i=0;i<count;i++){
+        if(report_reasons){const char *text=JS_ToCString(j->context,pending[i].reason);char out[2048];
+            snprintf(out,sizeof out,"Unhandled promise rejection: %.2000s",text?text:"Reason could not be converted");
+            if(!text)JS_FreeValue(j->context,JS_GetException(j->context));
+            else{append_stack(j->context,pending[i].reason,out,sizeof out);JS_FreeCString(j->context,text);}
+            log_text(j,2,out);
+        }
+        JS_FreeValue(j->context,pending[i].promise);JS_FreeValue(j->context,pending[i].reason);
+    }
+    if(overflow&&report_reasons)log_text(j,1,"Promise rejection tracking limit exceeded (128)");
 }
 static double begin(struct cb_js *j){double start=clock_now();j->deadline=start+.1;j->interrupted=0;JS_UpdateStackTop(j->runtime);return start;}
 static int finish(struct cb_js *j,double start,JSValue value,char **result){
@@ -67,7 +103,7 @@ struct cb_js *cb_js_new(struct cb_js_host host,int allow_eval){
         if(cb_js_eval(j,lock,strlen(lock),"<policy>",NULL)){cb_js_free(j);return NULL;}}
     return j;
 }
-void cb_js_free(struct cb_js *j){if(!j)return;if(j->context)JS_FreeContext(j->context);if(j->runtime)JS_FreeRuntime(j->runtime);free(j);}
+void cb_js_free(struct cb_js *j){if(!j)return;if(j->context){rejection_checkpoint(j,0);JS_FreeContext(j->context);}if(j->runtime)JS_FreeRuntime(j->runtime);free(j);}
 int cb_js_eval(struct cb_js *j,const char *source,size_t length,const char *url,char **result){
     if(result)*result=NULL;
     if(!j||j->failed||!source||length>SOURCE_LIMIT)return -1;
@@ -90,6 +126,7 @@ int cb_js_jobs(struct cb_js *j){
     if(!j||j->failed)return -1;
     double start=begin(j);JSContext *ctx=NULL;unsigned count=0;int rc=0;
     while(JS_IsJobPending(j->runtime)&&count++<256){rc=JS_ExecutePendingJob(j->runtime,&ctx);if(rc<0){report(j);break;}}
+    rejection_checkpoint(j,!j->interrupted);
     j->total+=clock_now()-start;
     if(JS_IsJobPending(j->runtime)||j->interrupted||j->total>2){j->failed=1;log_text(j,2,"JavaScript job budget exceeded");return -1;}return rc<0?-1:0;
 }

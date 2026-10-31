@@ -11,6 +11,11 @@ import shutil
 import shlex
 import subprocess
 import tempfile
+import importlib.util
+
+_provenance_spec = importlib.util.spec_from_file_location("cube_provenance", Path(__file__).with_name("provenance.py"))
+provenance = importlib.util.module_from_spec(_provenance_spec)
+_provenance_spec.loader.exec_module(provenance)
 
 ROOT = Path(__file__).resolve().parent.parent
 BINARIES = ("cube-browser", "cube-renderd", "cube-netd")
@@ -58,9 +63,9 @@ def main():
         if not shutil.which(required, path=env["PATH"]):
             parser.error(f"missing build tool: {required}")
     for required in (".deps/prefix/lib/libcairo.so.2", ".deps/lib/libmbedtls.a", ".deps/lib/libquickjs-core.a",
-                     ".deps/prefix/lib/libsqlite3.a", ".deps/prefix/lib/libjpeg.a"):
+                     ".deps/prefix/lib/libsqlite3.a", ".deps/prefix/lib/libjpeg.a", ".deps/prefix/lib/libwebpdecoder.a"):
         if not (ROOT / required).is_file():
-            parser.error(f"missing {required}; run the four scripts/bootstrap-*.sh scripts first")
+            parser.error(f"missing {required}; run the five scripts/bootstrap-*.sh scripts first")
     build = args.build_dir.resolve()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -70,10 +75,13 @@ def main():
     setup += [build, ROOT, "--prefix=/usr", "--bindir=lib/cube-browser", "--buildtype=release",
               "-Dprivate_libdir=$ORIGIN/lib", "-Db_lto=true"]
     run(["python3", ROOT / "scripts/version.py", "--check"], cwd=ROOT, env=env)
+    sources_before = provenance.manifest()
     run(setup, cwd=ROOT, env=env)
     run(["meson", "compile", "-C", build, "-j", str(args.jobs)], env=env)
     if not args.skip_tests:
         run(["meson", "test", "-C", build, "--no-suite=integration", "--num-processes=1", "--print-errorlogs"], env=env)
+    if provenance.manifest() != sources_before:
+        raise SystemExit("Browser sources changed during the build; rebuild from a stable checkout")
     arch = subprocess.check_output(["dpkg", "--print-architecture"], env=env, text=True).strip()
     archive = output / f"cube-browser_{version}_{arch}.deb"
     with tempfile.TemporaryDirectory(prefix="cube-browser-deb-") as temp:
@@ -95,12 +103,15 @@ def main():
         copy(ROOT / "packaging/copyright", docs / "copyright")
         copy(ROOT / "packaging/COPYING", docs / "COPYING")
         copy(ROOT / "packaging/NOTICE", docs / "NOTICE")
+        provenance.write(docs / "build.json",env["SOURCE_DATE_EPOCH"],arch,env)
         licenses = docs / "licenses"
         for source, name in (
             (ROOT / ".deps/licenses/mbedtls-LICENSE", "mbedtls-LICENSE"),
             (ROOT / ".deps/licenses/quickjs-LICENSE", "quickjs-LICENSE"),
             (ROOT / ".deps/prefix/share/licenses/libjpeg-turbo/copyright", "libjpeg-turbo-copyright"),
             (ROOT / "third_party/nanosvg/LICENSE.txt", "nanosvg-LICENSE"),
+            (ROOT / ".deps/licenses/webp-COPYING", "webp-COPYING"),
+            (ROOT / ".deps/licenses/webp-PATENTS", "webp-PATENTS"),
         ):
             copy(source, licenses / name)
         for name in ("COPYING", "COPYING-LGPL-2.1", "COPYING-MPL-1.1"):
@@ -165,6 +176,8 @@ def main():
             candidate = Path(partial.name)
         try:
             run(["dpkg-deb", "--root-owner-group", "-Zxz", "--build", stage, candidate], env=env)
+            if provenance.manifest() != sources_before:
+                raise SystemExit("Browser sources changed during packaging; no archive was published")
             candidate.chmod(0o644)
             candidate.replace(archive)
         finally:

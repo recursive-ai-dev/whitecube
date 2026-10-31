@@ -1,8 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
-// whitecube - Wayland-native tabbed compositor, white cubes everywhere.
+// whitecube - Wayland-native floating stacking compositor, white cubes everywhere.
 // No X11, no XWayland. Pure Wayland + wlroots (xwayland disabled build).
-// Tabbed windows above a living cube field; a persistent floating scripts panel.
+// Floating windows above a living cube field; a grouped window switcher.
 // Background, windows and layer-shell overlays have separate scene trees.
 #include <assert.h>
 #include <getopt.h>
@@ -40,6 +40,7 @@
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/box.h>
+#include <wlr/util/edges.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 #include <linux/input-event-codes.h>
@@ -275,7 +276,8 @@ struct wc_pointer {
 struct wc_drag {
 	struct wc_toplevel *toplevel;
 	uint32_t button;
-	bool resize;
+	bool resize, client_grab;
+	uint32_t edges;
 	double pointer_x, pointer_y;
 	int work_w, work_h, x, y, w, h;
 };
@@ -422,8 +424,21 @@ static struct wc_output *server_first_output(struct wc_server *s) {
 static int bounded(int value, int minimum, int maximum) {
 	return value < minimum ? minimum : value > maximum ? maximum : value;
 }
+static int wc_normalized_extent(uint32_t pixels, int available, bool round_up) {
+	uint64_t value = ((uint64_t)pixels * 1000 + (round_up ? (uint32_t)available - 1 : 0)) / (uint32_t)available;
+	return value > 1000 ? 1000 : value < 1 ? 1 : (int)value;
+}
 static void wc_cancel_drag(struct wc_server *s) {
 	if (!s->drag.toplevel) return;
+	if (s->drag.resize && s->drag.toplevel->xdg_toplevel)
+		wlr_xdg_toplevel_set_resizing(s->drag.toplevel->xdg_toplevel, false);
+	if (s->drag.client_grab && s->seat && s->seat->pointer_state.button_count) {
+		/* An interrupted client drag must not leave the seat's button held.
+		 * Clear focus first so cancellation cannot deliver input behind a lock. */
+		wlr_seat_pointer_clear_focus(s->seat);
+		wlr_seat_pointer_notify_button(s->seat, 0, s->drag.button, WL_POINTER_BUTTON_STATE_RELEASED);
+		s->grab_surface = NULL;
+	}
 	/* Keep the consumed button until its physical release, even after unmap. */
 	s->drag = (struct wc_drag){.button = s->drag.button};
 	if (s->cursor && s->cursor_mgr) wlr_cursor_set_xcursor(s->cursor, s->cursor_mgr, "default");
@@ -431,15 +446,40 @@ static void wc_cancel_drag(struct wc_server *s) {
 static void wc_update_drag(struct wc_server *s, double pointer_x, double pointer_y) {
 	struct wc_drag *d = &s->drag;
 	struct wc_toplevel *t = d->toplevel;
-	if (!t || d->work_w <= 0 || d->work_h <= 0) return;
-	int dx = (int)lround((pointer_x - d->pointer_x) * 1000 / d->work_w);
-	int dy = (int)lround((pointer_y - d->pointer_y) * 1000 / d->work_h);
+	if (!t || d->work_w <= 0 || d->work_h <= 0 || !isfinite(pointer_x) || !isfinite(pointer_y) ||
+	    !isfinite(d->pointer_x) || !isfinite(d->pointer_y)) return;
+	/* Saturate before integer conversion: any larger delta already reaches a
+	 * work-area boundary, and must never overflow lround/int. */
+	int dx = (int)fmax(-1000, fmin(1000, round((pointer_x - d->pointer_x) * 1000 / d->work_w)));
+	int dy = (int)fmax(-1000, fmin(1000, round((pointer_y - d->pointer_y) * 1000 / d->work_h)));
 	t->layout_x = d->x; t->layout_y = d->y;
 	t->layout_w = d->w; t->layout_h = d->h;
 	if (d->resize) {
-		int max_w = 1000 - d->x, max_h = 1000 - d->y;
-		t->layout_w = bounded(d->w + dx, max_w < 100 ? max_w : 100, max_w);
-		t->layout_h = bounded(d->h + dy, max_h < 100 ? max_h : 100, max_h);
+		uint32_t edges = d->edges ? d->edges : WLR_EDGE_RIGHT | WLR_EDGE_BOTTOM;
+		int min_w = 100, min_h = 100, max_w = 1000, max_h = 1000;
+		if (t->xdg_toplevel) {
+			const struct wlr_xdg_toplevel_state *state = &t->xdg_toplevel->current;
+			min_w = bounded(wc_normalized_extent(state->min_width, d->work_w, true), 100, 1000);
+			min_h = bounded(wc_normalized_extent(state->min_height, d->work_h, true), 100, 1000);
+			if (state->max_width) max_w = wc_normalized_extent(state->max_width, d->work_w, false);
+			if (state->max_height) max_h = wc_normalized_extent(state->max_height, d->work_h, false);
+		}
+		if (edges & WLR_EDGE_LEFT) {
+			int right = d->x + d->w, limit = bounded(max_w, 1, right);
+			t->layout_x = bounded(d->x + dx, right - limit, right - bounded(min_w, 1, limit));
+			t->layout_w = right - t->layout_x;
+		} else if (edges & WLR_EDGE_RIGHT) {
+			int limit = bounded(max_w, 1, 1000 - d->x);
+			t->layout_w = bounded(d->w + dx, bounded(min_w, 1, limit), limit);
+		}
+		if (edges & WLR_EDGE_TOP) {
+			int bottom = d->y + d->h, limit = bounded(max_h, 1, bottom);
+			t->layout_y = bounded(d->y + dy, bottom - limit, bottom - bounded(min_h, 1, limit));
+			t->layout_h = bottom - t->layout_y;
+		} else if (edges & WLR_EDGE_BOTTOM) {
+			int limit = bounded(max_h, 1, 1000 - d->y);
+			t->layout_h = bounded(d->h + dy, bounded(min_h, 1, limit), limit);
+		}
 	} else {
 		t->layout_x = bounded(d->x + dx, 0, 1000 - d->w);
 		t->layout_y = bounded(d->y + dy, 0, 1000 - d->h);
@@ -549,6 +589,29 @@ static void wc_toplevel_ensure_tab(struct wc_toplevel *t, struct wc_output *out)
 		t->label_w = 0;
 	}
 }
+static void wc_default_placement(struct wc_toplevel *t, int width, int height) {
+	if (t->layout_w > 0 && t->layout_h > 0) return;
+	unsigned preceding = 0; struct wc_toplevel *other;
+	wl_list_for_each(other, &t->server->toplevels, link)
+		if (other != t && other->mapped && other->workspace == t->workspace && !is_dialog(other)) preceding++;
+	/* Let the first buffer convey the client's preferred geometry. Bound large
+	 * windows while keeping a desktop margin and a stable fallback size. */
+	struct wlr_box geometry = {0};
+	if (t->xdg_toplevel && t->xdg_toplevel->base && t->xdg_toplevel->base->surface)
+		wlr_xdg_surface_get_geometry(t->xdg_toplevel->base, &geometry);
+	t->layout_w = geometry.width > 0 ? bounded(wc_normalized_extent((uint32_t)geometry.width, width, true), 100, 940) : 760;
+	t->layout_h = geometry.height > 0 ? bounded(wc_normalized_extent((uint32_t)geometry.height, height, true), 100, 900) : 780;
+	/* Normalized positions preserve placement across scale/output changes. */
+	t->layout_x = bounded(60 + 35 * (preceding % 5), 0, 1000 - t->layout_w);
+	t->layout_y = bounded(50 + 30 * (preceding % 5), 0, 1000 - t->layout_h);
+}
+static int wc_client_extent(int requested, uint32_t minimum, uint32_t maximum, int available) {
+	int low = minimum > (uint32_t)available ? available : (int)minimum;
+	int high = maximum && maximum < (uint32_t)available ? (int)maximum : available;
+	if (low < 1) low = 1;
+	if (high < low) high = low;
+	return bounded(requested, low, high);
+}
 static void wc_retile(struct wc_server *server) {
 	struct wc_output *out = server_first_output(server);
 	if (!out || !out->wlr_output) return;
@@ -558,7 +621,7 @@ static void wc_retile(struct wc_server *server) {
 	struct wlr_box box;
 	wlr_output_layout_get_box(server->output_layout, out->wlr_output, &box);
 	struct wc_toplevel *full = wc_fullscreen_window(server);
-	int work_y = full ? 0 : g_tab_h, work_h = H - work_y;
+	int work_y = full ? 0 : bounded(g_tab_h, 0, H - 1), work_h = H - work_y;
 	fullscreen_hint(full != NULL || server->locked);
 	wlr_scene_node_set_enabled(&server->top->node, !full && !server->locked);
 	wlr_scene_rect_set_size(out->tab_bg, W, g_tab_h);
@@ -598,21 +661,22 @@ static void wc_retile(struct wc_server *server) {
 			}
 		}
 		bool show = t->mapped && t->workspace == server->workspace && !t->hidden && !server->desktop_visible &&
-			(full ? t == full || (wc_is_ancestor(full, t) && wc_in_focus_chain(t, server->focused)) :
-			(wc_in_focus_chain(t, server->normal) || wc_in_focus_chain(t, server->focused) || is_scripts(t)));
+			(!full || t == full || (wc_is_ancestor(full, t) && wc_in_focus_chain(t, server->focused)));
 		wlr_scene_node_set_enabled(&t->scene_tree->node, show);
 		if (!show) continue;
 		int x = 0, y = work_y, w = W, h = work_h;
-		if (is_scripts(t) && !full && !t->maximized) {
+		if (t->fullscreen) { y = 0; h = H; }
+		if (!t->fullscreen && !t->maximized && !is_dialog(t) && !is_scripts(t)) wc_default_placement(t, W, work_h);
+		if (is_scripts(t) && !full && !t->fullscreen && !t->maximized) {
 			w = W * 88 / 100; h = (H - g_tab_h) * 47 / 100;
 			x = (W - w) / 2; y = H - h - 20;
 			if (y < g_tab_h) y = g_tab_h;
 		}
-		if (t != full && !t->maximized && t->layout_w > 0 && t->layout_h > 0) {
+		if (!t->fullscreen && !t->maximized && t->layout_w > 0 && t->layout_h > 0) {
 			x = W * t->layout_x / 1000; y = work_y + work_h * t->layout_y / 1000;
 			w = W * t->layout_w / 1000; h = work_h * t->layout_h / 1000;
 		}
-		if (is_dialog(t) && t != full && !t->maximized && !(t->layout_w > 0 && t->layout_h > 0)) {
+		if (is_dialog(t) && !t->fullscreen && !t->maximized && !(t->layout_w > 0 && t->layout_h > 0)) {
 			/* The client's own size (it was configured 0x0), within 90% of the screen. */
 			struct wlr_box geo; wlr_xdg_surface_get_geometry(t->xdg_toplevel->base, &geo);
 			int max_w = W * 9 / 10, max_h = work_h * 9 / 10;
@@ -625,6 +689,11 @@ static void wc_retile(struct wc_server *server) {
 			if (h > max_h) h = max_h;
 			x = (W - w) / 2; y = work_y + (work_h - h) / 2;
 		}
+		if (!t->fullscreen && !t->maximized) {
+			w = wc_client_extent(w, t->xdg_toplevel->current.min_width, t->xdg_toplevel->current.max_width, W);
+			h = wc_client_extent(h, t->xdg_toplevel->current.min_height, t->xdg_toplevel->current.max_height, work_h);
+			x = bounded(x, 0, W - w); y = bounded(y, work_y, H - h);
+		}
 		wlr_scene_node_set_position(&t->scene_tree->node, box.x + x, box.y + y);
 		if (t->configured_w != w || t->configured_h != h) {
 			wlr_xdg_toplevel_set_size(t->xdg_toplevel, w, h);
@@ -633,9 +702,6 @@ static void wc_retile(struct wc_server *server) {
 	}
 	/* Layout order also drives tabs, so never reorder it to change stacking.
 	 * Raise parents before their dialogs, with the focused family last. */
-	wc_raise_family(server->normal);
-	wl_list_for_each(t, &server->toplevels, link)
-		if (is_scripts(t)) wc_raise_family(t);
 	wc_raise_family(server->focused);
 	wc_more_update(server, out, W, n_tabs, vis);
 	/* Persist the final placement once on release, rather than fsync per motion. */
@@ -667,7 +733,7 @@ static bool wc_start_drag(struct wc_server *s, struct wc_toplevel *t, uint32_t b
 	if (!out) return false;
 	int W, H;
 	wlr_output_effective_resolution(out->wlr_output, &W, &H);
-	int work_y = wc_fullscreen_window(s) ? 0 : g_tab_h;
+	int work_y = wc_fullscreen_window(s) ? 0 : bounded(g_tab_h, 0, H - 1);
 	H -= work_y;
 	if (W <= 0 || H <= 0 || t->configured_w <= 0 || t->configured_h <= 0) return false;
 	struct wlr_box box;
@@ -676,12 +742,15 @@ static bool wc_start_drag(struct wc_server *s, struct wc_toplevel *t, uint32_t b
 	int h = bounded((int)lround(t->configured_h * 1000.0 / H), 1, 1000);
 	s->drag = (struct wc_drag){
 		.toplevel = t, .button = button, .resize = button == BTN_RIGHT,
+		.edges = button == BTN_RIGHT ? WLR_EDGE_RIGHT | WLR_EDGE_BOTTOM : WLR_EDGE_NONE,
+		.client_grab = s->seat->pointer_state.button_count != 0,
 		.pointer_x = s->cursor->x, .pointer_y = s->cursor->y, .work_w = W, .work_h = H,
 		.x = bounded((int)lround((t->scene_tree->node.x - box.x) * 1000.0 / W), 0, 1000 - w),
 		.y = bounded((int)lround((t->scene_tree->node.y - box.y - work_y) * 1000.0 / H), 0, 1000 - h),
 		.w = w, .h = h,
 	};
-	wlr_seat_pointer_clear_focus(s->seat);
+	if (!s->drag.client_grab) wlr_seat_pointer_clear_focus(s->seat);
+	if (s->drag.resize) wlr_xdg_toplevel_set_resizing(t->xdg_toplevel, true);
 	wlr_cursor_set_xcursor(s->cursor, s->cursor_mgr, button == BTN_RIGHT ? "se-resize" : "move");
 	return true;
 }
@@ -964,7 +1033,7 @@ static void wc_panel_refresh(struct wc_server *s) {
 			idx == o->panel_selected, prefix, tab_title(t), true, false);
 	}
 	if (!n) wc_draw_face(cr, g.pad, g.pad, g.w - 2 * g.pad, g_tab_h - 12, false,
-		"", "No open tabs", false, false);
+		"", "No open windows", false, false);
 	if (n > g.rows) { // slim scroll thumb on the right edge
 		double track = g.h - 2 * g.pad, th = track * g.rows / n, ty = g.pad + track * o->panel_scroll / n;
 		cairo_set_source_rgba(cr, 1, 1, 1, 0.55);
@@ -980,7 +1049,7 @@ static void wc_more_label(struct wc_output *o, int w, int h, bool active, int n,
 	cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
 	if (cairo_surface_status(surf) != CAIRO_STATUS_SUCCESS) { cairo_surface_destroy(surf); return; }
 	cairo_t *cr = cairo_create(surf);
-	char text[160]; snprintf(text, sizeof(text), "%d %s", n, n == 1 ? "tab" : "tabs");
+	char text[160]; snprintf(text, sizeof(text), "%d %s", n, n == 1 ? "window" : "windows");
 	// the face paints its own border, so draw it at label size and let the scene rects sit underneath
 	wc_draw_face(cr, 0, 0, w, h, active, "", text, false, true);
 	cairo_destroy(cr);
@@ -1536,6 +1605,7 @@ static void cursor_button(struct wl_listener *l, void *data) {
 		return;
 	}
 	if (s->drag.button && ev->state == WL_POINTER_BUTTON_STATE_RELEASED && ev->button == s->drag.button) {
+		if (s->drag.client_grab) wlr_seat_pointer_notify_button(s->seat, ev->time_msec, ev->button, ev->state);
 		wc_cancel_drag(s);
 		s->drag = (struct wc_drag){0};
 		wc_retile(s);
@@ -1932,10 +2002,11 @@ static void t_commit(struct wl_listener *l, void *data) {
 			if (W <= 0) W = 1280;
 			if (H <= 0) H = 800;
 		}
-		int work_h = H - g_tab_h > 100 ? H - g_tab_h : 100;
-		/* 0x0 lets a dialog pick its own size; retile centres and caps it. */
-		if (is_dialog(t)) wlr_xdg_toplevel_set_size(t->xdg_toplevel, 0, 0);
-		else wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, work_h);
+		int work_h = H > g_tab_h ? H - g_tab_h : 1;
+		/* Floating clients choose their preferred first size within these bounds.
+		 * Retile saves a bounded placement after their first buffer is mapped. */
+		if (t->fullscreen || t->maximized) wlr_xdg_toplevel_set_size(t->xdg_toplevel, W, t->fullscreen ? H : work_h);
+		else wlr_xdg_toplevel_set_size(t->xdg_toplevel, 0, 0);
 		/* No minimize and no window menu here, so clients hide those buttons. */
 		wlr_xdg_toplevel_set_wm_capabilities(t->xdg_toplevel,
 			WLR_XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE | WLR_XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN);
@@ -1961,8 +2032,37 @@ static void t_set_title(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, set_title);
 	wc_tab_label(t, t->label_w, t->label_h, t == t->server->focused && !t->hidden);
 }
-static void t_req_move(struct wl_listener *l, void *data) {}
-static void t_req_resize(struct wl_listener *l, void *data) {}
+static bool wc_client_drag_allowed(struct wc_toplevel *t, struct wlr_seat_client *seat, uint32_t serial) {
+	struct wc_server *s = t->server;
+	struct wlr_surface *surface = s->seat->pointer_state.focused_surface;
+	return !s->locked && !s->drag.button && seat && seat == s->seat->pointer_state.focused_client &&
+		surface && wlr_surface_get_root_surface(surface) == t->xdg_toplevel->base->surface &&
+		wlr_seat_validate_pointer_grab_serial(s->seat, surface, serial);
+}
+static void t_req_move(struct wl_listener *l, void *data) {
+	struct wc_toplevel *t = wl_container_of(l, t, request_move);
+	const struct wlr_xdg_toplevel_move_event *event = data;
+	if (event && event->toplevel == t->xdg_toplevel && wc_client_drag_allowed(t, event->seat, event->serial))
+		wc_start_drag(t->server, t, t->server->seat->pointer_state.grab_button);
+}
+static void t_req_resize(struct wl_listener *l, void *data) {
+	struct wc_toplevel *t = wl_container_of(l, t, request_resize);
+	const struct wlr_xdg_toplevel_resize_event *event = data;
+	if (!event || event->toplevel != t->xdg_toplevel || !event->edges || (event->edges & ~(WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT)) ||
+	    (event->edges & (WLR_EDGE_LEFT | WLR_EDGE_RIGHT)) == (WLR_EDGE_LEFT | WLR_EDGE_RIGHT) ||
+	    (event->edges & (WLR_EDGE_TOP | WLR_EDGE_BOTTOM)) == (WLR_EDGE_TOP | WLR_EDGE_BOTTOM) ||
+	    !wc_client_drag_allowed(t, event->seat, event->serial)) return;
+	if (wc_start_drag(t->server, t, t->server->seat->pointer_state.grab_button)) {
+		t->server->drag.resize = true; t->server->drag.edges = event->edges;
+		wlr_xdg_toplevel_set_resizing(t->xdg_toplevel, true);
+		const char *cursor = event->edges & WLR_EDGE_TOP ?
+			(event->edges & WLR_EDGE_LEFT ? "nw-resize" : event->edges & WLR_EDGE_RIGHT ? "ne-resize" : "n-resize") :
+			event->edges & WLR_EDGE_BOTTOM ?
+			(event->edges & WLR_EDGE_LEFT ? "sw-resize" : event->edges & WLR_EDGE_RIGHT ? "se-resize" : "s-resize") :
+			event->edges & WLR_EDGE_LEFT ? "w-resize" : "e-resize";
+		wlr_cursor_set_xcursor(t->server->cursor, t->server->cursor_mgr, cursor);
+	}
+}
 static void t_req_max(struct wl_listener *l, void *data) {
 	struct wc_toplevel *t = wl_container_of(l, t, request_maximize);
 	if (t->server->drag.toplevel == t) wc_cancel_drag(t->server);

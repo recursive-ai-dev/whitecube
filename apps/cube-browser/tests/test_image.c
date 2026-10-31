@@ -335,6 +335,27 @@ static void svg_rejections(void)
     free(complex);
 }
 
+static unsigned char *fixture(const char *name,size_t *length){
+    FILE *file=fopen(name,"rb");assert(file);assert(!fseek(file,0,SEEK_END));long size=ftell(file);assert(size>0&&size<2*1024*1024);rewind(file);
+    unsigned char *data=malloc((size_t)size);assert(data&&fread(data,1,(size_t)size,file)==(size_t)size);assert(!fclose(file));*length=(size_t)size;return data;
+}
+static void webp_tests(void){
+    size_t length;unsigned char *data=fixture("tests/fixtures/sample.webp",&length);char error[128];
+    cairo_surface_t *surface=cb_image_decode(data,length,"image/webp",error,sizeof error);assert(surface);
+    assert(cairo_image_surface_get_width(surface)==2&&cairo_image_surface_get_height(surface)==1);
+    assert(pixel(surface,0,0)==UINT32_C(0xffff0000)&&pixel(surface,1,0)==UINT32_C(0x80008040));cairo_surface_destroy(surface);
+    for(size_t i=1;i<length;i++)rejected(data,i,"image/webp");
+    assert(length>25&&!memcmp(data+12,"VP8L",4));
+    unsigned char saved[4];memcpy(saved,data+21,4);
+    /* VP8L width/height are 14-bit little-endian fields, before any pixels. */
+    uint32_t huge=(4096-1)|((4096-1)<<14)|(1u<<28);
+    for(unsigned i=0;i<4;i++)data[21+i]=(unsigned char)(huge>>(8*i));
+    rejected(data,length,"image/webp");
+    huge=8192-1;for(unsigned i=0;i<4;i++)data[21+i]=(unsigned char)(huge>>(8*i));rejected(data,length,"image/webp");
+    memcpy(data+21,saved,4);data[4]^=1;rejected(data,length,"image/webp");free(data);
+    data=fixture("tests/fixtures/animated.webp",&length);rejected(data,length,"image/webp");free(data);
+}
+
 int main(void)
 {
     rejected(NULL, 0, "image/png");
@@ -343,9 +364,10 @@ int main(void)
     rejected("GIF89a", 6, "image/gif");
     png_tests();
     jpeg_tests();
+    webp_tests();
     svg_pixels();
     svg_gradients();
     svg_rejections();
-    puts("images: PNG/JPEG, static SVG paths/gradients/alpha, MIME, XML, forbidden features and budgets passed");
+    puts("images: PNG/JPEG/static WebP, SVG paths/gradients/alpha, MIME, XML, forbidden features and budgets passed");
     return 0;
 }

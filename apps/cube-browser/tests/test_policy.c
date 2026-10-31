@@ -1,8 +1,25 @@
 #include "policy.h"
+#include "http.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+static void javascript_mimes(void){
+    const char *types[]={"application/ecmascript","application/javascript","application/x-ecmascript",
+        "application/x-javascript","text/ecmascript","text/javascript","text/javascript1.0",
+        "text/javascript1.1","text/javascript1.2","text/javascript1.3","text/javascript1.4",
+        "text/javascript1.5","text/jscript","text/livescript","text/x-ecmascript","text/x-javascript"};
+    for(size_t i=0;i<sizeof types/sizeof *types;i++){
+        assert(cb_javascript_mime(types[i],strlen(types[i])));
+        char header[128];snprintf(header,sizeof header," %s ; charset=utf-8",types[i]);assert(cb_http_javascript_mime(header));
+    }
+    const char *invalid[]={"","text/plain","application/json","text/javascriptx","text/javascript garbage","application/x-javascriptx"};
+    for(size_t i=0;i<sizeof invalid/sizeof *invalid;i++)assert(!cb_http_javascript_mime(invalid[i]));
+    assert(cb_http_javascript_mime("TEXT/JAVASCRIPT; charset=utf-8"));
+    assert(!cb_javascript_mime("text/javascript; charset=utf-8",strlen("text/javascript; charset=utf-8")));
+    assert(!cb_http_javascript_mime(NULL));
+}
 int main(void){
+    javascript_mimes();
     const char *doc="https://example.org/page";char origin[320];
     assert(!cb_origin("HTTPS://EXAMPLE.org:443/x#y",origin));assert(!strcmp(origin,"https://example.org:443"));
     assert(!cb_origin_header("HTTPS://EXAMPLE.org:443/x#y",origin));assert(!strcmp(origin,"https://example.org"));

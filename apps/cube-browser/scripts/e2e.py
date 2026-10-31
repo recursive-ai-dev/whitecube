@@ -594,11 +594,15 @@ def exercise_workflows(proxy, origin, requests, root, download_started, cancel_s
     proxy.key(38, proxy.control);proxy.type(origin + '/scripted');proxy.key(28)
     wait_for(lambda: proxy.title == 'Cube E2E scripted 1 1', 'clearing private origin storage resets script state')
     settings=root/'state/whitecube/accessibility.json';settings.parent.mkdir(parents=True,exist_ok=True)
-    before=hashlib.sha256(proxy.snapshot()[0]).digest()
+    # Observe the title-bar boundary itself: an unrelated pending repaint can
+    # change the full-frame hash before the preference poll has applied scale.
+    def scale_probe():
+        pixels,_,_,stride=proxy.snapshot()
+        return struct.unpack_from('<I',pixels,40*stride+4*4)[0]&0xffffff
     settings.write_text('{"ui_scale":1.5}')
-    wait_for(lambda: hashlib.sha256(proxy.snapshot()[0]).digest()!=before, 'live interface and page scaling')
-    commits=proxy.commits;settings.write_text('{"ui_scale":1.0}')
-    wait_for(lambda: proxy.commits>commits, 'interface scale restored')
+    wait_for(lambda: scale_probe()==0x302640, 'live interface and page scaling')
+    settings.write_text('{"ui_scale":1.0}')
+    wait_for(lambda: scale_probe()==0xf5f5f5, 'interface scale restored')
 
 
 
@@ -977,6 +981,14 @@ def run(options):
                     document.querySelector('form').addEventListener('submit',event=>{event.preventDefault();const p=document.getElementById('result');p.textContent='Saved '+document.getElementById('field').value;p.style.cssText='min-height:180px;background:#448877';});
                     document.getElementById('counter').onclick=()=>document.title='Cube E2E clicked';
                     </script></body>""", 'text/html'
+                elif self.path == '/lazy-images':
+                    body,mime=b'''<title>Cube E2E lazy gallery</title><body style="margin:0">
+                    <div style="height:1800px">Scroll to the image</div><img id="image" width="160" height="80" data-src="/assets/lazy.png"><div style="height:200px"></div>
+                    <script>const image=document.getElementById('image');
+                    image.onload=()=>document.title='Cube E2E lazy loaded';
+                    const observer=new IntersectionObserver((entries,owner)=>{
+                      for(const entry of entries)if(entry.isIntersecting){image.src=image.dataset.src;owner.unobserve(image);}
+                    });observer.observe(image);</script></body>''','text/html'
                 elif self.path == '/async-cancel':
                     body, mime = b'<title>Async cancellation</title><script>fetch("/slow-api").then(r=>r.text()).then(()=>document.title="OLD CALLBACK LEAKED")</script>', 'text/html'
                 elif self.path == '/slow-api':
@@ -1013,7 +1025,7 @@ def run(options):
                     body, mime = b'<title>Cube E2E history enabled</title><p>Save this visit, then clear it on exit.</p>', 'text/html'
                 elif self.path == '/assets/layout.css':
                     body, mime = css, 'text/css'
-                elif self.path == '/assets/image.png':
+                elif self.path in ('/assets/image.png','/assets/lazy.png'):
                     body, mime = png, 'image/png'
                 elif self.path == '/assets/vector.svg':
                     body, mime = vector, 'image/svg+xml'
@@ -1137,6 +1149,14 @@ def run(options):
                 wait_for(no_network_children, "no resource workers survived cancelled navigation")
                 time.sleep(.08)
                 assert proxy.title == 'Private browsing — Cube Browser' and not proxy.has_color(0xff00ff), 'old resource modified new page'
+                proxy.key(11,proxy.control)  # Restore 100% zoom for viewport visibility.
+                proxy.key(38,proxy.control);proxy.type(f'http://127.0.0.1:{server.server_port}/lazy-images');proxy.key(28)
+                wait_for(lambda: proxy.title=='Cube E2E lazy gallery', 'lazy gallery initial frame')
+                assert '/assets/lazy.png' not in requests, 'offscreen image loaded before scrolling'
+                proxy.key(107)  # End scrolls the native viewport to the image.
+                wait_for(lambda: proxy.title=='Cube E2E lazy loaded' and proxy.has_color(0xd85723), 'observer image loaded and painted after native scrolling')
+                assert requests.count('/assets/lazy.png')==1, 'lazy image should be fetched once'
+                save_frame(proxy,options.artifacts,'wayland-lazy-image.png')
                 exercise_interactions(proxy, f'http://127.0.0.1:{server.server_port}', requests, options.artifacts)
                 exercise_sessions(proxy, f'http://127.0.0.1:{server.server_port}', requests, observations)
                 exercise_scripts(proxy, f'http://127.0.0.1:{server.server_port}', requests, async_started, async_release)
@@ -1162,7 +1182,7 @@ def run(options):
                 assert browser_process.wait(timeout=5) == 0, "browser failed on keyboard close"
                 assert proxy.error is None, f"protocol proxy failed: {proxy.error}"
                 print(f"e2e: native app id, xdg configure/ack, {proxy.commits} shm commits, {proxy.releases} compositor releases; "
-                      "external CSS/PNG, Ctrl+L HTTP navigation, zoom, find, reload, back/forward, pending-resource cancellation, "
+                      "external CSS/PNG, scroll-triggered lazy images, Ctrl+L HTTP navigation, zoom, find, reload, back/forward, pending-resource cancellation, "
                       "Tab/Shift+Tab page focus, immediate input typing, exact GET submission, blocked PUT, POST login/logout, cookies, conditional cache, scripted events/storage/cancellation, settings, downloads/cancel, diagnostics, private clearing, anchors without refetch, "
                       "responsive zoom, live reduced-motion CSS, SVG, table links/edited inputs, renderer crash recovery, private history and Ctrl+W passed")
                 print("Input source: isolated standard wl_keyboard events; real headless Wayland compositor handled all presentation.")

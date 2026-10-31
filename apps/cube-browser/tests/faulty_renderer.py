@@ -45,6 +45,10 @@ elif mode == 'unsolicited-copy':
     send(18, a=5, b=2, text='UNSOLICITED_CLIPBOARD_VALUE')
 elif mode == 'unsolicited-link':
     send(7, text=os.environ['CB_TEST_ACTION_URL'])
+elif mode.startswith('resource-'):
+    send(13, a=1 if mode=='resource-index' else 0,
+         b=3 if mode=='resource-script' else 1 if mode=='resource-css' else 2,
+         c=2 if mode=='resource-flags' else 1, text=os.environ['CB_TEST_ACTION_URL'])
 else:
     assert mode in ('mutable', 'nonfinite')
     fd = os.memfd_create('invalid-frame', os.MFD_ALLOW_SEALING)

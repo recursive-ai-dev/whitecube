@@ -9,6 +9,7 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <webp/decode.h>
 
 static void image_error(char *error, size_t size, const char *message)
 {
@@ -25,6 +26,15 @@ static uint32_t big_endian_u32(const unsigned char *data)
 {
     return (uint32_t)data[0] << 24 | (uint32_t)data[1] << 16 |
            (uint32_t)data[2] << 8 | data[3];
+}
+static void premultiply_rgba(cairo_surface_t *surface,uint32_t width,uint32_t height){
+    unsigned char *pixels=cairo_image_surface_get_data(surface);int stride=cairo_image_surface_get_stride(surface);
+    for(uint32_t y=0;y<height;y++)for(uint32_t x=0;x<width;x++){
+        unsigned char *rgba=pixels+(size_t)y*stride+(size_t)x*4;uint32_t alpha=rgba[3];
+        uint32_t color=alpha<<24|((rgba[0]*alpha+127)/255)<<16|((rgba[1]*alpha+127)/255)<<8|(rgba[2]*alpha+127)/255;
+        memcpy(rgba,&color,sizeof color);
+    }
+    cairo_surface_mark_dirty(surface);
 }
 
 static uint32_t png_chunk_crc(const unsigned char *data, size_t length)
@@ -125,18 +135,7 @@ static cairo_surface_t *decode_png(const unsigned char *data, size_t length,
         cairo_surface_destroy(surface);
         return NULL;
     }
-    for (uint32_t y = 0; y < image.height; y++) {
-        unsigned char *row = pixels + (size_t)y * (size_t)stride;
-        for (uint32_t x = 0; x < image.width; x++) {
-            unsigned char *rgba = row + (size_t)x * 4;
-            uint32_t alpha = rgba[3];
-            uint32_t red = (rgba[0] * alpha + 127) / 255;
-            uint32_t green = (rgba[1] * alpha + 127) / 255;
-            uint32_t blue = (rgba[2] * alpha + 127) / 255;
-            uint32_t argb = alpha << 24 | red << 16 | green << 8 | blue;
-            memcpy(rgba, &argb, sizeof(argb));
-        }
-    }
+    premultiply_rgba(surface,image.width,image.height);
     png_image_free(&image);
     cairo_surface_mark_dirty(surface);
     return surface;
@@ -258,6 +257,28 @@ static cairo_surface_t *decode_jpeg(const unsigned char *data, size_t length,
     return surface;
 }
 
+static cairo_surface_t *decode_webp(const unsigned char *data,size_t length,char *error,size_t error_size){
+    if(length<12||memcmp(data,"RIFF",4)||memcmp(data+8,"WEBP",4)){
+        image_error(error,error_size,"Malformed WebP container");return NULL;
+    }
+    uint32_t riff=(uint32_t)data[4]|(uint32_t)data[5]<<8|(uint32_t)data[6]<<16|(uint32_t)data[7]<<24;
+    WebPBitstreamFeatures features;
+    if((uint64_t)riff+8!=length||WebPGetFeatures(data,length,&features)!=VP8_STATUS_OK){
+        image_error(error,error_size,"Truncated or malformed WebP header");return NULL;
+    }
+    if(features.has_animation){image_error(error,error_size,"Animated WebP is not supported");return NULL;}
+    if(!valid_size((uint32_t)features.width,(uint32_t)features.height)){
+        image_error(error,error_size,"Image dimensions exceed the decoding budget");return NULL;
+    }
+    cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,features.width,features.height);
+    if(cairo_surface_status(surface)!=CAIRO_STATUS_SUCCESS){image_error(error,error_size,"Cannot allocate the image surface");cairo_surface_destroy(surface);return NULL;}
+    int stride=cairo_image_surface_get_stride(surface);unsigned char *pixels=cairo_image_surface_get_data(surface);
+    if(!WebPDecodeRGBAInto(data,length,pixels,(size_t)stride*features.height,stride)){
+        image_error(error,error_size,"Truncated or malformed WebP pixels");cairo_surface_destroy(surface);return NULL;
+    }
+    premultiply_rgba(surface,(uint32_t)features.width,(uint32_t)features.height);return surface;
+}
+
 cairo_surface_t *cb_image_decode(const void *data, size_t length, const char *mime,
                                   char *error, size_t error_size)
 {
@@ -268,7 +289,8 @@ cairo_surface_t *cb_image_decode(const void *data, size_t length, const char *mi
     }
     if (mime && !strcmp(mime, "image/png")) return decode_png(data, length, error, error_size);
     if (mime && !strcmp(mime, "image/jpeg")) return decode_jpeg(data, length, error, error_size);
+    if (mime && !strcmp(mime, "image/webp")) return decode_webp(data, length, error, error_size);
     if (mime && !strcmp(mime, "image/svg+xml")) return cb_svg_decode(data, length, error, error_size);
-    image_error(error, error_size, "Only image/png, image/jpeg and static image/svg+xml are supported");
+    image_error(error, error_size, "Only PNG, JPEG, static WebP and static SVG are supported");
     return NULL;
 }

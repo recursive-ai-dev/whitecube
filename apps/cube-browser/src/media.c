@@ -60,7 +60,26 @@ static enum truth feature(struct parser *p,const char *start,const char *end){
         double wanted;if(!dimension(value,&wanted))return UNKNOWN;
         return (compare>0?actual>=wanted:compare<0?actual<=wanted:actual==wanted)?YES:NO;
     }
+    if(!strcmp(base,"resolution")){
+        double actual=p->env->resolution>0&&isfinite(p->env->resolution)?p->env->resolution:1;
+        if(!value)return compare?UNKNOWN:YES;
+        char *end;double wanted=g_ascii_strtod(value,&end);if(end==value||!isfinite(wanted)||wanted<=0)return UNKNOWN;
+        char numeric[260];size_t length=(size_t)(end-value);if(length>256)return UNKNOWN;
+        memcpy(numeric,value,length);memcpy(numeric+length,"px",3);double checked;if(!dimension(numeric,&checked))return UNKNOWN;
+        if(!g_ascii_strcasecmp(end,"dpi"))wanted/=96;else if(!g_ascii_strcasecmp(end,"dpcm"))wanted*=2.54/96;
+        else if(g_ascii_strcasecmp(end,"dppx")&&g_ascii_strcasecmp(end,"x"))return UNKNOWN;
+        return (compare>0?actual>=wanted:compare<0?actual<=wanted:actual==wanted)?YES:NO;
+    }
     if(compare)return UNKNOWN;
+    if(!strcmp(name,"hover")||!strcmp(name,"any-hover")||!strcmp(name,"pointer")||!strcmp(name,"any-pointer")||!strcmp(name,"prefers-color-scheme")){
+        const char *positive=strstr(name,"hover")?"hover":strstr(name,"pointer")?"fine":"light";
+        if(!value)return !strcmp(name,"prefers-color-scheme")?NO:YES;
+        if(!g_ascii_strcasecmp(value,positive))return YES;
+        if(strstr(name,"hover")&&!g_ascii_strcasecmp(value,"none"))return NO;
+        if(strstr(name,"pointer")&&(!g_ascii_strcasecmp(value,"none")||!g_ascii_strcasecmp(value,"coarse")))return NO;
+        if(!strcmp(name,"prefers-color-scheme")&&!g_ascii_strcasecmp(value,"dark"))return NO;
+        return UNKNOWN;
+    }
     if(!strcmp(name,"orientation")){
         if(!value)return YES;
         if(!g_ascii_strcasecmp(value,"portrait"))return p->env->height>=p->env->width?YES:NO;

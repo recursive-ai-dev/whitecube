@@ -128,7 +128,7 @@ int cb_engine_selector_matches(const struct node *n,const char *s) {
     return 1;
 }
 struct cb_media_env cb_engine_media_environment(const struct cb_page *p) {
-    return (struct cb_media_env){.width=p->width/p->zoom,.height=p->viewport_height/p->zoom,
+    return (struct cb_media_env){.resolution=p->zoom,.width=p->width/p->zoom,.height=p->viewport_height/p->zoom,
         .reduced_motion=p->reduced_motion,.strong_contrast=p->strong_contrast};
 }
 /* Strings/escapes are consumed before delimiters, so quoted braces cannot
@@ -283,7 +283,7 @@ enum property {
     P_DISPLAY, P_COLOR, P_BACKGROUND, P_SIZE, P_WEIGHT, P_ITALIC, P_UNDERLINE,
     P_FAMILY, P_ALIGN, P_PRE, P_LINE_HEIGHT, P_BORDER, P_BORDER_COLOR, P_GAP,
     P_DIRECTION, P_WIDTH, P_HEIGHT, P_MAX_WIDTH, P_MIN_HEIGHT, P_TABLE_SPACING, P_COLLAPSE, P_MARGIN, P_PADDING = P_MARGIN + 4,
-    P_WRAP = P_PADDING + 4, P_GROW, P_SHRINK, P_BASIS, P_JUSTIFY, P_ALIGN_ITEMS, P_ALIGN_SELF, P_GRID, P_POSITION, P_OVERFLOW, P_MIN_WIDTH, P_MAX_HEIGHT, P_BOX, P_ROW_GAP, P_TOP, P_RIGHT, P_BOTTOM, P_LEFT, P_COUNT
+    P_WRAP = P_PADDING + 4, P_GROW, P_SHRINK, P_BASIS, P_JUSTIFY, P_ALIGN_ITEMS, P_ALIGN_SELF, P_GRID, P_POSITION, P_OVERFLOW, P_MIN_WIDTH, P_MAX_HEIGHT, P_BOX, P_ROW_GAP, P_TOP, P_RIGHT, P_BOTTOM, P_LEFT, P_ASPECT, P_COUNT
 };
 void cb_engine_set_sides(struct length *out, uint64_t *scores, uint64_t rank, const char *v, int side) {
     struct length lengths[4]; int count = 0;
@@ -345,6 +345,7 @@ void cb_engine_apply_declaration(struct style *s, const struct style *parent, ui
     else if (!strcmp(name,"right")) prop=P_RIGHT;
     else if (!strcmp(name,"bottom")) prop=P_BOTTOM;
     else if (!strcmp(name,"left")) prop=P_LEFT;
+    else if (!strcmp(name,"aspect-ratio")) prop=P_ASPECT;
     else if (!strcmp(name,"flex")) {
         char first[64]="",second[64]="",third[64]="",extra[2];
         int count=sscanf(v,"%63s %63s %63s %1s",first,second,third,extra);
@@ -466,6 +467,16 @@ void cb_engine_apply_declaration(struct style *s, const struct style *parent, ui
     case P_MAX_HEIGHT: valid=cb_engine_parse_length(v,&l);if(valid)s->max_height=l;break;
     case P_BOX: valid=!strcmp(v,"border-box")||!strcmp(v,"content-box");if(valid)s->content_box=!strcmp(v,"content-box");break;
     case P_ROW_GAP: valid=cb_engine_parse_length(v,&l);if(valid)s->row_gap=CLAMP(cb_engine_length_value(l,0,s->font_size,1),0,1000);break;
+    case P_ASPECT: {
+        if(!strcmp(v,"auto")){s->aspect_ratio=0;break;}
+        char *end;double a=g_ascii_strtod(v,&end),b=1;
+        while(g_ascii_isspace(*end))end++;
+        if(*end=='/'){const char *start=end+1;b=g_ascii_strtod(start,&end);if(end==start)b=0;}
+        while(g_ascii_isspace(*end))end++;
+        valid=end!=v&&!*end&&isfinite(a)&&isfinite(b)&&a>0&&b>0&&a/b>=.0001&&a/b<=10000;
+        if(valid)s->aspect_ratio=a/b;
+        break;
+    }
     case P_TOP: case P_RIGHT: case P_BOTTOM: case P_LEFT: valid=cb_engine_parse_length(v,&l);if(valid)s->inset[prop-P_TOP]=l;break;
     default: break;
     }

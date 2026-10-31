@@ -51,7 +51,7 @@ struct style {
     int collapse_borders;
     struct length margin[4], padding[4], width, height, max_width, min_height;
     int weight, italic, underline, family, align, pre, flex_column;
-    double grow, shrink, row_gap;
+    double grow, shrink, row_gap, aspect_ratio;
     struct length basis, min_width, max_height, inset[4];
     int wrap, justify, align_items, align_self, grid_columns, position, overflow, content_box;
 };
@@ -79,6 +79,8 @@ struct node {
     unsigned multiple : 1;
     unsigned tab_skip : 1;
     unsigned image_width, image_height, colspan, rowspan;
+    uint32_t image_generation, image_notified;
+    unsigned image_pending : 1;
     size_t resource;
     struct node *parent, *first, *last, *next;
     struct style style;
@@ -118,11 +120,12 @@ struct item {
     int text_height, placeholder;
 };
 struct hit { double x, y, w, h; const char *url; const struct node *node; };
-struct page_script {struct node *node;size_t resource;char *source;int defer,done,unsupported;};
+struct page_script {struct node *node;size_t resource;char *source;const char *error;int defer,done;};
 struct cb_page {
     GPtrArray *nodes;
     struct page_script scripts[64];
     size_t script_count,script_bytes;
+    int script_overflow;
     struct node *root;
     char *title, *base, *policy;
     struct rule *rules;

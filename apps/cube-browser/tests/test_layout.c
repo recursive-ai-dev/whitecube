@@ -90,4 +90,13 @@ static void clipping_and_recovery(void) {
     assert(id(p->root,"d")->parent==id(p->root,"p")->parent);
     assert(id(p->root,"a")->parent==id(p->root,"b")->parent);cb_page_free(p);
 }
-int main(void){effective_zoom_limits();variables_and_selectors();flexible_rows();grid_and_position();clipping_and_recovery();puts("layout compatibility passed");}
+static void image_placeholders(void){
+    struct cb_page *p=page("<body style='margin:0'><img id=a width=120 height=80 alt='Useful alternate text'><div id=b>after</div>"
+        "<img id=c style='display:block;width:160px;aspect-ratio:2/1' alt=ratio></body>");
+    near(id(p->root,"a")->w,120);near(id(p->root,"a")->h,80);assert(id(p->root,"b")->y>=80);
+    near(id(p->root,"c")->w,160);near(id(p->root,"c")->h,80);
+    double after=id(p->root,"b")->y;cb_page_layout(p,640,2);
+    near(id(p->root,"a")->w,240);near(id(p->root,"a")->h,160);near(id(p->root,"b")->y,after*2);
+    pixel(p,1,1);cb_page_free(p);
+}
+int main(void){image_placeholders();effective_zoom_limits();variables_and_selectors();flexible_rows();grid_and_position();clipping_and_recovery();puts("layout compatibility passed");}

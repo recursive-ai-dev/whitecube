@@ -1,6 +1,6 @@
 # Cube Browser
 
-Cube Browser **0.10.1** is a native Wayland interactive-web preview for Whitecube.
+Cube Browser **0.11.0** is a native Wayland interactive-web preview for Whitecube.
 It has its own HTML/CSS engine, Pango/Cairo software rendering, mbedTLS and a
 bounded QuickJS interpreter behind the replaceable `cube-js` interface. It uses
 no Chromium, Firefox, WebKit, Electron, GTK, X11, XWayland or D-Bus.
@@ -13,16 +13,16 @@ See [compatibility](COMPATIBILITY.md), [validation](VALIDATION.md) and
 
 ## Install a standalone Debian package
 
-The built archive is `dist/cube-browser_0.10.1_amd64.deb`:
+The built archive is `dist/cube-browser_0.11.0_amd64.deb`:
 
 ```sh
-sudo apt install ./dist/cube-browser_0.10.1_amd64.deb
+sudo apt install ./dist/cube-browser_0.11.0_amd64.deb
 cube-browser --check
 cube-browser
 ```
 
 Launch **Cube Browser** from your desktop menu; its **New Private Window** action
-starts an isolated window. This build targets Ubuntu 26.04 amd64. Its actual
+starts an isolated window. Release binaries target Debian 13 amd64 and compatible newer systems. Its actual
 shared-library version requirements are recorded in the package. A native Wayland
 session and Linux Landlock ABI 3 or newer are required for windows; headless text
 and PNG exports work without a compositor. The package includes its workers and
@@ -33,7 +33,7 @@ Build and verify another package after bootstrapping the dependencies below:
 
 ```sh
 python3 packaging/build-deb.py
-python3 tests/test_package.py dist/cube-browser_0.10.1_amd64.deb
+python3 tests/test_package.py dist/cube-browser_0.11.0_amd64.deb
 ```
 
 See [packaging details](packaging/README.md) for dependencies, repeatable builds,
@@ -45,6 +45,7 @@ installation paths and removal. Building and testing do not install system files
 # Verified private dependencies; no system package installation.
 scripts/bootstrap-cairo.sh        # X-free Cairo and SQLite
 scripts/bootstrap-mbedtls.sh      # mbedTLS 3.6.7 LTS
+scripts/bootstrap-webp.sh         # pinned libwebp 1.6.0 static decoder
 scripts/bootstrap-jpeg.sh         # pinned Debian x86-64 libjpeg-turbo package
 scripts/bootstrap-quickjs.sh      # QuickJS 2026-06-04 core, without its OS library
 ./BUILD.sh                       # configure, compile and run the full test suite
@@ -97,6 +98,8 @@ also intended for this machine, rather than as a portable binary distribution.
 - Classic/deferred scripts, DOM text/tree/attribute changes, events and cancelled
   defaults, bounded HTML fragment insertion, promises, timers, text/JSON fetch
   and localStorage/sessionStorage.
+- Navigator metadata, media queries, scroll/resize events and viewport visibility
+  observers, with script-assigned image downloads for lazy-loading galleries.
 - Categorized native settings with editable preferences, persistent per-site script
   choices, console/network diagnostics
   and downloads with progress and cancellation.
@@ -223,7 +226,7 @@ Failures return nonzero; a PNG may still contain an error page. Export dimension
 range from 640×400 through 4096×4096.
 
 Documents and individual page resources are limited to 2 MiB. Pages have at most
-32 resource URLs, three concurrent resource workers, a 20-second resource budget,
+32 resource URLs, three concurrent resource workers, a 20-second resource batch budget,
 and 16 MiB of encoded resources. JS uses a 32 MiB heap, 100 ms turns, bounded jobs
 and a two-second cumulative execution budget. Local files cannot fetch external
 resources or use origin storage. Remote pages cannot navigate to local files or
@@ -233,7 +236,8 @@ Full HTML/CSS/SVG conformance, modules, dynamic scripts, iframes, Shadow
 DOM, file uploads, streaming fetch, service workers, IndexedDB, audio/video, WebGL,
 extensions, HTTP/2/3 and IPv6 remain outside this release. HTML fragments support
 `innerHTML`, `outerHTML` reads and `insertAdjacentHTML`; scripts, stylesheets and
-resource URLs introduced by fragments stay inert. Detailed grammar, quotas and failure behavior are in [COMPATIBILITY.md](COMPATIBILITY.md).
+resource URLs introduced by fragments stay inert until an explicit script image
+source assignment. Detailed grammar, quotas and failure behavior are in [COMPATIBILITY.md](COMPATIBILITY.md).
 
 ## Process boundaries and verification
 

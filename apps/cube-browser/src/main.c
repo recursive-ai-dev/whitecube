@@ -39,6 +39,7 @@ enum resource_state { RESOURCE_EMPTY, RESOURCE_QUEUED, RESOURCE_FETCHING,
 struct resource {
     enum resource_state state;
     unsigned kind;bool notified;
+    double apply_deadline;
     char url[4096];
     struct worker worker;
 };
@@ -249,10 +250,12 @@ static int read_local(int fd,char **html,size_t *size){
 static unsigned local_document_kind(const char *bytes,size_t size,const char *url){
     if(size>=8&&!memcmp(bytes,"\211PNG\r\n\032\n",8))return CB_DOCUMENT_PNG;
     if(size>=3&&(unsigned char)bytes[0]==0xff&&(unsigned char)bytes[1]==0xd8&&(unsigned char)bytes[2]==0xff)return CB_DOCUMENT_JPEG;
+    if(size>=12&&!memcmp(bytes,"RIFF",4)&&!memcmp(bytes+8,"WEBP",4))return CB_DOCUMENT_WEBP;
     char *lower=g_ascii_strdown(url,-1);unsigned kind=CB_DOCUMENT_HTML;
     if(g_str_has_suffix(lower,".png"))kind=CB_DOCUMENT_PNG;
     else if(g_str_has_suffix(lower,".jpg")||g_str_has_suffix(lower,".jpeg"))kind=CB_DOCUMENT_JPEG;
     else if(g_str_has_suffix(lower,".svg"))kind=CB_DOCUMENT_SVG;
+    else if(g_str_has_suffix(lower,".webp"))kind=CB_DOCUMENT_WEBP;
     g_free(lower);return kind;
 }
 static void navigate_request(struct browser*b,const char*input,bool history,bool from_page,const char *body,bool form){
@@ -374,9 +377,11 @@ static void interaction_result(struct browser *b,const struct cb_message *m){
     }
 }
 static void resource_catalog_entry(struct browser *b,const struct cb_message *m){
-    if(m->fd>=0||!b->catalog_pending||m->a!=b->resource_count||m->a>=CB_MAX_RESOURCES||m->b<1||m->b>3){
+    bool dynamic=m->c==1&&!b->catalog_pending&&b->scripts_enabled&&m->b==CB_POLICY_IMAGE;
+    if(m->fd>=0||(!dynamic&&(!b->catalog_pending||m->c))||m->a!=b->resource_count||m->a>=CB_MAX_RESOURCES||m->b<1||m->b>3){
         renderer_failed(b,"Invalid page resource list. Reload to try again.");return;
     }
+    if(dynamic&&!resources_loading(b))b->resource_deadline=now()+20;
     struct resource *r=&b->resources[b->resource_count++];r->kind=m->b;r->worker.socket=-1;
     if(!cb_url_remote(b->url)||!cb_url_remote(m->text)||
        cb_url_input(m->text,b->config.search_engine,r->url,sizeof(r->url))||
@@ -384,19 +389,19 @@ static void resource_catalog_entry(struct browser *b,const struct cb_message *m)
     else r->state=RESOURCE_QUEUED;
 }
 static void resources_pump(struct browser *b){
-    if(now()>=b->resource_deadline){
-        bool awaiting_renderer=b->catalog_pending,timed_out=false;
-        for(unsigned i=0;i<b->resource_count;i++){
-            struct resource *r=&b->resources[i];
-            awaiting_renderer|=r->state==RESOURCE_APPLYING;
+    double current=now();bool expired=current>=b->resource_deadline,timed_out=false;
+    if(expired&&b->catalog_pending){renderer_failed(b,"Page resource discovery exceeded its time limit. Reload to try again.");return;}
+    for(unsigned i=0;i<b->resource_count;i++){
+        struct resource *r=&b->resources[i];
+        if(r->state==RESOURCE_APPLYING&&current>=r->apply_deadline){renderer_failed(b,"Page rendering exceeded its time limit. Reload to try again.");return;}
+        if(expired){
             if(r->state==RESOURCE_QUEUED||r->state==RESOURCE_FETCHING){
                 if(r->state==RESOURCE_FETCHING)stop_worker(&r->worker);
                 r->state=RESOURCE_FAILED;timed_out=true;
             }
         }
-        if(awaiting_renderer){renderer_failed(b,"Page rendering exceeded its time limit. Reload to try again.");return;}
-        if(timed_out){page_status(b);dirty(b);}return;
     }
+    if(timed_out){page_status(b);dirty(b);}
     for(unsigned i=0;i<b->resource_count;i++){
         struct resource *r=&b->resources[i];
         if(r->state!=RESOURCE_FETCHING||!worker_readable(&r->worker))continue;
@@ -410,7 +415,7 @@ static void resources_pump(struct browser *b){
                 struct cb_message data={.type=CB_RESOURCE_DATA,.fd=m.fd,.a=i,.b=r->kind};
                 snprintf(data.text,sizeof(data.text),"%s",mime+1);
                 if(b->render.socket>=0&&!cb_send(b->render.socket,&data)){
-                    r->state=RESOURCE_APPLYING;b->resource_bytes+=(size_t)st.st_size;
+                    r->state=RESOURCE_APPLYING;r->notified=true;r->apply_deadline=now()+20;b->resource_bytes+=(size_t)st.st_size;
                 }
             }
             if(m.fd>=0)close(m.fd);
@@ -427,8 +432,8 @@ static void resources_pump(struct browser *b){
 
     }
     for(unsigned i=0;i<b->resource_count;i++){struct resource *r=&b->resources[i];
-        if(r->kind==3&&r->state==RESOURCE_FAILED&&!r->notified&&b->render.socket>=0){struct cb_message failed={.type=CB_RESOURCE_DATA,.a=i,.b=3,.c=1,.fd=-1};
-            if(!cb_send(b->render.socket,&failed)){r->state=RESOURCE_APPLYING;r->notified=true;}}
+        if(r->state==RESOURCE_FAILED&&!r->notified&&b->render.socket>=0){struct cb_message failed={.type=CB_RESOURCE_DATA,.a=i,.b=r->kind,.c=1,.fd=-1};
+            if(!cb_send(b->render.socket,&failed)){r->state=RESOURCE_APPLYING;r->notified=true;r->apply_deadline=now()+20;}}
     }
     if(launch_failed){page_status(b);dirty(b);}
 }
@@ -462,6 +467,11 @@ static void web_pump(struct browser *b){
         if(network_start(b,&r->worker,job)){struct cb_message out={.type=CB_WEB_RESPONSE,.a=r->id,.fd=-1};cb_send(b->render.socket,&out);r->state=0;}
         else{r->state=2;active++;}
     }
+}
+static void web_cancel(struct browser *b,const struct cb_message *m){
+    if(m->fd>=0||!m->a||m->b||m->c||*m->text||!b->scripts_enabled){renderer_failed(b,"Invalid fetch cancellation.");return;}
+    for(unsigned i=0;i<32;i++){struct web_request *r=&b->web[i];if(r->state&&r->id==m->a){if(r->state==2)stop_worker(&r->worker);r->state=0;return;}}
+    /* A completed response may already be in flight; cancellation is idempotent. */
 }
 static void storage_write(struct browser *b,const struct cb_message *m){
     char *data=NULL;size_t size=0;
@@ -515,7 +525,7 @@ static const struct {const char *name,*help;} settings_info[]={
     {"Browsing history","Open history saved on this device."},
     {"Bookmarks","Open saved bookmarks. Ctrl+D bookmarks the current page."},
     {"New private window","Start a separate window with temporary browsing data."},
-    {"Load images","Allow PNG, JPEG and static SVG, including inline images."},
+    {"Load images","Allow PNG, JPEG, static WebP and SVG, including inline images."},
     {"JavaScript by default","Site exceptions take precedence over this default."},
     {"JavaScript for this site","Save a script exception for the current HTTP(S) origin."},
     {"Allow cookies","Third-party cookies are always blocked. Off blocks all cookies."},
@@ -638,7 +648,7 @@ static void check_worker(struct browser*b,bool network){
     if(network){
         stop_worker(w);
         if(m.type==CB_ERROR)fail_page(b,m.text);
-        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.a>=200&&m.a<=599&&m.b<=CB_DOCUMENT_SVG&&cb_url_remote(m.text)){
+        else if(m.type==CB_DOCUMENT&&m.fd>=0&&m.a>=200&&m.a<=599&&m.b<=CB_DOCUMENT_WEBP&&cb_url_remote(m.text)){
             char checked[4096];if(cb_url_input(m.text,b->config.search_engine,checked,sizeof checked)){close(m.fd);fail_page(b,"Invalid response URL.");return;}
             b->http_status=m.a;
             if(m.b==CB_DOCUMENT_TEXT){char *text=NULL;size_t size;if(cb_read_document(m.fd,&text,&size)==0){char *escaped=cb_html_escape(text);char *html=g_strdup_printf("<html><body><pre>%s</pre></body></html>",escaped);free(text);free(escaped);close(m.fd);m.fd=cb_document_fd(html,strlen(html));g_free(html);}}
@@ -649,13 +659,14 @@ static void check_worker(struct browser*b,bool network){
             int fd=m.fd;m.fd=-1;if(fd<0||document_kind(b,fd,b->url,m.b))fail_page(b,"Could not send the response to the renderer.");
         }else fail_page(b,"Invalid response from network worker.");
     }else if(m.type==CB_WEB_REQUEST){web_request(b,&m);}
+    else if(m.type==CB_WEB_CANCEL){web_cancel(b,&m);}
     else if(m.type==CB_STORAGE_WRITE){storage_write(b,&m);}
     else if(m.type==CB_CONSOLE){if(m.fd<0&&m.a<=2&&!m.b&&!m.c)console_add(b,m.text);else renderer_failed(b,"Invalid console message.");}
     else if(m.type==CB_WEB_STATE){if(m.fd<0&&m.a<=1&&m.b<=1&&!m.c){if(b->script_loading&&m.b)b->script_settle=now()+1;b->script_busy=m.a;b->script_loading=!m.b;}else renderer_failed(b,"Invalid script status.");}
     else if(m.type==CB_WEB_DIRTY){if(m.fd<0&&!m.a&&!m.b&&!m.c)request_layout(b);else renderer_failed(b,"Invalid script repaint request.");}
     else if(m.type==CB_RESOURCE_REQUEST){resource_catalog_entry(b,&m);}
     else if(m.type==CB_RESOURCES_END){
-        if(m.fd>=0||!b->catalog_pending||m.a!=b->resource_count){
+        if(m.fd>=0||!b->catalog_pending||m.a!=b->resource_count||m.b||m.c){
             renderer_failed(b,"Incomplete page resource list.");
         }else{b->catalog_pending=false;page_status(b);}
     }else if(m.type==CB_RESOURCE_DONE){

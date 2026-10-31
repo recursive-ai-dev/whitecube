@@ -1,4 +1,5 @@
 #include "engine-internal.h"
+#include "http.h"
 
 char *cb_engine_decode(const char *s, size_t len) {
     GString *out = g_string_sized_new(len);
@@ -56,6 +57,7 @@ struct node *cb_engine_new_node(struct cb_page *p, struct node *parent, const ch
     g_strlcpy(n->tag, tag, sizeof n->tag);
     n->parent = parent;
     n->resource = SIZE_MAX;
+    if(!strcmp(tag,"img"))n->image_generation=1;
     n->maxlength = VALUE_LIMIT;n->colspan=1;n->rowspan=1;
     if (parent) {
         if (parent->last) parent->last->next = n;
@@ -120,7 +122,7 @@ int cb_page_set_resource(struct cb_page *p, size_t index, const void *bytes, siz
     if(!p || index>=p->resource_count || !bytes)return -1;
     struct resource *resource=&p->resources[index];
     if(resource->kind==CB_RESOURCE_SCRIPT){
-        if(length>1024*1024||memchr(bytes,0,length)||(!cb_engine_mime_is(mime,"text/javascript")&&!cb_engine_mime_is(mime,"application/javascript")))return -1;
+        if(length>1024*1024||memchr(bytes,0,length)||!cb_http_javascript_mime(mime))return -1;
         g_free(resource->css);resource->css=g_utf8_make_valid(bytes,length);resource->css_length=strlen(resource->css);resource->loaded=1;return 0;
     }
     if(resource->kind==CB_RESOURCE_CSS) {
@@ -134,7 +136,7 @@ int cb_page_set_resource(struct cb_page *p, size_t index, const void *bytes, siz
         cb_engine_rebuild_rules(p);return 0;
     }
     if(resource->kind==CB_RESOURCE_IMAGE) {
-        const char *type=cb_engine_mime_is(mime,"image/png")?"image/png":cb_engine_mime_is(mime,"image/jpeg")?"image/jpeg":cb_engine_mime_is(mime,"image/svg+xml")?"image/svg+xml":NULL;
+        const char *type=cb_engine_mime_is(mime,"image/png")?"image/png":cb_engine_mime_is(mime,"image/jpeg")?"image/jpeg":cb_engine_mime_is(mime,"image/svg+xml")?"image/svg+xml":cb_engine_mime_is(mime,"image/webp")?"image/webp":NULL;
         if(!type)return -1;
         char error[128];
         cairo_surface_t *image=cb_image_decode(bytes,length,type,error,sizeof error);
@@ -144,7 +146,7 @@ int cb_page_set_resource(struct cb_page *p, size_t index, const void *bytes, siz
         if(pixels>16u*1024u*1024u-(p->image_pixels-previous)){cairo_surface_destroy(image);return -1;}
         p->image_pixels=p->image_pixels-previous+pixels;
         if(resource->image)cairo_surface_destroy(resource->image);
-        resource->image=image;return 0;
+        resource->image=image;resource->loaded=1;return 0;
     }
     return -1;
 }
@@ -191,6 +193,17 @@ unsigned cb_engine_parse_maxlength(const char *value,size_t length) {
 }
 
 void cb_engine_init_controls(struct cb_page *p, struct node *n);
+
+/* Data blocks stay in the DOM without entering the executable script queue. */
+static int script_kind(GHashTable *attrs){
+    const char *type=attrs?g_hash_table_lookup(attrs,"type"):NULL;
+    const char *language=attrs?g_hash_table_lookup(attrs,"language"):NULL;
+    char *value=type?g_strdup(type):language&&*language?g_strconcat("text/",language,NULL):g_strdup("text/javascript");
+    if(!*value){g_free(value);return 1;}
+    int kind=!g_ascii_strcasecmp(value,"module")?2:!g_ascii_strcasecmp(value,"importmap")?3:!g_ascii_strcasecmp(value,"speculationrules")?4:0;
+    if(!kind){g_strstrip(value);if(cb_javascript_mime(value,strlen(value)))kind=1;}
+    g_free(value);return kind;
+}
 
 struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url) {
     if (!html) return NULL;
@@ -303,18 +316,23 @@ struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url
             while (end && cb_engine_name_char(end[strlen(closer)])) end = cb_engine_find_ci(end + 2, closer);
             if (!end) end = s + strlen(s);
             if (!overflow && !strcmp(tag, "style") && !scratch.disabled && cb_engine_screen_media(scratch.media)) cb_engine_add_css_media(p,s,(size_t)(end-s),scratch.media);
-            if(!overflow&&p->script_count<64&&!strcmp(tag,"script")){
+            if(!overflow&&!strcmp(tag,"script")){
                 struct node *n=cb_engine_new_node(p,stack[depth],tag);
-                if(n){n->attrs=scratch.attrs;scratch.attrs=NULL;struct node *text=cb_engine_new_node(p,n,"#text");
+                if(n){n->attrs=scratch.attrs;scratch.attrs=NULL;n->id=scratch.id;scratch.id=NULL;n->classes=scratch.classes;scratch.classes=NULL;
+                    struct node *text=cb_engine_new_node(p,n,"#text");
                     size_t length=(size_t)(end-s);if(text)text->text=g_utf8_make_valid(s,length);
-                    const char *type=n->attrs?g_hash_table_lookup(n->attrs,"type"):NULL;
-                    struct page_script *script=&p->scripts[p->script_count++];script->node=n;script->resource=SIZE_MAX;
-                    script->unsupported=(type&&*type&&g_ascii_strcasecmp(type,"text/javascript")&&g_ascii_strcasecmp(type,"application/javascript"))||length>1024*1024-p->script_bytes;
-                    script->defer=n->attrs&&g_hash_table_contains(n->attrs,"defer");
-                    if(n->attrs&&g_hash_table_contains(n->attrs,"async"))script->defer=1;
-                    if(!script->unsupported&&scratch.src)script->resource=cb_engine_discover_resource(p,CB_RESOURCE_SCRIPT,scratch.src);
-                    else if(!script->unsupported){script->source=g_utf8_make_valid(s,length);p->script_bytes+=length;}
-                    if(scratch.src&&script->resource==SIZE_MAX)script->unsupported=1;
+                    int kind=script_kind(n->attrs);
+                    if(kind&&p->script_count>=64)p->script_overflow=1;
+                    else if(kind){
+                        struct page_script *script=&p->scripts[p->script_count++];script->node=n;script->resource=SIZE_MAX;
+                        script->error=kind==2?"JavaScript modules are unsupported":kind==3?"Import maps are unsupported":kind==4?"Speculation rules are unsupported":NULL;
+                        if(!script->error&&length>1024*1024-p->script_bytes&&!scratch.src)script->error="Inline script byte limit exceeded (1 MiB per document)";
+                        script->defer=n->attrs&&g_hash_table_contains(n->attrs,"defer");
+                        if(n->attrs&&g_hash_table_contains(n->attrs,"async"))script->defer=1;
+                        if(!script->error&&scratch.src){script->resource=cb_engine_discover_resource(p,CB_RESOURCE_SCRIPT,scratch.src);
+                            if(script->resource==SIZE_MAX)script->error="External script URL refused or resource limit exceeded";
+                        }else if(!script->error){script->source=g_utf8_make_valid(s,length);p->script_bytes+=length;}
+                    }
                 }
             }
             if (!overflow && !strcmp(tag, "title")) {
@@ -364,7 +382,7 @@ struct cb_page *cb_page_parse(const char *html, size_t len, const char *base_url
                 n->colspan=scratch.colspan;n->rowspan=scratch.rowspan;
                 if(!strcmp(tag,"img")){
                     if(scratch.src&&!g_ascii_strncasecmp(scratch.src,"data:",5)){n->src=scratch.src;scratch.src=NULL;}
-                    else n->resource=cb_engine_discover_resource(p,CB_RESOURCE_IMAGE,scratch.src);
+                    else {n->resource=cb_engine_discover_resource(p,CB_RESOURCE_IMAGE,scratch.src);n->image_pending=scratch.src&&n->resource==SIZE_MAX;}
                 }
                 if(!strcmp(tag,"link") && scratch.rel && !scratch.disabled && p->sheet_count<STYLESHEET_LIMIT) {
                     char *rel=g_ascii_strdown(scratch.rel,-1);

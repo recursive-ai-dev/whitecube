@@ -72,7 +72,8 @@ class AppLaunch(unittest.TestCase):
                                 self.skipTest('Midnight Commander is not installed')
                             client = subprocess.Popen(command, env=environment, stdout=app_log, stderr=app_log)
                             try:
-                                deadline = time.monotonic() + 8
+                                # A fresh GTK/font cache can outlast the short socket deadline.
+                                deadline = time.monotonic() + 20
                                 while True:
                                     lines = layout.read_text().splitlines()
                                     rows = [line.split() for line in lines if line.startswith('W ')]

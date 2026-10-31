@@ -28,7 +28,8 @@ struct cb_page *cb_page_from_image(const void *bytes, size_t length,
 void cb_page_set_images_enabled(struct cb_page *page, int enabled);
 void cb_page_set_policy(struct cb_page *page,const char *policy);
 void cb_page_add_css(struct cb_page *page, const char *css, size_t len);
-/* Immutable discovery list: at most 32 unique HTTP(S) resources. No I/O here. */
+/* Append-only list: at most 32 unique HTTP(S) resources across initial discovery
+ * and explicit script image assignments. No I/O here. */
 size_t cb_page_resource_count(const struct cb_page *page);
 int cb_page_resource(const struct cb_page *page, size_t index, int *kind, const char **url);
 /* Copies CSS or decodes an image. Call layout again after a successful update. */

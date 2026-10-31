@@ -5,7 +5,7 @@
 #include <string.h>
 
 int main(void){
-    struct cb_media_env e={800,600,0,0};
+    struct cb_media_env e={800,600,0,0,1};
     const char *matches[]={NULL,"","  ","all","screen","SCREEN","only screen",
         "not print","not unknown","(width:800px)","(min-width:800px)","(max-width:800px)",
         "screen and (min-width:50em) and (max-height:37.5rem)","(min-height:6e2px)",
@@ -32,6 +32,12 @@ int main(void){
     for(size_t i=0;i<sizeof misses/sizeof misses[0];i++){
         if(cb_media_matches(misses[i],&e)){fprintf(stderr,"Unexpected match: %s\n",misses[i]);return 1;}
     }
+    assert(cb_media_matches("(hover:hover) and (pointer:fine) and (prefers-color-scheme:light)",&e));
+    assert(!cb_media_matches("(pointer:coarse), (hover:none), (prefers-color-scheme:dark)",&e));
+    assert(cb_media_matches("(resolution:96dpi) and (resolution:1dppx)",&e));
+    assert(!cb_media_matches("not (hover:coarse), not (pointer:dark), (resolution:0x1p0dppx)",&e));
+    e.resolution=2;assert(cb_media_matches("(min-resolution:192dpi) and (max-resolution:2dppx)",&e));
+    assert(!cb_media_matches("(resolution:1dppx), (resolution:1), (resolution:nandppx)",&e));
     e.width=600;e.height=600;e.reduced_motion=e.strong_contrast=1;
     assert(cb_media_matches("(orientation:portrait)",&e));
     assert(cb_media_matches("(prefers-reduced-motion) and (prefers-contrast:more)",&e));

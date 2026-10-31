@@ -1,5 +1,92 @@
 # Cube Browser validation
 
+## 0.11.0 / Whitecube 0.10.0 release gate
+
+The Debian 13 amd64 release build passes all 24 non-Wayland suites, including
+real resource timeout/recovery, cancellation, event/quota, observer records,
+image-interface, computed-style, WebP and C-compiler round-trip checks. The final
+inline-image percentage-width path also passes the native DOM regression.
+
+All 13 browser component suites pass ASan/UBSan with the QuickJS core rebuilt
+with instrumentation in the Debian builder. The three affected compositor,
+workspace and hotplug suites also pass ASan/UBSan. Leak detection is disabled
+explicitly; these results make no leak-check claim.
+
+Whitecube passes all 13 native core suites. Native GUI checks cover trainer
+pages and benchmark capture, editor pages, Qt workspace management, Cube Strap,
+application IDs/restored placements and the four file tools. The latest Qt run
+passes 232 tests with one explicit optional QtTest skip; all 61 packaging tests
+and 52 command-suite tests pass. Release validation fixed cache creation in the
+Qt entry points and made screenshot capture wait for a drawable frame.
+
+The corpus gate renders 10 deterministic documents at two widths: 20 PNGs with
+text assertions and profile nonpersistence checks. Median render time in this
+run is 514.63 ms, a local smoke measurement rather than a portable benchmark.
+The native Wayland workflow passes against the rebuilt floating compositor:
+300 submitted buffers and 299 releases in the recorded run. It exercises actual
+End-key lazy loading, rendered pixels, navigation, zoom, forms, cookies/cache,
+bookmarks, settings persistence, downloads, anchors and renderer crash recovery.
+
+The optimized standalone Debian package passes four extracted-archive checks,
+including relocation into a path with spaces, private-library resolution,
+license/metadata checks, sandboxed worker discovery and headless text/PNG output.
+The Linux archive passes SHA-256 payload verification, relocated JavaScript and
+image export checks. Two conversions of the same Debian package are byte-for-byte
+identical. Final archives are built from the recorded release source commit;
+clean-build provenance is checked against immutable Git objects. Source changes
+during building or packaging reject the candidate archive.
+
+Evidence is retained in `build/floating-browser-release.log`,
+`build/floating-final-browser-sanitizers.log`,
+`build/floating-latest-desktop-checks.log` and `build/release-0.10.0/`.
+The published verification report records the final desktop archive, installation
+lifecycle and installed-runtime checks. Reproduce that gate with:
+
+```sh
+python3 -I tools/verify-release.py --deb packaging/out/whitecube-desktop_0.10.0_amd64.deb \
+  --previous-deb packaging/out/whitecube-desktop_0.9.6_amd64.deb \
+  --output build/whitecube-0.10.0-verification
+```
+
+These are isolated fixtures, not a test of the unidentified public gallery.
+Physical displays, hardware acceleration, complete web-platform compatibility
+and modules remain outside these results. See COMPATIBILITY.md for limits.
+
+## Earlier development checks
+
+## 2026-10-31 runtime and lazy-image checks
+
+The local build passes 22 non-Wayland Meson suites, including 22 HTTP web-API
+cases. New coverage checks Navigator/location metadata, readable inert JSON and
+template blocks, legacy JavaScript MIME aliases, separate module/quota messages,
+source stacks, scroll/zoom geometry, media-query changes, observer limits,
+animation callbacks, dynamic image downloads and cached-image load events.
+Image requests retain CSP, settings, local-file restrictions and the shared
+32-resource quota. Adversarial renderer tests reject late scripts/stylesheets,
+out-of-order resource indices and invalid request flags.
+
+The native Wayland workflow passes with the existing extracted Weston 14.0.2.
+Its lazy-gallery fixture verifies that an offscreen image is not fetched until a
+real End-key scroll, then checks the request, load event and painted pixels.
+Screenshot: `build/lazy-image-e2e/wayland-lazy-image.png`. The accessibility-scale
+check now waits for the actual title-bar boundary rather than an arbitrary
+pending repaint. The adjacent Whitecube compositor cannot start on this host
+because its `libdisplay-info.so.2` dependency is unavailable, so the supported
+Weston path supplies native presentation coverage.
+
+All 13 component suites also pass under ASan/UBSan with the QuickJS core rebuilt
+for instrumentation. This run uses `CUBE_SANITIZER_LEAKS=0` and makes no leak-check
+claim. These are deterministic local fixtures; the reported public gallery was
+not identified by URL or tested directly. Modules, complete browser APIs and
+general heavy-site compatibility remain outside these results.
+
+```sh
+meson compile -C build
+meson test -C build --no-suite integration --print-errorlogs
+python3 scripts/e2e.py --browser build/cube-browser --weston-dir .deps/weston --artifacts build/lazy-image-e2e
+CUBE_SANITIZER_LEAKS=0 scripts/check-sanitizers.sh
+```
+
 ## 0.10.1 image and configuration checks
 
 The prepared Debian 13 builder runs all 23 browser suites, including real

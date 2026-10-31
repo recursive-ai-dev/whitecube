@@ -5,7 +5,8 @@
 #include <string.h>
 #include <stdio.h>
 static unsigned errors,logs;
-static void output(void *data,unsigned level,const char *message){(void)data;assert(message);if(level==2)errors++;else logs++;}
+static char last_error[2048];
+static void output(void *data,unsigned level,const char *message){(void)data;assert(message);if(level==2){errors++;snprintf(last_error,sizeof last_error,"%s",message);}else logs++;}
 static void run(struct cb_js *j,const char *source,const char *expected){char *out=NULL;assert(!cb_js_eval(j,source,strlen(source),"test.js",&out));assert(out&&!strcmp(out,expected));free(out);}
 int main(void){
     /* ASan's signal/proc hooks cannot run under the production syscall filter.
@@ -24,7 +25,17 @@ int main(void){
     run(j,"let done=0;Promise.resolve(4).then(v=>done=v);done","0");assert(!cb_js_jobs(j));run(j,"done","4");
     run(j,"typeof std+':'+typeof os+':'+typeof process+':'+typeof SharedArrayBuffer","\"undefined:undefined:undefined:undefined\"");
     run(j,"console.log('bounded console');true","true");assert(logs==1);
-    assert(cb_js_eval(j,"throw new Error('expected')",strlen("throw new Error('expected')"),"error.js",NULL));assert(errors);assert(cb_js_memory(j)<32u*1024u*1024u);cb_js_free(j);
+    assert(cb_js_eval(j,"throw new Error('expected')",strlen("throw new Error('expected')"),"error.js",NULL));assert(errors);assert(strstr(last_error,"error.js:1"));
+    run(j,"console.error(new Error('logged'));true","true");assert(strstr(last_error,"test.js:1"));
+    run(j,"const hiddenStack=new Error('getter');Object.defineProperty(hiddenStack,'stack',{get(){throw Error('stack getter')}});console.error(hiddenStack);1+1","2");
+    assert(!strcmp(last_error,"Error: getter"));
+    unsigned before=errors;
+    run(j,"Promise.reject(new Error('handled')).catch(()=>{});true","true");assert(errors==before);
+    assert(!cb_js_jobs(j));assert(errors==before);
+    run(j,"Promise.reject(new Error('unhandled'));true","true");assert(errors==before);
+    assert(!cb_js_jobs(j));assert(errors==before+1&&strstr(last_error,"Unhandled promise rejection: Error: unhandled")&&strstr(last_error,"test.js:1"));
+    run(j,"Promise.reject({toString(){throw Error('conversion')}});true","true");assert(!cb_js_jobs(j));assert(strstr(last_error,"Reason could not be converted"));run(j,"1+1","2");
+    assert(cb_js_memory(j)<32u*1024u*1024u);cb_js_free(j);
     j=cb_js_new((struct cb_js_host){.log=output},0);assert(j);
     assert(cb_js_eval(j,"eval('1')",strlen("eval('1')"),"eval.js",NULL));assert(cb_js_eval(j,"(()=>{}).constructor('return 1')()",strlen("(()=>{}).constructor('return 1')()"),"eval.js",NULL));
     run(j,"1+1","2");assert(cb_js_eval(j,"while(true){}",strlen("while(true){}"),"runaway.js",NULL));assert(cb_js_failed(j));cb_js_free(j);

@@ -1,5 +1,23 @@
 #include "http.h"
 #include <string.h>
+#include <strings.h>
+int cb_javascript_mime(const char *value,size_t length){
+    /* https://mimesniff.spec.whatwg.org/#javascript-mime-type */
+    static const char *const types[]={"application/ecmascript","application/javascript",
+        "application/x-ecmascript","application/x-javascript","text/ecmascript","text/javascript",
+        "text/javascript1.0","text/javascript1.1","text/javascript1.2","text/javascript1.3",
+        "text/javascript1.4","text/javascript1.5","text/jscript","text/livescript",
+        "text/x-ecmascript","text/x-javascript"};
+    if(!value)return 0;
+    for(size_t i=0;i<sizeof types/sizeof *types;i++)if(length==strlen(types[i])&&!strncasecmp(value,types[i],length))return 1;
+    return 0;
+}
+int cb_http_javascript_mime(const char *value){
+    if(!value)return 0;
+    value+=strspn(value," \t\r\n\f");size_t length=strcspn(value,";");
+    while(length&&strchr(" \t\r\n\f",value[length-1]))length--;
+    return cb_javascript_mime(value,length);
+}
 static int bounded(const char *s,size_t n,int multiline){
     if(!memchr(s,0,n))return 0;
     for(;*s;s++)if((unsigned char)*s<32&&!(multiline&&(*s=='\n'||*s=='\t')))return 0;

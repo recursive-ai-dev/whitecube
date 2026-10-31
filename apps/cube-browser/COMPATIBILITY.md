@@ -124,6 +124,15 @@ constructors. Selected language cases, promise jobs, exceptions, runaway code an
 allocation limits are tested; this is not a claim that the full Test262 suite has
 been run. Upstream API reference: <https://bellard.org/quickjs/quickjs.html>.
 
+The classic queue admits 64 scripts and 1 MiB of inline source per document.
+JavaScript type attributes accept the standard MIME essence aliases, including
+legacy `language` declarations; external responses also allow MIME parameters.
+JSON, JSON-LD and template data blocks remain queryable DOM nodes without
+executing, fetching `src`, consuming execution slots or producing warnings.
+Unsupported modules, import maps, speculation rules and script quotas report
+distinct reasons. Error diagnostics include available script URLs, line numbers
+and stacks within the existing console bound.
+
 ## DOM and asynchronous APIs
 
 Pages can use stable Element/Text objects, selectors from the CSS subset,
@@ -137,6 +146,29 @@ sibling traversal and descendant tag/class collections return snapshots. DOM
 `textContent` includes hidden descendants and is bounded by the 1 MiB host result
 limit, rather than the smaller form-value bound.
 
+`navigator` and `clientInformation` share a `Navigator` identity object with
+string identification fields, fixed `en-US` language preferences, Linux platform,
+zero touch points and one exposed execution thread. Its user agent matches the
+network worker's `cube-browser/<series>` header. Unsupported capability APIs such
+as service workers and clipboard remain absent. `location` includes `host` and
+serialized `origin`, with opaque local origins reported as `"null"`.
+
+`getBoundingClientRect`/`getClientRects`, viewport dimensions, vertical scroll
+offsets and document scroll height use CSS pixels at the current zoom. Native
+viewport changes dispatch scroll/resize events. `matchMedia` shares the CSS media
+query subset and supports change listeners, with 128 query lists per document.
+`requestAnimationFrame` uses the bounded timer queue with a monotonic timestamp;
+it is a timer-backed approximation rather than display-synchronized scheduling.
+
+`IntersectionObserver` supports the viewport root, pixel/percentage root margins,
+up to 128 sorted thresholds, observe/unobserve/disconnect and initial/threshold
+notifications after native layout. There are at most 64 active observers and
+1024 observed targets in total. Delivery occurs during viewport updates;
+`takeRecords` is empty after synchronous delivery at that checkpoint. Element
+roots, nested scroll containers, partial ancestor clipping and visibility tracking
+are outside this subset. See the reference
+[Intersection Observer specification](https://www.w3.org/TR/intersection-observer/).
+
 `innerHTML` reads and replaces an element's children; `outerHTML` is read-only.
 `insertAdjacentHTML` and `insertAdjacentElement` support all four positions.
 HTML insertion uses the browser's bounded recovery parser, without the complete
@@ -149,12 +181,24 @@ serialization escapes text/attributes, preserves relative attribute URLs, emits
 attribute names in sorted order and rejects output over 128 KiB.
 
 Fragment scripts are inert. Styles/title declarations and external resource
-catalogs from fragments are discarded; inserted images do not fetch new resources.
+catalogs from fragments are discarded; insertion alone does not fetch new resources.
 Inline style attributes still use the normal cascade and CSP checks. Inline event
 attributes are not evaluated. DOMContentLoaded follows the ordered classic/deferred
 script queue. Scripts run after HTML parsing; parser-blocking `document.write`,
 modules, dynamic script execution, live collections, iframes, Shadow DOM and full
 CSSOM remain unsupported. Async script attributes use the deferred queue.
+
+Explicit `img.src`/`setAttribute('src',...)` assignments can fetch images, including
+on `new Image()` or fragment-created elements. These append image-only requests to
+the trusted UI's resource list; script and stylesheet requests cannot use this
+path. Initial and dynamic requests share the 32-URL/16-MiB document lifetime
+quotas and three-worker concurrency limit. An idle batch receives a new 20-second
+deadline. The UI checks CSP, image preferences, remote URL restrictions and
+redirect policies as for initial resources; local documents cannot start remote
+image requests. Load/error events and complete/natural dimensions are exposed for
+network image responses. Source replacement retains old requests in the lifetime
+quota. Dynamic data images reuse the existing decoder and policy/pixel limits.
+Responsive `srcset` and dynamically executed scripts remain unsupported.
 
 Promises and function-only timers run within interpreter budgets (64 active timers,
 16 timer callbacks per turn). Fetch supports GET with omit/same-origin credentials,
@@ -235,14 +279,14 @@ currently removes spacing while keeping individual cell borders.
 
 ## Image documents and inline images
 
-HTTP(S) PNG, JPEG and restricted static SVG image URLs open directly as image
+HTTP(S) PNG, JPEG, static WebP and restricted static SVG image URLs open directly as image
 pages. The original sealed response is decoded once by the renderer, without a
 second fetch or an HTML interpretation of its bytes. Image pages run no scripts.
-Local PNG/JPEG files are recognized by signature or extension; local SVG files
-use the `.svg` extension. Additional formats (including GIF, WebP and AVIF) remain
+Local PNG/JPEG/WebP files are recognized by signature or extension; local SVG files
+use the `.svg` extension. Additional formats (including GIF and AVIF) remain
 unsupported. Local files retain the 2 MiB cap and symlink refusal.
 
-`<img src="data:...">` supports explicit `image/png`, `image/jpeg` and
+`<img src="data:...">` supports explicit `image/png`, `image/jpeg`, `image/webp` and
 `image/svg+xml` MIME types, either with `;base64` or percent-encoded bytes. These
 images use no network or file access and also work in local HTML documents.
 The existing 8192-byte attribute limit bounds each data URL; at most 32 inline
@@ -269,3 +313,47 @@ then scaled with the page. XML elements, depth, shapes, coordinates, gradient
 stops and estimated painting work have separate limits, alongside the existing
 2 MiB/4096-dimension/8-million-pixel image budgets. Full SVG compatibility is still
 on the roadmap.
+
+## Runtime improvements in 0.11.0
+
+Static WebP uses a private libwebp 1.6.0 decoder. Its upstream archive SHA-256 is
+`e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564`.
+Only complete single-frame RIFF files are accepted; animations are refused.
+Existing 2 MiB encoded, 4096-dimension and 8-million-pixel per-image limits apply.
+Declared width/height and supported positive `aspect-ratio` reserve image space
+before decoding. Missing and failed images keep a clipped alt-text placeholder.
+
+`getComputedStyle(element)` returns a live read-only CSSStyleDeclaration subset
+from the engine's cascade, including inherited colors/fonts, resolved variables,
+box dimensions, lengths and supported flex properties. Dimensions use CSS pixels
+independent of zoom. Unsupported properties return an empty string; unsupported
+pseudo-elements throw NotSupportedError. This is not a complete CSSOM. Percentage
+margin/padding values remain serialized percentages. Detached styles are empty.
+
+DOM replaceChild validates parentage, cycles and depth before mutation. Replacing
+a node with itself succeeds without removal. cloneNode copies bounded attributes
+and optional descendants into detached nodes; it does not copy event listeners,
+script slots or image resource grants. Explicit later image src assignment can
+request a resource through the existing policy path.
+
+Events support redispatch, once/passive/capture, abortable listeners and the
+legacy Event/CustomEvent initialization interfaces. Listener registration counts
+change only after successful registration and removal. AbortController/AbortSignal
+cancel GET fetches and remove native queued/running work; timeout signals accept
+0–60000 ms. Other fetch restrictions still apply. Rejections are reported only
+after the job checkpoint if they remain unhandled, with a bounded 128-entry queue.
+
+IntersectionObserver supports viewport roots, px/% margins bounded to one million
+units, 128 finite thresholds, 64 active observers and 1024 total observed targets.
+It uses edge-inclusive intersections, ratio 1 for intersecting zero-area targets,
+and queues records for the job checkpoint. takeRecords drains queued entries;
+disconnect clears pending entries and cancels delivery. Partially clipped ancestor
+geometry is not fully modeled. matchMedia retains only lists with change
+subscriptions (up to 128 active lists); unused query results do not exhaust a
+lifetime quota. Desktop input reports fine pointer/hover, the page's light color
+scheme, and resolution in dppx/dpi/dpcm using effective page zoom.
+
+Location getters read the native current URL, including same-document fragments,
+default ports and encoded file paths. Scripted navigation remains unsupported.
+Images have a distinct HTMLImageElement prototype and CSS-pixel width/height,
+currentSrc, complete and natural dimension properties.

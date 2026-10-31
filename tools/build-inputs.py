@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BUILDER_RECIPES = ('tools/build-debian.sh', 'tools/build-inputs.py', 'tools/prepare-native-deps.sh',
                    'apps/cube-browser/scripts/bootstrap-cairo.sh',
                    'apps/cube-browser/scripts/bootstrap-jpeg.sh',
+                   'apps/cube-browser/scripts/bootstrap-webp.sh',
                    'apps/cube-browser/scripts/bootstrap-quickjs.sh',
                    'apps/cube-browser/scripts/bootstrap-mbedtls.sh',
                    'apps/cube-player/scripts/bootstrap.sh')

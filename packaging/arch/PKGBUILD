@@ -2,7 +2,7 @@
 pkgname=whitecube-desktop
 pkgver=$(tr -d '[:space:]' < "${WHITECUBE_SRC:?set WHITECUBE_SRC}/packaging/VERSION")
 pkgrel=1
-pkgdesc='Pure-Wayland tabbed cube desktop (no X server, no XWayland)'
+pkgdesc='Pure-Wayland floating stacking cube desktop (no X server, no XWayland)'
 arch=(x86_64)
 url='https://github.com/recursive-ai-dev/whitecube'
 license=(custom)

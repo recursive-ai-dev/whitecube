@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Verify an actual .deb and exercise it after extraction, without installing it."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -62,7 +63,8 @@ class DebianPackageTest(unittest.TestCase):
         for name in ("COPYING", "NOTICE", "copyright", "README.md", "README.Debian",
                      "licenses/quickjs-LICENSE", "licenses/mbedtls-LICENSE",
                      "licenses/libjpeg-turbo-copyright", "licenses/nanosvg-LICENSE",
-                     "licenses/COPYING-LGPL-2.1", "licenses/sqlite-PUBLIC-DOMAIN"):
+                     "licenses/COPYING-LGPL-2.1", "licenses/sqlite-PUBLIC-DOMAIN",
+                     "licenses/webp-COPYING", "licenses/webp-PATENTS"):
             self.assertTrue((docs / name).is_file(), name)
         # No maintainer scripts or machine-specific profile changes.
         self.assertFalse(any((self.control / script).exists() for script in ("postinst", "postrm", "preinst", "prerm")))
@@ -76,6 +78,28 @@ class DebianPackageTest(unittest.TestCase):
         for line in (self.control / "md5sums").read_text().splitlines():
             digest, relative = line.split("  ", 1)
             self.assertEqual(hashlib.md5((self.tree / relative).read_bytes()).hexdigest(), digest, relative)
+
+    def test_provenance_identifies_the_exact_browser_source(self):
+        data=json.loads((self.tree/'usr/share/doc/cube-browser/build.json').read_text())
+        self.assertEqual(data['version'],(ROOT/'VERSION').read_text().strip())
+        self.assertEqual(data['architecture'],'amd64')
+        self.assertTrue(data['build_options']['lto'])
+        self.assertEqual(data['dependencies']['libwebp'],'1.6.0')
+        sources=data['sources']
+        self.assertEqual(data['source_sha256'],hashlib.sha256(json.dumps(sources,sort_keys=True,separators=(',',':')).encode()).hexdigest())
+        source=data['source']
+        revision=source['commit'] if source['dirty'] is False else None
+        if revision:
+            self.assertRegex(revision,r'^[0-9a-f]{40}$')
+            self.assertIsInstance(source['prefix'],str)
+        for relative,digest in sources.items():
+            path=ROOT/relative
+            self.assertTrue(path.resolve().is_relative_to(ROOT.resolve()))
+            # A release remains verifiable after a later documentation commit.
+            # Clean builds must identify the exact immutable Git source object.
+            content=(subprocess.check_output(['git','show',revision+':'+source['prefix']+relative],cwd=ROOT)
+                     if revision else path.read_bytes())
+            self.assertEqual(hashlib.sha256(content).hexdigest(),digest,relative)
 
     def test_private_library_and_no_checkout_runtime_paths(self):
         for name in ("cube-browser", "cube-renderd"):

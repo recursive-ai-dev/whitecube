@@ -5,11 +5,11 @@ in the main README, then run:
 
 ```sh
 python3 packaging/build-deb.py
-python3 tests/test_package.py dist/cube-browser_0.10.1_amd64.deb
+python3 tests/test_package.py dist/cube-browser_0.11.0_amd64.deb
 ```
 
 The builder uses Debian system development tools and libraries, the pinned
-private X-free Cairo, and static SQLite, JPEG, QuickJS and Mbed TLS. It builds
+private X-free Cairo, and static SQLite, JPEG, WebP, QuickJS and Mbed TLS. It builds
 in `build-deb/`, runs the unit and worker tests, and writes an architecture-specific
 archive and SHA-256 file to `dist/`. Tests run sequentially to avoid competing
 with the browser's short JavaScript execution budgets. It requires `dpkg-dev` and
@@ -22,7 +22,7 @@ parallelism. No system files or running desktop session are changed by building.
 Install the built archive with:
 
 ```sh
-sudo apt install ./dist/cube-browser_0.10.1_amd64.deb
+sudo apt install ./dist/cube-browser_0.11.0_amd64.deb
 ```
 
 Start **Cube Browser** from the application menu or run `cube-browser`. The menu
@@ -60,3 +60,23 @@ The builder fixes timestamps and ownership, strips debug information, normalizes
 source paths in compiler output and emits sorted checksums. To verify a release,
 run it twice with the same source, toolchain, dependencies and timestamp, then
 compare SHA-256 files.
+
+## Relocatable Linux archive
+
+After building and testing the Debian package:
+
+```sh
+python3 packaging/build-tar.py dist/cube-browser_0.11.0_amd64.deb
+python3 tests/test_tar.py dist/cube-browser-0.11.0-linux-amd64.tar.xz
+```
+
+Extract the archive anywhere and run its top-level `cube-browser` launcher.
+All three executables, private Cairo, upstream licenses and documentation are
+included. System library requirements match the Debian package; this is not a
+fully static distribution. `build.json` records source-file hashes, pinned
+versions, toolchain and SOURCE_DATE_EPOCH. Clean Git builds also record their
+immutable source commit; verification uses that commit even after later tracking
+documentation changes. Source changes during building or packaging reject the
+candidate archive. The archive contains SHA256SUMS for
+every regular payload file. Repeating conversion of the same Debian package is
+byte-for-byte deterministic. Neither builder installs software on the host.

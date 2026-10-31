@@ -1,12 +1,14 @@
-WHITE CUBE / SPACE DESKTOP
+WHITE CUBE / FLOATING SPACE DESKTOP
+Windows float and overlap: click to raise, drag a supported title bar to move,
+or hold Alt and left-drag anywhere. Alt+right-drag resizes the window.
 Click Apps (top left) for the app menu: categories, type to search, Enter to
 launch, Esc to close. Click the Wi-Fi box (top right) for network settings, the clock for quick
 settings (volume, brightness, Wi-Fi, lock, power). Super or Alt+Space opens the
-app menu. All windows are grouped under one "N tabs" button for this workspace.
-Click it or press Alt+G to list every tab: click a row to switch, its x or middle-click
+app menu. The "N windows" button lists the floating windows on this workspace.
+Click it or press Alt+G to list every window: click a row to switch, its x or middle-click
 to close, wheel to scroll, Escape or a click elsewhere to dismiss. Arrow keys,
 Tab/Shift+Tab, Home/End and PageUp/PageDown select rows; Enter switches, Delete closes.
-The list opens at the focused window; hidden windows are marked. Empty workspaces show "0 tabs".
+The list opens at the focused window; hidden windows are marked. Empty workspaces show "0 windows".
 
 Hold Alt with a key:
   F1..F4  Coding / Play / Monitor / Browse workspace
@@ -16,15 +18,15 @@ Hold Alt with a key:
   v       show desktop / restore windows
   c       living field controls (real 2D and 3D automata)
   w       open the browser desktop and project shelf
-  g       open / close the grouped tab list
+  g       open / close the grouped window list
   s       settings: network, display, appearance, keyboard, sound, power, system
   Enter   terminal (foot)
   t       chat panel (focus or start cube-chat in this workspace)
   d       launcher (fuzzel)
   h       this help
   a       keyboard display preferences, native workspace names and recovery
-  Tab / Shift+Tab  next / previous visible tab
-  1..9    jump to a tab in this workspace (also reveals hidden panels)
+  Tab / Shift+Tab  next / previous visible window
+  1..9    jump to a window in this workspace (also reveals hidden panels)
   Shift+arrows  move focused window within the work area
   Ctrl+arrows   resize focused window within the work area
   left-drag    move the window under the pointer (hold Alt)

@@ -196,7 +196,11 @@ class AppTests(unittest.TestCase):
         response = (f'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {len(document)}\r\n\r\n'.encode() + document)
         for fault, message in (('unsolicited-submit', 'Invalid interaction response'),
                                ('unsolicited-copy', 'Invalid interaction response'),
-                               ('unsolicited-link', 'unsolicited navigation')):
+                               ('unsolicited-link', 'unsolicited navigation'),
+                               ('resource-script', 'Invalid page resource list'),
+                               ('resource-css', 'Invalid page resource list'),
+                               ('resource-index', 'Invalid page resource list'),
+                               ('resource-flags', 'Invalid page resource list')):
             with self.subTest(fault=fault), serve({'/page': response, '/unrequested': response}) as (server, url):
                 helper.write_text((ROOT/'tests/faulty_renderer.py').read_text().replace("os.environ['CB_TEST_FRAME_FAULT']", repr(fault)).replace("os.environ['CB_TEST_ACTION_URL']", repr(url+'/unrequested')))
                 result = subprocess.run([str(app/'cube-browser'), '--dump', url+'/page'],

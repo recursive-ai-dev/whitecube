@@ -12,6 +12,7 @@ import threading
 import json
 import math
 import tempfile
+import time
 from pathlib import Path
 
 import gi
@@ -124,13 +125,29 @@ def apply_theme():
 
 
 def screenshot(window: Gtk.Window, path: str) -> None:
-    w, h = window.get_width(), window.get_height()
+    # Page transitions and configure acknowledgements can temporarily leave a
+    # mapped widget without a render node. Wait for actual frame readiness.
     paintable = Gtk.WidgetPaintable.new(window)
-    snap = Gtk.Snapshot()
-    paintable.snapshot(snap, w, h)
-    node = snap.to_node()
-    texture = window.get_native().get_renderer().render_texture(node, None)
-    texture.save_to_png(path)
+    context = GLib.MainContext.default()
+    deadline = time.monotonic() + 2
+    while True:
+        w, h = window.get_width(), window.get_height()
+        native = window.get_native()
+        renderer = native.get_renderer() if native else None
+        if renderer and window.get_mapped() and w > 0 and h > 0:
+            snap = Gtk.Snapshot()
+            paintable.snapshot(snap, w, h)
+            node = snap.to_node()
+            if node is not None:
+                texture = renderer.render_texture(node, None)
+                if not texture.save_to_png(path):
+                    raise OSError(f"Could not save screenshot: {path}")
+                return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"Window did not produce a drawable frame ({w}x{h}, mapped={window.get_mapped()})")
+        window.queue_draw()
+        context.iteration(False)
+        time.sleep(.01)
 
 
 class CubeApp(Adw.Application):

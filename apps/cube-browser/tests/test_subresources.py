@@ -117,6 +117,7 @@ class Subresources(unittest.TestCase):
         fixtures = [
             ('/pixel.png', 'IMAGE/PNG; example=parameter', solid_png((33, 166, 119)), 0x21a677, 0),
             ('/photo.jpg', 'image/jpeg', (ROOT/'tests/fixtures/sample.jpg').read_bytes(), 0xff0000, 2),
+            ('/static.webp', 'image/webp', (ROOT/'tests/fixtures/solid.webp').read_bytes(), 0x2493bc, 0),
             ('/vector.svg', 'image/svg+xml', b'<svg xmlns="http://www.w3.org/2000/svg" width="32" height="20"><rect width="32" height="20" fill="#7855ab"/></svg>', 0x7855ab, 0),
         ]
         for path, mime, body, color, tolerance in fixtures:
@@ -130,6 +131,8 @@ class Subresources(unittest.TestCase):
             ('pixel.PNG', solid_png((33, 166, 119)), 0x21a677, 0),
             ('signature-without-extension', solid_png((33, 166, 119)), 0x21a677, 0),
             ('photo.jpg', (ROOT/'tests/fixtures/sample.jpg').read_bytes(), 0xff0000, 2),
+            ('static.WEBP', (ROOT/'tests/fixtures/solid.webp').read_bytes(), 0x2493bc, 0),
+            ('webp-without-extension', (ROOT/'tests/fixtures/solid.webp').read_bytes(), 0x2493bc, 0),
             ('vector.svg', b'<svg width="32" height="20"><rect width="32" height="20" fill="#7855ab"/></svg>', 0x7855ab, 0),
         ]
         for name, body, color, tolerance in fixtures:

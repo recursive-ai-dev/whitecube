@@ -18,6 +18,8 @@ import sys
 import threading
 
 # Works when invoked as an absolute script by sudo with a clean environment.
+# Helpers also run independently of the desktop entry point.
+sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from chrootables.backend import Store, MUTATIONS, OperationCancelled
 

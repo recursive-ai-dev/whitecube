@@ -1,7 +1,10 @@
 #!/usr/bin/python3 -I
 """Launch Cube Chrootables, Whitecube's bundled Qt workspace manager."""
-from pathlib import Path
 import sys
+
+# Installed application trees are shared and must stay read-only at runtime.
+sys.dont_write_bytecode = True
+from pathlib import Path
 
 # Isolated Python still needs this private package directory on its import path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))

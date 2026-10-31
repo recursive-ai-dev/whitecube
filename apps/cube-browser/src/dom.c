@@ -2,10 +2,11 @@
 #include "dom.h"
 #include "js.h"
 #include "web-bootstrap.h"
+#include "version.h"
 #include <time.h>
 #include <unistd.h>
 struct timer {unsigned id;double due,delay;int interval;};
-struct cb_dom {struct cb_page *page;struct cb_js *js;int socket,dirty,loaded,last_state,gesture;struct timer timers[64];unsigned timer_count,fetch_count,fetches[32];size_t text_bytes;};
+struct cb_dom {struct cb_page *page;struct cb_js *js;int socket,dirty,geometry_dirty,images_pending,loaded,last_state,gesture;double scroll,created;struct timer timers[64];unsigned timer_count,fetch_count,fetches[32],current_script;size_t text_bytes;};
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static char *number(unsigned n){return g_strdup_printf("%u",n);}
 static char *boolean(int value){return g_strdup(value?"true":"false");}
@@ -54,6 +55,7 @@ static int insert_html(struct cb_dom *d,struct node *target,const char *position
     for(guint i=1;i<fragment->nodes->len;i++){
         struct node *child=g_ptr_array_index(fragment->nodes,i);
         child->page=p;child->uid=(unsigned)++p->node_count;child->control=NULL;child->resource=SIZE_MAX;
+        child->image_pending=0;
         /* Fragment resource URLs remain inert, including inline data images. */
         g_clear_pointer(&child->src,g_free);
         if(child->inline_image){cairo_surface_destroy(child->inline_image);child->inline_image=NULL;}
@@ -61,7 +63,7 @@ static int insert_html(struct cb_dom *d,struct node *target,const char *position
     }
     while(fragment->root->first)append(parent,fragment->root->first,before);
     g_ptr_array_set_size(fragment->nodes,1);cb_page_free(fragment);
-    d->text_bytes+=bytes;d->dirty=1;return 0;
+    d->text_bytes+=bytes;d->dirty=d->geometry_dirty=1;return 0;
 }
 /* Bounded HTML serialization uses attributes rather than resolved URL fields,
  * preserving relative references and preventing double entity decoding. */
@@ -105,10 +107,13 @@ static void refresh_controls(struct cb_dom *d){
     for(size_t i=0;i<d->page->control_count;i++){struct control *c=&d->page->controls[i];struct node *form=c->node->parent;while(form&&!cb_engine_tag_is(form,"form"))form=form->parent;c->form=c->node->external_form?cb_engine_form_id(d->page->root,c->node->external_form):form;}
 }
 static int set_attr(struct cb_dom *d,struct node *n,const char *name,const char *value){
+    struct cb_page *p=d->page;
     if(n->tag[0]=='#'||!*name||strlen(name)>31||(value&&strlen(value)>ATTR_LIMIT))return -1;
     for(const char *p=name;*p;p++)if(!cb_engine_name_char(*p)&&*p!=':')return -1;
     if(!n->attrs)n->attrs=g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);
     char *key=g_ascii_strdown(name,-1);if(value&&g_hash_table_size(n->attrs)>=64&&!g_hash_table_contains(n->attrs,key)){g_free(key);return -1;}
+    int image_source=!strcmp(key,"src")&&cb_engine_tag_is(n,"img");
+    if(image_source&&n->image_generation==UINT32_MAX){g_free(key);return -1;}
     if(value)g_hash_table_replace(n->attrs,g_strdup(key),g_strdup(value));else g_hash_table_remove(n->attrs,key);
     char **slot=NULL;
 #define ATTR(k,f) if(!strcmp(key,k))slot=&n->f
@@ -122,7 +127,23 @@ static int set_attr(struct cb_dom *d,struct node *n,const char *name,const char 
     if(!strcmp(key,"checked")){n->checked=value!=NULL;if(n->control)n->control->checked=n->checked;}
     if(!strcmp(key,"value")&&n->control){g_free(n->control->value);n->control->value=cb_engine_bounded_value(value?value:"",n->control->kind==C_TEXTAREA);n->control->cursor=strlen(n->control->value);}
     if(!strcmp(key,"type")&&n->control&&cb_engine_tag_is(n,"input"))n->control->kind=value&&!g_ascii_strcasecmp(value,"password")?C_PASSWORD:C_TEXT;
-    g_free(key);d->dirty=1;return 0;
+    if(image_source){
+        n->image_generation++;
+        size_t count=p->resource_count;
+        int data=value&&!g_ascii_strncasecmp(value,"data:",5);
+        n->resource=value&&*value&&!data?cb_engine_discover_resource(p,CB_RESOURCE_IMAGE,value):SIZE_MAX;
+        g_clear_pointer(&n->src,g_free);
+        if(n->inline_image){p->image_pixels-=(size_t)cairo_image_surface_get_width(n->inline_image)*cairo_image_surface_get_height(n->inline_image);cairo_surface_destroy(n->inline_image);n->inline_image=NULL;}
+        if(data){n->src=g_strdup(value);cb_engine_inline_images(p);}
+        struct resource *resource=n->resource<p->resource_count?&p->resources[n->resource]:NULL;
+        n->image_pending=value&&(!resource||resource->loaded||resource->failed);
+        if(n->image_pending)d->images_pending=1;
+        if(p->resource_count>count){struct cb_message m={.type=CB_RESOURCE_REQUEST,.a=(unsigned)n->resource,.b=CB_RESOURCE_IMAGE,.c=1,.fd=-1};
+            snprintf(m.text,sizeof m.text,"%s",p->resources[n->resource].url);cb_send(d->socket,&m);}
+    }
+    if(cb_engine_tag_is(n,"img")&&!strcmp(key,"width"))n->image_width=value?cb_engine_image_dimension(value,strlen(value)):0;
+    if(cb_engine_tag_is(n,"img")&&!strcmp(key,"height"))n->image_height=value?cb_engine_image_dimension(value,strlen(value)):0;
+    g_free(key);d->dirty=d->geometry_dirty=1;return 0;
 }
 static void query_nodes(struct node *root,const char *selector,int id,int include,GString *out,unsigned *count){
     if(include&&root->tag[0]!='#'&&((id&&root->id&&!strcmp(root->id,selector))||(!id&&matches_list(root,selector)))){if((*count)++)g_string_append_c(out,',');g_string_append_printf(out,"%u",root->uid);}
@@ -157,7 +178,103 @@ static char *get(struct cb_dom *d,struct node *n,const char *key){
         char *result=failed?NULL:quote(out->str);g_string_free(out,TRUE);return result;
     }
     if(!strcmp(key,"activeElement"))return number(d->page->focus?d->page->focus->uid:0);
+    if(cb_engine_tag_is(n,"img")){
+        struct resource *r=n->resource<d->page->resource_count?&d->page->resources[n->resource]:NULL;
+        cairo_surface_t *image=n->inline_image?n->inline_image:r?r->image:NULL;
+        if(!strcmp(key,"currentSrc"))return quote(r?r->url:n->inline_image&&n->src?n->src:"");
+        if(!strcmp(key,"imageWidth")||!strcmp(key,"imageHeight")){
+            int width=!strcmp(key,"imageWidth");
+            if(d->geometry_dirty&&attached(n)){cb_page_layout(d->page,d->page->width,d->page->zoom);d->geometry_dirty=0;}
+            return number((unsigned)MAX(0,round(attached(n)&&n->laid_out?(width?n->w:n->h)/d->page->zoom:width?n->image_width:n->image_height)));
+        }
+        if(!strcmp(key,"complete"))return boolean(!r||r->loaded||r->failed);
+        if(!strcmp(key,"naturalWidth"))return number(image?(unsigned)cairo_image_surface_get_width(image):0);
+        if(!strcmp(key,"naturalHeight"))return number(image?(unsigned)cairo_image_surface_get_height(image):0);
+    }
     return NULL;
+}
+/* Preflight the complete clone before allocating document nodes. Detached
+ * clones retain attributes but no listeners, script slots or resource grants. */
+static void clone_cost(const struct node *n,int deep,size_t *count,size_t *bytes){
+    (*count)++;if(n->text)*bytes+=strlen(n->text);
+    if(n->attrs){GHashTableIter it;gpointer key,value;g_hash_table_iter_init(&it,n->attrs);while(g_hash_table_iter_next(&it,&key,&value))*bytes+=strlen(key)+strlen(value);}
+    if(deep)for(const struct node *c=n->first;c;c=c->next)clone_cost(c,1,count,bytes);
+}
+static struct node *clone_node(struct cb_page *p,const struct node *source,int deep){
+    struct node *n=cb_engine_new_node(p,NULL,source->tag);unsigned uid=n->uid;*n=*source;
+    n->page=p;n->uid=uid;n->parent=n->first=n->last=n->next=NULL;
+    n->control=NULL;n->custom=NULL;n->attrs=NULL;n->inline_image=NULL;n->resource=SIZE_MAX;
+    n->laid_out=n->clipped_out=n->image_pending=0;n->image_generation=1;n->image_notified=0;
+#define COPY(field) n->field=g_strdup(source->field)
+    COPY(text);COPY(id);COPY(classes);COPY(inline_css);COPY(href);COPY(alt);
+    COPY(rel);COPY(media);COPY(name);COPY(value);COPY(type);COPY(action);COPY(method);COPY(placeholder);COPY(external_form);
+    COPY(submit_action);COPY(submit_method);
+#undef COPY
+    n->src=NULL;
+    if(source->attrs){n->attrs=g_hash_table_new_full(g_str_hash,g_str_equal,g_free,g_free);GHashTableIter it;gpointer key,value;
+        g_hash_table_iter_init(&it,source->attrs);while(g_hash_table_iter_next(&it,&key,&value))g_hash_table_insert(n->attrs,g_strdup(key),g_strdup(value));}
+    if(deep)for(const struct node *c=source->first;c;c=c->next)append(n,clone_node(p,c,1),NULL);
+    return n;
+}
+/* Report only properties represented by the engine. Values come from the
+ * cascade used for layout, rather than reparsing the author's style text. */
+static void css_pair(GString *out,const char *key,const char *value){
+    char *k=quote(key),*v=quote(value);g_string_append_printf(out,"%s%s:%s",out->len>1?",":"",k,v);g_free(k);g_free(v);
+}
+static void css_number(GString *out,const char *key,double value,const char *unit){
+    char number[G_ASCII_DTOSTR_BUF_SIZE];g_ascii_formatd(number,sizeof number,"%.12g",isfinite(value)?value:0);
+    char *text=g_strconcat(number,unit,NULL);css_pair(out,key,text);g_free(text);
+}
+static void css_length(GString *out,const char *key,struct length l,double font){
+    if(l.kind==L_AUTO)css_pair(out,key,"auto");
+    else css_number(out,key,l.value*(l.kind==L_EM?font:1),l.kind==L_PERCENT?"%":"px");
+}
+static void css_color(GString *out,const char *key,struct color c){
+    char alpha[G_ASCII_DTOSTR_BUF_SIZE];g_ascii_formatd(alpha,sizeof alpha,"%.6g",CLAMP(c.a,0,1));
+    char *text=c.a>=1?g_strdup_printf("rgb(%d, %d, %d)",(int)round(c.r*255),(int)round(c.g*255),(int)round(c.b*255)):
+        g_strdup_printf("rgba(%d, %d, %d, %s)",(int)round(c.r*255),(int)round(c.g*255),(int)round(c.b*255),alpha);
+    css_pair(out,key,text);g_free(text);
+}
+static double css_available(struct cb_page *p,struct node *n){
+    struct node *parent=n->parent;if(!parent||!parent->laid_out)return p->width/p->zoom;
+    double basis=css_available(p,parent);struct style *s=&parent->style;
+    return MAX(0,parent->w/p->zoom-2*s->border-cb_engine_length_value(s->padding[1],basis,s->font_size,1)-cb_engine_length_value(s->padding[3],basis,s->font_size,1));
+}
+static char *computed_style(struct cb_dom *d,struct node *n){
+    struct cb_page *p=d->page;
+    if(!attached(n)||n->tag[0]=='#')return g_strdup("{}");
+    if(d->geometry_dirty){cb_page_layout(p,p->width,p->zoom);d->geometry_dirty=0;}
+    struct style *s=&n->style;GString *out=g_string_new("{");
+    const char *display[]={"inline","block","none","flex","table","table-row-group","table-row","table-cell","table-caption","grid"};
+    css_pair(out,"display",display[s->display]);css_pair(out,"position",s->position==1?"relative":s->position==2?"absolute":"static");
+    css_pair(out,"overflow",s->overflow?"hidden":"visible");css_pair(out,"box-sizing",s->content_box?"content-box":"border-box");
+    css_color(out,"color",s->color);css_color(out,"background-color",s->background);css_color(out,"border-color",s->border_color);
+    css_number(out,"font-size",s->font_size,"px");css_number(out,"font-weight",s->weight,"");css_number(out,"line-height",s->line_height*s->font_size,"px");
+    css_pair(out,"font-family",s->family==1?"monospace":s->family==2?"serif":"sans-serif");
+    css_pair(out,"text-align",s->align==1?"center":s->align==2?"right":"left");
+    css_pair(out,"font-style",s->italic?"italic":"normal");css_pair(out,"text-decoration-line",s->underline?"underline":"none");
+    css_pair(out,"white-space",s->pre?"pre-wrap":"normal");
+    css_number(out,"border-width",s->border,"px");css_number(out,"column-gap",s->gap,"px");css_number(out,"row-gap",s->row_gap,"px");
+    css_pair(out,"flex-direction",s->flex_column?"column":"row");css_pair(out,"flex-wrap",s->wrap?"wrap":"nowrap");
+    css_number(out,"flex-grow",s->grow,"");css_number(out,"flex-shrink",s->shrink,"");css_length(out,"flex-basis",s->basis,s->font_size);
+    double basis=css_available(p,n),pad[4];for(int i=0;i<4;i++)pad[i]=MAX(0,cb_engine_length_value(s->padding[i],basis,s->font_size,1));
+    int inline_replaced=s->display==D_INLINE&&(cb_engine_tag_is(n,"img")||n->control);
+    if(n->laid_out&&(s->display!=D_INLINE||inline_replaced)){
+        css_number(out,"width",MAX(0,n->w/p->zoom-(s->content_box&&!inline_replaced?pad[1]+pad[3]+2*s->border:0)),"px");
+        css_number(out,"height",MAX(0,n->h/p->zoom-(s->content_box&&!inline_replaced?pad[0]+pad[2]+2*s->border:0)),"px");
+    }else{css_length(out,"width",s->width,s->font_size);css_length(out,"height",s->height,s->font_size);}
+    if(s->aspect_ratio>0)css_number(out,"aspect-ratio",s->aspect_ratio,"");else css_pair(out,"aspect-ratio","auto");
+    css_length(out,"min-width",s->min_width,s->font_size);css_length(out,"max-width",s->max_width,s->font_size);
+    css_length(out,"min-height",s->min_height,s->font_size);css_length(out,"max-height",s->max_height,s->font_size);
+    const char *sides[]={"top","right","bottom","left"};
+    for(int i=0;i<4;i++){
+        char key[32];g_snprintf(key,sizeof key,"margin-%s",sides[i]);css_length(out,key,s->margin[i],s->font_size);
+        g_snprintf(key,sizeof key,"padding-%s",sides[i]);css_length(out,key,s->padding[i],s->font_size);
+        css_length(out,sides[i],s->inset[i],s->font_size);
+    }
+    if(n->custom){GHashTableIter iter;gpointer key,value;unsigned count=0;g_hash_table_iter_init(&iter,n->custom);
+        while(count<64&&g_hash_table_iter_next(&iter,&key,&value)){if(strlen(value)<=4096){css_pair(out,key,value);count++;}}}
+    g_string_append_c(out,'}');return g_string_free(out,FALSE);
 }
 static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
     struct cb_dom *d=opaque;struct cb_page *p=d->page;struct node *n=argc?node(d,argv[0]):NULL;
@@ -176,7 +293,7 @@ static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
         }else if(!strcmp(key,"checked")&&n->control)n->control->checked=!strcmp(value,"true");
         else if(!strcmp(key,"title")&&n==p->root){if(length>1024)return NULL;g_free(p->title);p->title=g_strdup(value);}
         else if(set_attr(d,n,key,(!strcmp(key,"disabled")||!strcmp(key,"hidden"))&&!strcmp(value,"false")?NULL:value))return NULL;
-        d->dirty=1;return boolean(1);
+        d->dirty=d->geometry_dirty=1;return boolean(1);
     }
     if(op==4&&argc>=3&&n){char *name=g_ascii_strdown(argv[2],-1);char *result=NULL;
         if(!strcmp(argv[1],"get"))result=quote(n->attrs?g_hash_table_lookup(n->attrs,name):NULL);
@@ -194,7 +311,7 @@ static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
         if(!strcmp(argv[2],"remove")){if(child->parent!=n)return NULL;detach(child);}
         else {if(before&&before->parent!=n)return NULL;unsigned depth=0;for(struct node *at=n;at;at=at->parent){if(at==child)return NULL;depth++;}if(depth+subtree_depth(child)>DEPTH_LIMIT)return NULL;if(before!=child)append(n,child,before);refresh_controls(d);}
         refresh_controls(d);if(p->focus&&!attached(p->focus))p->focus=NULL;
-        d->dirty=1;return boolean(1);
+        d->dirty=d->geometry_dirty=1;return boolean(1);
     }
     if(op==7&&argc==1){char *url=cb_engine_resolve_url(p,argv[0]),*out=quote(url);g_free(url);return out;}
     if(op==8&&argc==0)return quote(p->base);
@@ -214,6 +331,55 @@ static char *host(void *opaque,unsigned op,size_t argc,const char *const *argv){
     }
     if(op==12&&argc==3&&n){if(insert_html(d,n,argv[1],argv[2]))return NULL;refresh_controls(d);if(p->focus&&!attached(p->focus))p->focus=NULL;return boolean(1);}
     if(op==13&&argc==2&&n&&n->tag[0]!='#')return boolean(matches_list(n,argv[1]));
+    if(op==14&&argc==1){
+        if(!strcmp(argv[0],"userAgent"))return quote("cube-browser/" CB_VERSION_SERIES);
+        if(!strcmp(argv[0],"appVersion"))return quote(CB_VERSION);
+        if(!strcmp(argv[0],"origin")){char origin[320];return quote(cb_origin_header(p->base,origin)?"null":origin);}
+        if(!strcmp(argv[0],"viewport"))return g_strdup_printf("[%.6f,%.6f,%.6f]",p->width/p->zoom,p->viewport_height/p->zoom,d->scroll/p->zoom);
+        if(!strcmp(argv[0],"time"))return g_strdup_printf("%.6f",(now()-d->created)*1000);
+        if(!strcmp(argv[0],"currentScript"))return number(d->current_script);
+        if(!strcmp(argv[0],"height"))return g_strdup_printf("%.6f",p->height/p->zoom);
+    }
+    if(op==15&&argc==1&&n){
+        if(d->geometry_dirty){cb_page_layout(p,p->width,p->zoom);d->geometry_dirty=0;}
+        if(!attached(n)||!n->laid_out)return g_strdup("[0,0,0,0,false,false]");
+        return g_strdup_printf("[%.6f,%.6f,%.6f,%.6f,%s,true]",n->x/p->zoom,(n->y-d->scroll)/p->zoom,n->w/p->zoom,n->h/p->zoom,n->clipped_out?"false":"true");
+    }
+    if(op==16&&argc==1&&strlen(argv[0])<=MEDIA_QUERY_LIMIT){struct cb_media_env env=cb_engine_media_environment(p);return boolean(cb_media_matches(argv[0],&env));}
+    if(op==17&&argc==0){d->dirty=1;return boolean(1);}
+    if(op==22&&argc==0){
+        GUri *uri=g_uri_parse(p->base,G_URI_FLAGS_ENCODED|G_URI_FLAGS_PARSE_RELAXED,NULL);if(!uri)return NULL;
+        const char *scheme=g_uri_get_scheme(uri),*hostname=g_uri_get_host(uri);int port=g_uri_get_port(uri);
+        if((port==80&&scheme&&!strcmp(scheme,"http"))||(port==443&&scheme&&!strcmp(scheme,"https")))port=-1;
+        char *protocol=g_strconcat(scheme?scheme:"",":",NULL),*hostpart=hostname&&strchr(hostname,':')?g_strdup_printf("[%s]",hostname):g_strdup(hostname?hostname:"");
+        char *host=port<0?g_strdup(hostpart):g_strdup_printf("%s:%d",hostpart,port),*porttext=port<0?g_strdup(""):g_strdup_printf("%d",port);
+        const char *query=g_uri_get_query(uri),*fragment=g_uri_get_fragment(uri),*path=g_uri_get_path(uri);
+        char *search=query&&*query?g_strconcat("?",query,NULL):g_strdup(""),*hash=fragment&&*fragment?g_strconcat("#",fragment,NULL):g_strdup("");
+        char origin[320];GString *out=g_string_new("{");css_pair(out,"href",p->base);css_pair(out,"protocol",protocol);
+        css_pair(out,"origin",cb_origin_header(p->base,origin)?"null":origin);css_pair(out,"hostname",hostpart);css_pair(out,"host",host);css_pair(out,"port",porttext);
+        css_pair(out,"pathname",path&&*path?path:"/");css_pair(out,"search",search);css_pair(out,"hash",hash);g_string_append_c(out,'}');
+        g_free(protocol);g_free(hostpart);g_free(host);g_free(porttext);g_free(search);g_free(hash);g_uri_unref(uri);return g_string_free(out,FALSE);
+    }
+    if(op==20&&argc==3&&n){
+        struct node *child=node(d,argv[1]),*old=node(d,argv[2]);
+        if(!child||!old||old->parent!=n||n->text||child==p->root)return NULL;
+        if(child==old)return number(old->uid);
+        unsigned depth=0;for(struct node *at=n;at;at=at->parent){if(at==child)return NULL;depth++;}
+        if(depth+subtree_depth(child)>DEPTH_LIMIT)return NULL;
+        append(n,child,old);detach(old);refresh_controls(d);if(p->focus&&!attached(p->focus))p->focus=NULL;
+        d->dirty=d->geometry_dirty=1;return number(old->uid);
+    }
+    if(op==21&&argc==2&&n&&n!=p->root){
+        int deep=!strcmp(argv[1],"true");size_t count=0,bytes=0;clone_cost(n,deep,&count,&bytes);
+        if(count>NODE_LIMIT-p->node_count||bytes>4*TEXT_LIMIT-d->text_bytes)return NULL;
+        struct node *made=clone_node(p,n,deep);d->text_bytes+=bytes;return number(made->uid);
+    }
+    if(op==19&&argc==1&&n)return computed_style(d,n);
+    if(op==18&&argc==1){
+        char *end;unsigned long id=strtoul(argv[0],&end,10);if(!*argv[0]||*end||!id||id>UINT32_MAX)return NULL;
+        for(unsigned i=0;i<d->fetch_count;i++)if(d->fetches[i]==id){d->fetches[i]=d->fetches[--d->fetch_count];emit(d,CB_WEB_CANCEL,(unsigned)id,0,NULL,-1);return boolean(1);}
+        return boolean(0);
+    }
     return NULL;
 }
 static int dispatch(struct cb_dom *d,struct node *n,const char *type,const char *key){
@@ -232,31 +398,56 @@ static void normalize_document(struct cb_page *p){
 }
 struct cb_dom *cb_dom_new(struct cb_page *page,int socket,const char *storage,int allow_eval){
     if(!page||!page->script_count)return NULL;
-    struct cb_dom *d=g_new0(struct cb_dom,1);d->page=page;d->socket=socket;d->last_state=-1;normalize_document(page);refresh_controls(d);
+    struct cb_dom *d=g_new0(struct cb_dom,1);d->page=page;d->socket=socket;d->last_state=-1;d->created=now();d->geometry_dirty=d->images_pending=1;normalize_document(page);refresh_controls(d);
     d->js=cb_js_new((struct cb_js_host){d,host,log_message},allow_eval);if(!d->js){g_free(d);return NULL;}
     if(cb_js_eval(d->js,cb_web_bootstrap,strlen(cb_web_bootstrap),"<web APIs>",NULL)||cb_js_call(d->js,"__cubeInit",storage?storage:"[{},{}]",NULL)){cb_dom_free(d);return NULL;}
+    if(page->script_overflow)log_message(d,1,"Script count limit exceeded (64 executable scripts per document)");
     cb_dom_resource(d);return d;
 }
 void cb_dom_free(struct cb_dom *d){if(d){cb_js_free(d->js);g_free(d);}}
+int cb_dom_viewport(struct cb_dom *d,double scroll){
+    if(!d||cb_js_failed(d->js))return 0;
+    d->scroll=scroll;d->geometry_dirty=0;cb_js_call(d->js,"__cubeViewport","[]",NULL);cb_js_jobs(d->js);
+    return d->geometry_dirty;
+}
+void cb_dom_image_event(struct cb_dom *d,size_t resource,int accepted){
+    (void)accepted;
+    if(!d)return;
+    for(guint i=0;i<d->page->nodes->len;i++){struct node *n=g_ptr_array_index(d->page->nodes,i);
+        if(cb_engine_tag_is(n,"img")&&n->resource==resource){n->image_pending=1;d->images_pending=1;}}
+}
+static void image_events(struct cb_dom *d){
+    if(!d->images_pending||cb_js_failed(d->js))return;
+    struct {struct node *node;uint32_t generation;} pending[64];unsigned count=0;
+    d->images_pending=0;
+    for(guint i=0;i<d->page->nodes->len;i++){struct node *n=g_ptr_array_index(d->page->nodes,i);if(!n->image_pending)continue;
+        if(count==64){d->images_pending=1;continue;}n->image_pending=0;pending[count].node=n;pending[count++].generation=n->image_generation;}
+    for(unsigned i=0;i<count;i++){struct node *n=pending[i].node;uint32_t generation=pending[i].generation;
+        if(n->image_generation!=generation||n->image_notified==generation)continue;
+        n->image_notified=generation;
+        dispatch(d,n,cb_engine_node_image(d->page,n)?"load":"error","");
+    }
+}
 void cb_dom_resource(struct cb_dom *d){
     if(!d||d->loaded||cb_js_failed(d->js))return;
     for(int deferred=0;deferred<2;deferred++)for(size_t i=0;i<d->page->script_count;i++){
         struct page_script *s=&d->page->scripts[i];if(s->done||!!s->defer!=deferred)continue;
-        if(s->unsupported){s->done=1;log_message(d,1,"Unsupported script type or script limit exceeded");continue;}
+        if(s->error){s->done=1;log_message(d,1,s->error);continue;}
         const char *source=s->source,*url=d->page->base;
         if(s->resource!=SIZE_MAX){struct resource *r=&d->page->resources[s->resource];url=r->url;if(!cb_policy_allows(d->page->policy,d->page->base,url,CB_POLICY_SCRIPT,0)){s->done=1;continue;}if(r->failed){s->done=1;continue;}if(!r->loaded)return;source=r->css;}
         else if(cb_engine_remote_url(url)?!cb_policy_allows(d->page->policy,d->page->base,url,CB_POLICY_SCRIPT,1):!g_str_has_prefix(url,"file:///")){s->done=1;continue;}
-        s->done=1;if(source)cb_js_eval(d->js,source,strlen(source),url,NULL);cb_js_jobs(d->js);if(cb_js_failed(d->js))return;
+        s->done=1;d->current_script=s->node->uid;if(source)cb_js_eval(d->js,source,strlen(source),url,NULL);d->current_script=0;cb_js_jobs(d->js);if(cb_js_failed(d->js))return;
     }
     d->loaded=1;cb_js_call(d->js,"__cubeLoaded","[]",NULL);cb_js_jobs(d->js);d->dirty=1;
 }
 void cb_dom_tick(struct cb_dom *d){
     if(!d)return;
     cb_dom_resource(d);
+    image_events(d);
     if(!cb_js_failed(d->js))for(unsigned i=0,fired=0;i<d->timer_count&&fired<16;){struct timer t=d->timers[i];if(now()<t.due){i++;continue;}if(t.interval)d->timers[i++].due=now()+t.delay;else d->timers[i]=d->timers[--d->timer_count];
         char args[32];snprintf(args,sizeof args,"[%u]",t.id);cb_js_call(d->js,"__cubeTimer",args,NULL);cb_js_jobs(d->js);fired++;}
     if(d->dirty){emit(d,CB_WEB_DIRTY,0,0,NULL,-1);d->dirty=0;}
-    int busy=d->timer_count||d->fetch_count;int state=busy|(d->loaded?2:0)|(cb_js_failed(d->js)?4:0);
+    int busy=d->timer_count||d->fetch_count||d->images_pending;int state=busy|(d->loaded?2:0)|(cb_js_failed(d->js)?4:0);
     if(state!=d->last_state){emit(d,CB_WEB_STATE,cb_js_failed(d->js)?0:busy,d->loaded||cb_js_failed(d->js),NULL,-1);d->last_state=state;}
 }
 void cb_dom_response(struct cb_dom *d,const struct cb_message *m){

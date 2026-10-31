@@ -33,7 +33,7 @@ build_app() {
 }
 
 browser=$root/apps/cube-browser
-for f in .deps/prefix/lib/pkgconfig/cairo.pc .deps/prefix/lib/pkgconfig/sqlite3.pc .deps/prefix/lib/pkgconfig/libjpeg.pc \
+for f in .deps/prefix/lib/pkgconfig/cairo.pc .deps/prefix/lib/pkgconfig/sqlite3.pc .deps/prefix/lib/pkgconfig/libjpeg.pc .deps/prefix/lib/pkgconfig/libwebpdecoder.pc \
          .deps/lib/libquickjs-core.a .deps/lib/libmbedtls.a; do
   [[ -f $browser/$f ]] || { echo "build-native-apps.sh: apps/cube-browser/$f is missing; run its scripts/bootstrap-*.sh" >&2; exit 1; }
 done

@@ -23,4 +23,7 @@ struct cb_http_metadata {
 };
 int cb_http_request_valid(const struct cb_http_request *r);
 int cb_http_metadata_valid(const struct cb_http_metadata *m);
+/* Exact JavaScript MIME essence, or a response Content-Type with parameters. */
+int cb_javascript_mime(const char *value,size_t length);
+int cb_http_javascript_mime(const char *value);
 #endif

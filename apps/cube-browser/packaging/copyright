@@ -22,10 +22,12 @@ Comment: Statically includes Mbed TLS 3.6.7. Complete upstream license in
  licenses/mbedtls-LICENSE.
 
 Files: usr/lib/cube-browser/cube-renderd
-Copyright: 2026 recursive-ai-dev and the QuickJS, libjpeg-turbo and NanoSVG contributors
+Copyright: 2026 recursive-ai-dev and the QuickJS, libjpeg-turbo, libwebp and NanoSVG contributors
 License: Apache-2.0 and MIT and BSD-3-Clause and IJG and Zlib
 Comment: Statically includes QuickJS 2026-06-04, libjpeg-turbo 2.1.5 and
- NanoSVG. Upstream notices are in licenses/.
+ libwebp 1.6.0 and NanoSVG. Upstream notices are in licenses/, including
+ webp-COPYING and webp-PATENTS. WebP source:
+ https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.6.0.tar.gz
 
 Files: usr/lib/cube-browser/cube-browser
 Copyright: 2026 recursive-ai-dev
@@ -48,7 +50,8 @@ License: MIT
  See the complete upstream license in licenses/quickjs-LICENSE.
 
 License: BSD-3-Clause
- See the complete upstream notices in licenses/libjpeg-turbo-copyright.
+ See the complete upstream notices in licenses/libjpeg-turbo-copyright
+ and licenses/webp-COPYING, with the WebP patent grant in webp-PATENTS.
 
 License: IJG
  See the complete upstream notices in licenses/libjpeg-turbo-copyright.

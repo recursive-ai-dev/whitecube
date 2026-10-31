@@ -1,3 +1,27 @@
+# Cube Browser 0.11.0 / Whitecube Desktop 0.10.0
+
+Whitecube now uses floating stacking windows. New windows cascade, ordinary
+windows remain visible together, focus raises the selected window and dialogs,
+and validated client move/resize requests work alongside Alt+drag controls.
+See the desktop's docs/FLOATING-WINDOWS.md. Log out and start a new Whitecube
+session to use the rebuilt compositor.
+
+Cube Browser adds Navigator metadata and useful script diagnostics, scroll-driven
+lazy images, static WebP, live computed styles, reserved image placeholders,
+transactional replacement and bounded cloning, abortable fetches/listeners,
+queued visibility observations, sustainable media queries, current location
+metadata and a distinct image DOM interface. Failed resources now settle and
+handled promise rejections stay out of the error console.
+
+Distributions include the Whitecube Desktop Debian package and standalone Cube
+Browser Debian and relocatable Linux archives for amd64. All browser workers,
+private libraries and required upstream notices are included. SHA-256 files
+accompany the artifacts. Build and validation evidence is in VALIDATION.md and
+TODO.md. Heavy sites that require modules, additional codecs or a full browser
+platform can still fail; the unidentified reported gallery was not tested.
+
+## Previous releases
+
 # Cube Browser 0.10.1
 
 This update adds direct PNG/JPEG/static SVG viewing for URLs and local files,
