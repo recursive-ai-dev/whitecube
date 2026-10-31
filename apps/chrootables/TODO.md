@@ -67,28 +67,39 @@ release polish. Each checkbox requires working code and relevant verification.
 - [x] **21. Keep release version, provenance and installation instructions coherent.**
   Distinguish the Cube application version from its upstream engine, document
   terminal authentication and Studio installation, and preserve license notices.
-- [ ] **22. Gate and publish the reviewed release.** Run the combined regression
+- [x] **22. Gate and publish the reviewed release.** Run the combined regression
   suite and artifact checks in CI, commit only the authorized application changes,
   reconcile `main` without overwriting others' work, and publish the verified
   binaries on the matching GitHub release.
 
 ## Verification record
 
-Implementation and release results will be recorded here as the work completes.
+All 22 items are implemented and delivered.
 
-- Desktop items 5–7 and 11–14: focused client (20), desktop (50), and terminal
-  (76) tests passed, followed by the combined 357-test suite and real-launcher
-  demo/empty-store screenshots. Python compilation and whitespace checks passed.
-- Protocol limits allow 8 MiB inventory frames and 16 MiB of queued wire data.
-  Decoding yields after 100 messages or 64 KiB per turn; one larger inventory
-  frame may be decoded to make progress. JSON nesting is limited to 64 levels.
-  Terminal cells retain 32 characters, and the operation console retains at most
-  256 Ki UTF-16 units as well as its existing 4,000-block limit.
+- **Source:** tag `cube-chrootables-v1.3.0`, commit
+  `0ba0a94d06aba046147ff86c68617caa12afd826`.
+- **Release:** [Cube Chrootables Studio 1.3.0](https://github.com/recursive-ai-dev/whitecube/releases/tag/cube-chrootables-v1.3.0).
+  Includes DEB, RPM, Arch `any.pkg.tar.zst`, x86_64 host-runtime AppImage,
+  four individual checksum files, `SHA256SUMS`, and `release-manifest.json`.
+- **Application/engine:** 357 tests passed on both Qt 6.10.2 and Qt 6.11.2;
+  demo and absent-store screenshots rendered without creating an image store.
+  The protected-publication cancellation regression passed 20 consecutive runs
+  with an explicit ordering barrier.
+- **Cube Strap:** 26 checks and the isolated Wayland workflow smoke passed,
+  including timestamp-independent build/import and cancellation cleanup.
+- **Distribution:** seven packaging tests passed, including actual extraction,
+  payload/ownership checks, documentation-excluded installation, checksum
+  verification and byte-identical rebuilds across paths and umasks for all formats.
+- **Native lifecycle:** Debian, Fedora and Arch installation, upgrade and removal
+  passed; workspace data survived package removal.
+- **Privileged engine:** real signed Debian bootstrap for minimal and Python
+  profiles, persistent/disposable sessions, recovery, shared folders, restricted
+  devices, cancellation and cleanup passed.
+- **Release gates:** [main validation](https://github.com/recursive-ai-dev/whitecube/actions/runs/41176492733)
+  and [complete tagged validation](https://github.com/recursive-ai-dev/whitecube/actions/runs/41176877396)
+  completed successfully before publication.
 
-Local release verification: 357 combined application/engine tests, 26 Cube Strap
-checks and seven packaging tests passed. The DEB, RPM, Arch and AppImage artifacts
-passed extracted CLI, helper, checksum and desktop smoke checks, and each format
-rebuilt byte-for-byte across output paths and umasks. Real desktop screenshots
-were rendered without creating an image store. Native installation/upgrade/removal
-and privileged signed-bootstrap integration are release CI gates. Publication is
-pending those gates and the final source-commit provenance rebuild.
+The application is version 1.3.0; its copied upstream engine remains version
+1.2.1. The Studio artifacts have independent command, payload and desktop names
+and intentionally share the existing Cube store/preferences. No image format
+conversion or unrelated browser/desktop source changes were included.
