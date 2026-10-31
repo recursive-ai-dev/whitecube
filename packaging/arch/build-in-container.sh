@@ -7,11 +7,11 @@ pacman-key --populate archlinux
 echo 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch' > /etc/pacman.d/mirrorlist
 sed -i 's/^#\?DisableSandbox.*/DisableSandbox/' /etc/pacman.conf
 grep -q '^DisableSandbox' /etc/pacman.conf || sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
-pacman -Syu --noconfirm --needed base-devel git curl unzip pkgconf meson ninja patchelf archiso nodejs npm \
-  python python-gobject python-cairo python-yaml python-requests python-pikepdf python-pillow python-numpy \
+pacman -Syu --noconfirm --needed base-devel git curl unzip pkgconf meson ninja patchelf archiso nodejs-lts-jod npm \
+  python python-gobject python-cairo python-yaml python-requests python-pikepdf python-pillow python-numpy python-pyarrow \
   wayland wayland-protocols libxkbcommon pango cairo libinput glib2 mpv libglvnd libpng expat fontconfig freetype2 \
   pixman libadwaita gtk4 gtk3 desktop-file-utils nss alsa-lib at-spi2-core libdrm mesa dbus dconf foot procps-ng \
-  ttf-dejavu libdisplay-info libliftoff libseat vulkan-headers vulkan-icd-loader glslang hwdata sudo fuzzel swaylock \
+  ttf-dejavu libdisplay-info libliftoff vulkan-headers vulkan-icd-loader glslang hwdata sudo fuzzel swaylock \
   swaybg libisoburn squashfs-tools debootstrap e2fsprogs dosfstools gptfdisk parted nftables dhcpcd iproute2 seatd \
   libxcomposite libxdamage libxrandr libcups dpkg fakeroot
 

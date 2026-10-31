@@ -9,9 +9,9 @@ license=(custom)
 options=(!strip !debug !lto)
 depends=(alsa-lib at-spi2-core cairo coreutils dbus dconf debootstrap dhcpcd dosfstools e2fsprogs expat fontconfig
   foot freetype2 fuzzel gcc-libs glib2 glibc gptfdisk gtk3 gtk4 iproute2 lcms2 less libadwaita libcups libdrm libglvnd
-  libinput libisoburn libliftoff libpng libseat libxcomposite libxdamage libxext libxfixes libxkbcommon libxrandr
+  libinput libisoburn libliftoff libpng libxcomposite libxdamage libxext libxfixes libxkbcommon libxrandr
   mesa mpv nftables nspr nss pango parted pixman procps-ng python python-cairo python-gobject python-numpy
-  python-pikepdf python-requests python-yaml seatd squashfs-tools sudo swaybg swaylock systemd util-linux wayland
+  python-pikepdf python-pyarrow python-requests python-yaml seatd squashfs-tools sudo swaybg swaylock systemd util-linux wayland
   xz zlib)
 optdepends=('fnott: desktop notifications' 'pipewire: audio services' 'wireplumber: audio services'
   'pipewire-pulse: audio services' 'qemu-desktop: Cube Lab virtual machines' 'edk2-ovmf: Cube Lab UEFI')
