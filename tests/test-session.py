@@ -44,10 +44,15 @@ print('fake compositor output')
 raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
 ''')
         self.compositor.chmod(0o755)
-        self.env = {**os.environ, 'HOME': str(self.home), 'XDG_STATE_HOME': str(self.root / 'state'),
-                    'XDG_RUNTIME_DIR': str(self.runtime), 'CAPTURE_FILE': str(self.capture),
-                    'DISPLAY': ':77', 'WAYLAND_DISPLAY': 'parent-wayland-7',
-                    'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/stale/session'}
+        # The fake compositor records this environment. Keep it independent of
+        # live-session GPU overrides, user configuration and unrelated secrets.
+        self.env = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ')
+                    if key in os.environ}
+        self.env.update({'HOME': str(self.home), 'XDG_STATE_HOME': str(self.root / 'state'),
+                         'XDG_CONFIG_HOME': str(self.root / 'config'),
+                         'XDG_RUNTIME_DIR': str(self.runtime), 'CAPTURE_FILE': str(self.capture),
+                         'DISPLAY': ':77', 'WAYLAND_DISPLAY': 'parent-wayland-7',
+                         'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/stale/session'})
         self.state = self.root / 'state/whitecube'
 
     def launch(self, *args, **extra):
@@ -106,7 +111,10 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
             self.assertNotIn('WLR_DRM_DEVICES', env)
         recovery = self.launch('--safe-mode')
         self.assertEqual(recovery.returncode, 0, recovery.stderr)
-        self.assertNotIn('WLR_DRM_DEVICES', self.wait_capture()['env'])
+        self.assertIsNone(self.wait_capture()['env'].get('WLR_DRM_DEVICES'))
+        recovery = self.launch('--safe-mode', WLR_DRM_DEVICES='/dev/dri/card9')
+        self.assertEqual(recovery.returncode, 0, recovery.stderr)
+        self.assertEqual(self.wait_capture()['env'].get('WLR_DRM_DEVICES'), '/dev/dri/card9')
 
     def test_launch_sets_wayland_environment_and_rotates_private_logs(self):
         result = self.launch()
