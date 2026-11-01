@@ -18,6 +18,7 @@ can help that layer, and probes only observe.
   - Retries back off to a ceiling and never stop; nothing disconnects the radio.
 """
 import argparse
+import array
 import configparser
 from contextlib import contextmanager
 import errno
@@ -104,7 +105,22 @@ def station_options(config):
     return {'country': config.get('country'), 'power_save': config.get('power_save', False)}
 
 
-def interfaces(sysfs=Path("/sys")):
+def permanent_mac(name):
+    """The burned-in MAC (ETHTOOL_GPERMADDR), or None. sysfs shows the current one, which may be randomized."""
+    SIOCETHTOOL, ETHTOOL_GPERMADDR, MAC_LENGTH = 0x8946, 0x20, 6
+    request = array.array('B', struct.pack('II', ETHTOOL_GPERMADDR, 32) + bytes(32))
+    ifreq = struct.pack('16sQ16x', name.encode(), request.buffer_info()[0])
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            fcntl.ioctl(sock, SIOCETHTOOL, ifreq)
+    except OSError:
+        return None
+    size = struct.unpack_from('I', request, 4)[0]
+    mac = bytes(request[8:8 + MAC_LENGTH])
+    return ':'.join(f'{byte:02x}' for byte in mac) if size == MAC_LENGTH and any(mac) else None
+
+
+def interfaces(sysfs=Path("/sys"), permanent=permanent_mac):
     result = []
     for link in sorted((sysfs / "class/net").glob("*")):
         if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", link.name):
@@ -119,7 +135,7 @@ def interfaces(sysfs=Path("/sys")):
         result.append({
             "interface": link.name,
             "usb_id": usb_id,
-            "mac": read(link / "address").lower(),
+            "mac": permanent(link.name) or read(link / "address").lower(),
             # Module name: Linux 6.12 registers this USB driver as rtw_8822cu, newer kernels as rtw88_8822cu.
             "driver": ((link / "device/driver/module").resolve().name if (link / "device/driver/module").exists()
                        else (link / "device/driver").resolve().name if (link / "device/driver").exists() else ""),
@@ -589,11 +605,15 @@ def migrate_profiles():
     print(f'The old {LEGACY_PROFILE_FILE} was not touched; delete it once the new file is working.')
 
 
+# Netplan-rendered profiles (Ubuntu's default) are generated into /run.
+NM_PROFILE_DIRS = ('/etc/NetworkManager/system-connections', '/run/NetworkManager/system-connections')
+
+
 def import_nm():
     require_root()
     profiles = []
     skipped = 0
-    for path in sorted(Path("/etc/NetworkManager/system-connections").glob("*")):
+    for path in [path for folder in NM_PROFILE_DIRS for path in sorted(Path(folder).glob("*"))]:
         if not path.is_file():
             continue
         parser = configparser.ConfigParser(interpolation=None)
@@ -617,7 +637,7 @@ def import_nm():
         raise RuntimeError("No supported saved WPA2 personal profiles found. Run cube-net setup interactively.")
     existing = load_profiles()
     known = {ssid for ssid, _ in existing}
-    write_profiles(existing + [(ssid, psk) for ssid, psk in profiles if ssid not in known])
+    write_profiles(existing + list({ssid: (ssid, psk) for ssid, psk in profiles if ssid not in known}.values()))
     print(f"Skipped {skipped} unsupported profile(s); original files were preserved.")
 
 
@@ -2401,7 +2421,9 @@ def run_service():
     if saved is None:
         raise RuntimeError(f"No saved networks: {CONFIG_DIR / PROFILE_FILE} does not exist")
     for path in [CONFIG_DIR / "device.json", saved, CONFIG_DIR / "dhcpcd.conf"]:
-        protected(path)
+        protected(path, allow_absent=path.name == "device.json")   # device.json only holds options
+        if not path.exists():
+            continue
         metadata = path.stat()
         if metadata.st_uid != 0 or metadata.st_mode & 0o022:
             raise RuntimeError(f"{path} must be root-owned and not writable by other users")
@@ -2510,6 +2532,99 @@ def run_service():
         lock.close()
 
 
+# The stack cube-net replaces. Masking also blocks their D-Bus activation.
+RIVAL_UNITS = ('NetworkManager.service', 'NetworkManager-dispatcher.service', 'wpa_supplicant.service', 'systemd-resolved.service')
+TAKEOVER_WAIT = 150                # the radio, the handshake and a slow DHCP server, then one probe suite
+
+
+def run_command(*command):
+    return subprocess.run(command, capture_output=True, text=True, timeout=60)
+
+
+def wait_until_online(wait=TAKEOVER_WAIT):
+    """True once status reports every layer up: association, lease, resolver and a bound TCP probe."""
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        if status().get('diagnostic_code') == 'online':
+            return True
+        time.sleep(2)
+    return False
+
+
+def takeover_restore(state, run, root):
+    """Hand the dongle back to the stack that had it, exactly as it was found."""
+    log('takeover: restoring the previous network stack')
+    run('systemctl', 'disable', '--now', 'whitecube-network.service')
+    run('ip', 'link', 'set', state['iface'], 'down')
+    resolv = root / 'etc/resolv.conf'
+    resolv.unlink(missing_ok=True)
+    if state['resolv_link'] is not None:
+        resolv.symlink_to(state['resolv_link'])
+    elif state['resolv_text'] is not None:
+        resolv.write_text(state['resolv_text'])
+    for unit in state['masked']:
+        run('systemctl', 'unmask', unit)
+    run('systemctl', 'daemon-reload')
+    for unit in state['active']:
+        run('systemctl', 'start', unit)
+
+
+def takeover(root=Path('/'), run=run_command, online=wait_until_online, seen=None):
+    """Make cube-net the only network stack here, or put everything back if it does not get online.
+
+    Saved networks are imported from NetworkManager when there are none. Rival packages stay installed
+    (masked) so the way back needs no network; removing them is a separate, deliberate step.
+    """
+    require_root()
+    config = device_config(root)
+    candidates = [item for item in (interfaces() if seen is None else seen) if matches(item, config)]
+    if len(candidates) != 1:
+        raise RuntimeError('The scoped dongle must be present exactly once; see cube-net status. Nothing was changed.')
+    iface = candidates[0]['interface']
+    if not any((root / 'etc/whitecube/network' / name).exists() for name in (PROFILE_FILE, LEGACY_PROFILE_FILE)):
+        with profile_lock():
+            import_nm()                     # raises before anything is touched when no profile is usable
+    if run('systemctl', 'cat', 'whitecube-network.service').returncode:
+        raise RuntimeError('whitecube-network.service is not installed. Nothing was changed.')
+    resolv = root / 'etc/resolv.conf'
+    state = {'iface': iface,
+             'resolv_link': os.readlink(resolv) if resolv.is_symlink() else None,
+             'resolv_text': resolv.read_text() if resolv.is_file() and not resolv.is_symlink() else None,
+             'active': [unit for unit in RIVAL_UNITS if run('systemctl', 'is-active', unit).stdout.strip() == 'active'],
+             'masked': []}
+
+    def interrupted(signum, _frame):
+        raise RuntimeError(f'interrupted by signal {signum}')
+
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+    try:
+        for unit in RIVAL_UNITS:
+            if run('systemctl', 'is-enabled', unit).stdout.strip() == 'masked':
+                continue                    # masked before we came: stays that way after a rollback
+            state['masked'].append(unit)
+            if run('systemctl', 'mask', '--now', unit).returncode:
+                raise RuntimeError(f'could not stop and mask {unit}')
+        # What the old stack configured must not outlive it: a stale lease would hide a failed DHCP.
+        run('ip', 'link', 'set', iface, 'down')
+        run('ip', 'address', 'flush', 'dev', iface)
+        resolv.unlink(missing_ok=True)
+        resolv.symlink_to('../run/whitecube-net/resolv.conf')
+        run('systemctl', 'daemon-reload')
+        run('systemctl', 'reset-failed', 'whitecube-network.service')
+        if run('systemctl', 'enable', '--now', 'whitecube-network.service').returncode:
+            raise RuntimeError('whitecube-network.service did not start')
+        if not online():
+            raise RuntimeError(f'not online after {TAKEOVER_WAIT} s; see journalctl -u whitecube-network.service -b')
+    except Exception:
+        takeover_restore(state, run, root)
+        raise
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    print('cube-net is now the only network stack and is online.')
+    print('The rival units are masked. To remove them: sudo apt purge network-manager wpasupplicant systemd-resolved')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -2529,6 +2644,7 @@ def main():
         p = sub.add_parser(action)
         p.add_argument('profile_id')
     sub.add_parser("import-nm", help="Import saved WPA2 NM profiles locally; root required")
+    sub.add_parser("takeover", help="Replace NetworkManager, wpa_supplicant and systemd-resolved; rolls back unless online; root required")
     sub.add_parser("selftest", help="Read-only check that the built-in Wi-Fi station can work here; no root needed")
     sub.add_parser("migrate", help="Copy saved networks from the old wpa.conf into networks.json; root required")
     sub.add_parser("run", help="Service entrypoint; root required")
@@ -2556,6 +2672,8 @@ def main():
     elif args.command == "import-nm":
         with profile_lock():
             import_nm()
+    elif args.command == "takeover":
+        takeover()
     elif args.command == "selftest":
         sys.exit(1 if selftest() else 0)
     elif args.command == "migrate":

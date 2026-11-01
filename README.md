@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.10.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.10.1_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,14 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.10.1
+
+`sudo cube-net takeover` makes the native controller the only network stack: it imports
+saved networks, masks NetworkManager, wpa_supplicant and systemd-resolved, links
+`/etc/resolv.conf`, starts `whitecube-network.service`, and rolls back unless it gets
+online. The dongle is now recognized while its MAC is randomized, and the service starts
+without the optional `device.json`. See [the release notes](docs/RELEASE-0.10.1.md).
 
 ## Improvements in 0.10.0
 
@@ -163,8 +171,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.10.0_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.10.0_amd64.deb
+sha256sum --check whitecube-desktop_0.10.1_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.10.1_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

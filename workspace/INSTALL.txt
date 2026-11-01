@@ -150,6 +150,10 @@ No npm/pip packages or Internet downloads are needed at runtime.
 
 NETWORK SETUP, WHILE BOOTED INTO THE NVME
 
+To replace NetworkManager, wpa_supplicant and systemd-resolved in one step, run
+"sudo cube-net takeover"; it rolls back by itself unless cube-net gets online. The
+manual steps follow.
+
 The included controller is your custom userspace connection controller over the
 existing Linux network stack. It is scoped to USB 2001:3329, MAC
 88:76:b9:f2:9d:29 and driver rtw88_8822cu. The audited target has the complete

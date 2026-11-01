@@ -1,3 +1,15 @@
+MAKING cube-net THE ONLY NETWORK STACK (0.10.1)
+  sudo cube-net takeover
+Imports saved WPA2 networks from NetworkManager when none exist, stops and masks NetworkManager,
+wpa_supplicant and systemd-resolved, links /etc/resolv.conf to /run/whitecube-net/resolv.conf, enables
+and starts whitecube-network.service, and waits for status "online". If that does not happen within
+150 s, or it is interrupted, everything is put back as it was. Then remove the old stack:
+  sudo apt purge network-manager wpasupplicant systemd-resolved
+Before a reinstall of any of them, unmask its unit. Lost with the old stack: NetworkManager's MAC
+randomization (cube-net uses the dongle's permanent MAC), DNS-over-TLS through resolved (DNS goes to the
+DHCP server's resolvers), and anything depending on NetworkManager, such as Proton VPN's packages.
+The dongle is identified by its permanent MAC, so a randomized current MAC no longer hides it.
+
 Whitecube dongle controller (cube-net), revision 3 - 2026-10-09
 
 REVISION 3: NO wpa_supplicant

@@ -123,7 +123,7 @@ def check_competitors(env, net):
     rivals = [name for name in found if name != 'dhcpcd']
     if rivals:
         return [finding('WARN', 'competing network managers', 'running: ' + ', '.join(rivals) + '; cube-net refuses to start next to them',
-                        'stop them before restarting whitecube-network.service')]
+                        'sudo cube-net takeover   (rolls back by itself unless cube-net gets online)')]
     return [finding('ok', 'competing network managers', 'none running')]
 
 

@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import struct
@@ -22,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -1473,10 +1475,150 @@ class ServiceSmoke(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "No saved networks"):
             self.run_service(lambda t: {"state": "COMPLETED"}, seconds=5)
 
+    def test_device_options_file_is_optional(self):
+        (self.config / "device.json").unlink()
+        self.run_service(lambda t: {"state": "COMPLETED", "ssid": "EMPIRE", "rssi": -50}, seconds=5)
+        self.assertEqual(len(FakeStation.instances), 1)
+
     def test_a_group_readable_store_is_refused(self):
         (self.config / "networks.json").chmod(0o640)
         with self.assertRaisesRegex(RuntimeError, "mode 0600"):
             self.run_service(lambda t: {"state": "COMPLETED"}, seconds=5)
+
+
+class DongleIdentity(unittest.TestCase):
+    """A randomized MAC (NetworkManager's default privacy setting) must not hide the scoped dongle."""
+
+    def sysfs(self, root, address):
+        link = root / "class/net/wlx8876b9f29d29"
+        usb = root / "usb"
+        (usb / "driver/module").mkdir(parents=True)
+        (usb / "idVendor").write_text("2001\n")
+        (usb / "idProduct").write_text("3329\n")
+        link.mkdir(parents=True)
+        (link / "device").symlink_to(usb)
+        (link / "address").write_text(address + "\n")
+        return root
+
+    def test_the_permanent_address_identifies_the_dongle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sysfs = self.sysfs(Path(tmp), "f2:c7:ab:da:a9:6d")
+            found = net.interfaces(sysfs, permanent=lambda name: net.DEFAULT_DEVICE["mac"])
+            self.assertEqual(found[0]["mac"], net.DEFAULT_DEVICE["mac"])
+            found = net.interfaces(sysfs, permanent=lambda name: None)
+            self.assertEqual(found[0]["mac"], "f2:c7:ab:da:a9:6d")      # no ethtool answer: the current one
+
+    def test_the_kernel_query_has_no_answer_for_loopback_or_an_absent_interface(self):
+        self.assertIsNone(net.permanent_mac("lo"))
+        self.assertIsNone(net.permanent_mac("nosuchdev0"))
+
+
+class ImportNetworkManager(unittest.TestCase):
+    KEYFILE = "[connection]\nid={0}\n[wifi]\nssid={0}\n[wifi-security]\nkey-mgmt=wpa-psk\npsk=passphrase-{0}\n"
+
+    def imported(self, etc_files, run_files):
+        with tempfile.TemporaryDirectory() as tmp:
+            etc, run = Path(tmp) / "etc", Path(tmp) / "run"
+            for folder, files in ((etc, etc_files), (run, run_files)):
+                folder.mkdir()
+                for name, text in files.items():
+                    (folder / name).write_text(text)
+            with mock.patch.object(net, "NM_PROFILE_DIRS", (etc, run)), mock.patch.object(net, "require_root"), \
+                    mock.patch.object(net, "load_profiles", return_value=[]), mock.patch.object(net, "write_profiles") as write, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                net.import_nm()
+            return write.call_args.args[0]
+
+    def test_netplan_profiles_in_run_are_imported(self):
+        self.assertEqual(self.imported({}, {"netplan-NM-x-EMPIRE.nmconnection": self.KEYFILE.format("EMPIRE"), "lo.nmconnection": "[connection]\nid=lo\n"}),
+                         [("EMPIRE", "passphrase-EMPIRE")])
+
+    def test_a_profile_in_both_places_is_imported_once(self):
+        keyfile = self.KEYFILE.format("EMPIRE")
+        self.assertEqual(self.imported({"a": keyfile}, {"b": keyfile}), [("EMPIRE", "passphrase-EMPIRE")])
+
+
+class Takeover(unittest.TestCase):
+    seen = [{"interface": "wlx0", "usb_id": "2001:3329", "mac": "88:76:b9:f2:9d:29", "driver": "rtw88_8822cu"}]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        (self.root / "etc/whitecube/network").mkdir(parents=True)
+        (self.root / "etc/whitecube/network/networks.json").write_text("[]")
+        (self.root / "etc/resolv.conf").symlink_to("../run/systemd/resolve/stub-resolv.conf")
+        self.calls = []
+        self.failing = set()
+        for patcher in (mock.patch.object(net, "require_root"),):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_command(self, *command):
+        self.calls.append(command)
+        stdout = ""
+        if command[1:2] == ("is-active",):
+            stdout = "inactive" if command[2] == "NetworkManager-dispatcher.service" else "active"
+        if command[1:2] == ("is-enabled",):
+            stdout = "masked" if command[2] == "systemd-resolved.service" else "enabled"
+        return mock.Mock(returncode=1 if command in self.failing else 0, stdout=stdout)
+
+    def takeover(self, online=True):
+        net.takeover(self.root, self.run_command, lambda: online, self.seen)
+
+    def test_success_masks_the_rivals_links_dns_and_enables_the_service(self):
+        self.takeover()
+        self.assertIn(("systemctl", "mask", "--now", "NetworkManager.service"), self.calls)
+        self.assertIn(("systemctl", "mask", "--now", "wpa_supplicant.service"), self.calls)
+        self.assertNotIn(("systemctl", "mask", "--now", "systemd-resolved.service"), self.calls)      # already masked
+        self.assertIn(("ip", "address", "flush", "dev", "wlx0"), self.calls)
+        self.assertEqual(os.readlink(self.root / "etc/resolv.conf"), "../run/whitecube-net/resolv.conf")
+        mask = self.calls.index(("systemctl", "mask", "--now", "wpa_supplicant.service"))
+        self.assertLess(mask, self.calls.index(("systemctl", "enable", "--now", "whitecube-network.service")))
+        self.assertFalse([call for call in self.calls if "unmask" in call])
+
+    def test_not_getting_online_restores_everything(self):
+        with self.assertRaisesRegex(RuntimeError, "not online"):
+            self.takeover(online=False)
+        self.assertEqual(os.readlink(self.root / "etc/resolv.conf"), "../run/systemd/resolve/stub-resolv.conf")
+        self.assertIn(("systemctl", "disable", "--now", "whitecube-network.service"), self.calls)
+        self.assertIn(("systemctl", "unmask", "NetworkManager.service"), self.calls)
+        self.assertNotIn(("systemctl", "unmask", "systemd-resolved.service"), self.calls)             # we did not mask it
+        self.assertIn(("systemctl", "start", "NetworkManager.service"), self.calls)
+        self.assertNotIn(("systemctl", "start", "NetworkManager-dispatcher.service"), self.calls)     # was not running
+        self.assertLess(self.calls.index(("systemctl", "unmask", "NetworkManager.service")),
+                        self.calls.index(("systemctl", "start", "NetworkManager.service")))
+
+    def test_a_failed_mask_or_start_restores_too(self):
+        for failing in (("systemctl", "mask", "--now", "wpa_supplicant.service"),
+                        ("systemctl", "enable", "--now", "whitecube-network.service")):
+            with self.subTest(failing=failing):
+                self.calls, self.failing = [], {failing}
+                with self.assertRaises(RuntimeError):
+                    self.takeover()
+                self.assertEqual(os.readlink(self.root / "etc/resolv.conf"), "../run/systemd/resolve/stub-resolv.conf")
+                self.assertIn(("systemctl", "start", "NetworkManager.service"), self.calls)
+
+    def test_a_signal_during_the_wait_restores_too(self):
+        def interrupted():
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(5)
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            net.takeover(self.root, self.run_command, interrupted, self.seen)
+        self.assertIn(("systemctl", "start", "NetworkManager.service"), self.calls)
+
+    def test_nothing_is_touched_without_the_dongle(self):
+        with self.assertRaisesRegex(RuntimeError, "Nothing was changed"):
+            net.takeover(self.root, self.run_command, lambda: True, [])
+        self.assertEqual(self.calls, [])
+
+    def test_nothing_is_touched_without_a_usable_profile(self):
+        (self.root / "etc/whitecube/network/networks.json").unlink()
+        with mock.patch.object(net, "profile_lock"), mock.patch.object(net, "import_nm", side_effect=RuntimeError("No supported")):
+            with self.assertRaisesRegex(RuntimeError, "No supported"):
+                self.takeover()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(os.readlink(self.root / "etc/resolv.conf"), "../run/systemd/resolve/stub-resolv.conf")
 
 
 if __name__ == "__main__":
