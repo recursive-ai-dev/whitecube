@@ -313,6 +313,9 @@ struct wc_server {
 	struct wl_listener cursor_button, cursor_axis, cursor_frame;
 	struct wlr_seat *seat;
 	struct wl_listener new_input, request_cursor, request_set_selection;
+	struct wl_listener request_start_drag, start_drag, data_drag_destroy;
+	struct wlr_drag *data_drag;
+	struct wlr_scene_tree *drag_icons;
 	struct wl_list keyboards;
 	struct wl_list outputs;
 	struct wlr_output_layout *output_layout;
@@ -1538,6 +1541,45 @@ static void seat_selection_req(struct wl_listener *l, void *data) {
 	if (!g_clipboard || s->locked) { if (ev->source) wlr_data_source_destroy(ev->source); return; }
 	wlr_seat_set_selection(s->seat, ev->source, ev->serial);
 }
+/* Drag and drop between clients. A drag may start only from the press still holding
+ * the client's implicit grab; anything else is refused and its source told so. */
+static void seat_start_drag_req(struct wl_listener *l, void *data) {
+	struct wc_server *s = wl_container_of(l, s, request_start_drag);
+	struct wlr_seat_request_start_drag_event *ev = data;
+	if (!s->locked && !s->drag.button && wlr_seat_validate_pointer_grab_serial(s->seat, ev->origin, ev->serial))
+		wlr_seat_start_pointer_drag(s->seat, ev->drag, ev->serial);
+	else wlr_data_source_destroy(ev->drag->source);
+}
+static void data_drag_destroyed(struct wl_listener *l, void *data) {
+	(void)data;
+	struct wc_server *s = wl_container_of(l, s, data_drag_destroy);
+	wl_list_remove(&s->data_drag_destroy.link);
+	s->data_drag = NULL;
+	s->grab_surface = NULL;
+}
+static void seat_start_drag(struct wl_listener *l, void *data) {
+	struct wc_server *s = wl_container_of(l, s, start_drag);
+	struct wlr_drag *drag = data;
+	s->data_drag = drag;
+	s->data_drag_destroy.notify = data_drag_destroyed;
+	wl_signal_add(&drag->events.destroy, &s->data_drag_destroy);
+	wlr_scene_node_set_position(&s->drag_icons->node, (int)s->cursor->x, (int)s->cursor->y);
+	if (drag->icon) wlr_scene_drag_icon_create(s->drag_icons, drag->icon);
+	wlr_cursor_set_xcursor(s->cursor, s->cursor_mgr, "grabbing");
+}
+/* Destroying the source sends it wl_data_source.cancelled and ends the drag; only
+ * ending the grab would leave the client waiting for a result forever. */
+static void wc_cancel_data_drag(struct wc_server *s) {
+	if (!s->data_drag) return;
+	if (s->data_drag->source) wlr_data_source_destroy(s->data_drag->source);
+	else wlr_seat_pointer_end_grab(s->seat);
+}
+static void wc_seat_listen_drag(struct wc_server *s) {
+	s->request_start_drag.notify = seat_start_drag_req;
+	wl_signal_add(&s->seat->events.request_start_drag, &s->request_start_drag);
+	s->start_drag.notify = seat_start_drag;
+	wl_signal_add(&s->seat->events.start_drag, &s->start_drag);
+}
 static struct wc_toplevel *tab_at(struct wc_server *s, double lx, double ly, int *tab_x) {
 	if (ly < 0 || ly >= g_tab_h) return NULL;
 	struct wc_toplevel *t; int idx = 0;
@@ -1555,7 +1597,8 @@ static void cursor_process(struct wc_server *s, uint32_t time) {
 		wc_retile(s);
 		return;
 	}
-	if (!s->locked && s->grab_surface && s->seat->pointer_state.button_count &&
+	if (s->data_drag) wlr_scene_node_set_position(&s->drag_icons->node, (int)s->cursor->x, (int)s->cursor->y);
+	if (!s->data_drag && !s->locked && s->grab_surface && s->seat->pointer_state.button_count &&
 	    s->seat->pointer_state.focused_surface == s->grab_surface) {
 		/* A drag that leaves the window stays with it until release (no stray releases). */
 		wlr_seat_pointer_notify_motion(s->seat, time, s->cursor->x - s->grab_x, s->cursor->y - s->grab_y);
@@ -1575,6 +1618,8 @@ static void cursor_process(struct wc_server *s, uint32_t time) {
 			wlr_seat_pointer_notify_enter(s->seat, surface->surface, sx, sy);
 			wlr_seat_pointer_notify_motion(s->seat, time, sx, sy);
 		}
+	} else if (s->data_drag) {
+		wlr_seat_pointer_notify_clear_focus(s->seat); /* wl_data_device.leave for the old target */
 	} else {
 		wlr_seat_pointer_clear_focus(s->seat);
 		wlr_cursor_set_xcursor(s->cursor, s->cursor_mgr, "default");
@@ -1602,6 +1647,12 @@ static void cursor_button(struct wl_listener *l, void *data) {
 		cursor_process(s, ev->time_msec);
 		if (wc_lock_surface_allowed(s, s->seat->pointer_state.focused_surface))
 			wlr_seat_pointer_send_button(s->seat, ev->time_msec, ev->button, ev->state);
+		return;
+	}
+	if (s->data_drag) {
+		/* The drag's grab decides between drop and cancel; desktop clicks stay inert. */
+		wlr_seat_pointer_notify_button(s->seat, ev->time_msec, ev->button, ev->state);
+		if (!s->data_drag) cursor_process(s, ev->time_msec);
 		return;
 	}
 	if (s->drag.button && ev->state == WL_POINTER_BUTTON_STATE_RELEASED && ev->button == s->drag.button) {
@@ -2294,6 +2345,7 @@ static void server_new_lock(struct wl_listener *l, void *data) {
 	if (s->lock) { wlr_session_lock_v1_destroy(lock); return; }
 	s->lock = lock; s->locked = true;
 	wc_cancel_drag(s); s->drag = (struct wc_drag){0};
+	wc_cancel_data_drag(s);
 	wlr_seat_keyboard_end_grab(s->seat); wlr_seat_pointer_end_grab(s->seat);
 	wlr_seat_keyboard_clear_focus(s->seat); wlr_seat_pointer_clear_focus(s->seat);
 	if (g_clear_clipboard_on_lock || !g_clipboard)
@@ -2401,6 +2453,7 @@ int main(int argc, char *argv[]) {
 	server.windows = wlr_scene_tree_create(&server.scene->tree);
 	server.top = wlr_scene_tree_create(&server.scene->tree);
 	server.overlay = wlr_scene_tree_create(&server.scene->tree);
+	server.drag_icons = wlr_scene_tree_create(&server.scene->tree);
 	server.lock_tree = wlr_scene_tree_create(&server.scene->tree);
 	wlr_scene_node_set_enabled(&server.lock_tree->node, false);
 	wl_list_init(&server.lock_surfaces);
@@ -2450,6 +2503,7 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.seat->events.request_set_cursor, &server.request_cursor);
 	server.request_set_selection.notify = seat_selection_req;
 	wl_signal_add(&server.seat->events.request_set_selection, &server.request_set_selection);
+	wc_seat_listen_drag(&server);
 	const char *sock = wl_display_add_socket_auto(server.wl_display);
 	if (!sock) { wlr_log(WLR_ERROR, "socket failed"); return 1; }
 	if (!wlr_backend_start(server.backend)) { wlr_log(WLR_ERROR, "backend start failed"); return 1; }

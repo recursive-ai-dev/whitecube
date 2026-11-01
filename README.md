@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.10.1_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.10.2_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,12 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.10.2
+
+Files and other content can be dragged between windows, such as from PCManFM-Qt onto an
+upload area in Firefox. Locking the screen cancels a drag in progress. See
+[the release notes](docs/RELEASE-0.10.2.md).
 
 ## Improvements in 0.10.1
 
@@ -171,8 +177,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.10.1_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.10.1_amd64.deb
+sha256sum --check whitecube-desktop_0.10.2_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.10.2_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

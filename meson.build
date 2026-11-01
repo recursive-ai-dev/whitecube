@@ -48,6 +48,11 @@ test('compositor-config-and-bindings', compositor_test, suite: 'core')
 hotplug_test = executable('hotplug-test', 'tests/hotplug-test.c', c_args: ['-DWLR_USE_UNSTABLE'],
   dependencies: compositor_deps, build_rpath: native_rpath)
 test('output-hotplug', hotplug_test, env: ['WLR_RENDERER=pixman'], suite: 'core')
+dnd_client = executable('dnd-client', ['tests/dnd-client.c', xdg], include_directories: include_directories('src/protocols'),
+  dependencies: wayland_client)
+dnd_test = executable('dnd-test', 'tests/dnd-test.c', c_args: ['-DWLR_USE_UNSTABLE'],
+  dependencies: compositor_deps, build_rpath: native_rpath)
+test('drag-and-drop', dnd_test, args: [dnd_client], env: ['WLR_RENDERER=pixman'], suite: 'core')
 status_theme_test = executable('status-theme-test', 'tests/status-theme-test.c', dependencies: [m])
 test('status-theme-palette', status_theme_test, suite: 'core')
 settings_test = executable('settings-test', ['tests/settings-test.c'] + settings_sources,
