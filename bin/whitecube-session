@@ -112,8 +112,10 @@ def session_environment(env, runtime, script):
     # The compositor publishes its own socket before spawning desktop clients.
     if 'wayland' not in env.get('WLR_BACKENDS', '').split(','):
         result.pop('WAYLAND_DISPLAY', None)
-    for key in ('DISPLAY', 'DBUS_SESSION_BUS_ADDRESS'):
-        result.pop(key, None)
+    result.pop('DISPLAY', None)
+    # Ensure DBUS_SESSION_BUS_ADDRESS is set for GUI apps (compositor doesn't start its own DBus)
+    if 'DBUS_SESSION_BUS_ADDRESS' not in result:
+        result['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={runtime}/bus'
     return result
 
 
