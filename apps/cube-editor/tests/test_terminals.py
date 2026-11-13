@@ -52,6 +52,15 @@ class TerminalSelectionTests(unittest.TestCase):
         self.assertFalse(terminal['available'])
         self.assertTrue(terminal['required'])
 
+    def test_builtin_terminal_is_opt_in_and_checks_vte_availability(self):
+        import cube_terminal
+        with mock.patch.object(cube_terminal, 'builtin_available', return_value=False):
+            with self.assertRaisesRegex(engine.CubeError, 'gir1.2-vte-3.91'):
+                self.choose({'foot', 'qterminal'}, {'CUBE_EDITOR_TERMINAL': 'builtin'})
+        with mock.patch.object(cube_terminal, 'builtin_available', return_value=True):
+            argv = self.choose(set(), {'CUBE_EDITOR_TERMINAL': 'builtin'})
+            self.assertEqual(argv[:2], ['__CUBE_TERMINAL__', 'Image operation'])
+
 
 class TerminalLifecycleTests(ProjectFixture):
     def test_each_terminal_requires_worker_completion_even_on_zero_exit(self):
@@ -84,6 +93,33 @@ class TerminalLifecycleTests(ProjectFixture):
             timer.cancel()
         self.assertTrue(cleaned.exists(), 'Cancellation killed the worker before cleanup')
         self.assertIsNone(api.process)
+
+    def test_builtin_terminal_tails_events_including_final_line(self):
+        import cube_terminal
+        api = engine.Engine(self.project)
+        events = self.project.directory / 'events.jsonl'
+        seen = []
+        api.on_event = seen.append
+
+        def fake_run(command, title, cancel_event=None, worker_started_cb=None):
+            events.write_text(json.dumps({'type': 'started', 'job': api.job_id}) + '\n')
+            events.write_text(
+                json.dumps({'type': 'started', 'job': api.job_id}) + '\n'
+                + json.dumps({'type': 'finished', 'job': api.job_id, 'success': True})
+            )
+            return 0
+
+        with mock.patch.object(cube_terminal, 'run_in_terminal', side_effect=fake_run):
+            result = api.run(['__CUBE_TERMINAL__', 'Auth', 'echo', 'ok'])
+        self.assertTrue(result['success'])
+        self.assertTrue(any(ev.get('type') == 'started' for ev in seen))
+
+    def test_builtin_terminal_exit_without_finished_fails(self):
+        import cube_terminal
+        api = engine.Engine(self.project)
+        with mock.patch.object(cube_terminal, 'run_in_terminal', return_value=0):
+            with self.assertRaisesRegex(engine.CubeError, 'Worker did not finish'):
+                api.run(['__CUBE_TERMINAL__', 'Auth', 'echo', 'ok'])
 
 
 if __name__ == '__main__':

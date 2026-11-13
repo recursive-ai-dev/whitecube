@@ -64,6 +64,8 @@ class GuiRegressions(unittest.TestCase):
         self.path = Path(self.temp.name)
         home = mock.patch('engine.Path.home', return_value=self.path / 'home')
         home.start(); self.addCleanup(home.stop)
+        xdg = mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.path / 'home/.config')})
+        xdg.start(); self.addCleanup(xdg.stop)
         self.source = self.path / 'source.iso'
         self.source.write_bytes(b'GUI fixture, never executed')
         self.project = app.engine.Project.create(self.source, 'Original', self.path / 'projects', self.path / 'releases')
@@ -75,6 +77,12 @@ class GuiRegressions(unittest.TestCase):
         if self.window.save_timer:
             app.GLib.source_remove(self.window.save_timer)
             self.window.save_timer = None
+        if self.window.pulse_timer:
+            app.GLib.source_remove(self.window.pulse_timer)
+            self.window.pulse_timer = None
+        if self.window.vm_watch_timer:
+            app.GLib.source_remove(self.window.vm_watch_timer)
+            self.window.vm_watch_timer = None
         if self.window.release_monitor:
             self.window.release_monitor.cancel()
         self.window.destroy()
@@ -363,6 +371,67 @@ class GuiRegressions(unittest.TestCase):
         self.wait_until(lambda: not self.window.busy)
         self.assertIn('Current · BIOS live: passed', self.window.history_summary.get_text())
         self.assertIn('Current · checksum: passed', self.window.history_summary.get_text())
+
+    def test_inject_switch_requires_desktop_deb_and_overlap_hint(self):
+        self.window.entries['desktop_deb'].set_text('')
+        self.window.inject_switch.set_active(True)
+        errors = self.window.validate_fields()
+        self.assertIn('desktop_deb', errors)
+        self.assertTrue(self.window.field_errors['desktop_deb'].get_visible())
+        self.window.inject_switch.set_active(False)
+        self.window.entries['install_packages'].set_text('git vim')
+        self.window.entries['remove_packages'].set_text('vim')
+        self.window.validate_fields()
+        self.assertTrue(self.window.package_hint.get_visible())
+        self.assertIn('vim', self.window.package_hint.get_text())
+
+    def test_script_syntax_check_and_clear_log_view(self):
+        self.window.commands.get_buffer().set_text('echo hello\n')
+        self.window.check_script_syntax()
+        self.assertTrue(self.window.script_status.get_visible())
+        self.assertIn('valid', self.window.script_status.get_text())
+        self.window.commands.get_buffer().set_text('if true; then echo unclosed')
+        self.window.check_script_syntax()
+        self.assertIn('Syntax issue', self.window.script_status.get_text())
+        self.window.log('Test entry before clear')
+        self.assertTrue(any('Test entry before clear' in line for line in self.window.log_lines))
+        self.window.clear_log_view()
+        self.assertEqual(self.window.log_lines, [])
+        self.assertEqual(self.window.text(self.window.log_view), '')
+
+    def test_recent_forget_and_test_disk_autoselect_and_copy_sha(self):
+        self.project.remember()
+        self.window.refresh_recent()
+        self.assertTrue(any(isinstance(c, app.Gtk.Box) for c in iter_children(self.window.recent_box)))
+        self.window._forget_recent(self.project.directory)
+        self.assertEqual(app.engine.recent_projects(), [])
+        vm_tests = self.project.directory / 'vm-tests'
+        vm_tests.mkdir(exist_ok=True)
+        disk = vm_tests / 'disk1.qcow2'
+        disk.write_bytes(b'qcow2')
+        reopened = app.EditorWindow(self.application, str(self.project.directory))
+        try:
+            self.assertEqual(reopened.test_disk, disk)
+            self.assertIn('test disk ready', reopened.vm_status_chip.get_text())
+            self.assertTrue(reopened.discard_disk_button.get_sensitive())
+        finally:
+            if reopened.save_timer:
+                app.GLib.source_remove(reopened.save_timer)
+            if reopened.release_monitor:
+                reopened.release_monitor.cancel()
+            reopened.destroy()
+            self.pump()
+        release, digest = self.release_fixture()
+        self.window.remember_release_digest(release, digest, self.window.release_identity(release))
+        self.assertTrue(self.window.copy_sha_button.get_sensitive())
+        self.window.copy_release_sha()
+
+
+def iter_children(container):
+    child = container.get_first_child()
+    while child:
+        yield child
+        child = child.get_next_sibling()
 
 
 if __name__ == '__main__':

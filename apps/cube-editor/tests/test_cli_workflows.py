@@ -20,7 +20,7 @@ class CliWorkflowTests(ProjectFixture):
     def test_version_does_not_need_a_display_or_gtk(self):
         result = self.cli('--version')
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), 'cube-editor 0.5.0')
+        self.assertEqual(result.stdout.strip(), f'cube-editor {engine.VERSION}')
 
     def test_doctor_reports_failure_in_json_without_launching_any_worker(self):
         environment = dict(os.environ, CUBE_EDITOR_TERMINAL='no-such-cube-terminal')

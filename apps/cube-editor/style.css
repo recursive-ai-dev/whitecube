@@ -45,6 +45,7 @@ button:disabled { opacity: .4; }
 button.primary { background: @cube_ink; color: @cube_paper; padding: 8px 20px; box-shadow: 4px 4px 0 rgba(0,0,0,.32); }
 button.primary:hover { background: @cube_hover; }
 button.primary:active { box-shadow: none; }
+button.primary:disabled { background: @cube_control; color: @cube_muted; border-color: @cube_muted; box-shadow: none; opacity: 0.7; }
 button.secondary { background: @cube_header; padding: 7px 14px; }
 button.small { min-height: 20px; padding: 2px 8px; font-size: 10px; }
 button.flat { border-color: transparent; background: transparent; }
@@ -61,9 +62,9 @@ windowcontrols button:hover { border-color: @cube_ink; background: @cube_paper; 
 button:focus-visible { outline: 2px solid @cube_ink; outline-offset: 2px; }
 
 /* Rail: the black side of the cube */
-.rail { background: @cube_ink; color: @cube_paper; border-right: 2px solid @cube_ink; padding: 22px 14px; }
+.rail { background: @cube_ink; color: @cube_paper; border-right: 2px solid @cube_ink; padding: 16px 12px; }
 .rail .dim-label { color: #bdbdbd; opacity: 1; }
-.rail button { background: transparent; color: #cfcfcf; border: 2px solid transparent; padding: 10px 12px; }
+.rail button { background: transparent; color: #cfcfcf; border: 2px solid transparent; padding: 8px 10px; }
 .rail button:hover { border-color: @cube_paper; color: @cube_paper; background: transparent; }
 .rail button.selected { background: @cube_paper; color: @cube_ink; border-color: @cube_paper; }
 .rail button.primary { background: @cube_paper; color: @cube_ink; box-shadow: 4px 4px 0 rgba(255,255,255,.25); }
@@ -137,7 +138,7 @@ button.option:checked .recipe-title { text-decoration: underline; }
 entry, passwordentry, spinbutton { background: @cube_paper; color: @cube_ink; border: 2px solid @cube_ink; border-radius: 0;
   box-shadow: none; min-height: 24px; }
 entry, passwordentry { padding: 6px 9px; }
-entry:focus-within, passwordentry:focus-within, spinbutton:focus-within { outline: 2px solid @cube_ink; outline-offset: 2px; }
+entry:focus-within, passwordentry:focus-within, spinbutton:focus-within { box-shadow: 3px 3px 0 @cube_ink; }
 spinbutton button { border: 0; border-left: 2px solid @cube_ink; }
 dropdown > button { background: @cube_paper; }
 checkbutton check { border: 2px solid @cube_ink; border-radius: 0; background: @cube_paper; }
@@ -201,3 +202,9 @@ entry.error { border-style: dashed; }
 .palette list { background: transparent; }
 .palette list row { border-radius: 0; }
 .palette list row:selected { outline: 2px solid @cube_ink; outline-offset: -2px; background: @cube_paper; }
+.recent-row { padding: 6px 8px; border: 2px solid @cube_ink; background: @cube_paper; }
+.recent-row:hover { box-shadow: 3px 3px 0 rgba(0,0,0,.25); }
+.recent-row button.flat { border-color: transparent; }
+.payload-row { padding: 8px 10px; border: 2px solid @cube_ink; background: @cube_paper; }
+.syntax-ok { color: @cube_secondary; font-size: 11px; }
+.syntax-warn { color: @cube_ink; font-weight: 800; font-size: 11px; }

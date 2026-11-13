@@ -22,8 +22,8 @@ Description: Whitecube - Wayland desktop with native image and model training st
  The wc-* command suite (start with wc-help) opens apps and reports or changes audio,
  network, power and system state from a terminal, with shell completions.
  Cube Strap builds Debian whitecubes with a bundled deb-strap: chroot workspaces
- imported into Chrootables, or bootable UEFI virtual machines added to the whitecube
- image store and run in QEMU.
+ imported into Chrootables, or bootable UEFI virtual machines stored under
+ ~/.whitecube and booted natively in QEMU + OVMF (and managed via whitecube-vm).
  Cube Browser is a native Wayland web preview with its own HTML/CSS engine,
  sandboxed renderer and network workers. Cube Player plays films and music
  through libmpv in a native Wayland window.

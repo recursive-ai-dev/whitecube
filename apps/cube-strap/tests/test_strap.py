@@ -155,13 +155,69 @@ class Commands(unittest.TestCase):
     def test_import_and_run(self):
         self.assertEqual(strap.import_args(plan(size_gib=3, lifecycle='ephemeral'), Path('/a/devbox.tar.gz')),
                          ['--import', 'devbox', '/a/devbox.tar.gz', '3072', 'ephemeral'])
-        with mock.patch.object(strap, 'whitecube_command', return_value='/usr/bin/whitecube'):
-            self.assertEqual(strap.vm_import_argv(plan(), Path('/a/devbox.img'))[1:],
-                             ['import', '--type', 'ext4', '/a/devbox.img', 'devbox'])
-            argv = strap.vm_run_argv('devbox', 4096, forward_ssh=True)
-        self.assertEqual(argv[1:3], ['run', 'devbox'])
-        self.assertIn('--uefi', argv)
-        self.assertEqual(argv[-2:], ['--forward', '2222:22'])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ovmf_dir = root / 'ovmf'
+            ovmf_dir.mkdir()
+            code_fw = ovmf_dir / 'OVMF_CODE.fd'
+            vars_fw = ovmf_dir / 'OVMF_VARS.fd'
+            code_fw.write_bytes(b'CODE')
+            vars_fw.write_bytes(b'VARS')
+
+            raw_img = root / 'devbox.img'
+            with open(raw_img, 'wb') as handle:
+                handle.write(b'\xaa' * 4096)
+                handle.seek(8 * 1024 * 1024 - 4096)
+                handle.write(b'\x55' * 4096)
+
+            with mock.patch.dict(os.environ, {
+                'WHITECUBE_HOME': str(root / 'store'),
+                'WHITECUBE_OVMF_CODE': str(code_fw),
+                'WHITECUBE_OVMF_VARS': str(vars_fw),
+            }):
+                meta = strap.import_vm('devbox', raw_img, suite='trixie', recipe='server')
+                self.assertTrue(strap.vm_exists('devbox'))
+                disk = root / 'store/images/devbox/disk.img'
+                vars_copy = root / 'store/images/devbox/vars.fd'
+                self.assertEqual(disk.stat().st_size, 8 * 1024 * 1024)
+                self.assertLess(disk.stat().st_blocks * 512, 2 * 1024 * 1024)
+                self.assertEqual(vars_copy.read_bytes(), b'VARS')
+                self.assertEqual(meta['format'], 'raw')
+                self.assertEqual(meta['recipe'], 'server')
+
+                with mock.patch.object(strap, 'qemu_command', return_value='/usr/bin/qemu-system-x86_64'), \
+                     mock.patch.object(strap, 'vm_can_kvm', return_value=True):
+                    argv = strap.vm_run_argv('devbox', 4096, cpus=4, forward_ssh=True)
+                self.assertEqual(argv[0], '/usr/bin/qemu-system-x86_64')
+                self.assertEqual(argv[argv.index('-m') + 1], '4096')
+                self.assertEqual(argv[argv.index('-smp') + 1], '4')
+                self.assertIn('-enable-kvm', argv)
+                self.assertTrue(any(f'file={code_fw}' in item and 'readonly=on' in item for item in argv))
+                self.assertTrue(any(f'file={vars_copy}' in item for item in argv))
+                self.assertTrue(any(f'file={disk},format=raw,if=virtio' == item for item in argv))
+                self.assertTrue(any('hostfwd=tcp:127.0.0.1:2222-:22' in item for item in argv))
+
+                self.assertEqual([item['name'] for item in strap.list_vms()], ['devbox'])
+                lock_fd = strap._open_vm_lock(strap.vm_dir('devbox'))
+                try:
+                    self.assertTrue(strap.vm_is_running('devbox'))
+                    with self.assertRaises(BlockingIOError):
+                        strap.remove_vm('devbox')
+                finally:
+                    os.close(lock_fd)
+                self.assertFalse(strap.vm_is_running('devbox'))
+                self.assertTrue(strap.remove_vm('devbox'))
+                self.assertFalse(strap.vm_exists('devbox'))
+
+    def test_vm_validation_and_missing_runtime(self):
+        for bad in ('', '../escape', 'has,comma', 'has:colon', '.leading', 'bad/name'):
+            with self.assertRaises(ValueError):
+                strap.valid_vm_name(bad)
+        with mock.patch.object(strap, 'qemu_command', return_value=None), \
+             mock.patch.object(strap, 'ovmf_pair', return_value=None):
+            pkgs = [pkg for _, pkg in strap.vm_boot_missing()]
+            self.assertEqual(pkgs, ['qemu-system-x86', 'ovmf'])
+            self.assertNotIn('whitecube', pkgs)
 
     def test_progress_from_banners(self):
         self.assertEqual(strap.stage_fraction(strap.clean_line('\x1b[1m═══ Exporting Rootfs to x ═══\x1b[0m')), .85)

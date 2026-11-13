@@ -1,0 +1,282 @@
+#!/usr/bin/python3 -I
+"""Manage and boot Whitecube Debian virtual machines natively via QEMU and OVMF."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import subprocess
+import sys
+
+root = Path(__file__).resolve().parent.parent
+for directory in (root / 'apps/cube-strap', root / 'share/whitecube/cube-strap'):
+    if (directory / 'strap.py').is_file():
+        sys.path.insert(0, str(directory))
+        break
+else:
+    print('whitecube-vm: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
+    raise SystemExit(1)
+
+import strap
+
+
+def human_bytes(value: int) -> str:
+    size = float(max(0, int(value)))
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if size < 1024 or unit == 'TiB':
+            return f'{size:.1f} {unit}' if unit != 'B' else f'{int(size)} B'
+        size /= 1024
+    return f'{int(value)} B'
+
+
+def cmd_list(args) -> int:
+    vms = strap.list_vms()
+    if args.json:
+        print(json.dumps(vms, indent=2))
+        return 0
+    if not vms:
+        print(f'No VMs in {strap.whitecube_store() / "images"}')
+        return 0
+    header = f'{"NAME":<18} {"STATE":<8} {"FMT":<5} {"RAM":>8} {"DISK (USED / VIRTUAL)":<23} {"SUITE":<10} RECIPE'
+    print(header)
+    for vm in vms:
+        state = 'running' if vm['running'] else ('idle' if vm['disk_exists'] else 'broken')
+        disk_col = f'{human_bytes(vm["actual_bytes"])} / {human_bytes(vm["apparent_bytes"])}'
+        print(f'{vm["name"]:<18} {state:<8} {vm["format"]:<5} {str(vm["memory_mib"]) + "M":>8} '
+              f'{disk_col:<23} {(vm.get("suite") or "-"):<10} {vm.get("recipe") or "-"}')
+    return 0
+
+
+def cmd_check(args) -> int:
+    missing = strap.vm_boot_missing()
+    ovmf = strap.ovmf_pair()
+    report = {
+        'store': str(strap.whitecube_store() / 'images'),
+        'qemu': strap.qemu_command(),
+        'ovmf_code': str(ovmf[0]) if ovmf else None,
+        'ovmf_vars': str(ovmf[1]) if ovmf and ovmf[1] else None,
+        'kvm': strap.vm_can_kvm(),
+        'ready': not missing,
+        'missing': [{'component': desc, 'package': pkg} for desc, pkg in missing],
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f'Store:     {report["store"]}')
+        print(f'QEMU:      {report["qemu"] or "MISSING (install qemu-system-x86)"}')
+        print(f'OVMF CODE: {report["ovmf_code"] or "MISSING (install ovmf)"}')
+        if ovmf:
+            print(f'OVMF VARS: {report["ovmf_vars"] or "(monolithic firmware)"}')
+        print(f'KVM:       {"enabled (/dev/kvm rw)" if report["kvm"] else "software emulation (no /dev/kvm rw)"}')
+        if missing:
+            pkgs = ' '.join(pkg for _, pkg in missing)
+            print(f'Action:    install missing packages: sudo apt install {pkgs}')
+    return 0 if report['ready'] else 1
+
+
+def cmd_info(args) -> int:
+    meta = strap.vm_meta(args.name)
+    disk = Path(meta['disk_path'])
+    vars_path = strap.vm_dir(args.name) / 'vars.fd'
+    apparent = disk.stat().st_size if disk.is_file() else 0
+    actual = disk.stat().st_blocks * 512 if disk.is_file() else 0
+    missing = strap.vm_boot_missing()
+    argv = None if missing or not disk.is_file() else strap.vm_run_argv(args.name)
+    data = {
+        **meta,
+        'disk_exists': disk.is_file(),
+        'vars_path': str(vars_path),
+        'vars_exists': vars_path.is_file(),
+        'apparent_bytes': apparent,
+        'actual_bytes': actual,
+        'running': strap.vm_is_running(args.name),
+        'boot_ready': not missing and disk.is_file(),
+        'boot_argv': argv,
+    }
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f'Name:      {data["name"]}')
+    print(f'State:     {"running" if data["running"] else "idle"}')
+    print(f'Disk:      {data["disk_path"]} ({data["format"]}, {human_bytes(actual)} used / {human_bytes(apparent)} virtual)')
+    print(f'UEFI NVRAM:{data["vars_path"]}' + (' (present)' if data['vars_exists'] else ' (created on first boot)'))
+    print(f'Resources: {data["memory_mib"]} MiB RAM, {data["cpus"]} vCPU(s)')
+    if data.get('suite') or data.get('recipe'):
+        print(f'Build:     {data.get("suite") or "-"} / {data.get("recipe") or "-"} ({data.get("arch") or "amd64"})')
+    if argv:
+        print(f'Command:   {shlex.join(argv)}')
+    elif missing:
+        print(f'Boot note: missing packages: {" ".join(pkg for _, pkg in missing)}')
+    return 0
+
+
+def cmd_import(args) -> int:
+    name = args.name or args.image.stem
+    meta = strap.import_vm(
+        name,
+        args.image,
+        suite=args.suite,
+        arch=args.arch,
+        recipe=args.recipe,
+        memory_mib=args.memory,
+        cpus=args.cpus,
+        disk_format=args.format,
+    )
+    print(f'Imported VM {meta["name"]} ({meta["format"]}) -> {strap.vm_dir(meta["name"]) / meta["disk"]}')
+    return 0
+
+
+def _vm_log_path(name: str) -> Path:
+    state = getattr(strap, 'STATE', None)
+    if state is None:
+        xdg = os.environ.get('XDG_STATE_HOME')
+        state = (Path(xdg).expanduser() if xdg else Path.home() / '.local/state') / 'whitecube'
+    logs = state / 'logs'
+    logs.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = logs / f'vm-run-{name}.log'
+    if path.is_symlink():
+        raise OSError(f'Refusing symlinked VM log path: {path}')
+    return path
+
+
+def _forward_signals(child: subprocess.Popen) -> None:
+    def handler(signum, _frame):
+        if child.poll() is None:
+            try:
+                child.send_signal(signum)
+            except OSError:
+                pass
+
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def cmd_run(args) -> int:
+    target = strap.vm_dir(args.name)
+    if not strap.vm_exists(args.name):
+        raise FileNotFoundError(f'VM {args.name!r} was not found in {strap.whitecube_store() / "images"}')
+    argv = strap.vm_run_argv(
+        args.name,
+        memory_mib=args.memory,
+        cpus=args.cpus,
+        forward_ssh=args.ssh,
+        ssh_port=args.ssh_port,
+        headless=args.headless,
+        serial_stdio=args.serial,
+        snapshot=args.snapshot,
+    )
+    if args.dry_run:
+        print(shlex.join(argv))
+        return 0
+
+    try:
+        lock_fd = strap._open_vm_lock(target)
+    except BlockingIOError:
+        print(f'whitecube-vm: VM {args.name!r} is already running.', file=sys.stderr)
+        return 1
+
+    log_file = None
+    try:
+        stderr_target = None
+        try:
+            is_tty = sys.stderr.isatty()
+        except Exception:
+            is_tty = False
+        if not is_tty and not args.serial:
+            log_path = _vm_log_path(args.name)
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            log_file = os.fdopen(fd, 'w')
+            stderr_target = log_file
+        child = subprocess.Popen(argv, stderr=stderr_target)
+        _forward_signals(child)
+        code = child.wait()
+        if code != 0 and log_file is not None:
+            log_file.flush()
+            print(f'whitecube-vm: QEMU exited with status {code}; see {_vm_log_path(args.name)}', file=sys.stderr)
+        return code
+    finally:
+        if log_file is not None:
+            log_file.close()
+        os.close(lock_fd)
+
+
+def cmd_remove(args) -> int:
+    try:
+        removed = strap.remove_vm(args.name)
+    except BlockingIOError:
+        print(f'whitecube-vm: VM {args.name!r} is currently running; stop it before removing.', file=sys.stderr)
+        return 1
+    if not removed:
+        print(f'whitecube-vm: VM {args.name!r} does not exist.', file=sys.stderr)
+        return 1
+    strap.forget(args.name, 'vm')
+    print(f'Removed VM {args.name}')
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog='whitecube-vm',
+        description='Manage and boot Whitecube virtual machines natively with QEMU and OVMF.',
+    )
+    sub = parser.add_subparsers(dest='command', required=True)
+
+    p_list = sub.add_parser('list', help='List VMs in the Whitecube store')
+    p_list.add_argument('--json', action='store_true', help='Print machine-readable JSON')
+    p_list.set_defaults(func=cmd_list)
+
+    p_check = sub.add_parser('check', help='Check QEMU, OVMF firmware, KVM, and store readiness')
+    p_check.add_argument('--json', action='store_true', help='Print machine-readable JSON')
+    p_check.set_defaults(func=cmd_check)
+
+    p_info = sub.add_parser('info', help='Inspect a VM and preview its QEMU boot command')
+    p_info.add_argument('name', help='VM name')
+    p_info.add_argument('--json', action='store_true', help='Print machine-readable JSON')
+    p_info.set_defaults(func=cmd_info)
+
+    p_import = sub.add_parser('import', help='Import a raw .img or .qcow2 disk image into the store')
+    p_import.add_argument('image', type=Path, help='Path to .img or .qcow2 file')
+    p_import.add_argument('name', nargs='?', help='VM name (defaults to image stem)')
+    p_import.add_argument('--format', choices=('raw', 'qcow2'), help='Disk image format')
+    p_import.add_argument('--memory', type=int, default=2048, help='Default RAM in MiB (default: 2048)')
+    p_import.add_argument('--cpus', type=int, default=2, help='Default vCPU count (default: 2)')
+    p_import.add_argument('--suite', default='', help='Debian suite metadata label')
+    p_import.add_argument('--arch', default='amd64', help='Architecture label (default: amd64)')
+    p_import.add_argument('--recipe', default='', help='Recipe metadata label')
+    p_import.set_defaults(func=cmd_import)
+
+    p_run = sub.add_parser('run', help='Boot a VM in QEMU with UEFI OVMF')
+    p_run.add_argument('name', help='VM name')
+    p_run.add_argument('--memory', type=int, help='Override RAM in MiB')
+    p_run.add_argument('--cpus', type=int, help='Override vCPU count')
+    p_run.add_argument('--ssh', action='store_true', help='Forward 127.0.0.1:<port> to guest port 22')
+    p_run.add_argument('--ssh-port', type=int, default=2222, help='Host TCP port for SSH forward (default: 2222)')
+    p_run.add_argument('--headless', action='store_true', help='Run without graphical display (-display none)')
+    p_run.add_argument('--serial', action='store_true', help='Attach QEMU monitor and serial console to stdio')
+    p_run.add_argument('--snapshot', action='store_true', help='Discard disk and NVRAM writes after shutdown')
+    p_run.add_argument('--dry-run', action='store_true', help='Print the QEMU command without launching')
+    p_run.set_defaults(func=cmd_run)
+
+    for alias in ('remove', 'rm'):
+        p_rm = sub.add_parser(alias, help='Delete a VM image and remove its history entry')
+        p_rm.add_argument('name', help='VM name')
+        p_rm.set_defaults(func=cmd_remove)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(f'whitecube-vm: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

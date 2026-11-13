@@ -6,14 +6,22 @@
 # Not touched: woez's NOPASSWD: ALL line (see the note printed at the end).
 set -euo pipefail
 
-USER_ONLY=woez
-APPLY=0; DO_SUDO=1; DO_LOG=1
+APPLY=0; DO_SUDO=1; DO_LOG=1; REMOVE_NOPASSWD=0
 for a in "$@"; do case $a in
     --apply) APPLY=1 ;;
     --sudo-only) DO_LOG=0 ;;
     --logging-only) DO_SUDO=0 ;;
-    *) echo "usage: $0 [--apply] [--sudo-only|--logging-only]"; exit 2 ;; esac; done
+    --remove-nopasswd) REMOVE_NOPASSWD=1 ;;
+    *) echo "usage: $0 [--apply] [--sudo-only|--logging-only] [--remove-nopasswd]"; exit 2 ;; esac; done
 [ "$(id -u)" = 0 ] || { echo "run with sudo"; exit 1; }
+
+# Detect the actual user who invoked sudo (not root)
+SUDO_USER="${SUDO_USER:-${USER:-}}"
+if [ -z "$SUDO_USER" ] || [ "$SUDO_USER" = "root" ]; then
+    echo "Could not determine invoking user. Run via sudo from a regular user account." >&2
+    exit 1
+fi
+USER_ONLY="$SUDO_USER"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 BK=/root/hardening-backup-$STAMP
@@ -28,7 +36,7 @@ backup() { [ $APPLY = 1 ] && [ -e "$1" ] && cp -a --parents "$1" "$BK"; return 0
 
 # ---------------------------------------------------------------- sudo
 if [ $DO_SUDO = 1 ]; then
-# 1. whitecube-settings: %sudo -> woez, so nobody else gets the helper even if added to the group.
+# 1. whitecube-settings: %sudo -> $USER_ONLY, so nobody else gets the helper even if added to the group.
 cp /etc/sudoers.d/whitecube-settings "$WORK/wc"
 sed -i "s/^%sudo /$USER_ONLY /" "$WORK/wc"
 visudo -cf "$WORK/wc" >/dev/null
@@ -82,7 +90,7 @@ else
     say "install 90-hardening, rewrite whitecube-settings (%sudo -> $USER_ONLY), add @include to /etc/sudoers"
 fi
 
-# sudo group: only woez
+# sudo group: only $USER_ONLY
 for u in $(getent group sudo | cut -d: -f4 | tr , ' '); do
     [ "$u" = "$USER_ONLY" ] || run gpasswd -d "$u" sudo
 done
@@ -137,23 +145,36 @@ for f in /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/faillog; do
     [ -e "$f" ] && run truncate -s 0 "$f"
 done
 
-# woez's shell history
-RC=/home/$USER_ONLY/.bashrc
-if ! grep -q 'whitecube: no shell history' "$RC"; then
-    say "append no-history block to $RC"
-    if [ $APPLY = 1 ]; then
-        backup "$RC"
-        cat >> "$RC" <<'EOF'
+# invoking user's shell history
+USER_HOME=$(getent passwd "$USER_ONLY" | cut -d: -f6 || true)
+if [ -n "$USER_HOME" ] && [ -d "$USER_HOME" ]; then
+    RC="$USER_HOME/.bashrc"
+    if [ ! -f "$RC" ] || ! grep -q 'whitecube: no shell history' "$RC"; then
+        say "append no-history block to $RC"
+        if [ $APPLY = 1 ]; then
+            backup "$RC"
+            cat >> "$RC" <<'EOF'
 
 # whitecube: no shell history
 unset HISTFILE
 HISTSIZE=0
 HISTFILESIZE=0
 EOF
-        chown "$USER_ONLY": "$RC"
+            chown "$USER_ONLY": "$RC"
+        fi
     fi
+    [ -f "$USER_HOME/.bash_history" ] && run truncate -s 0 "$USER_HOME/.bash_history"
 fi
-run truncate -s 0 /home/$USER_ONLY/.bash_history
+fi
+
+# ---------------------------------------------------------------- remove NOPASSWD from /etc/sudoers
+if [ $REMOVE_NOPASSWD = 1 ]; then
+    say "remove NOPASSWD: ALL for $USER_ONLY from /etc/sudoers"
+    if [ $APPLY = 1 ]; then
+        backup /etc/sudoers
+        sed -i "/^$USER_ONLY ALL=(ALL:ALL) NOPASSWD: ALL$/d" /etc/sudoers
+        visudo -c >/dev/null || { echo "sudoers validation failed; rolling back"; cp -a "$BK/etc/sudoers" /etc/sudoers; exit 1; }
+    fi
 fi
 
 echo
@@ -164,6 +185,10 @@ else
     echo "Nothing changed. Re-run with --apply."
 fi
 echo
-echo "NOT changed: '$USER_ONLY ALL=(ALL:ALL) NOPASSWD: ALL' in /etc/sudoers. Any process running as $USER_ONLY"
-echo "(browser exploit, a script, an AI agent) gets root with no prompt. Removing NOPASSWD makes sudo ask for"
-echo "your password; edit with 'sudo visudo' (Whitecube's top bar uses 'sudo -n' only for the CUBE_FREE commands)."
+if [ $REMOVE_NOPASSWD = 1 ]; then
+    echo "NOPASSWD removed for $USER_ONLY. sudo will now prompt for password."
+else
+    echo "NOT changed: '$USER_ONLY ALL=(ALL:ALL) NOPASSWD: ALL' in /etc/sudoers. Any process running as $USER_ONLY"
+    echo "(browser exploit, a script, an AI agent) gets root with no prompt. Removing NOPASSWD makes sudo ask for"
+    echo "your password; edit with 'sudo visudo' (Whitecube's top bar uses 'sudo -n' only for the CUBE_FREE commands)."
+fi

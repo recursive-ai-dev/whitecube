@@ -4,7 +4,7 @@ Two kinds of cube:
   chroot  deb-strap exports a rootfs tarball (no kernel, no bootloader), which
           chrootable-manager imports as a workspace; it then shows in Cube Chrootables.
   vm      deb-strap builds a raw UEFI disk image (EFI + ext4 root, GRUB, cloud kernel),
-          which `whitecube import` adds to the image store; `whitecube run` boots it.
+          which import_vm stores sparsely under ~/.whitecube/images/ and QEMU + OVMF boots.
 
 The build itself is one privileged step (cube-strap-build, through sudo). Everything
 else runs as the desktop user. No GTK in this module, so it is testable on its own.
@@ -171,24 +171,75 @@ def build_params(plan: Plan, workdir: Path) -> dict:
     return {'workdir': str(workdir), 'kind': plan.kind}
 
 
+OVMF_PAIRS = (
+    ('/usr/share/OVMF/OVMF_CODE_4M.fd', '/usr/share/OVMF/OVMF_VARS_4M.fd'),
+    ('/usr/share/OVMF/OVMF_CODE.fd', '/usr/share/OVMF/OVMF_VARS.fd'),
+    ('/usr/share/ovmf/OVMF.fd', None),
+)
+
+
 def import_args(plan: Plan, archive: Path) -> list[str]:
     """chrootable-manager arguments that turn the tarball into a workspace."""
     return ['--import', plan.name, str(archive), str(plan.size_gib * 1024), plan.lifecycle]
 
 
-def whitecube_command() -> str | None:
-    return shutil.which('whitecube')
+def valid_vm_name(name: str) -> str:
+    """Validate a VM image name against path traversal and QEMU option syntax."""
+    import re
+    if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', name):
+        raise ValueError(f'Invalid VM name: {name!r}')
+    if '..' in name or ',' in name or ':' in name:
+        raise ValueError(f'Invalid VM name: {name!r}')
+    return name
 
 
-def vm_import_argv(plan: Plan, image: Path) -> list[str]:
-    return [whitecube_command() or 'whitecube', 'import', '--type', 'ext4', str(image), plan.name]
+def qemu_command() -> str | None:
+    return shutil.which('qemu-system-x86_64')
 
 
-def vm_run_argv(name: str, memory_mib: int = 2048, forward_ssh: bool = False) -> list[str]:
-    argv = [whitecube_command() or 'whitecube', 'run', name, '--uefi', '--display', '--memory', str(int(memory_mib))]
-    if forward_ssh:
-        argv += ['--forward', '2222:22']
-    return argv
+def ovmf_pair() -> tuple[Path, Path | None] | None:
+    """Locate UEFI firmware (OVMF code and optional NVRAM variables template)."""
+    custom_code = os.environ.get('WHITECUBE_OVMF_CODE', '').strip()
+    custom_vars = os.environ.get('WHITECUBE_OVMF_VARS', '').strip()
+    if custom_code:
+        code = Path(custom_code)
+        if code.is_file() and ',' not in str(code):
+            vars_tmpl = Path(custom_vars) if custom_vars else None
+            if vars_tmpl is None or (vars_tmpl.is_file() and ',' not in str(vars_tmpl)):
+                return code, vars_tmpl
+        return None
+    for code_raw, vars_raw in OVMF_PAIRS:
+        code = Path(code_raw)
+        if not code.is_file() or ',' in str(code):
+            continue
+        if vars_raw is None:
+            return code, None
+        vars_tmpl = Path(vars_raw)
+        if vars_tmpl.is_file() and ',' not in str(vars_tmpl):
+            return code, vars_tmpl
+    return None
+
+
+def vm_boot_missing() -> list[tuple[str, str]]:
+    """Return missing runtime prerequisites as (description, debian_package)."""
+    missing: list[tuple[str, str]] = []
+    if not qemu_command():
+        missing.append(('QEMU x86_64 emulator', 'qemu-system-x86'))
+    if not ovmf_pair():
+        missing.append(('OVMF UEFI firmware', 'ovmf'))
+    return missing
+
+
+def vm_can_kvm() -> bool:
+    return os.path.exists('/dev/kvm') and os.access('/dev/kvm', os.R_OK | os.W_OK)
+
+
+def whitecube_vm_command() -> str | None:
+    """Locate the whitecube-vm CLI (checkout bin/ wins over PATH)."""
+    local = Path(__file__).resolve().parents[2] / 'bin/whitecube-vm'
+    if local.is_file() and os.access(local, os.X_OK):
+        return str(local)
+    return shutil.which('whitecube-vm')
 
 
 def whitecube_store() -> Path:
@@ -196,10 +247,346 @@ def whitecube_store() -> Path:
     return Path(env).expanduser() if env else Path.home() / '.whitecube'
 
 
+def vm_dir(name: str) -> Path:
+    valid_vm_name(name)
+    store = whitecube_store()
+    images = store / 'images'
+    target = images / name
+    for component in (store, images, target):
+        if component.is_symlink():
+            raise OSError(f'Refusing symlinked VM store path: {component}')
+    return target
+
+
 def sparsify(path: Path) -> None:
-    """`whitecube import` copies the disk densely; punch the zero runs back out."""
+    """Punch zero-block holes out of a sparse raw VM disk image."""
     if shutil.which('fallocate') and path.is_file():
         subprocess.run(['fallocate', '--dig-holes', str(path)], capture_output=True, timeout=1800)
+
+
+def _copy_sparse(src: Path, dst: Path) -> None:
+    """Copy a VM disk image while preserving sparse zero holes."""
+    import errno
+    chunk_size = 1024 * 1024
+    zeros = b'\x00' * chunk_size
+    with open(src, 'rb') as source:
+        sfd = source.fileno()
+        total_size = os.fstat(sfd).st_size
+        dfd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.ftruncate(dfd, total_size)
+            if hasattr(os, 'SEEK_DATA') and hasattr(os, 'SEEK_HOLE'):
+                try:
+                    pos = 0
+                    while pos < total_size:
+                        data_start = os.lseek(sfd, pos, os.SEEK_DATA)
+                        hole_start = os.lseek(sfd, data_start, os.SEEK_HOLE)
+                        offset = data_start
+                        while offset < hole_start:
+                            buf = os.pread(sfd, min(chunk_size, hole_start - offset), offset)
+                            if not buf:
+                                break
+                            if not (len(buf) == chunk_size and buf == zeros) and any(buf):
+                                written = 0
+                                while written < len(buf):
+                                    written += os.pwrite(dfd, buf[written:], offset + written)
+                            offset += len(buf)
+                        pos = hole_start
+                    os.fsync(dfd)
+                    return
+                except OSError as exc:
+                    if exc.errno == errno.ENXIO:
+                        os.fsync(dfd)
+                        return
+                    os.lseek(sfd, 0, os.SEEK_SET)
+            offset = 0
+            while offset < total_size:
+                buf = source.read(min(chunk_size, total_size - offset))
+                if not buf:
+                    break
+                if not (len(buf) == chunk_size and buf == zeros) and any(buf):
+                    written = 0
+                    while written < len(buf):
+                        written += os.pwrite(dfd, buf[written:], offset + written)
+                offset += len(buf)
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def ensure_vm_vars(vars_path: Path, vars_template: Path) -> Path:
+    """Create a per-VM writable UEFI NVRAM copy when absent."""
+    if vars_path.is_symlink():
+        raise OSError(f'Refusing symlinked UEFI vars path: {vars_path}')
+    if not vars_path.is_file():
+        tmp = vars_path.with_name(f'.vars.{os.getpid()}.tmp')
+        if tmp.is_symlink():
+            tmp.unlink()
+        shutil.copyfile(vars_template, tmp)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, vars_path)
+    return vars_path
+
+
+def _open_vm_lock(target: Path):
+    import fcntl
+    lock_path = target / 'vm.lock'
+    if lock_path.is_symlink():
+        raise OSError(f'Refusing symlinked VM lock: {lock_path}')
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def vm_is_running(name: str) -> bool:
+    """Return True if the VM runtime lock is currently held."""
+    import fcntl
+    try:
+        target = vm_dir(name)
+    except (OSError, ValueError):
+        return False
+    lock_path = target / 'vm.lock'
+    if not lock_path.exists():
+        return False
+    if lock_path.is_symlink():
+        return False
+    try:
+        fd = os.open(lock_path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def vm_meta(name: str) -> dict:
+    """Load normalized metadata for a stored VM."""
+    import json
+    target = vm_dir(name)
+    meta_path = target / 'meta.json'
+    if not meta_path.is_file() or meta_path.is_symlink():
+        raise FileNotFoundError(f'VM {name!r} does not exist in {whitecube_store() / "images"}')
+    raw = json.loads(meta_path.read_text())
+    disk_name = raw.get('disk') or ('disk.qcow2' if (target / 'disk.qcow2').is_file() else 'disk.img')
+    if '/' in disk_name or disk_name in ('', '.', '..'):
+        raise ValueError(f'Invalid disk name in VM metadata: {disk_name!r}')
+    disk_path = target / disk_name
+    if disk_path.is_symlink():
+        raise OSError(f'Refusing symlinked VM disk path: {disk_path}')
+    fmt = raw.get('format') or ('qcow2' if disk_path.suffix.lower() == '.qcow2' else 'raw')
+    return {
+        **raw,
+        'name': name,
+        'disk': disk_name,
+        'disk_path': str(disk_path),
+        'format': fmt if fmt in ('raw', 'qcow2') else 'raw',
+        'memory_mib': int(raw.get('memory_mib') or 2048),
+        'cpus': int(raw.get('cpus') or 2),
+    }
+
+
+def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
+              recipe: str = '', memory_mib: int = 2048, cpus: int = 2,
+              disk_format: str | None = None) -> dict:
+    """Import a raw or qcow2 disk image into ~/.whitecube/images/<name>."""
+    from datetime import datetime, timezone
+    import json
+    valid_vm_name(name)
+    source = Path(image)
+    if not source.is_file():
+        raise FileNotFoundError(f'VM disk image not found: {source}')
+    if source.stat().st_size <= 0:
+        raise ValueError(f'VM disk image is empty: {source}')
+    fmt = disk_format or ('qcow2' if source.suffix.lower() == '.qcow2' else 'raw')
+    if fmt not in ('raw', 'qcow2'):
+        raise ValueError(f'Unsupported VM disk format: {fmt!r}')
+    mem = max(512, min(int(memory_mib), 131072))
+    smp = max(1, min(int(cpus), 64))
+
+    store = whitecube_store()
+    images = store / 'images'
+    target = vm_dir(name)
+    store.mkdir(mode=0o700, exist_ok=True)
+    images.mkdir(mode=0o700, exist_ok=True)
+    target.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(target, 0o700)
+
+    lock_fd = _open_vm_lock(target)
+    try:
+        disk_name = 'disk.qcow2' if fmt == 'qcow2' else 'disk.img'
+        disk_path = target / disk_name
+        tmp_disk = target / f'.{disk_name}.{os.getpid()}.tmp'
+        try:
+            _copy_sparse(source, tmp_disk)
+            if fmt == 'raw':
+                sparsify(tmp_disk)
+            os.chmod(tmp_disk, 0o600)
+            os.replace(tmp_disk, disk_path)
+        finally:
+            tmp_disk.unlink(missing_ok=True)
+
+        ovmf = ovmf_pair()
+        if ovmf and ovmf[1] is not None:
+            vars_path = target / 'vars.fd'
+            vars_path.unlink(missing_ok=True)
+            ensure_vm_vars(vars_path, ovmf[1])
+
+        st = disk_path.stat()
+        meta = {
+            'schema': 1,
+            'name': name,
+            'type': 'ext4',
+            'disk': disk_name,
+            'format': fmt,
+            'uefi': True,
+            'memory_mib': mem,
+            'cpus': smp,
+            'suite': suite,
+            'arch': arch,
+            'recipe': recipe,
+            'size_bytes': st.st_size,
+            'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        tmp_meta = target / f'.meta.{os.getpid()}.json.tmp'
+        try:
+            fd = os.open(tmp_meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, 'w') as out:
+                json.dump(meta, out, indent=2)
+                out.write('\n')
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_meta, target / 'meta.json')
+        finally:
+            tmp_meta.unlink(missing_ok=True)
+        return meta
+    finally:
+        os.close(lock_fd)
+
+
+def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = None,
+                forward_ssh: bool = False, ssh_port: int = 2222,
+                headless: bool = False, serial_stdio: bool = False,
+                snapshot: bool = False) -> list[str]:
+    """Build the native QEMU + OVMF command line to boot a stored VM."""
+    meta = vm_meta(name)
+    disk_path = Path(meta['disk_path'])
+    if not disk_path.is_file():
+        raise FileNotFoundError(f'VM disk image is missing: {disk_path}')
+    if ',' in str(disk_path):
+        raise ValueError(f'QEMU disk path cannot contain commas: {disk_path}')
+    qemu = qemu_command()
+    if not qemu:
+        raise RuntimeError('QEMU x86_64 emulator is not installed (install package "qemu-system-x86").')
+    ovmf = ovmf_pair()
+    if not ovmf:
+        raise RuntimeError('UEFI OVMF firmware is not installed (install package "ovmf").')
+
+    mem = max(512, min(int(memory_mib if memory_mib is not None else meta['memory_mib']), 131072))
+    smp = max(1, min(int(cpus if cpus is not None else meta['cpus']), 64))
+    port = int(ssh_port)
+    if not 1 <= port <= 65535:
+        raise ValueError(f'SSH forward port must be 1..65535, got {ssh_port!r}')
+
+    argv = [qemu, '-name', f'whitecube-{name}', '-machine', 'q35', '-m', str(mem), '-smp', str(smp)]
+    if vm_can_kvm():
+        argv += ['-enable-kvm', '-cpu', 'host']
+    else:
+        argv += ['-cpu', 'max']
+
+    code_path, vars_template = ovmf
+    if vars_template is not None:
+        vars_path = ensure_vm_vars(vm_dir(name) / 'vars.fd', vars_template)
+        if ',' in str(vars_path):
+            raise ValueError(f'QEMU firmware path cannot contain commas: {vars_path}')
+        vars_opts = f'if=pflash,format=raw,file={vars_path}'
+        if snapshot:
+            vars_opts += ',snapshot=on'
+        argv += ['-drive', f'if=pflash,format=raw,readonly=on,file={code_path}', '-drive', vars_opts]
+    else:
+        argv += ['-bios', str(code_path)]
+
+    drive = f'file={disk_path},format={meta["format"]},if=virtio'
+    if snapshot:
+        drive += ',snapshot=on'
+    argv += ['-drive', drive]
+
+    net = 'user,model=virtio-net-pci'
+    if forward_ssh:
+        net += f',hostfwd=tcp:127.0.0.1:{port}-:22'
+    argv += ['-nic', net, '-device', 'virtio-rng-pci']
+
+    if headless:
+        argv += ['-display', 'none']
+    else:
+        argv += ['-vga', 'virtio', '-display', 'gtk']
+    if serial_stdio:
+        argv += ['-serial', 'mon:stdio']
+    return argv
+
+
+def vm_launch_argv(name: str, memory_mib: int | None = None, cpus: int | None = None,
+                   forward_ssh: bool = False, ssh_port: int = 2222) -> list[str]:
+    """Prefer whitecube-vm so GUI boots hold vm.lock and log stderr cleanly."""
+    cli = whitecube_vm_command()
+    if cli:
+        argv = [cli, 'run', name]
+        if memory_mib is not None:
+            argv += ['--memory', str(int(memory_mib))]
+        if cpus is not None:
+            argv += ['--cpus', str(int(cpus))]
+        if forward_ssh:
+            argv += ['--ssh', '--ssh-port', str(int(ssh_port))]
+        return argv
+    return vm_run_argv(name, memory_mib=memory_mib, cpus=cpus, forward_ssh=forward_ssh, ssh_port=ssh_port)
+
+
+def list_vms() -> list[dict]:
+    """List every stored VM directory cleanly."""
+    images = whitecube_store() / 'images'
+    if not images.is_dir() or images.is_symlink():
+        return []
+    found: list[dict] = []
+    for entry in sorted(images.iterdir(), key=lambda p: p.name):
+        if entry.is_symlink() or not entry.is_dir():
+            continue
+        try:
+            meta = vm_meta(entry.name)
+        except (OSError, ValueError):
+            continue
+        disk_path = Path(meta['disk_path'])
+        apparent = disk_path.stat().st_size if disk_path.is_file() else 0
+        actual = disk_path.stat().st_blocks * 512 if disk_path.is_file() else 0
+        found.append({
+            **meta,
+            'disk_exists': disk_path.is_file(),
+            'apparent_bytes': apparent,
+            'actual_bytes': actual,
+            'running': vm_is_running(entry.name),
+        })
+    return found
+
+
+def remove_vm(name: str) -> bool:
+    """Remove a non-running VM from the store."""
+    target = vm_dir(name)
+    if not target.exists():
+        return False
+    lock_fd = _open_vm_lock(target)
+    try:
+        shutil.rmtree(target)
+        return True
+    finally:
+        os.close(lock_fd)
 
 
 def new_workdir() -> Path:
@@ -271,7 +658,11 @@ def forget(name: str, kind: str) -> None:
 
 
 def vm_exists(name: str) -> bool:
-    return (whitecube_store() / 'images' / name / 'meta.json').is_file()
+    try:
+        meta = vm_meta(name)
+    except (OSError, ValueError):
+        return False
+    return Path(meta['disk_path']).is_file()
 
 
 def load_draft() -> dict:

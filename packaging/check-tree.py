@@ -45,6 +45,7 @@ GUEST_OWNED_PATHS = {
 EXTERNAL_REFERENCES = {
     'usr/share/doc/whitecube-desktop/README.md': {'/usr/bin/whitecube'},
     'usr/share/whitecube/cube-prompts/README.md': {'/usr/bin/cube-prompts-studio'},  # Standalone edition.
+    'usr/lib/whitecube/trainer-parquet-runtime/runtime.json': {'/usr/bin/python3.13'},
     'usr/libexec/whitecube/cube-settings-helper': {
         '/usr/bin/amixer', '/usr/bin/wpctl', '/usr/bin/chronyc', '/usr/bin/setupcon',
     },
@@ -152,7 +153,7 @@ def main():
                 'usr/share/whitecube/chrootables/chrootables/broker.py', 'usr/share/whitecube/chrootables/chrootables/client.py',
                 'usr/share/whitecube/chrootables/chrootables/style.py', 'usr/share/whitecube/chrootables/chrootables/terminal.py',
                 'usr/share/applications/cube-chrootables.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-chrootables.svg',
-                'usr/bin/cube-strap', 'usr/share/whitecube/cube-strap/app.py', 'usr/share/whitecube/cube-strap/strap.py',
+                'usr/bin/cube-strap', 'usr/bin/whitecube-vm', 'usr/share/whitecube/cube-strap/app.py', 'usr/share/whitecube/cube-strap/strap.py',
                 'usr/share/whitecube/cube-strap/deb-strap.sh', 'usr/libexec/whitecube/cube-strap-build',
                 'usr/share/applications/cube-strap.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-strap.svg',
                 'usr/bin/cube-prompts', 'usr/share/whitecube/cube-prompts/app.py',

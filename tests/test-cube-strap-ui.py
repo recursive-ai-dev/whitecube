@@ -1,7 +1,7 @@
 #!/usr/bin/python3 -I
 """Drive the native Cube Strap window on an isolated Wayland compositor.
 
-sudo, cube-strap-build, chrootable-manager and whitecube are fakes in a temporary bin
+sudo, cube-strap-build, chrootable-manager and qemu-system-x86_64 are fakes in a temporary bin
 directory: the test builds a chroot cube and a VM cube end to end, a failing build, and
 renders every page, without root, network, debootstrap or the real stores.
 """
@@ -52,12 +52,8 @@ printf '%s\\n' cube-chrootables > "$FIXTURE/chrootables.launch"
 printf '%s\\n' old-launcher > "$FIXTURE/chrootables.launch"
 exit 99
 ''',
-    'whitecube': r'''#!/bin/sh
-case $1 in
-  import) mkdir -p "$WHITECUBE_HOME/images/$5"; cp "$4" "$WHITECUBE_HOME/images/$5/disk.img"
-          echo '{"type": "ext4", "disk": "disk.img"}' > "$WHITECUBE_HOME/images/$5/meta.json" ;;
-  run) printf '%s\n' "$@" > "$FIXTURE/run.args" ;;
-esac
+    'qemu-system-x86_64': r'''#!/bin/sh
+printf '%s\n' "$@" > "$FIXTURE/run.args"
 ''',
 }
 
@@ -147,9 +143,14 @@ def inside(fixture, screenshots):
             assert strap.load_history()[-1]['status'] == 'built', strap.load_history()[-1]
             assert strap.vm_exists('vmbox')
             assert 'image_size = "12G"' in (fixture / 'last.conf').read_text()
-            yield 300
-            run = (fixture / 'run.args').read_text().split()
-            assert run[:2] == ['run', 'vmbox'] and run[-2:] == ['--forward', '2222:22'], run
+            for _ in range(25):
+                if (fixture / 'run.args').exists():
+                    break
+                yield 100
+            run = (fixture / 'run.args').read_text().splitlines()
+            assert 'whitecube-vmbox' in run, run
+            assert any(line.startswith('if=pflash,') and 'vars.fd' in line for line in run), run
+            assert any('hostfwd=tcp:127.0.0.1:2222-:22' in line for line in run), run
             w.name.set_text('vmbox'); w.password.set_text('secret2')
             assert 'already exists' in w.problem.get_text()
 
@@ -174,7 +175,7 @@ def inside(fixture, screenshots):
                 yield 350
                 app.screenshot(w, str(screenshots / f'cube-strap-{page}.png'))
             print('PASS: validation, sudo unlock path, chroot build and Chrootables import, VM build, '
-                  'whitecube import and boot with SSH forward, failed build cleanup, history, forget')
+                  'native VM import and QEMU/OVMF boot with SSH forward, failed build cleanup, history, forget')
 
     application = SmokeApp(options)
     result = application.run([sys.argv[0]])
@@ -196,6 +197,9 @@ def run(screenshots):
             (fixture / 'bin' / name).chmod(0o755)
         (fixture / 'apps/chrootables').mkdir(parents=True)
         (fixture / 'apps/cube-strap').mkdir()
+        (fixture / 'ovmf').mkdir()
+        (fixture / 'ovmf/OVMF_CODE.fd').write_bytes(b'OVMF_CODE')
+        (fixture / 'ovmf/OVMF_VARS.fd').write_bytes(b'OVMF_VARS')
         shutil.copyfile(ROOT / 'apps/chrootables/broker.py', fixture / 'apps/chrootables/broker.py')
         shutil.copyfile(fixture / 'bin/cube-strap-build', fixture / 'apps/cube-strap/cube-strap-build')
         (fixture / 'apps/cube-strap/cube-strap-build').chmod(0o755)
@@ -206,6 +210,8 @@ def run(screenshots):
                    PATH=f'{fixture / "bin"}:{os.environ.get("PATH", "/usr/bin:/bin")}',
                    CHROOTABLES_SUDO=str(fixture / 'bin/sudo'), CHROOTABLES_MANAGER=str(fixture / 'bin/chrootable-manager'),
                    WHITECUBE_HOME=str(fixture / 'store'),
+                   WHITECUBE_OVMF_CODE=str(fixture / 'ovmf/OVMF_CODE.fd'),
+                   WHITECUBE_OVMF_VARS=str(fixture / 'ovmf/OVMF_VARS.fd'),
                    WLR_BACKENDS='headless', WLR_RENDERER='pixman', WLR_HEADLESS_OUTPUTS='1',
                    GDK_BACKEND='wayland', GSK_RENDERER='cairo', NO_AT_BRIDGE='1', GSETTINGS_BACKEND='memory')
         for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'WAYLAND_SOCKET', 'DBUS_SESSION_BUS_ADDRESS'):

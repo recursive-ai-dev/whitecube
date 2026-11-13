@@ -48,7 +48,7 @@ class Tree(unittest.TestCase):
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
-                     'cube-chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'net-off', 'net-on'):
+                     'cube-chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'whitecube-vm', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
             self.assertTrue(path.exists(), name)
             self.assertTrue(os.access(path, os.X_OK), name)
@@ -110,7 +110,7 @@ class Tree(unittest.TestCase):
 
     def test_cube_editor_runtime_and_desktop_integration_are_shipped(self):
         editor = self.stage / 'usr/share/whitecube/cube-editor'
-        for name in ('app.py', 'engine.py', 'worker.py', 'kernel.py', 'COPYING', 'NOTICE'):
+        for name in ('app.py', 'engine.py', 'worker.py', 'kernel.py', 'cube_terminal.py', 'COPYING', 'NOTICE'):
             self.assertTrue((editor / name).is_file(), name)
             self.assertTrue(os.access(editor / name, os.R_OK), name)
         entry = (self.stage / 'usr/share/applications/cube-editor.desktop').read_text()
@@ -258,6 +258,7 @@ class Tree(unittest.TestCase):
             self.assertIn('private library is missing', done.stdout)
             output = subprocess.run(['ldd', str(ROOT / 'build/whitecube')], capture_output=True, text=True, check=True).stdout
             resolved = dict(checker.RESOLVED.findall(output))
+            staged_names = list(checker.PRIVATE)
             for name in checker.PRIVATE:
                 source = Path(resolved[name]).resolve()
                 if name == 'libcairo.so.2':
@@ -265,6 +266,14 @@ class Tree(unittest.TestCase):
                     if candidate.is_file():
                         source = candidate.resolve()
                 shutil.copyfile(source, private / name)
+            wlroots_ldd = subprocess.run(
+                ['ldd', str(Path(resolved['libwlroots-0.18.so']).resolve())],
+                capture_output=True, text=True, check=True,
+            ).stdout
+            for dep_name, dep_path in checker.RESOLVED.findall(wlroots_ldd):
+                if dep_name.startswith('libdisplay-info.so.') and dep_path.startswith('/usr/lib/whitecube/'):
+                    shutil.copyfile(Path(dep_path).resolve(), private / dep_name)
+                    staged_names.append(dep_name)
             done = subprocess.run(check, capture_output=True, text=True)
             self.assertEqual(done.returncode, 0, done.stdout)
             self.assertTrue(checker.resolution_problems('libexample.so => not found\n', private.resolve()))
@@ -287,7 +296,7 @@ class Tree(unittest.TestCase):
             if control.exists():
                 control.unlink()
                 control.parent.rmdir()
-            for name in checker.PRIVATE:
+            for name in staged_names:
                 (private / name).unlink(missing_ok=True)
     def test_the_path_checker_passes_and_catches_a_stale_path(self):
         check = [sys.executable, '-I', str(ROOT / 'packaging/check-tree.py'), str(self.stage), '--sources', str(ROOT / 'src')]

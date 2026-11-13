@@ -9,9 +9,19 @@ for f in /etc/sudoers /etc/sudoers.d/*; do
     grep -vE '^\s*(#|$)' "$f"
 done
 
+# Detect the user who invoked sudo
+SUDO_USER="${SUDO_USER:-${USER:-}}"
+if [ -z "$SUDO_USER" ] || [ "$SUDO_USER" = "root" ]; then
+    SUDO_USER="$(logname 2>/dev/null || echo)"
+fi
+
 echo; echo "== who can use sudo =="
 getent group sudo admin wheel
-sudo -l -U woez 2>&1 | sed 's/^/  /'
+if [ -n "$SUDO_USER" ]; then
+    sudo -l -U "$SUDO_USER" 2>&1 | sed 's/^/  /'
+else
+    echo "  (could not determine invoking user)"
+fi
 
 echo; echo "== other root paths =="
 awk -F: '$3==0{print "uid0:",$1}' /etc/passwd

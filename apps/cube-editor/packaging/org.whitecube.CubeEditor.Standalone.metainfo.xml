@@ -19,5 +19,5 @@
   <developer id="org.whitecube"><name>Whitecube contributors</name></developer>
   <provides><binary>cube-editor-studio</binary><binary>cube-editor-cli</binary></provides>
   <content_rating type="oars-1.1"/>
-  <releases><release version="0.5.0" date="2026-10-27"/></releases>
+  <releases><release version="0.6.0" date="2026-11-12"/></releases>
 </component>

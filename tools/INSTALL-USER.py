@@ -35,7 +35,7 @@ def main():
     args = parser.parse_args()
     project = Path(__file__).resolve().parent.parent
     user_dir = Path.home()
-    if os.geteuid() == 0 or os.geteuid() != os.getuid():
+    if os.geteuid() == 0 or os.getuid() == 0:
         parser.error('run as the desktop account without sudo')
     bindir = user_dir / '.local/bin'
     files = {}

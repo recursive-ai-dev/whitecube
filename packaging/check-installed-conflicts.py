@@ -71,15 +71,19 @@ def canonical_path(path, root, cache):
                     resolved.pop()
                 continue
             candidate = root.joinpath(*resolved, part)
-            if candidate.is_symlink():
-                links += 1
-                if links > 40:
-                    raise RuntimeError(f'cyclic host directory alias: {path}')
-                target = PurePosixPath(os.readlink(candidate))
-                if target.is_absolute():
-                    resolved = []
-                pending = list(target.parts) + pending
-            else:
+            try:
+                if candidate.is_symlink():
+                    links += 1
+                    if links > 40:
+                        raise RuntimeError(f'cyclic host directory alias: {path}')
+                    target = PurePosixPath(os.readlink(candidate))
+                    if target.is_absolute():
+                        resolved = []
+                    pending = list(target.parts) + pending
+                else:
+                    resolved.append(part)
+            except PermissionError:
+                # Cannot read symlink (e.g., /root/.config), treat as regular directory
                 resolved.append(part)
         cache[parent] = '/' + '/'.join(resolved)
     return cache[parent].rstrip('/') + '/' + source.name

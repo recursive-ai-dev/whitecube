@@ -4,7 +4,7 @@ Build from the Cube Editor directory:
 
 ```sh
 ./packaging/build-deb.sh
-sudo apt install ./packaging/out/cube-editor_0.5.0_all.deb
+sudo apt install ./packaging/out/cube-editor_0.6.0_all.deb
 cube-editor-studio
 ```
 
@@ -16,8 +16,8 @@ starts the application. Verify the result with:
 
 ```sh
 cd packaging/out
-sha256sum --check cube-editor_0.5.0_all.deb.sha256
-dpkg-deb --info cube-editor_0.5.0_all.deb
+sha256sum --check cube-editor_0.6.0_all.deb.sha256
+dpkg-deb --info cube-editor_0.6.0_all.deb
 ```
 
 For another output location, use `--output-directory PATH`. Use `--no-tests`

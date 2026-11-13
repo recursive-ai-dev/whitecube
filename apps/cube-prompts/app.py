@@ -1665,6 +1665,7 @@ class PromptsApp(Adw.Application):
         super().__init__(application_id='org.whitecube.CubePrompts', flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.options = options
         self.window = None
+        self._screenshot_retries = 0
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -1685,13 +1686,23 @@ class PromptsApp(Adw.Application):
 
     def screenshot(self):
         window = self.window
-        paintable = Gtk.WidgetPaintable.new(window)
-        snapshot = Gtk.Snapshot()
-        paintable.snapshot(snapshot, window.get_width(), window.get_height())
-        node = snapshot.to_node()
-        if node:
-            texture = window.get_native().get_renderer().render_texture(node, None)
-            texture.save_to_png(str(self.options.screenshot))
+        w, h = window.get_width(), window.get_height()
+        native = window.get_native()
+        renderer = native.get_renderer() if native else None
+        if renderer and window.get_mapped() and w > 0 and h > 0:
+            paintable = Gtk.WidgetPaintable.new(window)
+            snapshot = Gtk.Snapshot()
+            paintable.snapshot(snapshot, w, h)
+            node = snapshot.to_node()
+            if node:
+                texture = renderer.render_texture(node, None)
+                texture.save_to_png(str(self.options.screenshot))
+                self.quit()
+                return False
+        self._screenshot_retries += 1
+        if self._screenshot_retries < 25:
+            GLib.timeout_add(150, self.screenshot)
+            return False
         self.quit()
         return False
 

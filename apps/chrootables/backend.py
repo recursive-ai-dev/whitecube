@@ -74,7 +74,7 @@ def manager_path() -> Path:
     if override:
         return Path(override)
     local = HERE / 'chrootable-manager'
-    return local if local.is_file() else INSTALLED_MANAGER
+    return local.resolve() if local.is_file() else INSTALLED_MANAGER
 
 
 def valid_name(text: str) -> bool:

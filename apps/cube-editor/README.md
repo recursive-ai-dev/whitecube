@@ -8,11 +8,11 @@ its old Python runtime and GTK wizard are not runtime dependencies.
 
 ## Run and install
 
-Build and install the standalone **Cube Editor 0.5.0** package from this directory:
+Build and install the standalone **Cube Editor 0.6.0** package from this directory:
 
 ```sh
 bash packaging/build-deb.sh
-sudo apt install ./packaging/out/cube-editor_0.5.0_all.deb
+sudo apt install ./packaging/out/cube-editor_0.6.0_all.deb
 cube-editor-studio
 ```
 
@@ -112,11 +112,16 @@ is made that every third-party installer or distribution supports customization.
 
 ## Editing, recovery and release tools
 
-Version 0.5.0 adds a project overview with the next suggested action, a studio
-menu, keyboard command selection, smaller-window navigation, and system/light/dark
-appearance. Window geometry and the last studio page are saved in
-`$XDG_CONFIG_HOME/cube-editor/preferences.json` (default `~/.config`). Use
-**Ctrl K** for commands, **Ctrl ,** for appearance, and **F1** for shortcuts.
+Version 0.6.0 adds read-only guest rootfs inspection (OS name, kernel versions,
+installed package browser, installer type) on Source & Customize, local
+`whitecube-desktop` `.deb` discovery & metadata preview, live Bash syntax
+checking (`bash -n`), package overlap hints, recent-project state badges with
+one-click forget, auto-selected installer test disks with live QEMU status,
+smooth progress pulsing, semantic activity log highlighting, `Gtk.FileDialog`
+adoption, and a refreshed monochrome visual pass. Window geometry and the last
+studio page are saved in `$XDG_CONFIG_HOME/cube-editor/preferences.json`
+(default `~/.config`). Use **Ctrl K** for commands, **Ctrl ,** for appearance,
+and **F1** for shortcuts.
 
 **System diagnostics** checks workflow tools, Python bindings, project inputs,
 recovery state, storage, VM acceleration and UEFI firmware. It is also available

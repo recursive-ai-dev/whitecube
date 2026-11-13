@@ -128,6 +128,8 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
             self.assertNotIn(stale, env)
         self.assertEqual(record['argv'][0], '-s')
         self.assertIn('cube-status', record['argv'][1])
+        self.assertNotIn('xwayland-satellite', record['argv'][1])
+        self.assertNotIn('DISPLAY', record['argv'][1])
         log = self.state / 'session.log'
         self.assertIn('fake compositor output', log.read_text())
         self.assertEqual(log.stat().st_mode & 0o777, 0o600)
@@ -135,6 +137,17 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
         self.assertEqual(self.launch().returncode, 0)
         self.assertEqual((self.state / 'session.log.old').read_bytes(), original)
         self.assertEqual((self.state / 'failed-starts').read_text(), '')
+
+    def test_live_dbus_socket_in_runtime_is_exposed(self):
+        import socket
+        bus = self.runtime / 'bus'
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(bus))
+            result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = self.wait_capture()['env']
+        self.assertEqual(env.get('DBUS_SESSION_BUS_ADDRESS'), f'unix:path={bus}')
+        self.assertNotIn('DISPLAY', env)
 
     def test_check_reports_prerequisites_without_starting_compositor(self):
         result = self.launch('--check')

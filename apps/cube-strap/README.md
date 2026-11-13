@@ -6,7 +6,9 @@ Builds Debian whitecubes from a GTK4 window in the Whitecube look:
   `whitecube-chrootable-manager --import` turns the gzip tarball into a workspace.
   It then shows in **Cube Chrootables** (`cube-chrootables`), and the Shell button opens it in a terminal.
 - **Virtual machine**: deb-strap builds a raw UEFI disk (EFI + ext4 root, GRUB, the cloud kernel).
-  `whitecube import` adds it to the image store, and `whitecube run NAME` boots it. The Server
+  Cube Strap stores it sparsely under `~/.whitecube/images/NAME` (with a per-VM OVMF NVRAM
+  copy) and boots it natively in QEMU (`qemu-system-x86_64` + `ovmf`); `whitecube-vm`
+  exposes `list`, `info`, `check`, `import`, `run`, and `remove` on the command line. The Server
   recipe forwards host port 2222 to the VM's SSH.
 
 Recipes: Minimal, Everyday tools and Developer for both kinds. Server and Desktop (XFCE) are VM-only.

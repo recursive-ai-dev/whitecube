@@ -31,7 +31,7 @@ import uuid
 
 # Standalone launchers use isolated Python; allow only sibling application modules.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-VERSION = '0.5.0'
+VERSION = '0.6.0'
 DEFAULT_PROJECTS = Path.home() / "cubic/work"
 DEFAULT_OUTPUT = Path.home() / "cubic/complete"
 DEFAULT_SOURCE = Path.home() / "cubic/iso/lubuntu-26.04.1-desktop-amd64.iso"
@@ -105,9 +105,18 @@ def terminal_command(command, title='Cube Editor'):
 
     Foot needs Wayland; LXQt, GNOME, KDE and Xfce terminals also support X11.
     Server-based terminals need explicit wait/separate flags for job monitoring.
-    The override is one supported executable, never a shell expression.
+    The override is one supported executable (or 'builtin' when Vte 3.91 is
+    available), never a shell expression.
     """
     override = os.environ.get('CUBE_EDITOR_TERMINAL', '')
+    if override == 'builtin':
+        try:
+            from cube_terminal import builtin_available
+        except ImportError as exc:
+            raise CubeError(f'CUBE_EDITOR_TERMINAL=builtin unavailable: {exc}') from exc
+        if not builtin_available():
+            raise CubeError('CUBE_EDITOR_TERMINAL=builtin requires python3-gi and gir1.2-vte-3.91')
+        return ['__CUBE_TERMINAL__', title] + list(command)
     candidates = [override] if override else list(TERMINALS) + ['x-terminal-emulator']
     for candidate in candidates:
         executable = shutil.which(candidate)
@@ -134,6 +143,15 @@ def terminal_command(command, title='Cube Editor'):
                         + '. Foot also requires a Wayland session.')
     raise CubeError('Install QTerminal, GNOME Terminal, Konsole, Xfce Terminal, xterm, or Foot (Wayland) '
                     'to authenticate image operations.')
+
+
+def run_cube_terminal(command, title='Cube Editor'):
+    """Run command in the built-in GTK4/VTE terminal. Blocks until exit."""
+    try:
+        from cube_terminal import run_in_terminal
+    except ImportError as exc:
+        raise CubeError(f'Built-in terminal unavailable: {exc}. Install python3-gi and gir1.2-vte-3.91') from exc
+    return run_in_terminal(command, title)
 
 
 def package_list(value):
@@ -494,7 +512,7 @@ class Project:
         return self
 
     def remember(self):
-        path = Path.home() / ".config/cube-editor/recent.json"
+        path = recent_path()
         recent = recent_projects(raw=True)
         recent = [str(self.directory)] + [p for p in recent if p != str(self.directory)]
         atomic_json(path, recent[:30])
@@ -550,9 +568,23 @@ class Project:
             return True
 
 
+def config_dir():
+    """Return cube-editor's user config directory, honoring XDG_CONFIG_HOME."""
+    xdg = os.environ.get('XDG_CONFIG_HOME', '').strip()
+    if xdg:
+        base = Path(xdg).expanduser()
+        if base.is_absolute():
+            return base / 'cube-editor'
+    return Path.home() / '.config/cube-editor'
+
+
+def recent_path():
+    return config_dir() / 'recent.json'
+
+
 def recent_projects(raw=False):
     try:
-        entries = json.loads((Path.home() / ".config/cube-editor/recent.json").read_text())
+        entries = json.loads(recent_path().read_text())
     except (OSError, ValueError):
         entries = []
     paths = [p for p in entries if isinstance(p, str) and (Path(p) / "cube-editor.json").is_file()]
@@ -566,6 +598,200 @@ def recent_projects(raw=False):
         except (OSError, ValueError, CubeError):
             continue
     return projects
+
+
+def forget_recent(directory):
+    """Remove a project directory from the recent-projects index without deleting files."""
+    target = str(Path(directory).expanduser())
+    try:
+        resolved = str(Path(directory).expanduser().resolve())
+    except OSError:
+        resolved = target
+    recent = [p for p in recent_projects(raw=True) if p not in (target, resolved)]
+    atomic_json(recent_path(), recent[:30])
+
+
+def discover_desktop_debs():
+    """Find locally built whitecube-desktop .deb packages, newest first."""
+    candidates = []
+    home = Path.home()
+    roots = [
+        home / 'Projects/whitecube/packaging/out',
+        home / 'whitecube/packaging/out',
+        home / 'Downloads',
+    ]
+    seen = set()
+    for folder in roots:
+        if not folder.is_dir():
+            continue
+        try:
+            for item in folder.glob('whitecube-desktop_*.deb'):
+                if not item.is_file() or item.is_symlink():
+                    continue
+                resolved = str(item.resolve())
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                try:
+                    mtime = item.stat().st_mtime_ns
+                except OSError:
+                    mtime = 0
+                candidates.append((mtime, item))
+        except OSError:
+            continue
+    candidates.sort(key=lambda pair: (pair[0], str(pair[1])), reverse=True)
+    return [pair[1] for pair in candidates]
+
+
+def inspect_deb(path):
+    """Read Debian package metadata without installing or executing scripts."""
+    deb = Path(path).expanduser()
+    if not deb.is_file() or deb.suffix != '.deb':
+        return None
+    info = {'path': str(deb), 'size_bytes': deb.stat().st_size}
+    if not shutil.which('dpkg-deb'):
+        return info
+    try:
+        result = subprocess.run(
+            ['dpkg-deb', '-f', str(deb), 'Package', 'Version', 'Architecture', 'Installed-Size'],
+            capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            return None
+        for line in result.stdout.splitlines():
+            if ': ' in line:
+                key, value = line.split(': ', 1)
+                info[key.lower().replace('-', '_')] = value.strip()
+        return info if info.get('package') else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def installed_packages(project):
+    """Parse installed packages from an extracted guest root without root privileges."""
+    status_path = project.rootfs / 'var/lib/dpkg/status'
+    try:
+        if not status_path.is_file():
+            return []
+        raw = status_path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return []
+    packages = []
+    for paragraph in raw.split('\n\n'):
+        if not paragraph.strip():
+            continue
+        fields = {}
+        current_key = None
+        for line in paragraph.splitlines():
+            if line.startswith(' ') and current_key:
+                continue
+            if ': ' in line:
+                key, value = line.split(': ', 1)
+                current_key = key
+                fields[key] = value.strip()
+        if fields.get('Status') == 'install ok installed' and fields.get('Package'):
+            try:
+                size_kb = int(fields.get('Installed-Size', '0'))
+            except ValueError:
+                size_kb = 0
+            packages.append({
+                'name': fields['Package'],
+                'version': fields.get('Version', ''),
+                'arch': fields.get('Architecture', ''),
+                'size_kb': size_kb,
+                'summary': fields.get('Description', '').splitlines()[0] if fields.get('Description') else '',
+            })
+    packages.sort(key=lambda item: item['name'])
+    return packages
+
+
+def guest_summary(project):
+    """Collect fast, read-only metadata about an extracted guest filesystem."""
+    root = project.rootfs
+    summary = {
+        'extracted': (project.directory / '.extracted').is_file() and root.is_dir(),
+        'os_name': '',
+        'codename': '',
+        'hostname': '',
+        'package_count': 0,
+        'kernels': [],
+        'installer': 'Live only',
+        'restore_available': (project.directory / 'restore-point/manifest.json').is_file(),
+    }
+    if not summary['extracted']:
+        return summary
+    for candidate in (root / 'etc/os-release', root / 'usr/lib/os-release'):
+        try:
+            if candidate.is_file():
+                os_fields = {}
+                for line in candidate.read_text(encoding='utf-8', errors='replace').splitlines():
+                    if '=' in line and not line.lstrip().startswith('#'):
+                        key, value = line.split('=', 1)
+                        os_fields[key.strip()] = value.strip().strip('"').strip("'")
+                summary['os_name'] = os_fields.get('PRETTY_NAME') or os_fields.get('NAME', '')
+                summary['codename'] = os_fields.get('VERSION_CODENAME', '')
+                if summary['os_name']:
+                    break
+        except OSError:
+            pass
+    try:
+        hostname_file = root / 'etc/hostname'
+        if hostname_file.is_file():
+            summary['hostname'] = hostname_file.read_text(encoding='utf-8', errors='replace').strip()
+    except OSError:
+        pass
+    summary['package_count'] = len(installed_packages(project))
+    try:
+        boot = root / 'boot'
+        if boot.is_dir():
+            summary['kernels'] = sorted(
+                p.name.removeprefix('vmlinuz-') for p in boot.glob('vmlinuz-*') if not p.is_symlink() or p.exists()
+            )
+    except OSError:
+        pass
+    try:
+        if (root / 'etc/calamares/settings.conf').is_file():
+            summary['installer'] = 'Calamares'
+        elif (root / 'usr/bin/ubiquity').exists():
+            summary['installer'] = 'Ubiquity'
+    except OSError:
+        pass
+    return summary
+
+
+def check_script_syntax(script):
+    """Run bash -n on a custom script without executing it; returns error text or None."""
+    if not script or not script.strip():
+        return None
+    if not shutil.which('bash'):
+        return None
+    try:
+        result = subprocess.run(['bash', '-n', '-s'], input=script, capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            lines = [line.strip() for line in (result.stderr or '').splitlines() if line.strip()]
+            return lines[0] if lines else 'Bash syntax error'
+        return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def list_test_disks(project):
+    """List existing qcow2 installer test disks in the project, newest first."""
+    folder = project.directory / 'vm-tests'
+    if not folder.is_dir() or folder.is_symlink():
+        return []
+    disks = []
+    try:
+        for item in folder.glob('*.qcow2'):
+            if item.is_file() and not item.is_symlink():
+                try:
+                    mtime = item.stat().st_mtime_ns
+                except OSError:
+                    mtime = 0
+                disks.append((mtime, item))
+    except OSError:
+        return []
+    disks.sort(key=lambda pair: (pair[0], str(pair[1])), reverse=True)
+    return [pair[1] for pair in disks]
 
 
 def inspect_iso(source_iso, selected=""):
@@ -798,56 +1024,30 @@ class Engine:
             self.project.save(release_checks=checks)
         return checks[-1]
 
-    def run(self, command):
-        """Launch an argv array, following authenticated worker events."""
-        if not isinstance(command, (tuple, list)) or not command or any(not isinstance(arg, str) for arg in command):
-            raise CubeError("Commands must be argument arrays")
-        self._cancelled.clear()
-        self._worker_started = False
-        self._cancel_time = None
-        self._interactive_worker = Path(command[0]).name in (*TERMINALS, 'x-terminal-emulator') or str(WORKER) in command
-        cancel_file = self.project.directory / ".cancel"
-        cancel_file.unlink(missing_ok=True)
-        events = self.project.directory / "events.jsonl"
+    def _make_event_tailer(self, events):
+        """Create an incremental events.jsonl reader handling truncation and rotation."""
         info = events.stat() if events.exists() else None
         offset = info.st_size if info else 0
         event_identity = (info.st_dev, info.st_ino) if info else None
-        self.emit({"type": "state", "message": "Starting interactive worker"})
-        try:
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
-        except FileNotFoundError as error:
-            raise CubeError(f"Required command is missing: {command[0]}") from error
-        process = self.process
-        output_lines = deque(maxlen=128)
-        reader_errors = []
-        reader = None
+        partial = ''
         terminal = None
-        partial = ""
 
-        def read_output():
-            try:
-                for line in process.stdout:
-                    output_lines.append(line[-4000:])
-                    self.emit({"type": "log", "message": line.rstrip()})
-            except Exception as error:
-                reader_errors.append(error)
-
-        def tail_events(final=False):
+        def tail(final=False):
             nonlocal offset, partial, terminal, event_identity
             try:
                 with events.open(errors='replace') as stream:
-                    info = os.fstat(stream.fileno())
-                    identity = (info.st_dev, info.st_ino)
-                    if identity != event_identity or info.st_size < offset:
+                    stat_info = os.fstat(stream.fileno())
+                    identity = (stat_info.st_dev, stat_info.st_ino)
+                    if identity != event_identity or stat_info.st_size < offset:
                         offset, partial = 0, ''
                     event_identity = identity
                     stream.seek(offset)
                     chunk = stream.read()
                     offset = stream.tell()
             except FileNotFoundError:
-                return
+                return terminal
             partial += chunk
-            lines = partial.split("\n")
+            lines = partial.split('\n')
             partial = '' if final else lines.pop()
             for line in lines:
                 event = worker_event(line)
@@ -858,12 +1058,49 @@ class Engine:
                 if event['type'] == 'finished':
                     terminal = event
                 self.emit(event)
+            return terminal
+
+        return tail
+
+    def run(self, command):
+        """Launch an argv array, following authenticated worker events."""
+        if not isinstance(command, (tuple, list)) or not command or any(not isinstance(arg, str) for arg in command):
+            raise CubeError("Commands must be argument arrays")
+
+        if command[0] == '__CUBE_TERMINAL__':
+            return self._run_cube_terminal(command[1:])
+
+        self._cancelled.clear()
+        self._worker_started = False
+        self._cancel_time = None
+        self._interactive_worker = Path(command[0]).name in (*TERMINALS, 'x-terminal-emulator') or str(WORKER) in command
+        cancel_file = self.project.directory / ".cancel"
+        cancel_file.unlink(missing_ok=True)
+        tail_events = self._make_event_tailer(self.project.directory / "events.jsonl")
+        self.emit({"type": "state", "message": "Starting interactive worker"})
+        try:
+            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", start_new_session=True)
+        except FileNotFoundError as error:
+            raise CubeError(f"Required command is missing: {command[0]}") from error
+        process = self.process
+        output_lines = deque(maxlen=128)
+        reader_errors = []
+        reader = None
+        terminal = None
+
+        def read_output():
+            try:
+                for line in process.stdout:
+                    output_lines.append(line[-4000:])
+                    self.emit({"type": "log", "message": line.rstrip()})
+            except Exception as error:
+                reader_errors.append(error)
 
         try:
             reader = threading.Thread(target=read_output, daemon=True)
             reader.start()
             while process.poll() is None:
-                tail_events()
+                terminal = tail_events()
                 if reader_errors:
                     raise reader_errors[0]
                 if self._cancelled.is_set() and not self._worker_started and self._cancel_time and time.monotonic() - self._cancel_time > 1:
@@ -871,7 +1108,7 @@ class Engine:
                         os.killpg(process.pid, signal.SIGTERM)
                 time.sleep(0.1)
             # The final event can arrive between the last tail and terminal exit.
-            tail_events(final=True)
+            terminal = tail_events(final=True)
             reader.join(timeout=2)
             if reader_errors:
                 raise reader_errors[0]
@@ -914,6 +1151,70 @@ class Engine:
         if code:
             raise CubeError(f"Command exited with status {code}")
         return {"success": True, "returncode": code}
+
+    def _run_cube_terminal(self, args):
+        """Run command via opt-in built-in GTK4/VTE terminal."""
+        if not args:
+            raise CubeError("Missing terminal title")
+        title = args[0]
+        worker_command = args[1:]
+
+        self._cancelled.clear()
+        self._worker_started = False
+        self._cancel_time = None
+        self._interactive_worker = True
+        cancel_file = self.project.directory / ".cancel"
+        cancel_file.unlink(missing_ok=True)
+        tail_events = self._make_event_tailer(self.project.directory / "events.jsonl")
+        self.emit({"type": "state", "message": "Starting interactive worker"})
+
+        terminal_result = {"event": None, "error": None}
+        monitoring = threading.Event()
+        monitoring.set()
+
+        def monitor_events():
+            try:
+                while monitoring.is_set():
+                    event = tail_events()
+                    if event is not None:
+                        terminal_result["event"] = event
+                        monitoring.clear()
+                        break
+                    time.sleep(0.05)
+            except Exception as exc:
+                terminal_result["error"] = exc
+
+        monitor_thread = threading.Thread(target=monitor_events, daemon=True)
+        monitor_thread.start()
+
+        try:
+            from cube_terminal import run_in_terminal
+            run_in_terminal(
+                worker_command,
+                title,
+                cancel_event=self._cancelled,
+                worker_started_cb=lambda: self._worker_started,
+            )
+        except Exception as exc:
+            terminal_result["error"] = exc
+        finally:
+            monitoring.clear()
+            monitor_thread.join(timeout=2)
+            final_event = tail_events(final=True)
+            if final_event is not None:
+                terminal_result["event"] = final_event
+
+        if terminal_result["error"]:
+            raise CubeError(f"Terminal error: {terminal_result['error']}")
+
+        terminal = terminal_result["event"]
+        if self._cancelled.is_set() or (terminal and terminal.get("cancelled")):
+            raise Cancelled("Operation cancelled. The original ISO is unchanged.")
+        if terminal:
+            if not terminal.get("success"):
+                raise CubeError(terminal.get("message", "Worker failed"))
+            return terminal
+        raise CubeError("Worker did not finish. Authentication may have been cancelled, or the terminal closed.")
 
     def cancel(self):
         self._cancelled.set()

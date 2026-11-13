@@ -109,9 +109,21 @@ def require_root():
 
 
 def caller():
-    """The desktop user: SUDO_UID when elevated, otherwise ourselves."""
-    uid = int(os.environ.get("SUDO_UID", os.getuid())) if os.geteuid() == 0 else os.getuid()
-    return pwd.getpwuid(uid)
+    """The desktop user: SUDO_UID when elevated via sudo, otherwise ourselves.
+    
+    Requires SUDO_UID to be set when running as root (via sudo).
+    Fails if SUDO_UID is missing or invalid when euid=0.
+    """
+    if os.geteuid() == 0:
+        sudo_uid = os.environ.get("SUDO_UID")
+        if not sudo_uid or not sudo_uid.isdigit():
+            fail("SUDO_UID not set or invalid; this helper must be run via sudo from the desktop user.")
+        uid = int(sudo_uid)
+        try:
+            return pwd.getpwuid(uid)
+        except KeyError:
+            fail(f"SUDO_UID={uid} does not correspond to a valid user.")
+    return pwd.getpwuid(os.getuid())
 
 
 def read(path, default=""):

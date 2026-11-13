@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import engine
 from engine import Cancelled, CubeError, Engine, Project, atomic_text, guest_destination, inspect_iso, package_list
 from worker import Worker, checksum_tree, copy_payload, rebuild_iso
 
@@ -31,11 +32,14 @@ class ProjectFixture(unittest.TestCase):
         self.path = Path(self.temp.name)
         self.home = mock.patch("engine.Path.home", return_value=self.path / "home")
         self.home.start()
+        self.xdg = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.path / "home/.config")})
+        self.xdg.start()
         self.source = self.path / "source.iso"
         self.source.write_bytes(b"test source")
         self.project = Project.create(self.source, "Review Cube", self.path / "projects", self.path / "output")
 
     def tearDown(self):
+        self.xdg.stop()
         self.home.stop()
         self.temp.cleanup()
 
@@ -323,6 +327,90 @@ class ISOIntegrationTests(ProjectFixture):
         run(["xorriso", "-osirrox", "on", "-indev", str(self.project.output_path), "-extract", "/casper", str(export_tree)])
         contents = run(["unsquashfs", "-cat", str(export_tree / "filesystem.squashfs"), "etc/cube-editor"])
         self.assertEqual(contents, "customized\n")
+
+
+class StudioHelpersTests(ProjectFixture):
+    def test_config_dir_and_forget_recent(self):
+        custom_xdg = self.path / "xdg-cfg"
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(custom_xdg)}):
+            self.assertEqual(engine.config_dir(), custom_xdg / "cube-editor")
+            self.project.remember()
+            self.assertEqual(len(engine.recent_projects()), 1)
+            engine.forget_recent(self.project.directory)
+            self.assertEqual(engine.recent_projects(), [])
+
+    def test_discover_desktop_debs_and_inspect_deb(self):
+        out = self.path / "home/Projects/whitecube/packaging/out"
+        out.mkdir(parents=True)
+        older = out / "whitecube-desktop_0.11.0_amd64.deb"
+        newer = out / "whitecube-desktop_0.11.1_amd64.deb"
+        older.write_bytes(b"placeholder")
+        newer.write_bytes(b"placeholder")
+        os.utime(older, (1000, 1000))
+        os.utime(newer, (2000, 2000))
+        found = engine.discover_desktop_debs()
+        self.assertEqual(found, [newer, older])
+        self.assertIsNone(engine.inspect_deb(self.path / "missing.deb"))
+        self.assertIsNone(engine.inspect_deb(self.source))
+        pkg_root = self.path / "pkg"
+        (pkg_root / "DEBIAN").mkdir(parents=True)
+        os.chmod(pkg_root, 0o755)
+        os.chmod(pkg_root / "DEBIAN", 0o755)
+        (pkg_root / "DEBIAN/control").write_text(
+            "Package: whitecube-desktop\nVersion: 0.11.1\nArchitecture: amd64\n"
+            "Maintainer: Test <t@example.org>\nDescription: test pkg\n"
+        )
+        built = self.path / "sample.deb"
+        if shutil.which("dpkg-deb"):
+            run(["dpkg-deb", "--build", str(pkg_root), str(built)])
+            info = engine.inspect_deb(built)
+            self.assertEqual(info["package"], "whitecube-desktop")
+            self.assertEqual(info["version"], "0.11.1")
+            self.assertEqual(info["architecture"], "amd64")
+
+    def test_guest_summary_and_installed_packages(self):
+        empty = engine.guest_summary(self.project)
+        self.assertFalse(empty["extracted"])
+        root = self.project.rootfs
+        (root / "etc").mkdir(parents=True)
+        (root / "boot").mkdir(parents=True)
+        (root / "var/lib/dpkg").mkdir(parents=True)
+        (root / "etc/os-release").write_text('PRETTY_NAME="Whitecube Base 26.04"\nVERSION_CODENAME=resolute\n')
+        (root / "etc/hostname").write_text("whitecube-live\n")
+        (root / "boot/vmlinuz-6.12.0-1-generic").write_bytes(b"")
+        (root / "etc/calamares").mkdir(parents=True)
+        (root / "etc/calamares/settings.conf").write_text("---\n")
+        (root / "var/lib/dpkg/status").write_text(
+            "Package: bash\nStatus: install ok installed\nArchitecture: amd64\nInstalled-Size: 1024\n"
+            "Version: 5.2\nDescription: GNU Bourne Again SHell\n long description line\n\n"
+            "Package: removed-pkg\nStatus: deinstall ok config-files\nVersion: 1.0\n\n"
+            "Package: nano\nStatus: install ok installed\nArchitecture: all\nVersion: 8.0\nDescription: small editor\n"
+        )
+        (self.project.directory / ".extracted").write_text("1\n")
+        summary = engine.guest_summary(self.project)
+        self.assertTrue(summary["extracted"])
+        self.assertEqual(summary["os_name"], "Whitecube Base 26.04")
+        self.assertEqual(summary["hostname"], "whitecube-live")
+        self.assertEqual(summary["package_count"], 2)
+        self.assertEqual(summary["kernels"], ["6.12.0-1-generic"])
+        self.assertEqual(summary["installer"], "Calamares")
+        pkgs = engine.installed_packages(self.project)
+        self.assertEqual([p["name"] for p in pkgs], ["bash", "nano"])
+        self.assertEqual(pkgs[0]["summary"], "GNU Bourne Again SHell")
+
+    def test_check_script_syntax_and_list_test_disks(self):
+        self.assertIsNone(engine.check_script_syntax(""))
+        self.assertIsNone(engine.check_script_syntax("if true; then echo ok; fi"))
+        self.assertIsNotNone(engine.check_script_syntax("if true; then echo broken"))
+        vm_tests = self.project.directory / "vm-tests"
+        vm_tests.mkdir()
+        d1 = vm_tests / "older.qcow2"
+        d2 = vm_tests / "newer.qcow2"
+        d1.write_bytes(b"q1")
+        d2.write_bytes(b"q2")
+        os.utime(d1, (1000, 1000))
+        os.utime(d2, (2000, 2000))
+        self.assertEqual(engine.list_test_disks(self.project), [d2, d1])
 
 
 if __name__ == "__main__":

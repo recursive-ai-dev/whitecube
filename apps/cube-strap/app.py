@@ -3,7 +3,8 @@
 
 The window runs as the desktop user. The build is one sudo call (cube-strap-build); a
 password typed here goes to `sudo -S` once through Cube Strap's compatibility helper and is
-never kept. Chroot cubes are imported with chrootable-manager, VM cubes with `whitecube import`.
+never kept. Chroot cubes are imported with chrootable-manager, VM cubes natively into the
+VM store (~/.whitecube) and booted with QEMU + OVMF (or `whitecube-vm`).
 """
 import argparse
 import os
@@ -26,7 +27,7 @@ VERSION = '1.0.0'
 APP_ID = 'org.whitecube.CubeStrap'
 KIND_TEXT = {
     'chroot': ('Chroot workspace', 'Shares this kernel. Opens in Cube Chrootables; enter it in a terminal.'),
-    'vm': ('Virtual machine', 'Its own kernel and UEFI disk. Boots in QEMU through whitecube.'),
+    'vm': ('Virtual machine', 'Its own kernel and UEFI disk. Boots natively in QEMU + OVMF.'),
 }
 
 
@@ -249,7 +250,7 @@ class StrapWindow(Adw.ApplicationWindow):
 
     def cubes_page(self):
         page = self.page('cubes', 'Cubes')
-        page.append(label('Cubes built here. Chroot cubes live in Cube Chrootables; VM cubes in the whitecube store.',
+        page.append(label('Cubes built here. Chroot cubes live in Cube Chrootables; VM cubes live in ~/.whitecube (whitecube-vm).',
                           'dim-label'))
         self.cube_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.cube_list.add_css_class('boxed-list')
@@ -338,7 +339,7 @@ class StrapWindow(Adw.ApplicationWindow):
         self.problem.set_visible(bool(found) and bool(plan.name))
         self.build_button.set_sensitive(not found and not self.building)
         where = ('imported into Cube Chrootables' if plan.kind == 'chroot'
-                 else 'added to the whitecube store as a UEFI disk')
+                 else 'stored as a native QEMU/OVMF UEFI disk')
         self.summary.set_text(f'{plan.name or "This cube"}: {strap.RECIPES.get(plan.recipe, ("?",))[0]} '
                               f'{plan.suite}, {plan.size_gib} GiB, {where}.')
         strap.save_draft(plan)
@@ -394,10 +395,24 @@ class StrapWindow(Adw.ApplicationWindow):
         self.notify(f'{name} removed from this list (the cube itself is untouched).')
 
     def boot(self, name, forward_ssh=False):
-        if not strap.whitecube_command():
-            self.notify('The whitecube image tool is not installed.')
+        if not strap.vm_exists(name):
+            self.notify(f'VM {name} was not found in the store.')
+            self.fill_cubes()
             return
-        self.spawn(strap.vm_run_argv(name, forward_ssh=forward_ssh))
+        missing = strap.vm_boot_missing()
+        if missing:
+            pkgs = ' '.join(pkg for _, pkg in missing)
+            self.notify(f'VM booting needs QEMU and OVMF (install packages: {pkgs}).')
+            return
+        if strap.vm_is_running(name):
+            self.notify(f'{name} is already running.')
+            return
+        try:
+            argv = strap.vm_launch_argv(name, forward_ssh=forward_ssh)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.notify(str(error))
+            return
+        self.spawn(argv)
         self.notify(f'Booting {name}' + (' (ssh -p 2222 localhost)' if forward_ssh else ''))
 
     def shell(self, name):
@@ -421,9 +436,6 @@ class StrapWindow(Adw.ApplicationWindow):
         found = strap.problems(plan, self.taken(plan.kind))
         if found:
             self.notify(found[0])
-            return
-        if plan.kind == 'vm' and not strap.whitecube_command():
-            self.notify('VM cubes need the whitecube image tool (package "whitecube").')
             return
         self.background(self.manager.authenticated,
                         lambda ok, _e: self.run_build(plan) if ok else self.ask_password(plan))
@@ -493,12 +505,8 @@ class StrapWindow(Adw.ApplicationWindow):
                 self.manager.change(strap.import_args(plan, archive), on_line=self.say)
             else:
                 image = workdir / f'{plan.name}.img'
-                code = self.stream(strap.vm_import_argv(plan, image))
-                if code != 0:
-                    detail = 'whitecube import failed. See the log.'
-                    return
-                self.say('Making the stored disk sparse again...')
-                strap.sparsify(strap.whitecube_store() / 'images' / plan.name / 'disk.img')
+                self.say(f'Saving sparse VM disk to {strap.vm_dir(plan.name)}...')
+                strap.import_vm(plan.name, image, suite=plan.suite, arch=getattr(plan, 'arch', 'amd64'), recipe=plan.recipe)
             status = 'built'
             detail = f'{plan.name} is ready ({strap.human_seconds(time.monotonic() - started)}).'
         except backend.AuthRequired:

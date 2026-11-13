@@ -101,6 +101,23 @@ def find_compositor(script):
     raise SessionError('whitecube-compositor is missing or not executable; reinstall whitecube-desktop')
 
 
+def _is_unix_socket(path):
+    try:
+        return Path(path).is_socket()
+    except OSError:
+        return False
+
+
+def _valid_dbus_address(address):
+    if not address:
+        return False
+    first = address.split(';', 1)[0]
+    if first.startswith('unix:path='):
+        path = first[len('unix:path='):].split(',', 1)[0]
+        return _is_unix_socket(path)
+    return True
+
+
 def session_environment(env, runtime, script):
     result = dict(env)
     directory = str(Path(script).resolve().parent)
@@ -113,9 +130,13 @@ def session_environment(env, runtime, script):
     if 'wayland' not in env.get('WLR_BACKENDS', '').split(','):
         result.pop('WAYLAND_DISPLAY', None)
     result.pop('DISPLAY', None)
-    # Ensure DBUS_SESSION_BUS_ADDRESS is set for GUI apps (compositor doesn't start its own DBus)
+    # Drop stale inherited D-Bus unix:path sockets; otherwise expose runtime/bus when live.
+    if not _valid_dbus_address(result.get('DBUS_SESSION_BUS_ADDRESS')):
+        result.pop('DBUS_SESSION_BUS_ADDRESS', None)
     if 'DBUS_SESSION_BUS_ADDRESS' not in result:
-        result['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={runtime}/bus'
+        bus = Path(runtime) / 'bus'
+        if _is_unix_socket(bus):
+            result['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={bus}'
     return result
 
 

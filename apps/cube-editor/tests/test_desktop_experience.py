@@ -53,6 +53,8 @@ class DesktopWorkflowTests(unittest.TestCase):
         config.start(); self.addCleanup(config.stop)
         home = mock.patch('engine.Path.home', return_value=self.path / 'home')
         home.start(); self.addCleanup(home.stop)
+        xdg = mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.path / 'home/.config')})
+        xdg.start(); self.addCleanup(xdg.stop)
         self.window = app.EditorWindow(self.application)
         self.addCleanup(self.cleanup_window)
 
