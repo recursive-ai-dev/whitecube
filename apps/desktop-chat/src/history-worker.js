@@ -18,7 +18,8 @@ function list(query, options) {
   const result = [];
   for (const id of present) {
     try {
-      const stat = fs.statSync(history.filename(id), { bigint: true });
+      const stat = fs.lstatSync(history.filename(id), { bigint: true });
+      if (!stat.isFile()) { remove(id); continue; }
       const signature = `${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
       let entry = cache.get(id);
       if (!entry || entry.signature !== signature || (needle && entry.text === null)) {

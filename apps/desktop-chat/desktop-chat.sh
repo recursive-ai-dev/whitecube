@@ -4,6 +4,7 @@ set -eu
 script_path=$(readlink -f -- "$0") || exit 1
 app_dir=${script_path%/*}
 cd -- "$app_dir" || exit 1
+cli_mode=0
 case ${1:-} in
   -h|--help)
     cat <<'HELP'
@@ -15,6 +16,7 @@ Open the Desktop Chat workspace. Repeated launches control the running app.
   --toggle                   Toggle the window
   --settings, --configure     Open settings
   --checkpoint RUN/FILE.pt    Select a trained local checkpoint
+  --cli <command> [args...]   Run headless CLI diagnostics (doctor/models/chats/export)
   --quit                     Quit the running app
   --version                  Print application version
   --help                     Show this help
@@ -34,20 +36,33 @@ HELP
     fi
     printf 'Desktop Chat %s\n' "$version"
     exit 0 ;;
+  --cli)
+    shift
+    if [ -n "${NODE:-}" ] && [ -x "$NODE" ]; then
+      exec "$NODE" "$app_dir/src/cli.js" "$@"
+    elif command -v node >/dev/null 2>&1; then
+      exec node "$app_dir/src/cli.js" "$@"
+    elif command -v nodejs >/dev/null 2>&1; then
+      exec nodejs "$app_dir/src/cli.js" "$@"
+    fi
+    cli_mode=1
+    ;;
 esac
-unset ELECTRON_RUN_AS_NODE
-platform=${DESKTOP_CHAT_OZONE_PLATFORM:-${ELECTRON_OZONE_PLATFORM_HINT:-}}
-if [ -z "$platform" ]; then
-  if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
-    platform=wayland
-  elif [ -n "${DISPLAY:-}" ]; then
-    platform=x11
-  else
-    platform=auto
+if [ "$cli_mode" -eq 0 ]; then
+  unset ELECTRON_RUN_AS_NODE
+  platform=${DESKTOP_CHAT_OZONE_PLATFORM:-${ELECTRON_OZONE_PLATFORM_HINT:-}}
+  if [ -z "$platform" ]; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ] || [ "${XDG_SESSION_TYPE:-}" = wayland ]; then
+      platform=wayland
+    elif [ -n "${DISPLAY:-}" ]; then
+      platform=x11
+    else
+      platform=auto
+    fi
   fi
+  case $platform in auto|wayland|x11) ;; *) printf '%s\n' 'Desktop Chat: platform must be auto, wayland or x11.' >&2; exit 2 ;; esac
+  export ELECTRON_OZONE_PLATFORM_HINT=$platform
 fi
-case $platform in auto|wayland|x11) ;; *) printf '%s\n' 'Desktop Chat: platform must be auto, wayland or x11.' >&2; exit 2 ;; esac
-export ELECTRON_OZONE_PLATFORM_HINT=$platform
 # Standalone Debian layout, existing Whitecube layout, source checkout, PATH.
 if [ -n "${DESKTOP_CHAT_RUNTIME:-}" ]; then
   runtime=$DESKTOP_CHAT_RUNTIME
@@ -66,5 +81,8 @@ elif command -v electron >/dev/null 2>&1; then
 else
   printf '%s\n' 'Desktop Chat: Electron is missing. Reinstall whitecube-desktop-chat, or run npm ci in the source checkout.' >&2
   exit 127
+fi
+if [ "$cli_mode" -eq 1 ]; then
+  ELECTRON_RUN_AS_NODE=1 exec "$runtime" "$app_dir/src/cli.js" "$@"
 fi
 exec "$runtime" "--ozone-platform=$platform" "$app_dir" "$@"

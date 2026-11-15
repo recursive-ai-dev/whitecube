@@ -18,6 +18,10 @@ whitecube-chat --settings
 whitecube-chat --toggle
 whitecube-chat --hide
 whitecube-chat --show
+whitecube-chat --cli doctor --json
+whitecube-chat --cli models
+whitecube-chat --cli chats --query "search text"
+whitecube-chat --cli export <CONVERSATION_UUID> --format markdown
 whitecube-chat --quit
 whitecube-chat --help
 whitecube-chat --version

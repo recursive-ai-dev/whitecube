@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts', 'chat')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -762,6 +762,64 @@ def check_prompts(env):
                     f'{prompts_bin} --cli doctor')]
 
 
+def check_chat(env):
+    """Report desktop-chat launcher, runtime files, and headless CLI diagnostics."""
+    share_dir = env.at('/usr/share/whitecube/desktop-chat')
+    runtime_dir = env.at('/usr/lib/whitecube/desktop-chat-runtime')
+    runtime_files = (
+        'desktop-chat.sh',
+        'main.js',
+        'src/cli.js',
+        'src/config.js',
+        'src/history.js',
+        'src/tools.js',
+    )
+    if env.root != Path('/'):
+        launcher = env.at('/usr/bin/desktop-chat')
+        has_any = (launcher.is_file() or launcher.is_symlink()) or share_dir.exists() or runtime_dir.exists()
+        if not has_any:
+            return [finding('info', 'chat', 'desktop-chat is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        electron_bin = runtime_dir / 'electron'
+        if not electron_bin.is_file() or not os.access(electron_bin, os.X_OK):
+            missing.append('desktop-chat-runtime/electron')
+        if not (launcher.is_file() or launcher.is_symlink()) or not os.access(launcher, os.X_OK) or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else f'{launcher} missing or not executable'
+            return [finding('FAIL', 'chat', f'staged desktop-chat incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'chat', 'staged desktop-chat launcher, runtime, and Electron bundle present')]
+
+    candidates = [
+        env.at('/usr/bin/desktop-chat'),
+        env.home / '.local/bin/desktop-chat',
+        env.project / 'apps/desktop-chat/desktop-chat.sh',
+    ]
+    chat_bin = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if chat_bin is None:
+        return [finding('info', 'chat', 'desktop-chat is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(chat_bin, os.X_OK):
+        return [finding('WARN', 'chat', f'{chat_bin} is not executable', 'ensure executable permissions on desktop-chat')]
+    sub_env = dict(os.environ)
+    sub_env['HOME'] = str(env.home)
+    try:
+        proc = subprocess.run([str(chat_bin), '--cli', 'doctor', '--json'], capture_output=True, text=True, timeout=5, env=sub_env)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'chat', f'could not query desktop-chat --cli doctor: {error}',
+                        f'{chat_bin} --cli doctor')]
+    if not isinstance(data, dict) or 'config' not in data or 'conversations' not in data:
+        return [finding('WARN', 'chat', 'desktop-chat --cli doctor returned unexpected JSON', f'{chat_bin} --cli doctor')]
+    if not data.get('ok'):
+        detail = data.get('config', {}).get('error') or data.get('conversations', {}).get('error') or 'configuration/history error'
+        return [finding('FAIL', 'chat', f'desktop-chat check failed: {detail}', f'{chat_bin} --cli doctor')]
+    conv_count = data.get('conversations', {}).get('count', 0)
+    ckpt_count = data.get('checkpoints', {}).get('count', 0)
+    return [finding('ok', 'chat',
+                    f'desktop-chat {data.get("version", "?")} ready ({conv_count} conversations, {ckpt_count} checkpoints)')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -787,6 +845,7 @@ def run_checks(env, selected=None):
         'vm': (lambda: check_vm(env),),
         'chrootables': (lambda: check_chrootables(env),),
         'prompts': (lambda: check_prompts(env),),
+        'chat': (lambda: check_chat(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

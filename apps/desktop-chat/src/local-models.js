@@ -4,7 +4,20 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 function readJson(filename) {
-  try { return JSON.parse(fs.readFileSync(filename, 'utf8')); } catch { return {}; }
+  try {
+    const lst = fs.lstatSync(filename);
+    if (!lst.isFile() || lst.size > 4 * 1024 * 1024) return {};
+    const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+    const fd = fs.openSync(filename, flags);
+    try {
+      const st = fs.fstatSync(fd);
+      if (!st.isFile() || st.size > 4 * 1024 * 1024) return {};
+      const parsed = JSON.parse(fs.readFileSync(fd, 'utf8'));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch { return {}; }
 }
 
 // Discover files without loading torch or unpickling a checkpoint. IDs always

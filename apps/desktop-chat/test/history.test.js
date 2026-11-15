@@ -150,3 +150,19 @@ test('closing an in-flight history worker settles its request and permits a fres
   await rejected;
   assert.equal((await history.listAsync())[0].id, chat.id);
 });
+
+test('symlinked conversation and active index files are rejected safely', t => {
+  const { history, directory } = fixture(t);
+  const good = history.create({});
+  const spoofed = history.create({});
+  const target = history.filename(spoofed.id);
+  const outside = path.join(directory, 'outside.json');
+  fs.copyFileSync(target, outside);
+  fs.unlinkSync(target);
+  fs.symlinkSync(outside, target);
+  assert.throws(() => history.get(spoofed.id), /regular conversation file/);
+  const active = path.join(directory, 'active.json');
+  fs.unlinkSync(active);
+  fs.symlinkSync(outside, active);
+  assert.equal(history.current().id, good.id);
+});

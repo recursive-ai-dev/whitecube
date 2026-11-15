@@ -155,3 +155,12 @@
 - **Tests & Verification**:
   - Extended `tests/test-cube-prompts.py` (`HeadlessCliAndHardeningTests`: `--version`, read-only `--cli doctor --json`, `list`/`show`/`render`/`export`/`import` round-trip, `--strict` variable failures, and non-blocking FIFO/symlink/oversize rejection in `config`, `keychain`, and `backup`) and `tests/test-doctor.py` (`test_prompts_check_reports_staged_and_cli_readiness`).
   - Verified `tests/test-cube-prompts.py` (9 unit tests + 6-page Wayland GUI smoke), `tests/test-doctor.py` (54 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/desktop-chat | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added headless Node CLI (`apps/desktop-chat/src/cli.js`) with `doctor [--json]`, `models [--json]`, `chats [--query ...] [--limit N] [--json]`, and `export <ID> [--format markdown|json]` (strictly read-only without Electron or creating empty state directories), wired via `apps/desktop-chat/desktop-chat.sh --cli` with `NODE` -> `node`/`nodejs` -> `ELECTRON_RUN_AS_NODE=1` runtime fallback (plus updated `--help` and `apps/desktop-chat/README.md`).
+  - Hardened regular non-symlink non-blocking bounded reads (`lstatSync` + `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, `isFile()`, size caps) across `src/config.js`, `src/history.js` (`get()` and `current()`, also exporting `validChat`), `src/history-worker.js` (`lstatSync` + `isFile()`), and `src/local-models.js`, plus non-regular target guard in `src/tools.js:edit_file()`.
+  - Wired read-only `check_chat(env)` and the `'chat'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `apps/desktop-chat/test/launcher.test.js` (`--cli` `doctor`, `models`, `chats`, `export`, and `ELECTRON_RUN_AS_NODE=1` fallback), `apps/desktop-chat/test/config.test.js` (symlink config rejection/atomic replacement), `apps/desktop-chat/test/history.test.js` (symlink conversation and `active.json` rejection), `apps/desktop-chat/test/tools.test.js` (non-regular `edit_file` rejection), and `tests/test-doctor.py` (`test_chat_check_reports_staged_and_cli_readiness`).
+  - Verified all 75 Node tests (`apps/desktop-chat/test/*.test.js`), `apps/desktop-chat/test/local-server-test.py`, `tests/test-doctor.py` (55 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

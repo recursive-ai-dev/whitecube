@@ -6,6 +6,21 @@ const { Worker } = require('node:worker_threads');
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+function readRegularText(filename, maxBytes, tooLargeMessage) {
+  const lst = fs.lstatSync(filename);
+  if (!lst.isFile()) throw new Error('Expected a regular conversation file.');
+  if (lst.size > maxBytes) throw new Error(tooLargeMessage);
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  const fd = fs.openSync(filename, flags);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error('Expected a regular conversation file.');
+    if (st.size > maxBytes) throw new Error(tooLargeMessage);
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 function timestamp(value) {
   if (typeof value !== 'string' || value.length !== 24) return false;
   const date = new Date(value);
@@ -65,8 +80,7 @@ class History {
   }
   get(id) {
     const filename = this.filename(id);
-    if (fs.statSync(filename).size > MAX_FILE_BYTES) throw new Error('This conversation is too large to open.');
-    const chat = JSON.parse(fs.readFileSync(filename, 'utf8'));
+    const chat = JSON.parse(readRegularText(filename, MAX_FILE_BYTES, 'This conversation is too large to open.'));
     if (!validChat(chat, id)) {
       throw new Error('Conversation data is damaged. The original file has been preserved.');
     }
@@ -131,7 +145,7 @@ class History {
     return worker?.terminate();
   }
   current() {
-    try { return this.get(JSON.parse(fs.readFileSync(path.join(this.directory, 'active.json'), 'utf8')).id); }
+    try { return this.get(JSON.parse(readRegularText(path.join(this.directory, 'active.json'), 64 * 1024, 'Active conversation index is too large.')).id); }
     catch { const last = this.list()[0]; return last ? this.get(last.id) : null; }
   }
   activate(chat) { atomicWrite(path.join(this.directory, 'active.json'), { id: chat.id }); return chat; }
@@ -165,4 +179,4 @@ function exportMarkdown(chat) {
   }
   return lines.join('\n');
 }
-module.exports = { History, sourceOf, exportMarkdown };
+module.exports = { History, sourceOf, exportMarkdown, validChat };

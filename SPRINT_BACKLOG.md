@@ -20,7 +20,7 @@
 - [x] `apps/cube-strap` (`whitecube-vm` UEFI VM builder and management)
 - [x] `apps/chrootables` (`cube-chrootables` & `whitecube-chrootable-manager`)
 - [x] `apps/cube-prompts` (SQLite prompt library, templates, and multi-model runner)
-- [ ] `apps/desktop-chat` (Electron chat, local model server bridge, search/drafts)
+- [x] `apps/desktop-chat` (Electron chat, local model server bridge, search/drafts)
 - [ ] `apps/wc-suite` & `apps/cube-apps` (CLI suite, completions, and native file utilities)
 
 ## Phase 4: Packaging & Release Readiness (`packaging/`, `tools/`)

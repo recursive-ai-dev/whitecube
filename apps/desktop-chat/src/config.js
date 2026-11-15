@@ -23,6 +23,24 @@ function configPath() {
   return path.join(app.getPath('userData'), 'config.json');
 }
 
+const MAX_CONFIG_BYTES = 1024 * 1024;
+
+function readRegularText(filename, maxBytes = MAX_CONFIG_BYTES) {
+  const lst = fs.lstatSync(filename);
+  if (!lst.isFile()) throw new Error('Expected a regular config file.');
+  if (lst.size > maxBytes) throw new Error('Config file exceeds size limit.');
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0);
+  const fd = fs.openSync(filename, flags);
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error('Expected a regular config file.');
+    if (st.size > maxBytes) throw new Error('Config file exceeds size limit.');
+    return fs.readFileSync(fd, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 function canEncrypt() {
   return safeStorage.isEncryptionAvailable() &&
     (!safeStorage.getSelectedStorageBackend || safeStorage.getSelectedStorageBackend() !== 'basic_text');
@@ -31,13 +49,11 @@ function canEncrypt() {
 function load() {
   const p = configPath();
   let raw = {};
-  if (fs.existsSync(p)) {
-    try {
-      raw = JSON.parse(fs.readFileSync(p, 'utf8'));
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
-    } catch (e) {
-      raw = {};
-    }
+  try {
+    raw = JSON.parse(readRegularText(p) || '{}');
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) raw = {};
+  } catch (e) {
+    raw = {};
   }
   const cfg = { ...DEFAULTS, ...raw };
 
@@ -73,7 +89,8 @@ function save(settings) {
   if (settings.apiKey !== undefined && typeof settings.apiKey !== 'string') throw new Error('API key must be text.');
   let existingRaw = {};
   try {
-    existingRaw = JSON.parse(fs.readFileSync(configPath(), 'utf8') || '{}');
+    existingRaw = JSON.parse(readRegularText(configPath()) || '{}');
+    if (!existingRaw || typeof existingRaw !== 'object' || Array.isArray(existingRaw)) existingRaw = {};
   } catch (e) {
     existingRaw = {}; // missing or corrupt: start fresh instead of refusing to save
   }

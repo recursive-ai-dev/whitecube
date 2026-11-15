@@ -697,6 +697,65 @@ class RunTests(Fixture):
                 self.assertEqual(live_fail['level'], 'FAIL')
                 self.assertIn('database', live_fail['detail'])
 
+    def test_chat_check_reports_staged_and_cli_readiness(self):
+        info = doctor.check_chat(self.env)[0]
+        self.assertEqual(info['level'], 'info')
+
+        self.put('usr/bin/desktop-chat', '#!/bin/sh\n').chmod(0o755)
+        self.put('usr/lib/whitecube/desktop-chat-runtime/electron', '#!/bin/sh\n').chmod(0o755)
+        for mod in (
+            'desktop-chat.sh',
+            'main.js',
+            'src/cli.js',
+            'src/config.js',
+            'src/history.js',
+            'src/tools.js',
+        ):
+            self.put(f'usr/share/whitecube/desktop-chat/{mod}', '')
+        ok = doctor.check_chat(self.env)[0]
+        self.assertEqual(ok['level'], 'ok')
+        self.assertIn('staged', ok['detail'])
+
+        (self.root / 'usr/share/whitecube/desktop-chat/src/cli.js').unlink()
+        bad = doctor.check_chat(self.env)[0]
+        self.assertEqual(bad['level'], 'FAIL')
+        self.assertIn('cli.js', bad['detail'])
+
+        fake_bin = self.home / '.local/bin/desktop-chat'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\nexit 0\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                'ok': True, 'version': '1.0.0',
+                'config': {'present': True, 'error': None},
+                'conversations': {'count': 2, 'error': None},
+                'checkpoints': {'count': 1},
+            }),
+            stderr='',
+        )
+        fail_proc = mock.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                'ok': False, 'version': '1.0.0',
+                'config': {'present': True, 'error': 'Config root must be a JSON object.'},
+                'conversations': {'count': 0, 'error': None},
+                'checkpoints': {'count': 0},
+            }),
+            stderr='',
+        )
+        if not Path('/usr/bin/desktop-chat').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                live_ok = doctor.check_chat(live_env)[0]
+                self.assertEqual(live_ok['level'], 'ok')
+                self.assertIn('2 conversations', live_ok['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=fail_proc):
+                live_fail = doctor.check_chat(live_env)[0]
+                self.assertEqual(live_fail['level'], 'FAIL')
+                self.assertIn('JSON object', live_fail['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

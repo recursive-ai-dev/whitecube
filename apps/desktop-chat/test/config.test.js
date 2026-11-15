@@ -86,3 +86,16 @@ test('malformed generation preferences fall back to usable defaults', () => fixt
   const settings = config.load();
   assert.equal(settings.toolsEnabled, true); assert.equal(settings.temperature, 0.7); assert.equal(settings.maxTokens, 8192);
 }));
+
+test('symlinked config file is ignored on load and atomically replaced on save', () => fixture((config, directory) => {
+  const target = path.join(directory, 'external.json');
+  fs.writeFileSync(target, JSON.stringify({ model: 'from-symlink', apiKeyPlain: 'leaked' }));
+  const cfgPath = path.join(directory, 'config.json');
+  fs.symlinkSync(target, cfgPath);
+  const loaded = config.load();
+  assert.equal(loaded.model, 'gpt-4o-mini');
+  assert.equal(loaded.apiKey, '');
+  config.save({ model: 'local-safe' });
+  assert.equal(fs.lstatSync(cfgPath).isSymbolicLink(), false);
+  assert.equal(config.load().model, 'local-safe');
+}));

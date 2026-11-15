@@ -82,3 +82,91 @@ test('standalone package launcher uses sibling runtime and help needs no Electro
     assert.deepEqual(fs.readFileSync(f.capture, 'utf8').split('\0').slice(4), ['--ozone-platform=x11', app, '--show', '']);
   } finally { f.cleanup(); }
 });
+
+test('launcher --cli supports headless doctor, models, chats, and export without Electron or creating empty state', () => {
+  const f = fixture();
+  try {
+    const userData = path.join(f.directory, 'user-data');
+    const trainOut = path.join(f.directory, 'train-out');
+    const cliEnv = {
+      ...process.env,
+      DISPLAY: '',
+      WAYLAND_DISPLAY: '',
+      XDG_SESSION_TYPE: '',
+      NODE: process.execPath,
+      DESKTOP_CHAT_USER_DATA: userData,
+      WHITECUBE_TRAIN_OUT: trainOut
+    };
+    const emptyDoc = spawnSync(launcher, ['--cli', 'doctor', '--json'], { env: cliEnv, encoding: 'utf8' });
+    assert.equal(emptyDoc.status, 0, emptyDoc.stderr);
+    const parsedEmpty = JSON.parse(emptyDoc.stdout);
+    assert.equal(parsedEmpty.ok, true);
+    assert.equal(parsedEmpty.config.present, false);
+    assert.equal(parsedEmpty.conversations.count, 0);
+    assert.equal(fs.existsSync(userData), false);
+
+    fs.mkdirSync(path.join(userData, 'conversations'), { recursive: true });
+    fs.writeFileSync(path.join(userData, 'config.json'), JSON.stringify({
+      endpoint: 'http://127.0.0.1:11434/v1',
+      model: 'qwen-local',
+      apiKeyPlain: 'secret-token',
+      modelAliases: { 'run1/ckpt_best.pt': 'Best Local Run' }
+    }));
+    const id = '11111111-2222-3333-4444-555555555555';
+    fs.writeFileSync(path.join(userData, 'conversations', `${id}.json`), JSON.stringify({
+      id,
+      title: 'CLI Export Test',
+      customTitle: true,
+      createdAt: '2026-03-01T10:00:00.000Z',
+      updatedAt: '2026-03-01T10:01:00.000Z',
+      source: { chatSource: 'api', endpoint: 'http://127.0.0.1:11434/v1', model: 'qwen-local', checkpointId: '' },
+      messages: [{ role: 'user', content: 'Hello CLI needle' }, { role: 'assistant', content: 'Ready.' }],
+      context: []
+    }));
+    fs.mkdirSync(path.join(trainOut, 'run1'), { recursive: true });
+    fs.writeFileSync(path.join(trainOut, 'run1', 'run.json'), JSON.stringify({ display_name: 'Run 1', parameters: 1234 }));
+    fs.writeFileSync(path.join(trainOut, 'run1', 'ckpt_best.pt'), 'stub');
+
+    const popDoc = spawnSync(launcher, ['--cli', 'doctor', '--json'], { env: cliEnv, encoding: 'utf8' });
+    assert.equal(popDoc.status, 0, popDoc.stderr);
+    assert.equal(popDoc.stdout.includes('secret-token'), false);
+    const parsedPop = JSON.parse(popDoc.stdout);
+    assert.equal(parsedPop.config.hasApiKey, true);
+    assert.equal(parsedPop.conversations.count, 1);
+    assert.equal(parsedPop.checkpoints.count, 1);
+
+    const models = spawnSync(launcher, ['--cli', 'models', '--json'], { env: cliEnv, encoding: 'utf8' });
+    assert.equal(models.status, 0, models.stderr);
+    assert.equal(JSON.parse(models.stdout)[0].name, 'Best Local Run');
+
+    const chats = spawnSync(launcher, ['--cli', 'chats', '--query', 'needle', '--json'], { env: cliEnv, encoding: 'utf8' });
+    assert.equal(chats.status, 0, chats.stderr);
+    assert.equal(JSON.parse(chats.stdout).length, 1);
+
+    const md = spawnSync(launcher, ['--cli', 'export', id, '--format', 'markdown'], { env: cliEnv, encoding: 'utf8' });
+    assert.equal(md.status, 0, md.stderr);
+    assert.match(md.stdout, /^# CLI Export Test/);
+    assert.match(md.stdout, /Hello CLI needle/);
+
+    // Verify Electron fallback when node/nodejs/NODE are unavailable sets ELECTRON_RUN_AS_NODE=1
+    const noNodeBin = path.join(f.directory, 'no-node-bin');
+    fs.mkdirSync(noNodeBin);
+    for (const tool of ['sh', 'readlink', 'cat', 'sed']) {
+      for (const dir of ['/bin', '/usr/bin']) {
+        const candidate = path.join(dir, tool);
+        if (fs.existsSync(candidate)) { fs.symlinkSync(candidate, path.join(noNodeBin, tool)); break; }
+      }
+    }
+    fs.writeFileSync(f.runtime, '#!/bin/sh\nprintf "%s\\n" "$ELECTRON_RUN_AS_NODE" "$@" > "$DESKTOP_CHAT_LAUNCH_CAPTURE"\n', { mode: 0o755 });
+    const fallback = spawnSync(launcher, ['--cli', '--version'], {
+      env: environment({ PATH: noNodeBin, NODE: '', DESKTOP_CHAT_RUNTIME: f.runtime, DESKTOP_CHAT_LAUNCH_CAPTURE: f.capture }),
+      encoding: 'utf8'
+    });
+    assert.equal(fallback.status, 0, fallback.stderr);
+    assert.deepEqual(fs.readFileSync(f.capture, 'utf8').trim().split('\n'), [
+      '1',
+      path.join(path.dirname(launcher), 'src', 'cli.js'),
+      '--version'
+    ]);
+  } finally { f.cleanup(); }
+});

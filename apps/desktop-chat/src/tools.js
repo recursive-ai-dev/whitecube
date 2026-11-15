@@ -122,7 +122,9 @@ async function edit_file({ path: rawPath, old_string, new_string, replace_all })
   const target = resolvePath(rawPath);
   textArgument(old_string, 'old_string'); textArgument(new_string, 'new_string');
   if (replace_all !== undefined && typeof replace_all !== 'boolean') throw new Error('replace_all must be true or false.');
-  if ((await fsp.stat(target)).size > MAX_EDIT_BYTES) throw new Error('File exceeds the 8 MB editing limit.');
+  const st = await fsp.stat(target);
+  if (!st.isFile()) throw new Error('Only regular files can be edited.');
+  if (st.size > MAX_EDIT_BYTES) throw new Error('File exceeds the 8 MB editing limit.');
   const original = await fsp.readFile(target, 'utf8');
   if (original.includes('\0')) throw new Error('This appears to be a binary file. Only text files can be edited.');
 

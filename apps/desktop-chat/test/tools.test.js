@@ -76,6 +76,8 @@ test('move refuses to overwrite a destination and write previews show actual dif
   await fs.writeFile(file, 'old'); await fs.writeFile(other, 'keep');
   await assert.rejects(execute('move_file', { source: file, destination: other }), /already exists/);
   assert.equal(await fs.readFile(other, 'utf8'), 'keep');
+  await assert.rejects(execute('edit_file', { path: directory, old_string: 'a', new_string: 'b' }), /regular files/);
+  await assert.rejects(execute('edit_file', { path: '/dev/zero', old_string: 'a', new_string: 'b' }), /regular files/);
   assert.match(await previewTool('write_file', { path: file, content: 'new' }), /- old\n\+ new/);
   await execute('write_file', { path: file, content: 'new' });
   assert.equal(await fs.readFile(file, 'utf8'), 'new');
