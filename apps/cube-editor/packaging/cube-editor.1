@@ -25,13 +25,28 @@ Print the installed version without opening a display.
 Show the available options or CLI commands.
 .TP
 .B --cli
-Pass subsequent arguments to the CLI when using cube-editor-studio.
+Pass subsequent arguments to the CLI when using cube-editor-studio or cube-editor (without initializing GTK).
+.SH CLI COMMANDS
+.TP
+.B doctor \fI[project]\fP \fI[--strict]\fP
+Check workstation dependencies, GTK/libadwaita runtime, virtualization/UEFI readiness, and optional project state. Use \fB--strict\fP to fail on warnings too.
+.TP
+.B qemu-command \fIproject\fP \fI[--memory MB]\fP \fI[--uefi]\fP \fI[--disk PATH]\fP \fI[--installed]\fP \fI[--iso PATH]\fP
+Preview the QEMU test argv and shell command for a built ISO or installer disk without launching a VM.
+.TP
+.B presets
+List built-in customization recipe presets as JSON.
+.TP
+.B recent
+List valid recent project directories and metadata as JSON.
 .SH EXAMPLES
 .nf
 cube-editor-studio /path/to/project
+cube-editor --cli --version
 cube-editor-cli dependencies
 cube-editor-cli inspect /path/to/source.iso
 cube-editor-cli plan /path/to/project build
+cube-editor-cli qemu-command /path/to/project --uefi --memory 4096
 .fi
 .SH PRIVILEGES
 The interface runs as your normal user. Filesystem operations authenticate with

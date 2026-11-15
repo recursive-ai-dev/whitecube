@@ -42,10 +42,10 @@ def preferences_path():
 
 
 def load_preferences():
-    """Ignore corrupt preferences; project documents have separate validation."""
+    """Ignore corrupt or non-regular preferences; project documents have separate validation."""
     result = {'width': 1180, 'height': 820, 'maximized': False, 'stage': 'source', 'theme': 'system'}
     try:
-        data = json.loads(preferences_path().read_text())
+        data = engine.read_bounded_json(preferences_path(), label='preferences')
         if not isinstance(data, dict):
             return result
         for key, low, high in [('width', 720, 3840), ('height', 600, 2160)]:
@@ -57,7 +57,7 @@ def load_preferences():
             result['theme'] = data['theme']
         if data.get('stage') in [stage[0] for stage in STAGES]:
             result['stage'] = data['stage']
-    except (OSError, ValueError):
+    except (OSError, ValueError, engine.CubeError):
         pass
     return result
 
@@ -78,14 +78,7 @@ STAGES = [
     ('test', 'Test & release', 'computer-symbolic'),
     ('activity', 'Activity', 'view-list-symbolic'),
 ]
-RECIPES = [
-    ('Developer kit', 'Git, build tools, Python and curl.', ['git', 'build-essential', 'python3', 'python3-venv', 'curl'], []),
-    ('Media workstation', 'VLC, GIMP and a complete audio stack.', ['vlc', 'gimp', 'pipewire', 'wireplumber'], []),
-    ('Recovery image', 'Disk rescue, partitioning and diagnostics.', ['gddrescue', 'testdisk', 'gparted', 'smartmontools'], []),
-    ('Network toolbox', 'Inspect connections and solve network problems.', ['nmap', 'tcpdump', 'dnsutils', 'traceroute'], []),
-    ('Small & clean', 'Clear downloaded packages before rebuilding.', [], ['apt-get clean']),
-    ('Daily essentials', 'Editor, archive tools and a terminal multiplexer.', ['nano', 'unzip', 'zip', 'tmux'], []),
-]
+RECIPES = list(engine.RECIPES)
 
 
 def label(text='', css=None, wrap=False):

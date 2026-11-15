@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,15 @@ REQUIRED = {"xorriso": "Read and replay ISO boot records", "unsquashfs": "Extrac
             "chroot": "Run commands inside the image", "mount": "Private guest mounts"}
 OPTIONAL = {"qemu-system-x86_64": "Boot-test the completed ISO", "qemu-img": "Create installer test disks", "dpkg-deb": "Inspect desktop packages"}
 TERMINALS = ('foot', 'qterminal', 'gnome-terminal', 'konsole', 'xfce4-terminal', 'xterm')
+MAX_JSON_BYTES = 1024 * 1024
+RECIPES = (
+    ('Developer kit', 'Git, build tools, Python and curl.', ['git', 'build-essential', 'python3', 'python3-venv', 'curl'], []),
+    ('Media workstation', 'VLC, GIMP and a complete audio stack.', ['vlc', 'gimp', 'pipewire', 'wireplumber'], []),
+    ('Recovery image', 'Disk rescue, partitioning and diagnostics.', ['gddrescue', 'testdisk', 'gparted', 'smartmontools'], []),
+    ('Network toolbox', 'Inspect connections and solve network problems.', ['nmap', 'tcpdump', 'dnsutils', 'traceroute'], []),
+    ('Small & clean', 'Clear downloaded packages before rebuilding.', [], ['apt-get clean']),
+    ('Daily essentials', 'Editor, archive tools and a terminal multiplexer.', ['nano', 'unzip', 'zip', 'tmux'], []),
+)
 
 
 class CubeError(RuntimeError):
@@ -50,6 +60,39 @@ class CubeError(RuntimeError):
 
 class Cancelled(CubeError):
     pass
+
+
+def read_bounded_json(path, max_bytes=MAX_JSON_BYTES, label='JSON file'):
+    """Read a bounded regular UTF-8 JSON file without blocking on FIFOs or special files."""
+    target = Path(path).expanduser()
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as error:
+        raise CubeError(f'Cannot read {label}: {error}') from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise CubeError(f'Cannot read {label}: not a regular file')
+        if info.st_size > max_bytes:
+            raise CubeError(f'Cannot read {label}: exceeds {max_bytes} byte limit')
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    payload = b''.join(chunks)
+    if len(payload) > max_bytes:
+        raise CubeError(f'Cannot read {label}: exceeds {max_bytes} byte limit')
+    try:
+        return json.loads(payload.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError) as error:
+        raise CubeError(f'Cannot read {label}: {error}') from error
 
 
 def utcnow():
@@ -337,10 +380,7 @@ def export_recipe(project, path):
 
 
 def import_recipe(path):
-    try:
-        value = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as error:
-        raise CubeError(f'Cannot read recipe: {error}') from error
+    value = read_bounded_json(path, label='recipe')
     if not isinstance(value, dict) or value.get('format') != 'cube-editor-recipe' or value.get('version') != 1:
         raise CubeError('Unsupported recipe format')
     recipe = value.get('recipe')
@@ -498,11 +538,7 @@ class Project:
 
     @staticmethod
     def _read(path):
-        try:
-            with path.open() as stream:
-                return normalize_project(json.load(stream))
-        except (OSError, ValueError) as error:
-            raise CubeError(f'Cannot read project {path}: {error}') from error
+        return normalize_project(read_bounded_json(path, max_bytes=4 * MAX_JSON_BYTES, label=f'project {path}'))
 
     def save(self, **updates):
         with self.lock():
@@ -584,8 +620,10 @@ def recent_path():
 
 def recent_projects(raw=False):
     try:
-        entries = json.loads(recent_path().read_text())
-    except (OSError, ValueError):
+        entries = read_bounded_json(recent_path(), label='recent projects')
+    except (OSError, ValueError, CubeError):
+        entries = []
+    if not isinstance(entries, list):
         entries = []
     paths = [p for p in entries if isinstance(p, str) and (Path(p) / "cube-editor.json").is_file()]
     if raw:
@@ -1228,12 +1266,16 @@ class Engine:
                 os.killpg(process.pid, signal.SIGTERM)
 
     def qemu_command(self, memory=4096, uefi=False, disk=None, installed=False, iso=None):
+        if isinstance(memory, bool) or not isinstance(memory, int):
+            raise CubeError("QEMU memory must be an integer MB value")
         iso = Path(iso) if iso else self.project.output_path
         if not iso.is_file():
             raise CubeError("Build an ISO before opening the virtual machine")
+        if ',' in str(iso):
+            raise CubeError('QEMU ISO paths cannot contain commas')
         if not shutil.which("qemu-system-x86_64"):
             raise CubeError("Install qemu-system-x86 to test your image")
-        command = ["qemu-system-x86_64", "-m", str(max(512, min(int(memory), 65536))), "-smp", "2",
+        command = ["qemu-system-x86_64", "-m", str(max(512, min(memory, 65536))), "-smp", "2",
                    "-boot", "d", "-cdrom", str(iso), "-nic", "user,model=virtio-net-pci", "-display", "gtk", "-snapshot"]
         if os.access("/dev/kvm", os.R_OK | os.W_OK):
             command += ["-enable-kvm", "-cpu", "host"]
@@ -1298,8 +1340,11 @@ def main(argv=None):
     parser.add_argument('--version', action='version', version=f'cube-editor {VERSION}')
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("dependencies")
+    sub.add_parser("presets", help="List built-in customization recipe presets")
+    sub.add_parser("recent", help="List valid recent projects")
     doctor = sub.add_parser('doctor', help='Check this workstation and an optional project')
     doctor.add_argument('project', nargs='?')
+    doctor.add_argument('--strict', action='store_true', help='Fail on warnings as well as failures')
     report = sub.add_parser('report', help='Export an independently verified HTML release report')
     report.add_argument('project')
     report.add_argument('file', help='New .html report path')
@@ -1311,6 +1356,13 @@ def main(argv=None):
     create.add_argument("--name", default="My Cube")
     create.add_argument("--base-dir", default=str(DEFAULT_PROJECTS))
     create.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
+    qemu_cmd = sub.add_parser("qemu-command", help="Preview the QEMU test command without launching a VM")
+    qemu_cmd.add_argument("project")
+    qemu_cmd.add_argument("--memory", type=int, default=4096)
+    qemu_cmd.add_argument("--uefi", action="store_true")
+    qemu_cmd.add_argument("--disk")
+    qemu_cmd.add_argument("--installed", action="store_true")
+    qemu_cmd.add_argument("--iso")
     for operation in ("plan", "run", "verify", "preflight", "recovery", "releases", "verify-source", "export-recipe", "import-recipe"):
         p = sub.add_parser(operation)
         p.add_argument("project")
@@ -1324,6 +1376,11 @@ def main(argv=None):
     try:
         if args.command == "dependencies":
             value = dependencies()
+        elif args.command == "presets":
+            value = [{"name": name, "description": desc, "install_packages": pkgs, "commands": cmds}
+                     for name, desc, pkgs, cmds in RECIPES]
+        elif args.command == "recent":
+            value = recent_projects()
         elif args.command == 'doctor':
             from diagnostics import diagnose
             value = diagnose(Project.load(args.project) if args.project else None)
@@ -1346,6 +1403,12 @@ def main(argv=None):
                     value['launch'] = engine.worker_command(args.action)
                 except CubeError as error:
                     value.update(launch=None, launch_error=str(error))
+            elif args.command == "qemu-command":
+                command = engine.qemu_command(memory=args.memory, uefi=args.uefi, disk=args.disk,
+                                              installed=args.installed, iso=args.iso)
+                iso_used = Path(args.iso) if args.iso else engine.project.output_path
+                value = {"command": command, "shell": shlex.join(command), "uefi": bool(args.uefi),
+                         "installed": bool(args.installed), "iso": str(iso_used)}
             elif args.command == "verify":
                 value = engine.verify_release(record=True)
             elif args.command == 'verify-source':
@@ -1368,7 +1431,7 @@ def main(argv=None):
         print(json.dumps(value, indent=2))
         failed = ((args.command == 'verify' and not value['success']) or
                   (args.command == 'preflight' and not value['sufficient']) or
-                  (args.command == 'doctor' and not value['ready']) or
+                  (args.command == 'doctor' and (not value['ready'] or (args.strict and any(c['status'] == 'warning' for c in value['checks'])))) or
                   (args.command == 'report' and not value['verification']['success']))
         return 1 if failed else 0
     except (CubeError, OSError, ValueError) as error:

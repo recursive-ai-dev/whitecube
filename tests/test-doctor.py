@@ -464,6 +464,39 @@ class RunTests(Fixture):
                 self.assertIn('cube-netd', failed['detail'])
                 self.assertIn('ca-certificates', failed['detail'])
 
+    def test_editor_check_reports_staged_and_doctor_health(self):
+        self.assertIn('editor', doctor.CHECK_GROUPS)
+        self.assertEqual(doctor.check_editor(self.env)[0]['level'], 'info')
+        launcher = self.put('usr/bin/cube-editor', '#!/bin/sh\n')
+        launcher.chmod(0o755)
+        self.assertEqual(doctor.check_editor(self.env)[0]['level'], 'FAIL')
+        for mod in ('app.py', 'engine.py', 'worker.py', 'kernel.py', 'diagnostics.py'):
+            self.put(f'usr/share/whitecube/cube-editor/{mod}', '')
+        self.assertEqual(doctor.check_editor(self.env)[0]['level'], 'ok')
+
+        fake_bin = self.home / '.local/bin/cube-editor'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(returncode=0, stdout=json.dumps({
+            'format': 'cube-editor-diagnostics', 'ready': True,
+            'checks': [{'id': 'tool-xorriso', 'status': 'pass'}, {'id': 'uefi', 'status': 'warning'}],
+        }))
+        fail_proc = mock.Mock(returncode=1, stdout=json.dumps({
+            'format': 'cube-editor-diagnostics', 'ready': False,
+            'checks': [{'id': 'gtk-runtime', 'status': 'fail'}],
+        }))
+        if not Path('/usr/bin/cube-editor').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                res = doctor.check_editor(live_env)
+                self.assertEqual(res[0]['level'], 'ok')
+                self.assertIn('uefi', res[0]['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=fail_proc):
+                failed = doctor.check_editor(live_env)[0]
+                self.assertEqual(failed['level'], 'FAIL')
+                self.assertIn('gtk-runtime', failed['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

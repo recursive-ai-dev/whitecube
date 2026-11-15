@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -512,6 +512,51 @@ def check_browser(env):
                     f'{browser} --check')]
 
 
+def check_editor(env):
+    """Report cube-editor launcher, runtime module, and ISO workflow readiness."""
+    share_dir = env.at('/usr/share/whitecube/cube-editor')
+    runtime_files = ('app.py', 'engine.py', 'worker.py', 'kernel.py', 'diagnostics.py')
+    if env.root != Path('/'):
+        launcher = env.at('/usr/bin/cube-editor')
+        if not (launcher.is_file() or launcher.is_symlink()) and not share_dir.exists():
+            return [finding('info', 'editor', 'cube-editor is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        if not (launcher.is_file() or launcher.is_symlink()) or not os.access(launcher, os.X_OK) or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else f'{launcher} missing or not executable'
+            return [finding('FAIL', 'editor', f'staged cube-editor incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'editor', 'staged cube-editor launcher and runtime present')]
+    candidates = [
+        env.at('/usr/bin/cube-editor'),
+        env.home / '.local/bin/cube-editor',
+        env.project / 'bin/cube-editor',
+    ]
+    editor = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if editor is None:
+        return [finding('info', 'editor', 'cube-editor is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(editor, os.X_OK):
+        return [finding('WARN', 'editor', f'{editor} is not executable', f'chmod 0755 {editor}')]
+    try:
+        proc = subprocess.run([str(editor), '--cli', 'doctor'], capture_output=True, text=True, timeout=10)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'editor', f'could not query cube-editor doctor: {error}',
+                        f'{editor} --cli doctor')]
+    if not isinstance(data, dict) or data.get('format') != 'cube-editor-diagnostics':
+        return [finding('WARN', 'editor', 'cube-editor doctor returned unexpected JSON', f'{editor} --cli doctor')]
+    checks = data.get('checks', [])
+    failed = [c.get('id', '?') for c in checks if c.get('status') == 'fail']
+    warns = [c.get('id', '?') for c in checks if c.get('status') == 'warning']
+    if data.get('ready') and not failed:
+        note = f' (optional warnings: {", ".join(warns)})' if warns else ''
+        return [finding('ok', 'editor', f'cube-editor workstation checks ready{note}')]
+    return [finding('FAIL', 'editor',
+                    'cube-editor doctor failed: ' + (', '.join(failed) or 'unknown issue'),
+                    f'{editor} --cli doctor')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -532,6 +577,7 @@ def run_checks(env, selected=None):
         'folders': (lambda: check_folder_handler(env),),
         'audio': (lambda: check_audio(env),),
         'browser': (lambda: check_browser(env),),
+        'editor': (lambda: check_editor(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

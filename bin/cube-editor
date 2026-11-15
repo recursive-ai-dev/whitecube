@@ -1,13 +1,27 @@
 #!/usr/bin/python3 -I
-"""Launch the installed or checkout copy of cube-editor."""
+"""Launch the installed or checkout copy of cube-editor without unnecessary GTK setup."""
 import os
 from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parent.parent
 locations = [root / 'apps/cube-editor', root / 'share/whitecube/cube-editor']
-for directory in locations:
-    if (directory / 'app.py').is_file():
-        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])
-print('cube-editor: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
-raise SystemExit(1)
+directory = next((path for path in locations if (path / 'app.py').is_file() and (path / 'engine.py').is_file()), None)
+if directory is None:
+    print('cube-editor: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
+    raise SystemExit(1)
+
+arguments = sys.argv[1:]
+if arguments == ['--version']:
+    version_files = [directory / 'VERSION', directory / 'packaging/VERSION']
+    version = next((path.read_text().strip() for path in version_files if path.is_file()), None)
+    if version:
+        print(f'cube-editor {version}')
+        raise SystemExit(0)
+    os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'engine.py'), '--version'])
+
+cli = bool(arguments and arguments[0] == '--cli')
+if cli:
+    arguments = arguments[1:]
+target = directory / ('engine.py' if cli else 'app.py')
+os.execv('/usr/bin/python3', ['python3', '-I', str(target), *arguments])

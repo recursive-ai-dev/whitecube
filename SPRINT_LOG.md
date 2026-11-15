@@ -108,3 +108,13 @@
 - **Tests & Verification**:
   - Extended `apps/cube-player/tests/test_state.c` (unsafe URI scheme filtering & FIFO playlist rejection), `apps/cube-player/tests/test_ui.c` (`C` A-B loop reset & `+`/`-` volume keys), and `apps/cube-player/tests/test_install.py` (`--check --json`, standalone `--json` exit 2, non-creation of XDG dirs on `--check`, invalid `--volume`/`--speed`/`--repeat` exit 2).
   - Verified full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-editor | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added GTK-free `--version` (`0.6.0`) and `--cli` dispatch to `engine.py` in `bin/cube-editor` (matching `packaging/cube-editor-studio`).
+  - Added headless CLI subcommands `presets`, `recent`, `qemu-command`, and `doctor --strict` in `apps/cube-editor/engine.py`, plus shared `RECIPES` tuple reused by `apps/cube-editor/app.py` (`VERSION` preserved verbatim for `build-deb.sh` AST checks) and updated `apps/cube-editor/packaging/cube-editor.1`.
+  - Added `read_bounded_json()` (`O_RDONLY | O_CLOEXEC | O_NONBLOCK`, `fstat()` `S_ISREG`, and 1 MiB `MAX_JSON_BYTES` cap) in `apps/cube-editor/engine.py` and wired it into `import_recipe()`, `Project._read()`, `recent_projects()`, and `app.py`'s `load_preferences()`; hardened `Engine.qemu_command()` to reject `bool`/non-`int` memory values and commas in ISO paths.
+  - Wired read-only `check_editor(env)` and the `'editor'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `apps/cube-editor/tests/test_cli_workflows.py` (testing `presets`, `recent`, `doctor --strict`, `qemu-command` validation, FIFO/oversize JSON rejection in `import_recipe()` & `Project._read()`, and `bin/cube-editor --version`/`--cli`) and `tests/test-doctor.py` (`test_editor_check_reports_staged_and_doctor_health`).
+  - Verified `apps/cube-editor/tests` (`DesktopWorkflowTests` skipped without GTK display), `tests/test-cube-editor-ui.py`, `tests/test-doctor.py` (50 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

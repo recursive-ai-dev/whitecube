@@ -15,7 +15,7 @@
 - [x] `workspace/` (`whitecube-web` Python workspace suite)
 - [x] `apps/cube-browser` (Native browser features, security, and DOM/rendering extensions)
 - [x] `apps/cube-player` (Media playback, playlist parsing, and stream handling)
-- [ ] `apps/cube-editor` (Linux ISO studio, project guards, and QEMU workflow)
+- [x] `apps/cube-editor` (Linux ISO studio, project guards, and QEMU workflow)
 - [ ] `apps/cube-train` (GTK4 trainer, pipeline, checkpoint benchmarking, and cooling/resume)
 - [ ] `apps/cube-strap` (`whitecube-vm` UEFI VM builder and management)
 - [ ] `apps/chrootables` (`cube-chrootables` & `whitecube-chrootable-manager`)
