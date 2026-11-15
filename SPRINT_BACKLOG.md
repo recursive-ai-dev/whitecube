@@ -9,7 +9,7 @@
 
 ## Phase 2: Networking & Boot (`net/`, `boot/`)
 - [x] `net/cube-net`, `net-off`, `net-on` (Wi-Fi/DHCP controller, takeover, and firewall/switch resilience)
-- [ ] `boot/` (GRUB / Plymouth / tty1 black cube theme & recovery polish)
+- [x] `boot/` (GRUB / Plymouth / tty1 black cube theme & recovery polish)
 
 ## Phase 3: Workspace & Applications (`workspace/`, `apps/`)
 - [ ] `workspace/` (`whitecube-web` Python workspace suite)

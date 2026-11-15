@@ -28,6 +28,8 @@ for (i = 0; i < CELLS; i++) {
 }
 
 fun progress_callback(duration, progress) {
+  if (progress < 0) progress = 0;
+  if (progress > 1) progress = 1;
   pos = progress * CELLS;
   for (i = 0; i < CELLS; i++) {
     v = pos - i;
@@ -42,7 +44,7 @@ Plymouth.SetBootProgressFunction(progress_callback);
 status = "normal";
 
 fun dialog_setup() {
-  local.box; local.lock; local.entry;
+  local.lock; local.entry; local.prompt_sprite;
   lock.image = Image("lock.png");
   entry.image = Image("entry.png");
   total = lock.image.GetWidth() + 16 + entry.image.GetWidth();
@@ -56,15 +58,22 @@ fun dialog_setup() {
   entry.z = 100;
   entry.sprite = Sprite(entry.image);
   entry.sprite.SetPosition(entry.x, entry.y, entry.z);
+  prompt_sprite = Sprite();
+  prompt_sprite.SetZ(100);
   global.dialog.lock = lock;
   global.dialog.entry = entry;
+  global.dialog.prompt = prompt_sprite;
   global.dialog.bullet_image = Image("bullet.png");
+  global.dialog.max_bullets = Math.Int((entry.image.GetWidth() - 16) / (dialog.bullet_image.GetWidth() + 2));
+  if (global.dialog.max_bullets < 1) global.dialog.max_bullets = 1;
   dialog_opacity(1);
 }
 
 fun dialog_opacity(opacity) {
   dialog.lock.sprite.SetOpacity(opacity);
   dialog.entry.sprite.SetOpacity(opacity);
+  if (dialog.prompt)
+    dialog.prompt.SetOpacity(opacity);
   for (index = 0; dialog.bullet[index]; index++)
     dialog.bullet[index].sprite.SetOpacity(opacity);
 }
@@ -81,7 +90,15 @@ fun display_password_callback(prompt, bullets) {
     dialog_setup();
   else
     dialog_opacity(1);
-  for (index = 0; dialog.bullet[index] || index < bullets; index++) {
+  if (prompt && prompt != "") {
+    pimg = Image.Text(prompt, 0.85, 0.88, 0.94);
+    dialog.prompt.SetImage(pimg);
+    dialog.prompt.SetPosition(cx - pimg.GetWidth() / 2, dialog.entry.y - pimg.GetHeight() - 10, 100);
+  }
+  visible = bullets;
+  if (visible > dialog.max_bullets)
+    visible = dialog.max_bullets;
+  for (index = 0; dialog.bullet[index] || index < visible; index++) {
     if (!dialog.bullet[index]) {
       dialog.bullet[index].sprite = Sprite(dialog.bullet_image);
       dialog.bullet[index].x = dialog.entry.x + 8 + index * (dialog.bullet_image.GetWidth() + 2);
@@ -89,7 +106,7 @@ fun display_password_callback(prompt, bullets) {
       dialog.bullet[index].z = dialog.entry.z + 1;
       dialog.bullet[index].sprite.SetPosition(dialog.bullet[index].x, dialog.bullet[index].y, dialog.bullet[index].z);
     }
-    if (index < bullets)
+    if (index < visible)
       dialog.bullet[index].sprite.SetOpacity(1);
     else
       dialog.bullet[index].sprite.SetOpacity(0);
@@ -101,10 +118,12 @@ Plymouth.SetDisplayPasswordFunction(display_password_callback);
 
 #----------------------------------------- Messages --------------------------------
 message_sprite = Sprite();
-message_sprite.SetPosition(10, 10, 10000);
+message_sprite.SetZ(10000);
 
 fun display_message_callback(text) {
-  message_sprite.SetImage(Image.Text(text, 1, 1, 1));
+  img = Image.Text(text, 1, 1, 1);
+  message_sprite.SetImage(img);
+  message_sprite.SetPosition(cx - img.GetWidth() / 2, cy + sh * 0.42, 10000);
 }
 fun hide_message_callback(text) {
   message_sprite.SetImage(Image.Text("", 1, 1, 1));
@@ -113,6 +132,8 @@ Plymouth.SetDisplayMessageFunction(display_message_callback);
 Plymouth.SetHideMessageFunction(hide_message_callback);
 
 fun quit_callback() {
+  if (global.dialog)
+    dialog_opacity(0);
   logo.sprite.SetOpacity(1);
 }
 Plymouth.SetQuitFunction(quit_callback);

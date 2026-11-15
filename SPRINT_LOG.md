@@ -60,3 +60,12 @@
 - **Tests & Verification**:
   - Extended `net/test_cube_wifi.py` (roaming config validation, hysteresis roaming simulation, signal-sorted scan, `selftest --json`, `--version`), `net/test_cube_net.py` (`HookTests` comma servers, missing parent dir, `--check --json`, `--version`), `net/test_net_switch.py` (symlink/oversized config rejection, `--version`, `--dry-run --json`, `--status --json` counters), and `tests/test-doctor.py` (`test_dns_lease_and_lockdown_checks`).
   - Verified targeted suites (`test_net_switch.py` 33 ok, `test_cube_net.py` 130 ok, `test_cube_wifi.py`, `test-doctor.py` 48 ok), full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (235 path references ok), and `tests/test-packaging.py` (61 tests ok).
+
+## [2026-11-15] boot/ (GRUB / Plymouth / tty1 black cube theme & recovery polish) | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - `boot/gen-boot-theme.py`: replaced bare positional CLI with `argparse` while keeping `OUT_DIR [WIDTH HEIGHT]`, added `--seed`, `--scale` (1..4 HiDPI), `--verify` (pure-stdlib PNG IHDR dimension verification and `whitecube.script` `Image(...)` cross-check), `--json`, and `--version`, sharper 9-slice frame hairlines (`frame_tile`), dimension bounds (`320..7680` x `240..4320`), and clean Pillow dependency error reporting (`_require_pillow()`).
+  - `boot/install-boot.sh`: added `--status`, `--json`, `-n`/`--dry-run`, `--purge`, `--resolution WxH`, `--scale N`, `--timeout SEC`, `--no-issue`, `-V`/`--version`, `-h`/`--help`, `WC_BOOT_ROOT` sandboxed prefix support, preflight checks before touching backups, safe atomic `awk` `ENVIRON` variable updates in `set_var()`, and `/etc/issue` backup/absent state restoration.
+  - `boot/whitecube.script`: clamped progress to `[0, 1]`, added centered `dialog.prompt` text and width-clamped passphrase bullets (`dialog.max_bullets`) so long passphrases stay inside `entry.png`, centered status messages in `display_message_callback()`, and hid password dialogs in `quit_callback()`.
+- **Tests & Verification**:
+  - Added `tests/test-boot.py` (5 offline tests covering PNG asset/script consistency, HiDPI rendering & verification, bounds & missing-Pillow diagnostics, `sh -n`, `--dry-run`, and end-to-end sandboxed install + `--status --json` + `--revert --purge`) and wired it into `BUILD.sh`.
+  - Verified full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (235 path references ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
