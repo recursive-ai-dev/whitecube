@@ -69,3 +69,13 @@
 - **Tests & Verification**:
   - Added `tests/test-boot.py` (5 offline tests covering PNG asset/script consistency, HiDPI rendering & verification, bounds & missing-Pillow diagnostics, `sh -n`, `--dry-run`, and end-to-end sandboxed install + `--status --json` + `--revert --purge`) and wired it into `BUILD.sh`.
   - Verified full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (235 path references ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] net/cube-net Hardware Generalization (Multi-Vendor PCIe/USB Wi-Fi) | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Removed the single-dongle hardware lock (`USB 2001:3329` / `MAC 88:76:b9:f2:9d:29` / `rtw88_8822cu`) from `net/cube-net`: `DEFAULT_DEVICE` now defaults to `{"mode": "auto"}` to auto-detect any Linux `cfg80211`/`nl80211` wireless interface (PCIe, USB, SDIO) while excluding loopback and wired Ethernet interfaces (`is_wireless()`, sysfs `wireless`/`phy80211`/`DEVTYPE=wlan`).
+  - Generalized `device_config()` and `matches()` to validate and accept optional user-configured adapter pins (`interface`, `usb_id`, `mac`, `driver`, `bus`) without restricting users to one device model or MAC.
+  - Added `cube-net devices` (`list_devices()`) to inspect detected wireless and wired adapters, and `sudo cube-net select <iface> [--auto|--by-interface]` (`select_device()`) to manage optional `/etc/whitecube/network/device.json` pinning while preserving country/power-save/roaming tuning.
+  - Updated `diagnostic()` (`missing-device`, `driver-problem`, `identity-mismatch`, `identity-ambiguous` with `pci_wireless_devices()` + `usb_devices()` hardware presence checks), `audit()` (verifying `cfg80211` and detected/configured driver modules rather than only `rtw88_8822cu`), `status()`, `selftest()`, `run_service()`, `takeover()`, `net/whitecube-network.service` description, and `src/cube-status.c` (`waiting-for-device` alongside `waiting-for-dongle`).
+- **Tests & Verification**:
+  - Updated and extended `net/test_cube_net.py` (133 tests) and `net/test_cube_wifi.py` (165 tests) covering auto-detected PCIe Intel `iwlwifi`, arbitrary USB Wi-Fi dongles (`0e8d:7961` / `mt7921u`), wired Ethernet exclusion, multi-radio ambiguity + `select_device` pinning/revert, invalid config rejection, and `audit()` on generic kernels.
+  - Verified full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (236 path references ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

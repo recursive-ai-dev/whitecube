@@ -559,9 +559,19 @@ class DiagnosticTests(unittest.TestCase):
 
     def test_device_level_codes_still_work(self):
         absent = net.diagnostic(self.config, [], {}, False)
-        self.assertEqual(absent["diagnostic_code"], "missing-dongle")
-        wrong_mac = [dict(self.seen[0], mac="aa:bb:cc:dd:ee:ff")]
-        self.assertEqual(net.diagnostic(self.config, wrong_mac, {}, True)["diagnostic_code"], "identity-mismatch")
+        self.assertEqual(absent["diagnostic_code"], "missing-device")
+        unbound = net.diagnostic(self.config, [], {}, True)
+        self.assertEqual(unbound["diagnostic_code"], "driver-problem")
+        pcie = [{"interface": "wlp2s0", "wireless": True, "bus": "pci", "usb_id": "", "mac": "aa:bb:cc:dd:ee:01", "driver": "iwlwifi"}]
+        pcie_online = net.diagnostic(self.config, pcie, {"association_state": "COMPLETED", "ipv4_address": "10.0.0.10",
+                                                          "default_route": "10.0.0.1", "gateway_ok": True,
+                                                          "dns_ok": True, "connectivity_ok": True, "checks_epoch": net.time.time()}, False)
+        self.assertEqual(pcie_online["diagnostic_code"], "online")
+        pinned = {"mode": "pinned", "usb_id": "0e8d:7961", "mac": "aa:bb:cc:dd:ee:ff", "driver": "mt7921u"}
+        wrong_mac = [{"interface": "wlx0", "wireless": True, "usb_id": "0e8d:7961", "mac": "11:22:33:44:55:66", "driver": "mt7921u"}]
+        self.assertEqual(net.diagnostic(pinned, wrong_mac, {}, True)["diagnostic_code"], "identity-mismatch")
+        wrong_drv = [{"interface": "wlx0", "wireless": True, "usb_id": "0e8d:7961", "mac": "aa:bb:cc:dd:ee:ff", "driver": "wrongdrv"}]
+        self.assertEqual(net.diagnostic(pinned, wrong_drv, {}, True)["diagnostic_code"], "driver-problem")
         twice = self.seen + [dict(self.seen[0], interface="wlan1")]
         self.assertEqual(net.diagnostic(self.config, twice, {}, True)["diagnostic_code"], "identity-ambiguous")
 
@@ -847,12 +857,55 @@ class ProfileRegression(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 net.device_config(root)
 
-    def test_device_scope_is_still_enforced(self):
+    def test_device_config_allows_auto_and_arbitrary_pinning_while_validating_fields(self):
         root = Path(self.tmp.name) / "root"
         (root / "etc/whitecube/network").mkdir(parents=True)
-        (root / "etc/whitecube/network/device.json").write_text(json.dumps(dict(net.DEFAULT_DEVICE, mac="aa:bb:cc:dd:ee:ff")))
-        with self.assertRaises(ValueError):
-            net.device_config(root)
+        path = root / "etc/whitecube/network/device.json"
+        self.assertEqual(net.device_config(root), {"mode": "auto"})
+        for custom in (
+            {"driver": "iwlwifi", "mac": "AA:BB:CC:DD:EE:FF", "bus": "pci"},
+            {"usb_id": "0E8D:7961", "driver": "mt7921u"},
+            {"interface": "wlp3s0"},
+        ):
+            path.write_text(json.dumps(custom))
+            cfg = net.device_config(root)
+            self.assertEqual(cfg["mode"], "pinned")
+        for bad in (
+            {"mac": "not-a-mac"},
+            {"usb_id": "bad"},
+            {"driver": "bad driver!"},
+            {"interface": "lo"},
+            {"bus": "firewire"},
+            {"mode": "auto", "mac": "aa:bb:cc:dd:ee:ff"},
+            {"mode": "invalid"},
+        ):
+            path.write_text(json.dumps(bad))
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                net.device_config(root)
+
+    def test_audit_checks_general_wireless_and_pinned_drivers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            sysfs = Path(tmp) / "sys"
+            kver = root / "lib/modules/6.12.0-test"
+            (kver / "kernel/net/wireless").mkdir(parents=True)
+            (kver / "kernel/drivers/net/wireless/intel/iwlwifi").mkdir(parents=True)
+            (kver / "kernel/net/wireless/cfg80211.ko").write_bytes(b"")
+            (kver / "kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko.xz").write_bytes(b"")
+            (kver / "modules.dep").write_text(
+                "kernel/net/wireless/cfg80211.ko:\n"
+                "kernel/drivers/net/wireless/intel/iwlwifi/iwlwifi.ko.xz: kernel/net/wireless/cfg80211.ko\n"
+            )
+            (root / "lib/firmware").mkdir(parents=True)
+            for b in ("usr/sbin/dhcpcd", "usr/bin/getent"):
+                (root / b).parent.mkdir(parents=True, exist_ok=True)
+                (root / b).write_bytes(b"")
+            with mock.patch.object(net, "interfaces", return_value=[
+                {"interface": "wlp2s0", "wireless": True, "driver": "iwlwifi", "usb_id": "", "mac": "aa:bb:cc:dd:ee:01"}
+            ]):
+                report = net.audit(root, sysfs=sysfs)
+            self.assertTrue(report["dependencies_ready"], report)
+            self.assertIn("iwlwifi", report["kernels"][0]["checked_modules"])
 
 
 # ------------------------------------------------------------------ deployment files
@@ -1086,7 +1139,7 @@ def drive(world, seconds, start=5000.0):
 class ControllerTests(unittest.TestCase):
     def diagnosis(self, controller):
         config = dict(net.DEFAULT_DEVICE)
-        seen = [{"interface": "wlan0", "usb_id": config["usb_id"], "mac": config["mac"], "driver": config["driver"]}]
+        seen = [{"interface": "wlan0", "wireless": True, "usb_id": "", "mac": "aa:bb:cc:dd:ee:01", "driver": "iwlwifi"}]
         return net.diagnostic(config, seen, controller.runtime, True)["diagnostic_code"]
 
     def test_the_incident_with_the_real_loop_nothing_is_touched(self):
@@ -1460,7 +1513,7 @@ class ServiceSmoke(unittest.TestCase):
         self.assertEqual(len(nudges), 5)
         self.assertEqual(nudges[:3], [45, 90, 180])
         self.assertNotIn("disconnect", [c for _, c in calls])
-        self.assertIn("Waiting for the configured USB dongle", self.journal)
+        self.assertIn("Waiting for a matching Wi-Fi interface", self.journal)
         self.assertIn("recovery: requested reassociation #1 - not associated for 45s", self.journal)
         self.assertNotIn("EMPIRE", self.journal)
 
@@ -1503,9 +1556,28 @@ class ServiceSmoke(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "mode 0600"):
             self.run_service(lambda t: {"state": "COMPLETED"}, seconds=5)
 
+    def test_service_manages_arbitrary_pcie_wifi_adapter(self):
+        (self.config / "device.json").unlink()
+        seen = [{"interface": "wlp2s0", "wireless": True, "bus": "pci", "usb_id": "", "mac": "aa:bb:cc:dd:ee:01", "driver": "iwlwifi"}]
+        with mock.patch.object(net, "interfaces", return_value=seen), \
+                mock.patch.object(net, "competing_processes", return_value=[]), \
+                mock.patch.object(net.subprocess, "Popen", FakeChild), \
+                mock.patch.object(net, "Nl80211Driver", FakeDriver), \
+                mock.patch.object(net, "Station", FakeStation), \
+                mock.patch.object(net, "ControlServer", FakeControl), \
+                mock.patch.object(net, "wireless_signal", return_value=-52), \
+                mock.patch.object(net, "interface_ipv4", return_value="192.168.1.44"), \
+                mock.patch.object(net, "default_gateway", return_value="192.168.1.1"), \
+                mock.patch.object(net, "probe_suite", return_value={"checks_epoch": 1.0, "gateway_ok": True, "dns_ok": True, "dns_ms": 15, "connectivity_ok": True, "tcp_ms": 50}), \
+                mock.patch.object(net.time, "monotonic", (clock := SimulatedTime(lambda c: c.sleeps >= 3 and net.signal.raise_signal(net.signal.SIGTERM))).monotonic), \
+                mock.patch.object(net.time, "sleep", clock.sleep), \
+                contextlib.redirect_stdout(io.StringIO()) as journal:
+            net.run_service()
+        self.assertIn("Managing wlp2s0 with the built-in WPA2 station (iwlwifi)", journal.getvalue())
+
 
 class DongleIdentity(unittest.TestCase):
-    """A randomized MAC (NetworkManager's default privacy setting) must not hide the scoped dongle."""
+    """Wireless detection works across USB dongles, internal PCIe cards, randomized MACs, and wired coexistence."""
 
     def sysfs(self, root, address):
         link = root / "class/net/wlx8876b9f29d29"
@@ -1514,6 +1586,7 @@ class DongleIdentity(unittest.TestCase):
         (usb / "idVendor").write_text("2001\n")
         (usb / "idProduct").write_text("3329\n")
         link.mkdir(parents=True)
+        (link / "wireless").mkdir()
         (link / "device").symlink_to(usb)
         (link / "address").write_text(address + "\n")
         return root
@@ -1521,10 +1594,66 @@ class DongleIdentity(unittest.TestCase):
     def test_the_permanent_address_identifies_the_dongle(self):
         with tempfile.TemporaryDirectory() as tmp:
             sysfs = self.sysfs(Path(tmp), "f2:c7:ab:da:a9:6d")
-            found = net.interfaces(sysfs, permanent=lambda name: net.DEFAULT_DEVICE["mac"])
-            self.assertEqual(found[0]["mac"], net.DEFAULT_DEVICE["mac"])
+            found = net.interfaces(sysfs, permanent=lambda name: "88:76:b9:f2:9d:29")
+            self.assertEqual(found[0]["mac"], "88:76:b9:f2:9d:29")
+            self.assertTrue(found[0]["wireless"])
             found = net.interfaces(sysfs, permanent=lambda name: None)
             self.assertEqual(found[0]["mac"], "f2:c7:ab:da:a9:6d")      # no ethtool answer: the current one
+
+    def test_pcie_wifi_ignores_wired_ethernet_and_supports_select_pinning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            sysfs = Path(tmp) / "sys"
+            (root / "etc/whitecube/network").mkdir(parents=True)
+            (root / "etc/whitecube/network/device.json").write_text(json.dumps({"mode": "auto", "country": "US"}))
+            # Wired Ethernet (must be ignored by Wi-Fi selection)
+            eth = sysfs / "class/net/enp3s0"
+            eth_dev = sysfs / "devices/pci0000:00/enp3s0"
+            (eth_dev / "driver/module").mkdir(parents=True)
+            (eth_dev / "r8169").mkdir(exist_ok=True)
+            (sysfs / "bus/pci").mkdir(parents=True, exist_ok=True)
+            (eth_dev / "subsystem").symlink_to(sysfs / "bus/pci")
+            eth.mkdir(parents=True)
+            (eth / "device").symlink_to(eth_dev)
+            (eth / "address").write_text("00:11:22:33:44:55\n")
+            # Internal PCIe Intel Wi-Fi
+            wlp = sysfs / "class/net/wlp2s0"
+            wlp_dev = sysfs / "devices/pci0000:00/wlp2s0"
+            (sysfs / "drivers/iwlwifi").mkdir(parents=True)
+            (wlp_dev).mkdir(parents=True)
+            (wlp_dev / "driver").symlink_to(sysfs / "drivers/iwlwifi")
+            (wlp_dev / "subsystem").symlink_to(sysfs / "bus/pci")
+            wlp.mkdir(parents=True)
+            (wlp / "phy80211").mkdir()
+            (wlp / "device").symlink_to(wlp_dev)
+            (wlp / "address").write_text("aa:bb:cc:11:22:33\n")
+
+            self.assertEqual(net.selected_interface(root=root, sysfs=sysfs), "wlp2s0")
+            # Plug in an additional arbitrary USB Wi-Fi adapter (MediaTek 0e8d:7961)
+            usb = sysfs / "devices/usb1/mt7921u"
+            (sysfs / "drivers/mt7921u").mkdir(parents=True)
+            usb.mkdir(parents=True)
+            (usb / "driver").symlink_to(sysfs / "drivers/mt7921u")
+            (usb / "idVendor").write_text("0e8d\n")
+            (usb / "idProduct").write_text("7961\n")
+            wlx = sysfs / "class/net/wlx001122"
+            wlx.mkdir(parents=True)
+            (wlx / "wireless").mkdir()
+            (wlx / "device").symlink_to(usb)
+            (wlx / "address").write_text("dc:a6:32:01:02:03\n")
+
+            listed = net.list_devices(root=root, sysfs=sysfs)
+            self.assertEqual([w["interface"] for w in listed["wireless"]], ["wlp2s0", "wlx001122"])
+            self.assertEqual([e["interface"] for e in listed["wired"]], ["enp3s0"])
+            self.assertEqual(net.status(root=root, sysfs=sysfs)["diagnostic_code"], "identity-ambiguous")
+
+            with mock.patch.object(net, "require_root"), \
+                    mock.patch.object(net, "protected", lambda path, allow_absent=False: Path(path)):
+                cfg = net.select_device("wlx001122", root=root, sysfs=sysfs)
+                self.assertEqual((cfg["mode"], cfg["usb_id"], cfg["driver"], cfg["country"]), ("pinned", "0e8d:7961", "mt7921u", "US"))
+                self.assertEqual(net.selected_interface(root=root, sysfs=sysfs), "wlx001122")
+                reverted = net.select_device(auto=True, root=root, sysfs=sysfs)
+                self.assertEqual(reverted, {"mode": "auto", "country": "US"})
 
     def test_the_kernel_query_has_no_answer_for_loopback_or_an_absent_interface(self):
         self.assertIsNone(net.permanent_mac("lo"))

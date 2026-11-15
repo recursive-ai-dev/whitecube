@@ -1,5 +1,5 @@
 [Unit]
-Description=Whitecube network for USB 2001:3329
+Description=Whitecube Wi-Fi and network controller (cube-net)
 After=systemd-udevd.service
 # Either the native store or, until `cube-net migrate` has run, the old wpa.conf.
 ConditionPathExists=|/etc/whitecube/network/networks.json

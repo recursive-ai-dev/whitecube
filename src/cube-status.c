@@ -1321,7 +1321,7 @@ static void wifi_parse(struct st *s, const char *data, time_t now) {
 		s->wifi_bars = v > -55 ? 4 : v > -67 ? 3 : v > -75 ? 2 : 1;
 		snprintf(s->wifi_label, sizeof(s->wifi_label), "%s%s", !s->privacy_hide_network && ssid[0] ? ssid : "Connected",
 			online && !strncmp(online, "false", 5) ? " (no internet)" : "");
-	} else if (!strcmp(state, "waiting-for-dongle")) {
+	} else if (!strcmp(state, "waiting-for-dongle") || !strcmp(state, "waiting-for-device")) {
 		s->wifi_bars = -1; snprintf(s->wifi_label, sizeof(s->wifi_label), "No adapter");
 	} else if (!strcmp(state, "DISCONNECTED") || !strcmp(state, "INACTIVE") || !strcmp(state, "INTERFACE_DISABLED")) {
 		snprintf(s->wifi_label, sizeof(s->wifi_label), "Disconnected");

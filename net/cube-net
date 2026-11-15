@@ -1,11 +1,14 @@
 #!/usr/bin/python3 -I
-"""A small, dongle-specific Wi-Fi controller: its own WPA2 station over nl80211, plus dhcpcd.
+"""Whitecube's native Wi-Fi controller: its own WPA2 station over nl80211, plus dhcpcd.
+
+Auto-detects any Linux wireless (cfg80211/nl80211) interface by default, or pins a
+specific PCIe/USB/SDIO adapter via /etc/whitecube/network/device.json (`cube-net select`).
 
 The station (class Station) scans, joins a saved WPA2-personal network, runs the four-way and
 group-key handshakes, installs the keys and reconnects when the link drops. It needs no
 wpa_supplicant and no wpa_cli; the crypto, netlink and EAPOL code live in this file.
 
-status/check are read-only and do not require root. run is a service entrypoint.
+status/check/devices are read-only and do not require root. run is a service entrypoint.
 Credentials are only accepted from a terminal or an explicitly requested local
 profile import; they never appear in arguments, logs or JSON status.
 
@@ -45,7 +48,10 @@ import threading
 import time
 
 VERSION = "0.12.0"
-DEFAULT_DEVICE = {"usb_id": "2001:3329", "mac": "88:76:b9:f2:9d:29", "driver": "rtw88_8822cu"}
+DEFAULT_DEVICE = {"mode": "auto"}
+PIN_KEYS = ("interface", "usb_id", "mac", "driver", "bus")
+BUS_TYPES = ("usb", "pci", "sdio", "platform", "virt")
+LEGACY_REALTEK_FIRMWARE = "lib/firmware/rtw88/rtw8822c_fw.bin"
 CONFIG_DIR = Path("/etc/whitecube/network")
 RUNTIME_DIR = Path("/run/whitecube-net")
 PROFILE_FILE = "networks.json"          # saved networks: SSID and 256-bit PSK, root-only
@@ -85,15 +91,39 @@ def log(message):
 
 def device_config(root=Path("/")):
     path = root / "etc/whitecube/network/device.json"
-    config = json.loads(read(path)) if path.is_file() else DEFAULT_DEVICE.copy()
-    if not re.fullmatch(r"[0-9a-f]{4}:[0-9a-f]{4}", config.get("usb_id", "")):
-        raise ValueError("Invalid configured USB ID")
-    if not re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", config.get("mac", "")):
-        raise ValueError("Invalid configured MAC")
-    if config.get("driver") != "rtw88_8822cu":
-        raise ValueError("This controller expects the audited rtw88_8822cu driver")
-    if any(config.get(key) != value for key, value in DEFAULT_DEVICE.items()):
-        raise ValueError('This Whitecube build is scoped to USB 2001:3329, MAC 88:76:b9:f2:9d:29 and rtw88_8822cu.')
+    raw = json.loads(read(path)) if path.is_file() else DEFAULT_DEVICE.copy()
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid device configuration: expected a JSON object.")
+    config = dict(raw)
+    if config.get("interface") is not None:
+        iface = config["interface"]
+        if not isinstance(iface, str) or iface == "lo" or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", iface):
+            raise ValueError("Invalid configured interface name")
+    if config.get("usb_id") is not None:
+        usb_id = config["usb_id"]
+        if not isinstance(usb_id, str) or not re.fullmatch(r"[0-9a-fA-F]{4}:[0-9a-fA-F]{4}", usb_id):
+            raise ValueError("Invalid configured USB ID")
+        config["usb_id"] = usb_id.lower()
+    if config.get("mac") is not None:
+        mac = config["mac"]
+        if not isinstance(mac, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac):
+            raise ValueError("Invalid configured MAC")
+        config["mac"] = mac.lower()
+    if config.get("driver") is not None:
+        drv = config["driver"]
+        if not isinstance(drv, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", drv):
+            raise ValueError("Invalid configured driver name")
+    if config.get("bus") is not None:
+        if config["bus"] not in BUS_TYPES:
+            raise ValueError(f"Invalid configured bus: choose one of {', '.join(BUS_TYPES)}")
+    has_pins = any(config.get(key) is not None for key in PIN_KEYS)
+    if "mode" in config:
+        if config["mode"] not in ("auto", "pinned"):
+            raise ValueError('Invalid configured mode: use "auto" or "pinned".')
+        if config["mode"] == "auto" and has_pins:
+            raise ValueError('mode "auto" cannot be combined with pinned device filters')
+    else:
+        config["mode"] = "pinned" if has_pins else "auto"
     if 'country' in config and not (isinstance(config['country'], str) and re.fullmatch(r'[A-Z]{2}', config['country'])):
         raise ValueError('Invalid configured country: use a two-letter ISO code such as "CA".')
     if 'power_save' in config and not isinstance(config['power_save'], bool):
@@ -144,20 +174,29 @@ def permanent_mac(name):
 def interfaces(sysfs=Path("/sys"), permanent=permanent_mac):
     result = []
     for link in sorted((sysfs / "class/net").glob("*")):
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", link.name):
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,15}", link.name) or link.name == "lo":
             continue
-        dev = (link / "device").resolve()
+        dev_link = link / "device"
+        if not dev_link.exists():
+            continue
+        dev = dev_link.resolve()
         usb_id = ""
         for parent in [dev, *dev.parents]:
             vendor, product = read(parent / "idVendor"), read(parent / "idProduct")
             if vendor and product:
                 usb_id = f"{vendor}:{product}".lower()
                 break
+        uevent_lines = read(link / "uevent").splitlines()
+        is_wireless = (link / "wireless").exists() or (link / "phy80211").exists() or "DEVTYPE=wlan" in uevent_lines
+        subsystem = ((link / "device/subsystem").resolve().name if (link / "device/subsystem").exists()
+                     else ("usb" if usb_id else ""))
+        bus = "usb" if usb_id else subsystem
         result.append({
             "interface": link.name,
+            "wireless": is_wireless,
+            "bus": bus,
             "usb_id": usb_id,
             "mac": permanent(link.name) or read(link / "address").lower(),
-            # Module name: Linux 6.12 registers this USB driver as rtw_8822cu, newer kernels as rtw88_8822cu.
             "driver": ((link / "device/driver/module").resolve().name if (link / "device/driver/module").exists()
                        else (link / "device/driver").resolve().name if (link / "device/driver").exists() else ""),
             "operstate": read(link / "operstate"),
@@ -168,37 +207,84 @@ def interfaces(sysfs=Path("/sys"), permanent=permanent_mac):
     return result
 
 
+def is_wireless(interface):
+    return interface.get("wireless", True) and interface.get("interface") != "lo"
+
+
+def is_pinned(device):
+    return any(device.get(key) is not None for key in PIN_KEYS)
+
+
 def matches(interface, device):
-    return all(interface.get(key) == device[key] for key in ("usb_id", "mac", "driver"))
+    if not is_wireless(interface):
+        return False
+    for key in PIN_KEYS:
+        want = device.get(key)
+        if want is not None and interface.get(key) != want:
+            return False
+    return True
 
 
-def usb_devices(sysfs=Path('/sys')):
-    return [path for path in (sysfs / 'bus/usb/devices').glob('*')
-            if (read(path / 'idVendor') + ':' + read(path / 'idProduct')).lower() == DEFAULT_DEVICE['usb_id']]
+def usb_devices(sysfs=Path('/sys'), usb_id=None):
+    devices = sorted((sysfs / 'bus/usb/devices').glob('*'))
+    if usb_id is not None:
+        return [path for path in devices
+                if (read(path / 'idVendor') + ':' + read(path / 'idProduct')).lower() == usb_id]
+    return [path for path in devices if read(path / 'bDeviceClass').lower() == 'e0' or read(path / 'bInterfaceClass').lower() == 'e0']
+
+
+def pci_wireless_devices(sysfs=Path('/sys')):
+    return [path for path in sorted((sysfs / 'bus/pci/devices').glob('*'))
+            if read(path / 'class').lower().startswith('0x0280')]
 
 
 def diagnostic(config, seen, runtime, usb_present=False):
-    exact = [item for item in seen if matches(item, config)]
-    same_usb = [item for item in seen if item.get('usb_id') == config['usb_id']]
+    wireless_seen = [item for item in seen if is_wireless(item)]
+    exact = [item for item in wireless_seen if matches(item, config)]
     def result(code, summary, actions):
         return {'diagnostic_code': code, 'diagnostic_summary': summary, 'recovery_actions': actions}
     if not exact:
-        if not same_usb and not usb_present:
-            return result('missing-dongle', 'The scoped USB dongle is absent.',
-                          ['Reconnect USB 2001:3329 directly, then run cube-net status.'])
-        if any(item.get('mac') == config['mac'] and item.get('driver') != config['driver'] for item in same_usb) or not same_usb:
-            return result('driver-problem', 'USB 2001:3329 is present but the audited driver has no matching interface.',
-                          ['Run cube-net check and inspect journalctl -k for rtw88_8822cu or firmware errors.',
-                           'Inspect existing blacklists; do not restore deleted modules or unmask services automatically.'])
-        return result('identity-mismatch', 'The USB device does not match the scoped MAC/driver identity.',
-                      ['Use the dongle with MAC 88:76:b9:f2:9d:29; this controller will not manage another device.'])
+        if is_pinned(config):
+            if config.get('usb_id'):
+                same_usb = [item for item in wireless_seen if item.get('usb_id') == config['usb_id']]
+                if not same_usb and not usb_present:
+                    if wireless_seen:
+                        return result('identity-mismatch', 'Attached Wi-Fi adapters do not match /etc/whitecube/network/device.json.',
+                                      ['Run cube-net devices to inspect adapters, or sudo cube-net select <iface> / sudo cube-net select --auto.'])
+                    return result('missing-device', f"Configured USB Wi-Fi adapter ({config['usb_id']}) is absent.",
+                                  [f"Reconnect USB {config['usb_id']} or run sudo cube-net select --auto, then run cube-net status."])
+                if (config.get('driver') and any(item.get('driver') != config['driver'] and (config.get('mac') is None or item.get('mac') == config['mac']) for item in same_usb)) or not same_usb:
+                    return result('driver-problem', f"USB {config['usb_id']} is present without the expected driver ({config.get('driver') or 'cfg80211'}).",
+                                  ['Run cube-net check and inspect journalctl -k for Wi-Fi driver or firmware errors.',
+                                   'Inspect existing blacklists; do not restore deleted modules or unmask services automatically.'])
+                return result('identity-mismatch', 'The attached Wi-Fi device does not match the configured MAC/driver/interface filter.',
+                              ['Run cube-net devices to see detected adapters, or update pinning with sudo cube-net select --auto.'])
+            non_driver_match = [item for item in wireless_seen
+                                if all(config.get(k) is None or item.get(k) == config[k] for k in PIN_KEYS if k != 'driver')]
+            if (config.get('driver') and any(item.get('driver') != config['driver'] for item in non_driver_match)) or (usb_present and not wireless_seen):
+                return result('driver-problem', f"Configured Wi-Fi driver ({config.get('driver') or 'nl80211'}) has no active wireless interface.",
+                              ['Run cube-net check and inspect journalctl -k for Wi-Fi driver or firmware errors.',
+                               'Inspect existing blacklists and rfkill status.'])
+            if wireless_seen:
+                return result('identity-mismatch', 'Attached Wi-Fi adapters do not match the pinned configuration in /etc/whitecube/network/device.json.',
+                              ['Run cube-net devices to inspect adapters, or sudo cube-net select <iface> / sudo cube-net select --auto.'])
+            return result('missing-device', 'The configured Wi-Fi adapter was not found.',
+                          ['Connect the Wi-Fi adapter or run sudo cube-net select --auto, then run cube-net status.'])
+        if usb_present:
+            return result('driver-problem', 'Wireless hardware is present, but no nl80211 interface was created by a kernel driver.',
+                          ['Run cube-net check and inspect journalctl -k for Wi-Fi driver or firmware errors.',
+                           'Check rfkill status and kernel module blacklists.'])
+        return result('missing-device', 'No Wi-Fi adapter was detected.',
+                      ['Connect a USB Wi-Fi adapter or enable internal Wi-Fi, then run cube-net status.'])
     if len(exact) != 1:
-        return result('identity-ambiguous', 'More than one interface matches the scoped identity.', ['Inspect cube-net status before starting a controller.'])
+        names = ', '.join(item.get('interface', '?') for item in exact)
+        return result('identity-ambiguous', f'Multiple Wi-Fi interfaces match ({names}).',
+                      ['Run cube-net devices to compare adapters, then pin one with sudo cube-net select <iface>.'])
     state = runtime.get('association_state', 'unknown')
-    if state in ('unknown', 'stale', 'stopped', 'failed', 'controller-unavailable', 'waiting-for-dongle'):
+    if state in ('unknown', 'stale', 'stopped', 'failed', 'controller-unavailable', 'waiting-for-dongle', 'waiting-for-device'):
         return result('controller-unavailable', 'Fresh association status is unavailable.',
                       ['Inspect systemctl status whitecube-network.service and journalctl -u whitecube-network.service.',
-                       'After configuring a profile, start the scoped service deliberately; existing managers must not compete.'])
+                       'After configuring a profile, start the service deliberately; existing managers must not compete.'])
     if state != 'COMPLETED':
         return result('association-failed', 'Wi-Fi association has not completed.',
                       ['The controller keeps scanning and reconnecting with growing delays; it does not give up.',
@@ -408,40 +494,89 @@ class Health:
 def status(root=Path("/"), sysfs=Path("/sys")):
     config = device_config(root)
     seen = interfaces(sysfs)
-    selected = [item for item in seen if matches(item, config)]
+    wireless_seen = [item for item in seen if is_wireless(item)]
+    wired_seen = [item for item in seen if not item.get("wireless", True)]
+    selected = [item for item in wireless_seen if matches(item, config)]
     runtime = public_runtime(root)
     if len(selected) == 1 and root == Path('/'):
         signal_dbm = wireless_signal(selected[0]['interface'])
         if signal_dbm is not None:
             runtime['signal_dbm'] = signal_dbm
+    hw_present = (bool(usb_devices(sysfs, config.get("usb_id")))
+                  if config.get("usb_id")
+                  else bool(usb_devices(sysfs)) or bool(pci_wireless_devices(sysfs)))
     return {
         "controller": "whitecube-network", "device": config,
         "present": len(selected) == 1,
         "interface": selected[0] if len(selected) == 1 else None,
+        "available_wireless": wireless_seen,
+        "wired_interfaces": wired_seen,
         "credentials_configured": any((root / "etc/whitecube/network" / name).is_file() for name in (PROFILE_FILE, LEGACY_PROFILE_FILE)),
-        "matching_usb_devices": len([item for item in seen if item["usb_id"] == config["usb_id"]]),
+        "matching_devices": len(selected),
+        "matching_usb_devices": len([item for item in wireless_seen if config.get("usb_id") and item.get("usb_id") == config["usb_id"]]),
         "profiles": public_profiles(root),
         **runtime,
-        **diagnostic(config, seen, runtime, bool(usb_devices(sysfs))),
+        **diagnostic(config, wireless_seen, runtime, hw_present),
         "note": ("Probes: router neighbour discovery, a UDP query for deb.debian.org to each configured resolver, and a TCP "
-                 "connection to 1.1.1.1:443 (then 9.9.9.9:443) bound to the dongle. Probe failures are reported only; "
-                 "they never restart or disconnect Wi-Fi."),
+                 "connection to 1.1.1.1:443 (then 9.9.9.9:443) bound to the active Wi-Fi interface. Probe failures are reported "
+                 "only; they never restart or disconnect Wi-Fi."),
     }
 
 
-def audit(root):
+def _module_files_for(kernel, lines, module_name):
+    suffixes = tuple(f"/{module_name}.ko{ext}" for ext in ("", ".gz", ".xz", ".zst"))
+    line = next((entry for entry in lines if entry.split(":", 1)[0].endswith(suffixes)), "")
+    files = line.replace(":", "").split()
+    return [{"path": name, "present": (kernel / name).is_file()} for name in files]
+
+
+def audit(root, sysfs=Path("/sys")):
+    config = device_config(root) if (root / "etc/whitecube/network/device.json").is_file() else DEFAULT_DEVICE.copy()
+    seen = [item for item in interfaces(sysfs) if is_wireless(item)]
+    target_drivers = []
+    if config.get("driver"):
+        target_drivers.append(config["driver"])
+    for item in seen:
+        drv = item.get("driver")
+        if drv and drv not in target_drivers:
+            target_drivers.append(drv)
+    check_modules = ["cfg80211", *target_drivers]
     kernels = []
     module_base = root / "lib/modules"
     for kernel in sorted(module_base.glob("*")):
-        entry = {"kernel": kernel.name}
+        entry = {"kernel": kernel.name, "checked_modules": check_modules}
         lines = read(kernel / "modules.dep").splitlines()
-        line = next((line for line in lines if line.split(":", 1)[0].endswith("/rtw88_8822cu.ko.xz") or line.split(":", 1)[0].endswith("/rtw88_8822cu.ko")), "")
-        files = line.replace(":", "").split()
-        entry["module_files"] = [{"path": name, "present": (kernel / name).is_file()} for name in files]
-        entry["usb_alias_present"] = any("usb:v2001p3329" in line and line.endswith(" rtw88_8822cu") for line in read(kernel / "modules.alias").splitlines())
-        entry["ready"] = bool(files) and all(item["present"] for item in entry["module_files"]) and entry["usb_alias_present"]
+        files = []
+        seen_paths = set()
+        all_found = True
+        for mod in check_modules:
+            mod_files = _module_files_for(kernel, lines, mod)
+            if not mod_files:
+                all_found = False
+            for item in mod_files:
+                if item["path"] not in seen_paths:
+                    seen_paths.add(item["path"])
+                    files.append(item)
+        entry["module_files"] = files
+        if config.get("usb_id"):
+            vid, pid = config["usb_id"].split(":")
+            needle = f"usb:v{vid}p{pid}".lower()
+            aliases = read(kernel / "modules.alias").splitlines()
+            drv = config.get("driver")
+            entry["usb_alias_present"] = any(
+                needle in line.lower() and (not drv or line.endswith(f" {drv}"))
+                for line in aliases
+            )
+            entry["ready"] = all_found and bool(files) and all(item["present"] for item in files) and entry["usb_alias_present"]
+        else:
+            wireless_tree = (kernel / "kernel/drivers/net/wireless").is_dir()
+            entry["wireless_drivers_present"] = wireless_tree
+            entry["ready"] = all_found and bool(files) and all(item["present"] for item in files) and (bool(target_drivers) or wireless_tree)
         kernels.append(entry)
-    firmware = root / "lib/firmware/rtw88/rtw8822c_fw.bin"
+    if config.get("driver") in ("rtw88_8822cu", "rtw_8822cu"):
+        firmware_ok = (root / LEGACY_REALTEK_FIRMWARE).is_file()
+    else:
+        firmware_ok = (root / "lib/firmware").is_dir() or (root / "usr/lib/firmware").is_dir()
     binaries = {name: (root / path).is_file() for name, path in {
         "dhcpcd": "usr/sbin/dhcpcd", "getent": "usr/bin/getent",
     }.items()}
@@ -452,9 +587,10 @@ def audit(root):
         p = root / "etc/systemd/system" / name
         if p.is_symlink() and str(p.readlink()) == "/dev/null":
             masks.append(name)
-    return {"root": str(root), "kernels": kernels, "firmware_present": firmware.is_file(), "binaries": binaries,
+    return {"root": str(root), "device": config, "detected_wireless": seen, "kernels": kernels,
+            "firmware_present": firmware_ok, "binaries": binaries,
             "existing_masks_preserved": masks, "unused_wpa_binaries_present": legacy,
-            "dependencies_ready": bool(kernels) and all(k["ready"] for k in kernels) and firmware.is_file() and all(binaries.values()),
+            "dependencies_ready": bool(kernels) and all(k["ready"] for k in kernels) and firmware_ok and all(binaries.values()),
             "policy": "No packages or modules installed, loaded, restored, removed or unmasked. wpa_supplicant is not used and may be uninstalled."}
 
 
@@ -2111,7 +2247,13 @@ def selftest(json_output=False):
               wpa_psk(b'password', b'IEEE').hex() == 'f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e')
         config = device_config()
         candidates = [item for item in interfaces() if matches(item, config)]
-        check('the scoped dongle is present', len(candidates) == 1, candidates[0]['interface'] if candidates else 'not found')
+        if len(candidates) == 1:
+            detail = f"{candidates[0]['interface']} ({candidates[0].get('driver') or 'nl80211'})"
+        elif len(candidates) > 1:
+            detail = "ambiguous: " + ", ".join(item["interface"] for item in candidates)
+        else:
+            detail = "not found"
+        check('a Wi-Fi interface is ready', len(candidates) == 1, detail)
         if len(candidates) != 1:
             return len(failures)
         try:
@@ -2269,12 +2411,57 @@ class Supervisor:
         return None
 
 
-def selected_interface():
-    config = device_config()
-    candidates = [item for item in interfaces() if matches(item, config)]
-    if len(candidates) != 1:
-        raise RuntimeError('The configured USB, MAC and driver must identify exactly one attached dongle.')
+def selected_interface(root=Path('/'), sysfs=Path('/sys')):
+    config = device_config(root)
+    candidates = [item for item in interfaces(sysfs) if matches(item, config)]
+    if len(candidates) > 1:
+        names = ', '.join(item['interface'] for item in candidates)
+        raise RuntimeError(f'Multiple Wi-Fi interfaces match ({names}); run cube-net devices or pin one with sudo cube-net select <iface>.')
+    if not candidates:
+        raise RuntimeError('No matching Wi-Fi interface found (see cube-net status or cube-net devices).')
     return candidates[0]['interface']
+
+
+def list_devices(root=Path('/'), sysfs=Path('/sys')):
+    config = device_config(root)
+    seen = interfaces(sysfs)
+    wireless = [dict(item, selected=matches(item, config)) for item in seen if is_wireless(item)]
+    wired = [item for item in seen if not item.get('wireless', True)]
+    return {'config': config, 'wireless': wireless, 'wired': wired}
+
+
+def select_device(target=None, auto=False, by_interface=False, root=Path('/'), sysfs=Path('/sys')):
+    require_root()
+    cfg_dir = CONFIG_DIR if root == Path('/') else (root / 'etc/whitecube/network')
+    cfg_path = cfg_dir / 'device.json'
+    current = device_config(root) if cfg_path.is_file() else {}
+    preserved = {k: v for k, v in current.items() if k not in PIN_KEYS and k != 'mode'}
+    if auto:
+        updated = {'mode': 'auto', **preserved}
+    else:
+        if not target:
+            raise ValueError('Specify a wireless interface name or --auto.')
+        wireless = [item for item in interfaces(sysfs) if is_wireless(item)]
+        chosen = next((item for item in wireless if item['interface'] == target), None)
+        if chosen is None:
+            available = ', '.join(item['interface'] for item in wireless) or 'none'
+            raise ValueError(f'Unknown or non-wireless interface {target!r} (detected Wi-Fi: {available}).')
+        pins = {}
+        if by_interface:
+            pins['interface'] = chosen['interface']
+        else:
+            if chosen.get('mac'):
+                pins['mac'] = chosen['mac']
+            if chosen.get('driver'):
+                pins['driver'] = chosen['driver']
+            if chosen.get('usb_id'):
+                pins['usb_id'] = chosen['usb_id']
+            if not pins:
+                pins['interface'] = chosen['interface']
+        updated = {'mode': 'pinned', **pins, **preserved}
+    cfg_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    atomic_write(cfg_path, json.dumps(updated, indent=2) + '\n', 0o644)
+    return updated
 
 
 def scan_networks():
@@ -2567,7 +2754,7 @@ def run_service():
         pass  # An unreadable or hand-edited profile file is reported by the station, not rewritten here.
     runtime = public_runtime()
     previous_state = runtime['association_state']
-    runtime.update(association_state='waiting-for-dongle', signal_dbm=None, ssid=None,
+    runtime.update(association_state='waiting-for-device', signal_dbm=None, ssid=None,
                    service_restart_count=runtime['service_restart_count'] + (1 if runtime['updated_utc'] else 0),
                    last_error=None, ipv4_address=None, default_route=None, dns_ok=None, connectivity_ok=None,
                    gateway_ok=None, dns_ms=None, tcp_ms=None, checks_epoch=None, assoc_age_s=None,
@@ -2586,14 +2773,17 @@ def run_service():
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
     iface = None
+    selected_dev = None
     try:
-        print("Waiting for the configured USB dongle", flush=True)
+        print("Waiting for a matching Wi-Fi interface", flush=True)
         while not stopping:
             candidates = [item for item in interfaces() if matches(item, config)]
             if len(candidates) > 1:
-                raise RuntimeError("Device identity is ambiguous")
+                names = ", ".join(item["interface"] for item in candidates)
+                raise RuntimeError(f"Multiple Wi-Fi interfaces match ({names}); pin one in /etc/whitecube/network/device.json.")
             if candidates:
-                iface = candidates[0]["interface"]
+                selected_dev = candidates[0]
+                iface = selected_dev["interface"]
                 break
             publish_runtime(runtime)
             time.sleep(1)
@@ -2602,7 +2792,8 @@ def run_service():
         conflicts = competing_processes(iface)
         if conflicts:
             raise RuntimeError("Refusing to compete with existing controller(s): " + ", ".join(conflicts))
-        print(f"Managing {iface} with the built-in WPA2 station and the existing {config['driver']} module", flush=True)
+        drv_name = selected_dev.get("driver") or config.get("driver") or "nl80211"
+        print(f"Managing {iface} with the built-in WPA2 station ({drv_name})", flush=True)
         driver = Nl80211Driver(iface)
         station = Station(driver, load_profiles, log, options=station_options(config))
         thread = threading.Thread(target=station.run, name="cube-net-wifi", daemon=True)
@@ -2618,7 +2809,7 @@ def run_service():
             if any(child.poll() is not None for child in children):
                 raise RuntimeError("A network child process exited; the service will retry")
             if not any(item["interface"] == iface and matches(item, config) for item in interfaces()):
-                raise RuntimeError("Configured dongle removed or identity changed")
+                raise RuntimeError("Managed Wi-Fi interface removed or identity changed")
             controller.tick(tick)
             time.sleep(max(0.2, POLL_INTERVAL - (time.monotonic() - tick)))
     except (RuntimeError, OSError, subprocess.SubprocessError):
@@ -2701,7 +2892,7 @@ def takeover(root=Path('/'), run=run_command, online=wait_until_online, seen=Non
     config = device_config(root)
     candidates = [item for item in (interfaces() if seen is None else seen) if matches(item, config)]
     if len(candidates) != 1:
-        raise RuntimeError('The scoped dongle must be present exactly once; see cube-net status. Nothing was changed.')
+        raise RuntimeError('Exactly one matching Wi-Fi interface must be present; see cube-net status or cube-net devices. Nothing was changed.')
     iface = candidates[0]['interface']
     if not any((root / 'etc/whitecube/network' / name).exists() for name in (PROFILE_FILE, LEGACY_PROFILE_FILE)):
         with profile_lock():
@@ -2756,13 +2947,23 @@ def main():
     p.add_argument("--sysfs", type=Path, default=Path("/sys"))
     p = sub.add_parser("check", help="Read-only module/firmware/binary audit as JSON")
     p.add_argument("--root", type=Path, default=Path("/"))
+    p.add_argument("--sysfs", type=Path, default=Path("/sys"))
+    p = sub.add_parser("devices", help="List detected wireless/wired interfaces and selection config as JSON")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    p.add_argument("--sysfs", type=Path, default=Path("/sys"))
+    p = sub.add_parser("select", help="Pin a specific Wi-Fi interface in device.json, or revert to --auto; root required")
+    p.add_argument("interface", nargs="?", help="Wireless interface name (e.g. wlan0, wlp2s0)")
+    p.add_argument("--auto", action="store_true", help="Clear pinned adapter filters and auto-detect any Wi-Fi interface")
+    p.add_argument("--by-interface", action="store_true", help="Pin by interface name instead of MAC/driver/USB ID")
+    p.add_argument("--root", type=Path, default=Path("/"))
+    p.add_argument("--sysfs", type=Path, default=Path("/sys"))
     sub.add_parser("setup", help="Interactively add a WPA2 profile while preserving saved profiles")
     sub.add_parser("add", help="Interactively add a WPA2 profile; root and terminal required")
     sub.add_parser("manage", help="Interactive Wi-Fi manager; root and terminal required")
     p = sub.add_parser("profiles", help="Read-only saved profile IDs and SSIDs as JSON")
     p.add_argument("--root", type=Path, default=Path('/'))
-    sub.add_parser("scan", help="Scan using the running scoped controller; root required")
-    sub.add_parser('reconnect', help='Reassociate now and restart the retry delays for the scoped dongle; root required')
+    sub.add_parser("scan", help="Scan using the running Wi-Fi controller; root required")
+    sub.add_parser('reconnect', help='Reassociate now and restart the retry delays for the active Wi-Fi interface; root required')
     for action in ('connect', 'remove'):
         p = sub.add_parser(action)
         p.add_argument('profile_id')
@@ -2776,7 +2977,12 @@ def main():
     if args.command == "status":
         print(json.dumps(status(args.root.resolve(), args.sysfs.resolve()), indent=2))
     elif args.command == "check":
-        print(json.dumps(audit(args.root.resolve()), indent=2))
+        print(json.dumps(audit(args.root.resolve(), args.sysfs.resolve()), indent=2))
+    elif args.command == "devices":
+        print(json.dumps(list_devices(args.root.resolve(), args.sysfs.resolve()), indent=2))
+    elif args.command == "select":
+        print(json.dumps(select_device(args.interface, auto=args.auto, by_interface=args.by_interface,
+                                       root=args.root.resolve(), sysfs=args.sysfs.resolve()), indent=2))
     elif args.command in ('setup', 'add'):
         with profile_lock():
             add_profile()

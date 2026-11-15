@@ -1923,7 +1923,7 @@ class SelftestTests(unittest.TestCase):
             failures = net.selftest(json_output=True)
         payload = json.loads(out.getvalue())
         self.assertEqual((failures, payload["ok"], payload["failures"]), (1, False, 1))
-        self.assertTrue(any("scoped dongle" in c["name"] and not c["ok"] for c in payload["checks"]))
+        self.assertTrue(any("Wi-Fi interface is ready" in c["name"] and not c["ok"] for c in payload["checks"]))
         with mock.patch.object(sys, "argv", ["cube-net", "--version"]), contextlib.redirect_stdout(io.StringIO()) as out, \
                 self.assertRaises(SystemExit) as cm:
             net.main()
