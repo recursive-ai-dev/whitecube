@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Cube PDF Lock: password-protect PDFs with AES-256 (Whitecube style)."""
+import sys
 import threading
 from pathlib import Path
 
@@ -306,4 +307,7 @@ class PdfLockApp(ct.CubeApp):
 
 
 if __name__ == "__main__":
+    if '--version' in sys.argv[1:]:
+        print(f'Cube PDF Lock {ct.APP_VERSION}')
+        raise SystemExit(0)
     ct.quit_on_error_main(PdfLockApp)

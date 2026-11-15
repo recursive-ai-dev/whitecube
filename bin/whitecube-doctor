@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts', 'chat')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts', 'chat', 'suite')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -820,6 +820,78 @@ def check_chat(env):
                     f'desktop-chat {data.get("version", "?")} ready ({conv_count} conversations, {ckpt_count} checkpoints)')]
 
 
+def check_suite(env):
+    """Report wc-suite wrappers, shell completions, and cube-apps utilities readiness."""
+    if env.root != Path('/'):
+        staged_execs = (
+            '/usr/bin/wc-help',
+            '/usr/bin/wc-doctor',
+            '/usr/bin/wc-ls',
+            '/usr/bin/cube-hash',
+            '/usr/bin/cube-lock',
+            '/usr/bin/cube-pdf',
+            '/usr/bin/cube-rename',
+        )
+        staged_files = (
+            '/usr/lib/wc-suite/wc_suite.py',
+            '/usr/share/bash-completion/completions/wc-help',
+            '/usr/share/zsh/vendor-completions/_wc',
+            '/usr/share/whitecube/cube-apps/cube_theme.py',
+            '/usr/share/whitecube/cube-apps/cube_hash.py',
+        )
+        present_any = any(
+            (env.at(p).is_file() or env.at(p).is_symlink())
+            for p in (*staged_execs, *staged_files)
+        )
+        if not present_any:
+            return [finding('info', 'suite', 'wc-suite and cube-apps are not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [
+            p for p in staged_execs
+            if not (env.at(p).is_file() or env.at(p).is_symlink()) or not os.access(env.at(p), os.X_OK)
+        ] + [
+            p for p in staged_files
+            if not env.at(p).is_file()
+        ]
+        if missing:
+            return [finding('FAIL', 'suite', f'staged wc-suite / cube-apps incomplete (missing {", ".join(missing)})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'suite', 'staged wc-suite wrappers, completions, and cube-apps utilities present')]
+
+    wc_doctor = next(
+        (p for p in (env.at('/usr/bin/wc-doctor'), env.home / '.local/bin/wc-doctor') if p.is_file() and os.access(p, os.X_OK)),
+        None,
+    )
+    if wc_doctor is not None:
+        cmd = [str(wc_doctor), '--json']
+    elif (env.project / 'apps/wc-suite/wc_suite.py').is_file():
+        cmd = [sys.executable, '-I', str(env.project / 'apps/wc-suite/wc_suite.py'), 'doctor', '--json']
+    else:
+        return [finding('info', 'suite', 'wc-suite is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    sub_env = dict(os.environ)
+    sub_env['HOME'] = str(env.home)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5, env=sub_env)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'suite', f'could not query wc-doctor --json: {error}', 'wc-doctor')]
+    if not isinstance(data, dict) or 'version' not in data or 'tools' not in data:
+        return [finding('WARN', 'suite', 'wc-doctor --json returned unexpected output', 'wc-doctor')]
+    missing_wrappers = data.get('missing_wrappers') or []
+    cube_ready = all(
+        (env.at(f'/usr/bin/{name}').is_file() and os.access(env.at(f'/usr/bin/{name}'), os.X_OK))
+        or (env.home / '.local/bin' / name).is_file()
+        or (env.project / 'apps/cube-apps' / f'{name.replace("-", "_")}.py').is_file()
+        for name in ('cube-hash', 'cube-lock', 'cube-pdf', 'cube-rename')
+    )
+    if missing_wrappers and wc_doctor is not None:
+        return [finding('WARN', 'suite', f'wc-suite {data.get("version")} missing wrappers: {", ".join(missing_wrappers)}',
+                        'reinstall whitecube-desktop or wc-suite')]
+    note = '' if cube_ready else ' (cube-apps launchers unavailable)'
+    return [finding('ok', 'suite', f'wc-suite {data.get("version")} ready ({len(data.get("tools", {}))} tool groups){note}')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -846,6 +918,7 @@ def run_checks(env, selected=None):
         'chrootables': (lambda: check_chrootables(env),),
         'prompts': (lambda: check_prompts(env),),
         'chat': (lambda: check_chat(env),),
+        'suite': (lambda: check_suite(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

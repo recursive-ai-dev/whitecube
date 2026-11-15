@@ -13,6 +13,7 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -129,9 +130,25 @@ def detach(argv, name, *, cwd=None):
 
 def read(path, default=""):
     try:
-        return Path(path).read_text().strip()
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return default
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return default
+        chunks = []
+        remaining = 65536
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks).decode("utf-8").strip()
     except (OSError, UnicodeError):
         return default
+    finally:
+        os.close(fd)
 
 
 def output(data, as_json=False):
@@ -246,10 +263,15 @@ def catalog():
     return data
 
 
-@command("ls", "Help", "List installed commands, optionally filter or emit JSON", "wc-ls\nwc-ls audio\nwc-ls --json")
+@command("ls", "Help", "List installed commands, optionally filter or emit JSON", "wc-ls\nwc-ls audio\nwc-ls --group Utilities --json")
 def list_commands(args):
     query = args.filter.casefold()
-    data = {n: s for n, s in catalog().items() if query in f"{n} {s['summary']} {s['group']}".casefold()}
+    group_filter = (getattr(args, "group", None) or "").casefold()
+    data = {
+        n: s for n, s in catalog().items()
+        if query in f"{n} {s['summary']} {s['group']}".casefold()
+        and (not group_filter or s.get("group", "").casefold() == group_filter)
+    }
     if args.json:
         print(json.dumps(data, indent=2))
     else:
@@ -304,6 +326,9 @@ def completion_choices(name):
             choices.extend(str(x) for x in action.choices)
     if key in ("help", "ls"):
         choices.extend(sorted(n for n in catalog() if re.fullmatch(r"[A-Za-z0-9_.-]+", n)))
+        if key == "ls":
+            choices.extend(GROUPS)
+            choices.append("External")
     if key in ("vol", "mic"):
         choices.extend(("status", "up", "down", "mute", "unmute", "on", "off"))
     elif key == "bright":
@@ -886,11 +911,14 @@ def check(args):
 
 
 DOCTOR_TOOLS = {
-    "Applications": ("foot", "whitecube-terminal", "fuzzel", "whitecube-browser", "desktop-chat", "cube-settings", "command-center", "binsys", "xdg-open", "gparted"),
+    "Applications": ("foot", "whitecube-terminal", "fuzzel", "whitecube-browser", "desktop-chat",
+                     "cube-settings", "cube-prompts", "cube-chrootables", "cube-strap",
+                     "command-center", "binsys", "xdg-open", "gparted"),
+    "Cube Utilities": ("cube-hash", "cube-lock", "cube-pdf", "cube-rename"),
     "Desktop": ("swaylock", "whitecube-next-wallpaper", "grim", "slurp", "wl-copy", "wl-paste", "wlr-randr", "brightnessctl"),
     "Audio (alternatives)": ("amixer", "wpctl", "cube-audio"),
     "Network": ("ip", "ping", "cube-net", "iw", "rfkill", "bluetoothctl"),
-    "System": ("df", "lsblk", "ps", "systemctl", "journalctl", "sudo", "notify-send", "cube-check", "systemd-inhibit"),
+    "System": ("df", "lsblk", "ps", "systemctl", "journalctl", "sudo", "notify-send", "cube-check", "whitecube-doctor", "systemd-inhibit"),
 }
 
 
@@ -1023,10 +1051,16 @@ def timer_guard():
 
 
 def load_timer(path):
+    fd = None
     try:
-        if path.is_symlink() or path.stat().st_size > 65536:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 65536:
             raise ValueError("unsafe record")
-        data = json.loads(path.read_text())
+        raw = os.read(fd, 65537)
+        if len(raw) > 65536:
+            raise ValueError("unsafe record")
+        data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict) or data.get("id") != path.stem:
             raise ValueError("invalid identity")
         if data.get("status") not in ("pending", "done", "failed", "cancelled", "interrupted"):
@@ -1034,8 +1068,11 @@ def load_timer(path):
         if not isinstance(data.get("message"), str) or not isinstance(data.get("due"), (int, float)) or not math.isfinite(data["due"]):
             raise ValueError("invalid timer details")
         return data
-    except (OSError, ValueError, OverflowError):
+    except (OSError, ValueError, OverflowError, UnicodeError):
         raise Error(f"unreadable timer record: {path}") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 @command("timer", "Utilities", "Start, list, or cancel persistent desktop notification timers",
@@ -1182,6 +1219,7 @@ def parser(name):
         p.add_argument("--plain", action="store_true", help="do not use a pager for keyboard bindings")
     elif name == "ls":
         p.add_argument("filter", nargs="?", default="", help="filter names, groups, and descriptions")
+        p.add_argument("--group", help="filter by exact command group")
         p.add_argument("--json", action="store_true")
     elif name == "keys":
         p.add_argument("--plain", action="store_true")

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Cube Hash: checksums for files, with paste-to-verify (Whitecube style)."""
+import argparse
 import hashlib
+import json
 import os
 import re
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -415,5 +418,86 @@ class HashApp(ct.CubeApp):
         super().__init__(APP_ID)
 
 
+def read_regular_text(path: Path, max_bytes: int = 4 * 1024 * 1024) -> str:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError('Choose a regular file')
+        if st.st_size > max_bytes:
+            raise ValueError(f'File exceeds {max_bytes} byte limit')
+        chunks = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b''.join(chunks)
+        if len(raw) > max_bytes:
+            raise ValueError(f'File exceeds {max_bytes} byte limit')
+        return raw.decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def cli_main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--version' in argv and '--cli' not in argv:
+        print(f'Cube Hash {ct.APP_VERSION}')
+        return 0
+    if argv[:1] == ['--cli']:
+        argv = argv[1:]
+    p = argparse.ArgumentParser(prog='cube-hash --cli', description='Headless file checksum and manifest verifier')
+    p.add_argument('--algo', choices=[a for _, a in ALGOS], default='sha256')
+    p.add_argument('--verify', metavar='DIGEST', help='expected checksum (single-file mode)')
+    p.add_argument('--manifest', type=Path, help='GNU/BSD checksum manifest file')
+    p.add_argument('--json', action='store_true', help='emit machine-readable JSON')
+    p.add_argument('--version', action='version', version=f'Cube Hash {ct.APP_VERSION}')
+    p.add_argument('files', nargs='+', type=Path)
+    args = p.parse_args(argv)
+    if args.verify and args.manifest:
+        print('cube-hash: use either --verify or --manifest, not both', file=sys.stderr)
+        return 2
+    if args.verify and len(args.files) != 1:
+        print('cube-hash: --verify accepts exactly one file', file=sys.stderr)
+        return 2
+    if args.manifest:
+        manifest = parse_manifest(read_regular_text(args.manifest), default_algo=args.algo)
+        checked = verify_manifest(args.files, manifest)
+        results = []
+        ok = True
+        for path, (match, expected, actual) in checked.items():
+            if match is not True:
+                ok = False
+            results.append({'file': str(path), 'match': match, 'expected': expected, 'actual': actual})
+        if args.json:
+            print(json.dumps({'ok': ok, 'results': results}, indent=2))
+        else:
+            for item in results:
+                status = 'OK' if item['match'] is True else ('MISSING' if item['match'] is None else 'FAILED')
+                print(f"{item['file']}: {status}")
+        return 0 if ok else 1
+    expected = clean_expected(args.verify) if args.verify else ''
+    results = []
+    ok = True
+    for path in args.files:
+        actual = hash_file(path, args.algo)
+        match = (actual == expected) if expected else None
+        if expected and not match:
+            ok = False
+        results.append({'file': str(path), 'algo': args.algo, 'digest': actual, 'match': match})
+    if args.json:
+        print(json.dumps({'ok': ok, 'results': results}, indent=2))
+    else:
+        for item in results:
+            suffix = '' if item['match'] is None else ('  OK' if item['match'] else '  MISMATCH')
+            print(f"{item['digest']}  {item['file']}{suffix}")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if '--version' in sys.argv[1:] or sys.argv[1:2] == ['--cli']:
+        raise SystemExit(cli_main())
     ct.quit_on_error_main(HashApp)

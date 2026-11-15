@@ -21,7 +21,7 @@
 - [x] `apps/chrootables` (`cube-chrootables` & `whitecube-chrootable-manager`)
 - [x] `apps/cube-prompts` (SQLite prompt library, templates, and multi-model runner)
 - [x] `apps/desktop-chat` (Electron chat, local model server bridge, search/drafts)
-- [ ] `apps/wc-suite` & `apps/cube-apps` (CLI suite, completions, and native file utilities)
+- [x] `apps/wc-suite` & `apps/cube-apps` (CLI suite, completions, and native file utilities)
 
 ## Phase 4: Packaging & Release Readiness (`packaging/`, `tools/`)
 - [ ] `packaging/` (`install-tree.sh`, `check-tree.py`, `debian/`, ABI & conffile verification)

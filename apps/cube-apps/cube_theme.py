@@ -7,6 +7,7 @@ and CUBE_SHOT=<path> to render the window to a PNG and quit (for testing in
 the headless compositor).
 """
 import os
+import stat
 import sys
 import threading
 import json
@@ -14,6 +15,8 @@ import math
 import tempfile
 import time
 from pathlib import Path
+
+APP_VERSION = "0.12.0"
 
 import gi
 
@@ -228,11 +231,18 @@ def _last_folder_file():
 
 def last_folder():
     """The folder the previous pick happened in (shared by the Cube apps), if it still exists."""
+    fd = None
     try:
-        with open(_last_folder_file(), encoding="utf-8") as f:
-            folder = f.read(4096).strip()
+        fd = os.open(_last_folder_file(), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > 4096:
+            return None
+        folder = os.read(fd, 4096).decode("utf-8").strip()
     except (OSError, UnicodeError):
         return None
+    finally:
+        if fd is not None:
+            os.close(fd)
     return folder if folder and os.path.isabs(folder) and os.path.isdir(folder) else None
 
 
@@ -241,16 +251,25 @@ def remember_folder(folder):
     if not folder or not os.path.isdir(folder):
         return
     path = _last_folder_file()
+    parent = os.path.dirname(path)
+    tmp = None
     try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(prefix='.last-folder-', dir=os.path.dirname(path))
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        pst = os.lstat(parent)
+        if not stat.S_ISDIR(pst.st_mode) or pst.st_uid != os.getuid():
+            return
+        os.chmod(parent, 0o700)
+        fd, tmp = tempfile.mkstemp(prefix='.last-folder-', dir=parent)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(folder + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except OSError:
         pass
     finally:
-        if 'tmp' in locals():
+        if tmp:
             try:
                 os.unlink(tmp)
             except OSError:

@@ -756,6 +756,58 @@ class RunTests(Fixture):
                 self.assertEqual(live_fail['level'], 'FAIL')
                 self.assertIn('JSON object', live_fail['detail'])
 
+    def test_suite_check_reports_staged_and_live_readiness(self):
+        info = doctor.check_suite(self.env)[0]
+        self.assertEqual(info['level'], 'info')
+
+        for cmd in ('wc-help', 'wc-doctor', 'wc-ls', 'cube-hash', 'cube-lock', 'cube-pdf', 'cube-rename'):
+            self.put(f'usr/bin/{cmd}', '#!/bin/sh\n').chmod(0o755)
+        for data in (
+            'usr/lib/wc-suite/wc_suite.py',
+            'usr/share/bash-completion/completions/wc-help',
+            'usr/share/zsh/vendor-completions/_wc',
+            'usr/share/whitecube/cube-apps/cube_theme.py',
+            'usr/share/whitecube/cube-apps/cube_hash.py',
+        ):
+            self.put(data, '')
+        ok = doctor.check_suite(self.env)[0]
+        self.assertEqual(ok['level'], 'ok')
+        self.assertIn('staged', ok['detail'])
+
+        (self.root / 'usr/share/zsh/vendor-completions/_wc').unlink()
+        bad = doctor.check_suite(self.env)[0]
+        self.assertEqual(bad['level'], 'FAIL')
+        self.assertIn('_wc', bad['detail'])
+
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        fake_wc = self.home / '.local/bin/wc-doctor'
+        fake_wc.parent.mkdir(parents=True, exist_ok=True)
+        fake_wc.write_text('#!/bin/sh\nexit 0\n')
+        fake_wc.chmod(0o755)
+        ok_proc = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                'version': '2.0.0', 'missing_wrappers': [], 'tools': {'Applications': {}, 'Cube Utilities': {}}
+            }),
+            stderr='',
+        )
+        warn_proc = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                'version': '2.0.0', 'missing_wrappers': ['wc-timer'], 'tools': {'Applications': {}}
+            }),
+            stderr='',
+        )
+        if not Path('/usr/bin/wc-doctor').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                live_ok = doctor.check_suite(live_env)[0]
+                self.assertEqual(live_ok['level'], 'ok')
+                self.assertIn('2.0.0', live_ok['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=warn_proc):
+                live_warn = doctor.check_suite(live_env)[0]
+                self.assertEqual(live_warn['level'], 'WARN')
+                self.assertIn('wc-timer', live_warn['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

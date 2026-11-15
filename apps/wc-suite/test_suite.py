@@ -513,6 +513,38 @@ class SuiteTests(unittest.TestCase):
         self.assertFalse((wc.BIN / "wc-mic").exists())
         self.assertFalse((self.home / ".local/lib/wc-suite/wc_suite.py").exists())
 
+    def test_ls_group_filter_and_nonblocking_hardening(self):
+        with patch.object(wc, "HOME", self.home), patch.object(wc, "BIN", self.home / ".local/bin"), \
+             patch.object(wc, "STATE", self.home / ".local/state/wc-suite"):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                wc.list_commands(wc.parser("ls").parse_args(["--group", "Power", "--json"]))
+            parsed = json.loads(out.getvalue())
+            self.assertTrue(parsed)
+            self.assertTrue(all(spec["group"] == "Power" for spec in parsed.values()))
+            self.assertIn("wc-lock", parsed)
+            self.assertNotIn("wc-vol", parsed)
+
+            self.assertIn("Cube Utilities", wc.DOCTOR_TOOLS)
+            self.assertIn("whitecube-doctor", wc.DOCTOR_TOOLS["System"])
+
+            fifo = self.home / "pipe"
+            os.mkfifo(fifo)
+            self.assertEqual(wc.read(fifo, "fallback"), "fallback")
+
+            timers_dir = self.home / ".local/state/wc-suite/timers"
+            timers_dir.mkdir(parents=True)
+            fifo_timer = timers_dir / "abcdef123456.json"
+            os.mkfifo(fifo_timer)
+            with self.assertRaisesRegex(wc.Error, "unreadable timer record"):
+                wc.load_timer(fifo_timer)
+            real_timer = timers_dir / "real.json"
+            real_timer.write_text(json.dumps({"id": "fedcba654321", "status": "pending", "message": "hi", "due": 1.0}))
+            sym_timer = timers_dir / "fedcba654321.json"
+            sym_timer.symlink_to(real_timer)
+            with self.assertRaisesRegex(wc.Error, "unreadable timer record"):
+                wc.load_timer(sym_timer)
+
 
 if __name__ == "__main__":
     unittest.main()

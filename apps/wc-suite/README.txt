@@ -2,9 +2,10 @@ Whitecube command suite 2.0
 
 Start with wc-help. Use wc-help COMMAND or wc-COMMAND --help for complete
 usage, examples, and dependencies. wc-help --all prints the whole reference;
-wc-help --search TEXT and wc-ls TEXT search names, groups, and descriptions.
-wc-ls --json provides a machine-readable inventory. Additional executable
-wc-* files in ~/.local/bin are discovered automatically without executing them.
+wc-help --search TEXT and wc-ls TEXT search names, groups, and descriptions;
+wc-ls --group GROUP filters to a single group, and wc-ls --json provides a
+machine-readable inventory. Additional executable wc-* files in ~/.local/bin are
+discovered automatically without executing them.
 
 Existing command names are preserved. The former wc-help keyboard reference
 is now wc-keys (also wc-help --keys). Application wrappers still pass their

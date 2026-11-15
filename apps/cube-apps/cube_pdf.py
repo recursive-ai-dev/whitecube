@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Cube PDF Tools: merge, split and unlock PDFs (Whitecube style)."""
+import argparse
+import json
 from pathlib import Path
+import sys
 
 import pikepdf
 
@@ -399,5 +402,56 @@ class PdfToolsApp(ct.CubeApp):
         super().__init__(APP_ID)
 
 
+def cli_main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--version' in argv and '--cli' not in argv:
+        print(f'Cube PDF Tools {ct.APP_VERSION}')
+        return 0
+    if argv[:1] == ['--cli']:
+        argv = argv[1:]
+    p = argparse.ArgumentParser(prog='cube-pdf --cli', description='Headless PDF info, merge, and split utility')
+    p.add_argument('--version', action='version', version=f'Cube PDF Tools {ct.APP_VERSION}')
+    sub = p.add_subparsers(dest='cmd', required=True)
+    p_info = sub.add_parser('info')
+    p_info.add_argument('--password')
+    p_info.add_argument('--json', action='store_true')
+    p_info.add_argument('file', type=Path)
+    p_merge = sub.add_parser('merge')
+    p_merge.add_argument('-o', '--output', required=True, type=Path)
+    p_merge.add_argument('files', nargs='+', type=Path)
+    p_split = sub.add_parser('split')
+    p_split.add_argument('-p', '--pages', required=True)
+    p_split.add_argument('-d', '--directory', required=True, type=Path)
+    p_split.add_argument('--password')
+    p_split.add_argument('file', type=Path)
+    args = p.parse_args(argv)
+    if args.cmd == 'info':
+        with _open_pdf(args.file, args.password) as pdf:
+            payload = {
+                'file': str(args.file),
+                'pages': len(pdf.pages),
+                'encrypted': bool(pdf.is_encrypted),
+                'pdf_version': str(pdf.pdf_version),
+            }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"{payload['file']}: {payload['pages']} page(s), PDF {payload['pdf_version']}")
+        return 0
+    if args.cmd == 'merge':
+        out = merge(args.files, args.output)
+        print(out)
+        return 0
+    with _open_pdf(args.file, args.password) as src:
+        total = len(src.pages)
+    ranges = parse_ranges(args.pages, total)
+    created = split(args.file, ranges, args.directory, args.password)
+    for item in created:
+        print(item)
+    return 0
+
+
 if __name__ == "__main__":
+    if '--version' in sys.argv[1:] or sys.argv[1:2] == ['--cli']:
+        raise SystemExit(cli_main())
     ct.quit_on_error_main(PdfToolsApp)

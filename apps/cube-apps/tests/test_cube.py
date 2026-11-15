@@ -429,5 +429,80 @@ class ImprovementRegressions(Base):
             with self.assertRaises(ValueError): cl.encrypt_pdf(src, self.d / 'bad.pdf', password, '', True, True, False)
 
 
+class TestCliAndHardening(Base):
+    def test_last_folder_rejects_symlink_and_fifo_without_blocking(self):
+        state = self.d / 'state'
+        target_dir = self.d / 'target'
+        target_dir.mkdir()
+        saved = state / 'cube-apps' / 'last-folder'
+        saved.parent.mkdir(parents=True)
+        outside = self.d / 'outside'
+        outside.write_text(str(target_dir) + '\n')
+        saved.symlink_to(outside)
+        with patch.dict(os.environ, {'XDG_STATE_HOME': str(state)}):
+            self.assertIsNone(ct.last_folder())
+            saved.unlink()
+            os.mkfifo(saved)
+            self.assertIsNone(ct.last_folder())
+            saved.unlink()
+            ct.remember_folder(str(target_dir))
+            self.assertEqual(ct.last_folder(), str(target_dir))
+
+    def test_cube_apps_cli_workflows_and_version_flags(self):
+        import contextlib
+        import io
+        import json
+        import subprocess
+
+        apps_dir = Path(__file__).resolve().parent.parent
+        for script, expected in (
+            ('cube_hash.py', 'Cube Hash'),
+            ('cube_lock.py', 'Cube PDF Lock'),
+            ('cube_pdf.py', 'Cube PDF Tools'),
+            ('cube_rename.py', 'Cube Rename'),
+        ):
+            proc = subprocess.run([sys.executable, str(apps_dir / script), '--version'], capture_output=True, text=True, check=True)
+            self.assertIn(expected, proc.stdout)
+
+        sample = self.d / 'sample.txt'
+        sample.write_text('whitecube\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ch.cli_main(['--cli', '--json', str(sample)])
+        self.assertEqual(rc, 0)
+        digest = json.loads(out.getvalue())['results'][0]['digest']
+        self.assertEqual(ch.cli_main(['--cli', '--verify', digest, str(sample)]), 0)
+        self.assertEqual(ch.cli_main(['--cli', '--verify', '0' * 64, str(sample)]), 1)
+
+        manifest = self.d / 'SHA256SUMS'
+        manifest.write_text(f'{digest}  {sample.name}\n')
+        self.assertEqual(ch.cli_main(['--cli', '--manifest', str(manifest), str(sample)]), 0)
+
+        a = make_pdf(self.d / 'a.pdf', 1)
+        b = make_pdf(self.d / 'b.pdf', 2)
+        merged = self.d / 'merged.pdf'
+        self.assertEqual(cp.cli_main(['--cli', 'merge', '-o', str(merged), str(a), str(b)]), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cp.cli_main(['--cli', 'info', '--json', str(merged)]), 0)
+        self.assertEqual(json.loads(out.getvalue())['pages'], 3)
+        split_dir = self.d / 'split'
+        self.assertEqual(cp.cli_main(['--cli', 'split', '-p', '1, 2-3', '-d', str(split_dir), str(merged)]), 0)
+        self.assertTrue((split_dir / 'merged-p1.pdf').is_file())
+        self.assertTrue((split_dir / 'merged-p2-3.pdf').is_file())
+
+        f1 = self.d / 'one.txt'
+        f1.write_text('payload')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cr.cli_main(['--cli', '--prefix', 'new-', '--json', str(f1)]), 0)
+        dry = json.loads(out.getvalue())
+        self.assertFalse(dry['applied'])
+        self.assertTrue(f1.exists())
+        self.assertEqual(cr.cli_main(['--cli', '--prefix', 'new-', '--apply', str(f1)]), 0)
+        self.assertFalse(f1.exists())
+        self.assertTrue((self.d / 'new-one.txt').is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

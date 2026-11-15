@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Cube Rename: batch rename with a live preview and undo (Whitecube style)."""
-import re
-import uuid
+import argparse
 import ctypes
-import os
 import errno
+import json
+import os
+import re
+import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -322,5 +325,70 @@ class RenameApp(ct.CubeApp):
         super().__init__(APP_ID)
 
 
+def cli_main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if '--version' in argv and '--cli' not in argv:
+        print(f'Cube Rename {ct.APP_VERSION}')
+        return 0
+    if argv[:1] == ['--cli']:
+        argv = argv[1:]
+    p = argparse.ArgumentParser(prog='cube-rename --cli', description='Headless safe batch rename preview/apply utility')
+    p.add_argument('--find', default='')
+    p.add_argument('--replace', default='')
+    p.add_argument('--regex', action='store_true')
+    p.add_argument('--prefix', default='')
+    p.add_argument('--suffix', default='')
+    p.add_argument('--number', action='store_true')
+    p.add_argument('--start', type=int, default=1)
+    p.add_argument('--digits', type=int, default=2)
+    p.add_argument('--case', choices=('unchanged', 'lower', 'upper', 'title'), default='unchanged')
+    p.add_argument('--ext-case', choices=('unchanged', 'lower', 'upper'), default='unchanged')
+    p.add_argument('--order', choices=('none', 'name', 'reverse', 'natural'), default='none')
+    p.add_argument('--trim', action='store_true')
+    p.add_argument('--collapse-spaces', action='store_true')
+    p.add_argument('--first-only', action='store_true')
+    p.add_argument('--apply', action='store_true', help='commit rename plan on disk (default is dry-run)')
+    p.add_argument('--json', action='store_true')
+    p.add_argument('--version', action='version', version=f'Cube Rename {ct.APP_VERSION}')
+    p.add_argument('files', nargs='+', type=Path)
+    args = p.parse_args(argv)
+    opts = Opts(
+        find=args.find,
+        replace=args.replace,
+        regex=args.regex,
+        prefix=args.prefix,
+        suffix=args.suffix,
+        number=args.number,
+        start=args.start,
+        digits=args.digits,
+        case={'unchanged': 0, 'lower': 1, 'upper': 2, 'title': 3}[args.case],
+        trim=args.trim,
+        collapse_spaces=args.collapse_spaces,
+        first_only=args.first_only,
+        extension_case={'unchanged': 0, 'lower': 1, 'upper': 2}[args.ext_case],
+        order={'none': 0, 'name': 1, 'reverse': 2, 'natural': 3}[args.order],
+    )
+    rows = plan(args.files, opts)
+    problems = [prob for _src, _dst, prob in rows if prob]
+    applied = False
+    if args.apply and not problems:
+        apply(rows)
+        applied = True
+    payload = {
+        'ok': not problems,
+        'applied': applied,
+        'items': [{'source': str(src), 'target': str(dst), 'problem': prob} for src, dst, prob in rows],
+    }
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        for src, dst, prob in rows:
+            status = f'ERROR: {prob}' if prob else ('RENAMED' if applied else 'DRY-RUN')
+            print(f'{src.name} -> {dst.name} [{status}]')
+    return 0 if not problems else 1
+
+
 if __name__ == "__main__":
+    if '--version' in sys.argv[1:] or sys.argv[1:2] == ['--cli']:
+        raise SystemExit(cli_main())
     ct.quit_on_error_main(RenameApp)
