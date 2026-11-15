@@ -15,8 +15,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -139,7 +141,16 @@ def create_args(name, size, lifecycle, profile, minimum=1) -> list[str]:
 def import_args(name, archive, size, lifecycle) -> list[str]:
     _require(valid_name(name), 'Names use 1-64 letters, digits, dots, underscores or hyphens and start with a letter or digit.')
     path = Path(archive)
-    _require(path.is_absolute() and path.is_file(), 'Choose an archive file.')
+    _require(path.is_absolute(), 'Choose an archive file.')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise ValueError('Choose an archive file.') from error
+    try:
+        is_regular = stat.S_ISREG(os.fstat(fd).st_mode)
+    finally:
+        os.close(fd)
+    _require(is_regular, 'Choose an archive file.')
     _require(valid_size(size), f'Choose a size from 1 to {MAX_SIZE_MIB} MiB.')
     _require(lifecycle in LIFECYCLES, 'Choose persistent or ephemeral sessions.')
     return ['--import', name, str(path), str(int(size)), lifecycle]
@@ -276,11 +287,31 @@ def load_settings() -> dict:
     settings = dict(SETTING_DEFAULTS)
     try:
         path = config_dir() / 'settings.json'
-        if path.stat().st_size < 262144:
-            data = json.loads(path.read_text(encoding='utf-8'))
-            for key, default in SETTING_DEFAULTS.items():
-                if key in data and (default is None or isinstance(data[key], type(default))):
-                    settings[key] = data[key]
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size >= 262144:
+                raise ValueError('Settings file must be a bounded regular file.')
+            with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+                fd = -1
+                data = json.load(handle)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if not isinstance(data, dict):
+            raise ValueError('Settings JSON must be an object.')
+        for key, default in SETTING_DEFAULTS.items():
+            if key not in data:
+                continue
+            value = data[key]
+            if default is None:
+                if value is None or isinstance(value, str):
+                    settings[key] = value
+            elif type(default) is int:
+                if type(value) is int:
+                    settings[key] = value
+            elif isinstance(value, type(default)):
+                settings[key] = value
     except (OSError, ValueError):
         pass
     settings['history'] = [h for h in settings['history'] if isinstance(h, str)][:20]
@@ -293,14 +324,20 @@ def load_settings() -> dict:
 
 def save_settings(settings: dict) -> None:
     directory = config_dir()
+    payload = json.dumps({k: settings.get(k, v) for k, v in SETTING_DEFAULTS.items()}, indent=1)
+    tmp_path = None
     try:
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary = directory / 'settings.json.tmp'
-        temporary.write_text(json.dumps({k: settings.get(k, v) for k, v in SETTING_DEFAULTS.items()}, indent=1),
-                             encoding='utf-8')
-        temporary.replace(directory / 'settings.json')
+        fd, raw_path = tempfile.mkstemp(dir=directory, prefix='.settings.', suffix='.tmp')
+        tmp_path = Path(raw_path)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, directory / 'settings.json')
     except OSError:
-        pass
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def store_free_bytes(store: Path | None = None) -> int | None:

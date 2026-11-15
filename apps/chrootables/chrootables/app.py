@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 from . import __version__
 from .capture import save_screenshot
-from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, archive_file, name, shared_folder, session_command, terminal_command
+from .backend import DEFAULT_STORE, ROOT, PROFILES, SUITES, archive_file, name, read_regular, shared_folder, session_command, terminal_command
 from .client import Client
 from .style import STYLE, scaled_style
 from .terminal import TerminalWindow
@@ -1866,7 +1866,7 @@ class Window(QMainWindow):
         QMessageBox.warning(self, "Cube Chrootables", message)
 
     def load_demo(self):
-        self.data = json.loads((ROOT / "assets" / "demo.json").read_text())
+        self.data = json.loads(read_regular(ROOT / "assets" / "demo.json", limit=1024 * 1024))
         self.access_label.setText("○  Sample data · read-only")
         self.unlock_button.setEnabled(False)
         self.health_output.setPlainText("This is the desktop tour. Launch without --demo to inspect your host and manage real workspaces.")

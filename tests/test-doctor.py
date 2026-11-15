@@ -582,6 +582,65 @@ class RunTests(Fixture):
                 self.assertEqual(live_warn['level'], 'WARN')
                 self.assertIn('ovmf', live_warn['detail'])
 
+    def test_chrootables_check_reports_staged_and_manager_readiness(self):
+        self.assertIn('chrootables', doctor.CHECK_GROUPS)
+        self.assertEqual(doctor.check_chrootables(self.env)[0]['level'], 'info')
+        for bin_path in (
+            'usr/bin/cube-chrootables',
+            'usr/bin/whitecube-chrootable-manager',
+            'usr/libexec/whitecube/chrootable-manager',
+        ):
+            p = self.put(bin_path, '#!/bin/sh\nexit 0\n')
+            p.chmod(0o755)
+        self.assertEqual(doctor.check_chrootables(self.env)[0]['level'], 'FAIL')
+        for mod in (
+            'app.py', 'backend.py', 'broker.py', 'assets/demo.json',
+            'chrootables/__init__.py', 'chrootables/app.py', 'chrootables/authenticate.py',
+            'chrootables/backend.py', 'chrootables/broker.py', 'chrootables/capture.py',
+            'chrootables/client.py', 'chrootables/paths.py', 'chrootables/style.py',
+            'chrootables/terminal.py',
+        ):
+            self.put(f'usr/share/whitecube/chrootables/{mod}', '')
+        ok = doctor.check_chrootables(self.env)[0]
+        self.assertEqual(ok['level'], 'ok')
+        self.assertIn('staged', ok['detail'])
+
+        (self.root / 'usr/share/whitecube/chrootables/chrootables/terminal.py').unlink()
+        bad = doctor.check_chrootables(self.env)[0]
+        self.assertEqual(bad['level'], 'FAIL')
+        self.assertIn('terminal.py', bad['detail'])
+
+        fake_bin = self.home / '.local/bin/whitecube-chrootable-manager'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\nexit 0\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                'schema_version': 1, 'version': '1.2.1', 'ready': True,
+                'checks': [{'id': 'filesystem:overlay', 'status': 'warning'}],
+            }),
+            stderr='',
+        )
+        warn_proc = mock.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                'schema_version': 1, 'version': '1.2.1', 'ready': False,
+                'checks': [{'id': 'command:debootstrap', 'status': 'error'}],
+            }),
+            stderr='',
+        )
+        if not Path('/usr/bin/whitecube-chrootable-manager').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                live_ok = doctor.check_chrootables(live_env)[0]
+                self.assertEqual(live_ok['level'], 'ok')
+                self.assertIn('overlay', live_ok['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=warn_proc):
+                live_warn = doctor.check_chrootables(live_env)[0]
+                self.assertEqual(live_warn['level'], 'WARN')
+                self.assertIn('command:debootstrap', live_warn['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

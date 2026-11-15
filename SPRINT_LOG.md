@@ -137,3 +137,12 @@
 - **Tests & Verification**:
   - Extended `apps/cube-strap/tests/test_whitecube_vm.py` (`--version`, `set --memory/--cpus --json`, lock/bounds rejections, `--json` on `import`/`remove`, and `bin/cube-strap --version` / `--cli check --json`), `apps/cube-strap/tests/test_strap.py` (`Hardening` tests for `0o600` metadata, FIFO/non-regular file rejection, 1 MiB JSON cap, and resource validation), and `tests/test-doctor.py` (`test_vm_check_reports_staged_and_qemu_readiness`).
   - Verified `apps/cube-strap/tests` (32 tests ok), `tests/test-cube-strap-ui.py`, `tests/test-doctor.py` (52 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/chrootables | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added Qt/Wayland-free `--version` (`1.3.0` from `chrootables/__init__.py`) and `--cli [ARGS...]` pass-through to the bundled `chrootable-manager` in `bin/cube-chrootables` (plus updated `apps/chrootables/README.md`).
+  - Hardened `apps/chrootables/backend.py` (`load_settings()` opening with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, `S_ISREG`, <256 KiB cap, and strict `type() is int` bool rejection; `save_settings()` via atomic `tempfile.mkstemp()` `0o600` + `os.fsync` + `os.replace`; `import_args()` validating regular non-symlink files via `O_NOFOLLOW | O_NONBLOCK` + `S_ISREG`) and switched `apps/chrootables/chrootables/app.py`'s `load_demo()` to bounded `read_regular()`.
+  - Wired read-only `check_chrootables(env)` and the `'chrootables'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `tests/test-chrootables.py` (`bin/cube-chrootables --cli --version` and `--cli --capabilities --json`, `0o600` `save_settings()`, FIFO/bool rejection in `load_settings()` and `import_args()`) and `tests/test-doctor.py` (`test_chrootables_check_reports_staged_and_manager_readiness`).
+  - Verified `tests/test-chrootables.py` (all unit/backend/helper/Qt screenshot checks), `tests/test-doctor.py` (53 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

@@ -1,13 +1,49 @@
 #!/usr/bin/python3 -I
-"""Launch Whitecube's Qt workspace manager from an installation or checkout."""
+"""Launch Whitecube's Qt workspace manager or headless CLI from an install or checkout."""
+import ast
 import os
 from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parent.parent
 locations = [root / 'apps/chrootables', root / 'share/whitecube/chrootables']
-for directory in locations:
-    if (directory / 'app.py').is_file():
-        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])
+app_dir = next((directory for directory in locations if (directory / 'app.py').is_file()), None)
+
+
+def _read_version() -> str:
+    if app_dir is not None:
+        init_file = app_dir / 'chrootables/__init__.py'
+        if init_file.is_file():
+            tree = ast.parse(init_file.read_text(encoding='utf-8'))
+            for node in tree.body:
+                if isinstance(node, ast.Assign) and any(
+                    isinstance(target, ast.Name) and target.id == '__version__'
+                    for target in node.targets
+                ):
+                    value = ast.literal_eval(node.value)
+                    if isinstance(value, str):
+                        return value
+    return '1.3.0'
+
+
+if sys.argv[1:] == ['--version']:
+    print(_read_version())
+    raise SystemExit(0)
+
+if len(sys.argv) >= 2 and sys.argv[1] == '--cli':
+    managers = [
+        root / 'apps/chrootables/chrootable-manager',
+        root / 'libexec/whitecube/chrootable-manager',
+        root / 'share/whitecube/chrootables/chrootable-manager',
+    ]
+    manager = next((candidate for candidate in managers if candidate.is_file()), None)
+    if manager is None:
+        print('cube-chrootables: chrootable-manager is missing; reinstall whitecube-desktop', file=sys.stderr)
+        raise SystemExit(1)
+    cli_args = sys.argv[2:] or ['--help']
+    os.execv(str(manager), [str(manager), *cli_args])
+
+if app_dir is not None:
+    os.execv('/usr/bin/python3', ['python3', '-I', str(app_dir / 'app.py'), *sys.argv[1:]])
 print('cube-chrootables: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
 raise SystemExit(1)

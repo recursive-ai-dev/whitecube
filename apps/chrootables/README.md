@@ -5,7 +5,8 @@ Chrootables 1.2.1, with the local changes listed in `UPSTREAM.md`.
 
 Whitecube's Qt workbench for Debian images, copied from the standalone
 Chrootables desktop. Run `cube-chrootables` as your normal desktop user.
-`cube-chrootables --demo` opens a read-only tour with sample workspaces.
+`cube-chrootables --demo` opens a read-only tour with sample workspaces,
+`cube-chrootables --cli` forwards commands (such as `--list --json`, `--capabilities --json`, or `--doctor --json`) to the bundled engine without requiring Qt/Wayland, and `whitecube-doctor --check chrootables` checks installation and host readiness.
 The standalone `chrootables-desktop` remains a separate application.
 
 ## Distribution packages

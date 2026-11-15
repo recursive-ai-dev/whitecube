@@ -221,11 +221,21 @@ class BackendRules(unittest.TestCase):
                 settings = backend.load_settings()
                 settings.update(idle_minutes=30, sort='size', history=['ls'])
                 backend.save_settings(settings)
+                settings_file = Path(temp) / 'chrootables/settings.json'
+                self.assertEqual(settings_file.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(backend.load_settings()['sort'], 'size')
                 self.assertEqual(backend.load_settings()['history'], ['ls'])
-                (Path(temp) / 'chrootables/settings.json').write_text('{"sort": "evil", "idle_minutes": "x", "history": [1, "ok"]}')
+                settings_file.write_text('{"sort": "evil", "idle_minutes": true, "width": "x", "history": [1, "ok"]}')
                 loaded = backend.load_settings()
-                self.assertEqual((loaded['sort'], loaded['idle_minutes'], loaded['history']), ('name', 15, ['ok']))
+                self.assertEqual((loaded['sort'], loaded['idle_minutes'], loaded['width'], loaded['history']),
+                                 ('name', 15, 1240, ['ok']))
+                fifo = Path(temp) / 'chrootables/pipe.archive'
+                os.mkfifo(fifo)
+                with self.assertRaises(ValueError):
+                    backend.import_args('badfifo', str(fifo), 2048, 'ephemeral')
+                settings_file.unlink()
+                os.mkfifo(settings_file)
+                self.assertEqual(backend.load_settings()['idle_minutes'], 15)
             finally:
                 if saved is None:
                     os.environ.pop('XDG_CONFIG_HOME', None)
@@ -419,6 +429,12 @@ class CopiedApplicationContract(unittest.TestCase):
         result = subprocess.run([str(ROOT / 'bin/cube-chrootables'), '--version'],
                                 capture_output=True, text=True, check=True, timeout=10)
         self.assertEqual(result.stdout.strip(), __version__)
+        cli_ver = subprocess.run([str(ROOT / 'bin/cube-chrootables'), '--cli', '--version'],
+                                 capture_output=True, text=True, check=True, timeout=10)
+        self.assertTrue(cli_ver.stdout.strip())
+        caps = subprocess.run([str(ROOT / 'bin/cube-chrootables'), '--cli', '--capabilities', '--json'],
+                              capture_output=True, text=True, check=True, timeout=10)
+        self.assertEqual(json.loads(caps.stdout)['schema_version'], 1)
 
     def test_launcher_without_desktop_reports_failure_without_traceback(self):
         environment = dict(os.environ)

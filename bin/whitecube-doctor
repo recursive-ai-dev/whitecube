@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -655,6 +655,61 @@ def check_vm(env):
                     pkg_hint)]
 
 
+def check_chrootables(env):
+    """Report cube-chrootables launcher, runtime modules, and chrootable-manager readiness."""
+    share_dir = env.at('/usr/share/whitecube/chrootables')
+    runtime_files = (
+        'app.py', 'backend.py', 'broker.py', 'assets/demo.json',
+        'chrootables/__init__.py', 'chrootables/app.py', 'chrootables/authenticate.py',
+        'chrootables/backend.py', 'chrootables/broker.py', 'chrootables/capture.py',
+        'chrootables/client.py', 'chrootables/paths.py', 'chrootables/style.py',
+        'chrootables/terminal.py',
+    )
+    if env.root != Path('/'):
+        launcher = env.at('/usr/bin/cube-chrootables')
+        cli_bin = env.at('/usr/bin/whitecube-chrootable-manager')
+        helper = env.at('/usr/libexec/whitecube/chrootable-manager')
+        bins = (launcher, cli_bin, helper)
+        has_any = any(p.is_file() or p.is_symlink() for p in bins) or share_dir.exists()
+        if not has_any:
+            return [finding('info', 'chrootables', 'cube-chrootables is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        bad_bins = [str(p) for p in bins if not (p.is_file() or p.is_symlink()) or not os.access(p, os.X_OK)]
+        if bad_bins or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else 'missing/unexecutable ' + ', '.join(bad_bins)
+            return [finding('FAIL', 'chrootables', f'staged cube-chrootables incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'chrootables', 'staged cube-chrootables launcher, helper, and runtime present')]
+    candidates = [
+        env.at('/usr/bin/whitecube-chrootable-manager'),
+        env.home / '.local/bin/whitecube-chrootable-manager',
+        env.project / 'apps/chrootables/chrootable-manager',
+    ]
+    mgr = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if mgr is None:
+        return [finding('info', 'chrootables', 'whitecube-chrootable-manager is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(mgr, os.X_OK):
+        return [finding('WARN', 'chrootables', f'{mgr} is not executable', 'ensure executable permissions on chrootable-manager')]
+    try:
+        proc = subprocess.run([str(mgr), '--doctor', '--json'], capture_output=True, text=True, timeout=10)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'chrootables', f'could not query whitecube-chrootable-manager --doctor: {error}',
+                        f'{mgr} --doctor')]
+    if not isinstance(data, dict) or data.get('schema_version') != 1 or not isinstance(data.get('checks'), list):
+        return [finding('WARN', 'chrootables', 'whitecube-chrootable-manager --doctor returned unexpected JSON', f'{mgr} --doctor')]
+    errors = [c.get('id', '?') for c in data['checks'] if isinstance(c, dict) and c.get('status') == 'error']
+    warns = [c.get('id', '?') for c in data['checks'] if isinstance(c, dict) and c.get('status') == 'warning']
+    if data.get('ready') and not errors:
+        note = f' (optional warnings: {", ".join(warns)})' if warns else ''
+        return [finding('ok', 'chrootables', f'whitecube-chrootable-manager {data.get("version", "?")} host readiness ok{note}')]
+    return [finding('WARN', 'chrootables',
+                    'whitecube-chrootable-manager pending host checks: ' + (', '.join(errors) or 'unknown issue'),
+                    f'{mgr} --doctor')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -678,6 +733,7 @@ def run_checks(env, selected=None):
         'editor': (lambda: check_editor(env),),
         'trainer': (lambda: check_trainer(env),),
         'vm': (lambda: check_vm(env),),
+        'chrootables': (lambda: check_chrootables(env),),
     }
     for name, checks in groups.items():
         if name not in selected:
