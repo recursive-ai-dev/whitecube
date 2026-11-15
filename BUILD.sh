@@ -180,6 +180,8 @@ python3 -I tests/test-desktop-improvements.py
 python3 -I apps/desktop-chat/test/local-server-test.py
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_engine*.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_app.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_comparison_cli.py' -v
+python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_diagnostics.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_worker_descendants.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_snapshots.py' -v
 python3 -I -m unittest discover -s apps/cube-train/tests -p 'test_parquet_runtime.py' -v

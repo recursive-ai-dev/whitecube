@@ -227,6 +227,22 @@ class EngineReliabilityTests(unittest.TestCase):
             if child.poll() is None:
                 child.kill(); child.communicate()
 
+    def test_json_and_tail_readers_reject_fifos_without_blocking(self):
+        fifo = self.root / 'pipe.json'
+        os.mkfifo(fifo)
+        self.assertEqual(engine.read_json(fifo), {})
+        self.assertEqual(engine.tail_text(fifo), '')
+
+    def test_train_folder_resume_handles_missing_or_corrupt_metadata_cleanly(self):
+        run = self.run_dir()
+        (run / 'run.json').write_text('{broken')
+        train_folder = HERE / 'pipeline/train_folder.py'
+        proc = subprocess.run(['/usr/bin/python3', '-u', str(train_folder), '--resume', str(run), '--device', 'cpu'],
+                              text=True, capture_output=True, timeout=15)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn('unreadable or invalid run.json', proc.stderr)
+        self.assertNotIn('Traceback', proc.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

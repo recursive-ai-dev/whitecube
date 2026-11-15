@@ -233,8 +233,10 @@ losses, elapsed and cumulative training time and peak VRAM.
 ```sh
 whitecube-train --5m --steps 4000 --learning-rate 5e-4 --schedule wsd \
   --early-stop-patience 6 --max-minutes 90 --keep-snapshots 3 --thermal-pause
-whitecube-train --list-runs     # * pinned, B/L saved checkpoints
-whitecube-train --status        # the running desktop job
+whitecube-train --list-runs [--json]     # * pinned, B/L saved checkpoints
+whitecube-train --status [--json]        # the running desktop job
+whitecube-train --inspect-run RUN_ID [--json]
+cube-train --cli --list-runs --json      # headless dispatch via desktop launcher
 ```
 
 ## Checkpoint benchmarks

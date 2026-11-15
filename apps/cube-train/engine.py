@@ -8,6 +8,7 @@ import re
 import shlex
 import signal
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -102,10 +103,25 @@ def strict_json(text):
     return json.loads(text, parse_constant=invalid, parse_float=number)
 
 
+def _open_regular_readonly(path):
+    """Open an existing regular file without blocking on FIFOs or device nodes."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError('Not a regular file')
+        return os.fdopen(fd, 'rb')
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 def read_json(path, max_bytes=1024 * 1024):
     try:
-        path = Path(path)
-        with path.open('rb') as handle:
+        with _open_regular_readonly(Path(path)) as handle:
             data = handle.read(max_bytes + 1)
         value = strict_json(data.decode('utf-8')) if len(data) <= max_bytes else {}
         return value if isinstance(value, dict) else {}
@@ -198,7 +214,7 @@ def job_running(job):
 
 def tail_text(path, limit=48_000):
     try:
-        with Path(path).open('rb') as handle:
+        with _open_regular_readonly(Path(path)) as handle:
             handle.seek(0, 2)
             handle.seek(max(0, handle.tell() - limit))
             return handle.read().decode('utf-8', errors='replace')

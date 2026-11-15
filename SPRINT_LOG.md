@@ -118,3 +118,13 @@
 - **Tests & Verification**:
   - Extended `apps/cube-editor/tests/test_cli_workflows.py` (testing `presets`, `recent`, `doctor --strict`, `qemu-command` validation, FIFO/oversize JSON rejection in `import_recipe()` & `Project._read()`, and `bin/cube-editor --version`/`--cli`) and `tests/test-doctor.py` (`test_editor_check_reports_staged_and_doctor_health`).
   - Verified `apps/cube-editor/tests` (`DesktopWorkflowTests` skipped without GTK display), `tests/test-cube-editor-ui.py`, `tests/test-doctor.py` (50 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-train | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added GTK-free `--version` and `--cli` dispatch to `bin/cube-train` without requiring Wayland/GTK libraries, plus `--json` support on `--list-runs` and `--status` and the new `--inspect-run RUN_ID [--json]` command in `apps/cube-train/cli.py` (with updated `--help` and `apps/cube-train/README.md`).
+  - Hardened `apps/cube-train/engine.py` (`read_json()`, `tail_text()` via `_open_regular_readonly()`) and `apps/cube-train/pipeline/train_folder.py` (`_read_regular_json()`) with `O_RDONLY | O_CLOEXEC | O_NONBLOCK` and `stat.S_ISREG` guards to reject FIFOs/non-regular files without blocking.
+  - Added pre-Torch `--resume` validation in `apps/cube-train/pipeline/train_folder.py` so missing/corrupt `run.json` or invalid dimensions fail cleanly via `parser.exit(1, ...)` instead of unhandled tracebacks, and guarded zero-duration division in `apps/cube-train/pipeline/benchmark.py`.
+  - Wired read-only `check_trainer(env)` and the `'trainer'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `apps/cube-train/tests/test_comparison_cli.py` (`--list-runs --json`, `--status --json`, `--inspect-run [--json]`, and `bin/cube-train --version` / `--cli`), `apps/cube-train/tests/test_engine_improvements.py` (FIFO non-blocking rejection in `read_json`/`tail_text` and clean error exit on corrupt `--resume` `run.json`), and `tests/test-doctor.py` (`test_trainer_check_reports_staged_and_doctor_health`), and wired `test_comparison_cli.py` and `test_diagnostics.py` into `BUILD.sh`.
+  - Verified full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

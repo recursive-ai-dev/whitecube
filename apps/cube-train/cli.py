@@ -61,6 +61,48 @@ def _execute(python, script, args, *, isolated=True):
                          'Use --doctor --check-runtime to diagnose the selected environment.') from error
 
 
+def _clean_run_record(run):
+    return {key: value for key, value in run.items() if key != '_progress' and key != 'meta'}
+
+
+def status_report(trainer):
+    job = trainer.active_job()
+    run = next((item for item in trainer.list_runs() if job and item['directory'] == job['run']), None) if job else None
+    progress = engine.read_json(Path(job['run']) / 'progress.json') if job else {}
+    return {
+        'schema_version': 1,
+        'kind': 'whitecube_trainer_status',
+        'running': bool(job),
+        'pipeline_busy': bool(trainer.pipeline_busy()),
+        'summary': trainer.status_text(),
+        'job': job,
+        'run': _clean_run_record(run) if run else None,
+        'progress': progress or None,
+    }
+
+
+def inspect_text(report):
+    run = report.get('run') or {}
+    config = report.get('configuration') or {}
+    result = report.get('result') or {}
+    lines = [
+        f"Run: {run.get('name') or run.get('id', 'unknown')} ({run.get('id', 'unknown')})",
+        f"Status: {run.get('phase', 'unknown')} · {run.get('completed_steps', 0):,}/{run.get('steps', 0):,} steps",
+        f"Model: {str(run.get('size', '?')).upper()} ({run.get('parameters') or 0:,} parameters) · device {config.get('device', '?')}",
+    ]
+    if run.get('val_loss') is not None:
+        lines.append(f"Best validation loss: {run['val_loss']:.4f}")
+    if result.get('stop_reason'):
+        lines.append(f"Stop reason: {result['stop_reason']}")
+    lines.append(
+        f"Artifacts: {'best ' if run.get('best') else ''}{'latest ' if run.get('latest') else ''}"
+        f"({run.get('snapshots', 0)} snapshots, {len(report.get('benchmarks', []))} benchmarks, {len(report.get('previews', []))} previews)"
+    )
+    for warning in report.get('report_warnings', []):
+        lines.append(f'Warning: {warning}')
+    return '\n'.join(lines)
+
+
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     program = os.environ.get('WHITECUBE_TRAIN_COMMAND') or Path(sys.argv[0]).name
@@ -85,8 +127,33 @@ def main(argv=None):
         print(json.dumps(report, indent=2, allow_nan=False) if options.json else
               comparison_csv(report) if options.csv else comparison_text(report), end='' if options.csv else '\n')
         return 0
-    if args in (['--list-runs'], ['--status']):
-        print(trainer.summary() if args[0] == '--list-runs' else trainer.status_text())
+    if args[:1] == ['--list-runs']:
+        parser = argparse.ArgumentParser(prog=program + ' --list-runs', description='List saved training runs without loading checkpoints.')
+        parser.add_argument('--json', action='store_true', help='print a JSON list of saved runs')
+        options = parser.parse_args(args[1:])
+        if options.json:
+            payload = {'schema_version': 1, 'kind': 'whitecube_run_list',
+                       'runs': [_clean_run_record(run) for run in trainer.list_runs()]}
+            print(json.dumps(payload, indent=2, allow_nan=False))
+        else:
+            print(trainer.summary())
+        return 0
+    if args[:1] == ['--status']:
+        parser = argparse.ArgumentParser(prog=program + ' --status', description='Show active training job status.')
+        parser.add_argument('--json', action='store_true', help='print a JSON status report')
+        options = parser.parse_args(args[1:])
+        print(json.dumps(status_report(trainer), indent=2, allow_nan=False) if options.json else trainer.status_text())
+        return 0
+    if args[:1] == ['--inspect-run']:
+        parser = argparse.ArgumentParser(prog=program + ' --inspect-run', description='Inspect one saved run without loading model weights.')
+        parser.add_argument('run_id', help='run folder ID to inspect')
+        parser.add_argument('--json', action='store_true', help='print the full JSON run report')
+        options = parser.parse_args(args[1:])
+        try:
+            report = trainer.report(options.run_id)
+        except ValueError as error:
+            parser.error(str(error))
+        print(json.dumps(report, indent=2, allow_nan=False) if options.json else inspect_text(report))
         return 0
     if args[:1] == ['--export-notebook']:
         python = trainer.preferences()['python']
@@ -104,8 +171,9 @@ def main(argv=None):
     if any(flag in args for flag in ('--help', '-h')):
         from training_options import build_parser
         print(f'Whitecube Trainer {VERSION}\n\n'
-              f'  {program} --list-runs\n'
-              f'  {program} --status\n'
+              f'  {program} --list-runs [--json]\n'
+              f'  {program} --status [--json]\n'
+              f'  {program} --inspect-run RUN_ID [--json]\n'
               f'  {program} --doctor [--check-runtime] [--json] [--python PATH] [--device cpu|cuda]\n'
               f'  {program} --compare-runs [RUN_ID ...] [--json | --csv]\n'
               f'  {program} --benchmark RUN --output REPORT.json [--checkpoint best|latest|stepN]\n'

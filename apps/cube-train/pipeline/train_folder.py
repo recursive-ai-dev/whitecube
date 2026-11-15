@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -183,10 +184,32 @@ CONTROLS = {'early_stop_patience': 0, 'early_stop_min_delta': 0.0, 'log_interval
             'keep_snapshots': 0, 'max_minutes': 0, 'thermal_pause': False}
 
 
+def _read_regular_json(path, max_bytes=1024 * 1024):
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f'{path} is not a regular file')
+        with os.fdopen(fd, 'rb') as handle:
+            data = handle.read(max_bytes + 1)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    if len(data) > max_bytes:
+        raise ValueError(f'{path} exceeds the {max_bytes:,}-byte metadata limit')
+    value = json.loads(data.decode('utf-8'))
+    if not isinstance(value, dict):
+        raise ValueError(f'{path} must contain a JSON object')
+    return value
+
+
 def read_previous_result(run):
     try:
-        value = json.loads((run / 'result.json').read_text(encoding='utf-8'))
-        seconds = value.get('total_training_seconds', 0) if isinstance(value, dict) else 0
+        value = _read_regular_json(run / 'result.json')
+        seconds = value.get('total_training_seconds', 0)
         return {'total_training_seconds': seconds if isinstance(seconds, (int, float)) and math.isfinite(seconds) and seconds >= 0 else 0}
     except (OSError, ValueError):
         return {'total_training_seconds': 0}
@@ -237,6 +260,18 @@ def main():
             subprocess.run(['ionice', '-c', '3', '-p', str(os.getpid())], capture_output=True, check=True, timeout=5)
         except (OSError, subprocess.SubprocessError) as error:
             print(f'Idle disk priority unavailable: {error}', file=sys.stderr)
+    if args.resume:
+        preview_run = args.resume.expanduser().resolve()
+        if not preview_run.is_dir():
+            parser.exit(1, f'Resume directory does not exist: {preview_run}\n')
+        try:
+            preview_cfg = _read_regular_json(preview_run / "run.json")
+        except (OSError, ValueError) as error:
+            parser.exit(1, f'Cannot resume {preview_run}: unreadable or invalid run.json ({error})\n')
+        for required in ('batch_size', 'grad_accum_steps', 'steps'):
+            val = preview_cfg.get(required)
+            if isinstance(val, bool) or not isinstance(val, int) or val < 1:
+                parser.exit(1, f'Cannot resume {preview_run}: run.json is missing a valid positive integer "{required}"\n')
     if not args.prepare_only:
         global torch
         import torch
@@ -253,7 +288,12 @@ def main():
             parser.exit(1, "Another train process is active. Let it finish or stop it first.\n")
         if args.resume:
             run = args.resume.expanduser().resolve()
-            config = json.loads((run / "run.json").read_text())
+            if not run.is_dir():
+                parser.exit(1, f'Resume directory does not exist: {run}\n')
+            try:
+                config = _read_regular_json(run / "run.json")
+            except (OSError, ValueError) as error:
+                parser.exit(1, f'Cannot resume {run}: unreadable or invalid run.json ({error})\n')
             saved_size = config.get("model_size", "1m")
             if args.model_size is not None and args.model_size != saved_size:
                 parser.error(f"--{args.model_size} conflicts with this {saved_size} run; "
@@ -262,9 +302,16 @@ def main():
             data = run / "data"
             if not (data / "train.bin").is_file() or not (data / "val.bin").is_file():
                 parser.exit(1, f"No prepared corpus in {run}\n")
-            previous_result = json.loads((run / 'result.json').read_text()) if (run / 'result.json').is_file() else {}
+            try:
+                previous_result = _read_regular_json(run / 'result.json') if (run / 'result.json').exists() else {}
+            except (OSError, ValueError):
+                previous_result = {}
             if previous_result.get('completed_steps', 0) > 0 and not (run / 'ckpt_latest.pt').is_file():
                 parser.error('Continuing training requires ckpt_latest.pt. Restore it or start a new run.')
+            for required in ('batch_size', 'grad_accum_steps', 'steps'):
+                value = config.get(required)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    parser.exit(1, f'Cannot resume {run}: run.json is missing a valid positive integer "{required}"\n')
             args.batch_size = config["batch_size"]
             args.grad_accum_steps = config["grad_accum_steps"]
             # The optimizer and LR plan are restored from the checkpoint; keep

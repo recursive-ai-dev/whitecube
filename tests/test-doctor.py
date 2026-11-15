@@ -497,6 +497,44 @@ class RunTests(Fixture):
                 self.assertEqual(failed['level'], 'FAIL')
                 self.assertIn('gtk-runtime', failed['detail'])
 
+    def test_trainer_check_reports_staged_and_doctor_health(self):
+        self.assertIn('trainer', doctor.CHECK_GROUPS)
+        self.assertEqual(doctor.check_trainer(self.env)[0]['level'], 'info')
+        for bin_name in ('cube-train', 'whitecube-train'):
+            p = self.put(f'usr/bin/{bin_name}', '#!/bin/sh\n')
+            p.chmod(0o755)
+        self.assertEqual(doctor.check_trainer(self.env)[0]['level'], 'FAIL')
+        for mod in ('app.py', 'cli.py', 'engine.py', 'diagnostics.py', 'worker.py', 'pipeline/train_supervisor.py'):
+            self.put(f'usr/share/whitecube/cube-train/{mod}', '')
+        self.assertEqual(doctor.check_trainer(self.env)[0]['level'], 'ok')
+
+        fake_bin = self.home / '.local/bin/whitecube-train'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(returncode=1, stdout=json.dumps({
+            'version': '1.1.1', 'ok': False,
+            'checks': [
+                {'id': 'desktop', 'status': 'ok'},
+                {'id': 'output', 'status': 'ok'},
+                {'id': 'corpus', 'status': 'warning'},
+            ],
+        }))
+        fail_proc = mock.Mock(returncode=1, stdout=json.dumps({
+            'version': '1.1.1', 'ok': False,
+            'checks': [{'id': 'desktop', 'status': 'error'}, {'id': 'output', 'status': 'ok'}],
+        }))
+        if not Path('/usr/bin/whitecube-train').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                res = doctor.check_trainer(live_env)
+                self.assertEqual(res[0]['level'], 'ok')
+                self.assertIn('corpus', res[0]['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=fail_proc):
+                failed = doctor.check_trainer(live_env)[0]
+                self.assertEqual(failed['level'], 'FAIL')
+                self.assertIn('desktop', failed['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

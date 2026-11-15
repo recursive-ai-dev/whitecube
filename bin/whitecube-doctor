@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -557,6 +557,55 @@ def check_editor(env):
                     f'{editor} --cli doctor')]
 
 
+def check_trainer(env):
+    """Report cube-train / whitecube-train launchers, runtime modules, and readiness."""
+    share_dir = env.at('/usr/share/whitecube/cube-train')
+    runtime_files = ('app.py', 'cli.py', 'engine.py', 'diagnostics.py', 'worker.py', 'pipeline/train_supervisor.py')
+    if env.root != Path('/'):
+        cube_train = env.at('/usr/bin/cube-train')
+        cli_bin = env.at('/usr/bin/whitecube-train')
+        has_any = any(p.is_file() or p.is_symlink() for p in (cube_train, cli_bin)) or share_dir.exists()
+        if not has_any:
+            return [finding('info', 'trainer', 'cube-train is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        bad_bins = [str(p) for p in (cube_train, cli_bin) if not (p.is_file() or p.is_symlink()) or not os.access(p, os.X_OK)]
+        if bad_bins or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else 'missing/unexecutable ' + ', '.join(bad_bins)
+            return [finding('FAIL', 'trainer', f'staged cube-train incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'trainer', 'staged cube-train launchers and pipeline present')]
+    candidates = [
+        env.at('/usr/bin/whitecube-train'),
+        env.home / '.local/bin/whitecube-train',
+        env.project / 'bin/whitecube-train',
+    ]
+    trainer_cli = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if trainer_cli is None:
+        return [finding('info', 'trainer', 'cube-train is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(trainer_cli, os.X_OK):
+        return [finding('WARN', 'trainer', f'{trainer_cli} is not executable', f'chmod 0755 {trainer_cli}')]
+    try:
+        proc = subprocess.run([str(trainer_cli), '--doctor', '--json'], capture_output=True, text=True, timeout=10)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'trainer', f'could not query whitecube-train doctor: {error}',
+                        f'{trainer_cli} --doctor')]
+    if not isinstance(data, dict) or 'checks' not in data or 'version' not in data:
+        return [finding('WARN', 'trainer', 'whitecube-train --doctor returned unexpected JSON',
+                        f'{trainer_cli} --doctor')]
+    checks = {item.get('id'): item for item in data.get('checks', []) if isinstance(item, dict)}
+    hard_errors = [cid for cid in ('desktop', 'output') if checks.get(cid, {}).get('status') == 'error']
+    if hard_errors:
+        return [finding('FAIL', 'trainer', 'whitecube-train readiness failed: ' + ', '.join(hard_errors),
+                        f'{trainer_cli} --doctor')]
+    warns = [item.get('id', '?') for item in data.get('checks', [])
+             if isinstance(item, dict) and item.get('status') in ('warning', 'error')]
+    note = f' (pending setup: {", ".join(warns)})' if warns else ''
+    return [finding('ok', 'trainer', f'whitecube-train {data["version"]} diagnostics reachable{note}')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -578,6 +627,7 @@ def run_checks(env, selected=None):
         'audio': (lambda: check_audio(env),),
         'browser': (lambda: check_browser(env),),
         'editor': (lambda: check_editor(env),),
+        'trainer': (lambda: check_trainer(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

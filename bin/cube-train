@@ -5,9 +5,15 @@ import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
+argv = sys.argv[1:]
 for directory in (root / 'apps/cube-train', root / 'share/whitecube/cube-train'):
+    if argv[:1] == ['--cli'] and (directory / 'cli.py').is_file():
+        os.environ.setdefault('WHITECUBE_TRAIN_COMMAND', 'whitecube-train')
+        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'cli.py'), *argv[1:]])
+    if argv == ['--version'] and (directory / 'cli.py').is_file():
+        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'cli.py'), '--version'])
     if (directory / 'app.py').is_file():
         os.environ['GDK_BACKEND'] = 'wayland'
-        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])
+        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *argv])
 print('cube-train: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
 raise SystemExit(1)

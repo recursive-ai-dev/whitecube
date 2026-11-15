@@ -181,6 +181,50 @@ class HeadlessCLITests(unittest.TestCase):
         self.assertIn('Unavailable run IDs', result.stderr)
         self.assertNotIn('Traceback', result.stderr)
 
+    def test_list_runs_status_and_inspect_run_json_and_desktop_cli_dispatch(self):
+        repo_launcher = HERE.parent.parent / 'bin/cube-train'
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            runs = root / 'runs'
+            run = runs / 'run-01'
+            (run / 'data').mkdir(parents=True)
+            engine.atomic_json(run / 'run.json', {'model_size': '2m', 'steps': 10, 'device': 'cpu', 'display_name': 'Alpha'})
+            engine.atomic_json(run / 'result.json', {'completed_steps': 10, 'best_val_loss': 2.25, 'stop_reason': 'completed'})
+            env = dict(os.environ, HOME=temp, XDG_CONFIG_HOME=temp + '/config',
+                       XDG_STATE_HOME=temp + '/state', WHITECUBE_TRAIN_OUT=str(runs),
+                       DISPLAY='', WAYLAND_DISPLAY='')
+            listed = subprocess.run(['/usr/bin/python3', '-I', str(HERE / 'cli.py'), '--list-runs', '--json'],
+                                    env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            listed_data = json.loads(listed.stdout)
+            self.assertEqual([r['id'] for r in listed_data['runs']], ['run-01'])
+
+            status = subprocess.run(['/usr/bin/python3', '-I', str(HERE / 'cli.py'), '--status', '--json'],
+                                    env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            status_data = json.loads(status.stdout)
+            self.assertFalse(status_data['running'])
+            self.assertEqual(status_data['kind'], 'whitecube_trainer_status')
+
+            inspected = subprocess.run(['/usr/bin/python3', '-I', str(HERE / 'cli.py'), '--inspect-run', 'run-01', '--json'],
+                                       env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            self.assertEqual(json.loads(inspected.stdout)['run']['id'], 'run-01')
+
+            missing = subprocess.run(['/usr/bin/python3', '-I', str(HERE / 'cli.py'), '--inspect-run', 'nope'],
+                                     env=env, text=True, capture_output=True, timeout=15)
+            self.assertEqual(missing.returncode, 2)
+            self.assertNotIn('Traceback', missing.stderr)
+
+            if repo_launcher.is_file():
+                ver = subprocess.run([str(repo_launcher), '--version'], env=env, text=True, capture_output=True, timeout=15)
+                self.assertEqual(ver.returncode, 0, ver.stderr)
+                self.assertIn(cli.VERSION, ver.stdout)
+                cli_list = subprocess.run([str(repo_launcher), '--cli', '--list-runs', '--json'],
+                                          env=env, text=True, capture_output=True, timeout=15)
+                self.assertEqual(cli_list.returncode, 0, cli_list.stderr)
+                self.assertEqual(json.loads(cli_list.stdout)['runs'][0]['id'], 'run-01')
+
 
 if __name__ == '__main__':
     unittest.main()

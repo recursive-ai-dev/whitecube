@@ -167,7 +167,8 @@ def benchmark(run_dir, *, checkpoint='best', output=None, eval_iters=20, batch_s
                 'loss': loss, 'perplexity': perplexity, 'bits_per_token': loss / math.log(2),
                 'bits_per_byte': byte_nll / byte_tokens / math.log(2) if byte_tokens else None,
                 'tokens': tokens, 'byte_tokens': byte_tokens, 'batches': eval_iters,
-                'seconds': validation_seconds, 'tokens_per_second': tokens / validation_seconds,
+                'seconds': validation_seconds,
+                'tokens_per_second': tokens / validation_seconds if validation_seconds > 0 else 0.0,
                 'batch_sha256': batch_hash.hexdigest(),
                 'sampling': 'Fixed seeded windows sampled with replacement from val.bin',
                 'bits_per_byte_definition': 'Mean negative log2 probability of raw byte targets (IDs 0-255); excludes special tokens',
@@ -187,7 +188,7 @@ def benchmark(run_dir, *, checkpoint='best', output=None, eval_iters=20, batch_s
                     'prompt': prompt, 'prompt_token_ids': prompt_ids, 'seed': sample_seed,
                     'continuation': bytes(token for token in generated if token < 256).decode('utf-8', errors='replace'),
                     'token_ids': generated, 'tokens': len(generated), 'seconds': seconds,
-                    'tokens_per_second': len(generated) / seconds,
+                    'tokens_per_second': len(generated) / seconds if seconds > 0 else 0.0,
                     'stop_reason': 'eos' if generated and generated[-1] == ByteTokenizer.EOS else 'length',
                 })
                 generation_tokens += len(generated)
