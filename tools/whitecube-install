@@ -23,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 PROJECT = Path(__file__).resolve().parent.parent
@@ -31,6 +32,41 @@ EXTRAS = {
     'hardening': ('net/whitecube-network.hardening.conf', '/etc/systemd/system/whitecube-network.service.d/hardening.conf', 0o644),
     'sudoers': ('data/sudoers/whitecube-settings.hardened', '/etc/sudoers.d/whitecube-settings', 0o440),
 }
+MAX_MANIFEST_BYTES = 1024 * 1024
+
+
+def tool_version(project=PROJECT):
+    try:
+        text = read_regular_text(project / 'packaging/VERSION', 128).strip()
+        if text:
+            return text
+    except (OSError, ValueError):
+        pass
+    return '0.12.0'
+
+
+def read_regular_text(path, max_bytes=MAX_MANIFEST_BYTES):
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f'refusing non-regular file: {path}')
+        if st.st_size > max_bytes:
+            raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+            chunks.append(chunk)
+        return b''.join(chunks).decode('utf-8')
+    finally:
+        os.close(fd)
 
 
 def sources_newer_than_build(project=PROJECT):
@@ -93,8 +129,8 @@ def user_install(project=PROJECT, runner=run):
 def rollback_user(project=PROJECT):
     manifest_path = Path.home() / '.local/state/whitecube/privacy-install.json'
     try:
-        manifest = json.loads(manifest_path.read_text())
-    except (OSError, ValueError):
+        manifest = json.loads(read_regular_text(manifest_path))
+    except (OSError, ValueError, UnicodeDecodeError):
         raise SystemExit('no user install record found; nothing to roll back')
     for record in reversed(manifest['files']):
         target = Path(record['path'])
@@ -142,11 +178,18 @@ def system_install(project=PROJECT, runner=run, with_=(), root=Path('/'), stamp=
             raise SystemExit('the sudoers file does not parse; not installing it')
         saved = backup_extra(destination, stamp, root)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_name(destination.name + f'.new-{os.getpid()}')
-        shutil.copyfile(source, temporary)
-        os.chown(temporary, 0, 0)
-        os.chmod(temporary, mode)
-        os.replace(temporary, destination)
+        fd, tmp_name = tempfile.mkstemp(prefix='.' + destination.name + '-', dir=destination.parent)
+        temporary = Path(tmp_name)
+        try:
+            with os.fdopen(fd, 'wb') as out, open(source, 'rb') as src_stream:
+                shutil.copyfileobj(src_stream, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.chown(temporary, 0, 0)
+            os.chmod(temporary, mode)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
         print(f'installed {destination}' + (f' (previous copy: {saved})' if saved else ' (new file)'))
     print('\nNothing was restarted. When Wi-Fi may drop for ~20 s:')
     print('  sudo systemctl daemon-reload && sudo systemctl restart whitecube-network.service')
@@ -163,6 +206,8 @@ def main(argv=None):
     parser.add_argument('--with-cairo', action='store_true')
     parser.add_argument('--rollback-user', action='store_true')
     parser.add_argument('--rollback-system', metavar='BACKUP_DIR')
+    parser.add_argument('--json', action='store_true', help='emit structured JSON output for dry-run plans')
+    parser.add_argument('--version', action='version', version=f'whitecube-install {tool_version()}')
     args = parser.parse_args(argv)
     extras = [name for name in ('hardening', 'sudoers', 'cairo') if getattr(args, f'with_{name}')]
     if args.rollback_user:
@@ -175,13 +220,21 @@ def main(argv=None):
         parser.error('--with-* extras belong to the system install: add --system')
     if args.system:
         if not args.apply:
-            print('\n'.join(plan()))
+            steps = plan()
+            if args.json:
+                print(json.dumps({'mode': 'dry-run', 'scope': 'system', 'extras': extras, 'steps': steps}, indent=2))
+                return
+            print('\n'.join(steps))
             print('\nDry run. Add --apply (as root) to install.')
             return
         return system_install(with_=extras)
     if args.apply:
         return user_install()
-    print('\n'.join(plan()))
+    steps = plan()
+    if args.json:
+        print(json.dumps({'mode': 'dry-run', 'scope': 'user', 'extras': extras, 'steps': steps}, indent=2))
+        return
+    print('\n'.join(steps))
     print('\nDry run. Apply: whitecube-install --apply   then   sudo whitecube-install --system --apply')
 
 

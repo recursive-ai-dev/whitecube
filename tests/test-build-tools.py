@@ -136,6 +136,37 @@ class ReleaseReport(unittest.TestCase):
             self.assertIn('timed out', (output / 'slow.log').read_text())
             self.assertEqual(json.loads((output / 'report.json').read_text())['failed_check'], 'slow')
 
+    def test_release_rejects_empty_provenance_hashes_and_exposes_version(self):
+        expected = {'commit': 'a' * 40, 'version': '0.12.0'}
+        manifest = {'version': '0.12.0', 'build_provenance': {'source': {'commit': 'a' * 40, 'dirty': False}, 'builder_recipe_sha256': ''}}
+        with self.assertRaisesRegex(RuntimeError, 'builder_recipe_sha256'):
+            release.validate_release_source(manifest, expected)
+        bad_inputs = {'version': '0.12.0', 'build_provenance': {'source': {'commit': 'a' * 40, 'dirty': False}, 'inputs_sha256': []}}
+        with self.assertRaisesRegex(RuntimeError, 'inputs_sha256'):
+            release.validate_release_source(bad_inputs, expected)
+        proc = subprocess.run(['python3', '-I', str(ROOT / 'tools/verify-release.py'), '--version'], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn('verify-release ', proc.stdout)
+
+    def test_install_user_version_and_fifo_config_refusal(self):
+        with tempfile.TemporaryDirectory() as home:
+            home_path = Path(home)
+            cfg_dir = home_path / '.config/whitecube'
+            cfg_dir.mkdir(parents=True)
+            os.mkfifo(cfg_dir / 'config')
+            env = dict(os.environ, HOME=home)
+            proc = subprocess.run(['python3', '-I', str(ROOT / 'tools/INSTALL-USER.py')], capture_output=True, text=True, env=env)
+            if proc.returncode != 0 and 'cannot read existing config safely' in proc.stderr:
+                pass
+            elif 'build all binaries with ./BUILD.sh' in proc.stderr:
+                # Without build/whitecube, dry-run stops at binary check; verify read_regular_text directly.
+                iu = module('whitecube_install_user_test', 'tools/INSTALL-USER.py')
+                with self.assertRaisesRegex(ValueError, 'non-regular'):
+                    iu.read_regular_text(cfg_dir / 'config')
+        ver = subprocess.run(['python3', '-I', str(ROOT / 'tools/INSTALL-USER.py'), '--version'], capture_output=True, text=True)
+        self.assertEqual(ver.returncode, 0)
+        self.assertIn('INSTALL-USER ', ver.stdout)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

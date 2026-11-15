@@ -25,4 +25,4 @@
 
 ## Phase 4: Packaging & Release Readiness (`packaging/`, `tools/`)
 - [x] `packaging/` (`install-tree.sh`, `check-tree.py`, `debian/`, ABI & conffile verification)
-- [ ] `tools/` (`whitecube-migrate` & developer scripts)
+- [x] `tools/` (`whitecube-migrate` & developer scripts)

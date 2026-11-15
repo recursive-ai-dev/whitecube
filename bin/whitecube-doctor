@@ -365,8 +365,15 @@ def check_shadowing(env):
     """Once the package is installed, older per-user or /usr/local copies would still win on PATH."""
     if not env.at('/usr/bin/whitecube-compositor').exists():
         return []
-    names = ('whitecube', 'cube-status', 'cube-settings', 'cube-ca', 'cube-audio', 'cube-net', 'whitecube-session', 'whitecube-terminal', 'desktop-chat')
+    names = ('whitecube', 'whitecube-compositor', 'whitecube-desktop', 'whitecube-session', 'whitecube-terminal',
+             'whitecube-web', 'whitecube-browser', 'whitecube-doctor', 'whitecube-migrate', 'whitecube-train',
+             'whitecube-vm', 'whitecube-chrootable-manager', 'cube-status', 'cube-settings', 'cube-ca', 'cube-audio',
+             'cube-player', 'cube-net', 'cube-prompts', 'cube-chrootables', 'cube-strap', 'cube-train', 'cube-editor',
+             'cube-lock', 'cube-pdf', 'cube-hash', 'cube-rename', 'desktop-chat')
     stale = [str(d / n).replace(str(env.home), '~') for d in (env.home / '.local/bin', env.at('/usr') / 'local/bin') for n in names if (d / n).exists()]
+    wc_lib = env.home / '.local/lib/wc-suite'
+    if wc_lib.is_dir():
+        stale.append('~/.local/lib/wc-suite')
     if not stale:
         return [finding('ok', 'package', 'no older copies shadow the installed package')]
     return [finding('WARN', 'package', f'{len(stale)} older copies shadow /usr/bin: ' + ', '.join(stale[:4]) + (' ...' if len(stale) > 4 else ''),

@@ -28,22 +28,83 @@ from pathlib import Path
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 PACKAGE = 'whitecube-desktop'
-SYSTEM_COMMANDS = ('whitecube', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'cube-chat', 'cube-check', 'cube-lab',
-                   'cube-scripts', 'whitecube-desktop', 'whitecube-next-wallpaper', 'whitecube-session', 'whitecube-terminal',
-                   'whitecube-web')
-USER_COMMANDS = ('whitecube', 'cube-status', 'cube-settings', 'cube-ca', 'cube-privacy', 'cube-preferences', 'whitecube-session',
-                 'cube-lock', 'cube-pdf', 'cube-hash', 'cube-rename', 'desktop-chat')
+VERSION = '0.12.0'
+MAX_TEXT_BYTES = 2 * 1024 * 1024
+SYSTEM_COMMANDS = ('whitecube', 'whitecube-compositor', 'whitecube-desktop', 'whitecube-next-wallpaper',
+                   'whitecube-session', 'whitecube-terminal', 'whitecube-web', 'whitecube-bus', 'whitecube-portal',
+                   'whitecube-suspend', 'whitecube-browser', 'whitecube-doctor', 'whitecube-migrate', 'whitecube-train',
+                   'whitecube-vm', 'whitecube-chrootable-manager', 'cube-status', 'cube-settings', 'cube-ca',
+                   'cube-audio', 'cube-player', 'cube-net', 'cube-chat', 'cube-check', 'cube-lab', 'cube-scripts',
+                   'cube-prompts', 'cube-chrootables', 'cube-strap', 'cube-train', 'cube-editor',
+                   'cube-preferences', 'cube-privacy')
+USER_COMMANDS = (*SYSTEM_COMMANDS, 'cube-lock', 'cube-pdf', 'cube-hash', 'cube-rename', 'desktop-chat')
 USER_ENTRIES = ('cube-settings.desktop', 'desktop-chat.desktop', 'dev.woez.CubeLock.desktop', 'dev.woez.CubePdf.desktop',
-                'dev.woez.CubeHash.desktop', 'dev.woez.CubeRename.desktop')
+                'dev.woez.CubeHash.desktop', 'dev.woez.CubeRename.desktop', 'cube-prompts.desktop',
+                'cube-chrootables.desktop', 'cube-strap.desktop', 'cube-train.desktop', 'cube-editor.desktop',
+                'cube-player.desktop', 'whitecube-browser.desktop', 'whitecube-workspace.desktop')
 OLD_HELPER = '/usr/local/libexec/cube-settings-helper'
 NEW_HELPER = '/usr/libexec/whitecube/cube-settings-helper'
 UNIT = 'etc/systemd/system/whitecube-network.service'
 PACKAGED_UNIT = 'usr/lib/systemd/system/whitecube-network.service'
+
+
+def read_regular_text(path, max_bytes=MAX_TEXT_BYTES):
+    """Read UTF-8 text from PATH without following symlinks or blocking on FIFOs."""
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f'refusing non-regular file: {path}')
+        if st.st_size > max_bytes:
+            raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+            chunks.append(chunk)
+        return b''.join(chunks).decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def atomic_write_text(path, text, mode):
+    """Atomically write TEXT to PATH with MODE via a private temporary file in the same directory."""
+    fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchmod(out.fileno(), mode)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def tool_version():
+    version_file = Path(__file__).resolve().parent.parent / 'packaging/VERSION'
+    try:
+        if version_file.is_file() and not version_file.is_symlink():
+            text = read_regular_text(version_file, 128).strip()
+            if text:
+                return text
+    except (OSError, ValueError):
+        pass
+    return VERSION
 
 
 class Migration:
@@ -53,6 +114,7 @@ class Migration:
         self.visudo = visudo or (lambda path: self.run(['visudo', '-cf', str(path)]).returncode == 0)
         self.wait = wait or self.default_wait
         self.steps = []          # (description, callable) in order
+        self.warnings = []
         self.backup = None
         self.log = []
 
@@ -80,6 +142,28 @@ class Migration:
         shutil.copy2(path, target, follow_symlinks=False)
         self.log.append({'edited': str(path), 'copy': str(target)})
 
+    def _safe_read(self, path, label):
+        try:
+            return read_regular_text(path)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            self.warnings.append(f'skipped {label}: {exc}')
+            return None
+
+    def _is_within_sandbox(self, path):
+        resolved = path.resolve(strict=False)
+        roots = [self.root.resolve(strict=False)]
+        if self.home is not None:
+            roots.append(self.home.resolve(strict=False))
+        return any(resolved == base or base in resolved.parents for base in roots)
+
+    def _is_packaged_wc_wrapper(self, path):
+        if (self.at('usr/bin') / path.name).exists():
+            return True
+        if not path.is_file() or path.is_symlink():
+            return False
+        text = self._safe_read(path, str(path))
+        return bool(text and 'wc-suite/wc_suite.py' in text)
+
     @staticmethod
     def default_wait(seconds):
         """True when a Wi-Fi interface has an IPv4 address and a default route."""
@@ -95,6 +179,7 @@ class Migration:
     # ----- planning
     def plan(self, restart_network=False):
         self.steps.clear()
+        self.warnings.clear()
         if self.home is None:
             raise SystemExit('whitecube-migrate: cannot tell whose home directory to migrate; use --user NAME')
         packaged = self.at(PACKAGED_UNIT)
@@ -119,6 +204,25 @@ class Migration:
             old = self.home / '.local/bin' / name
             if old.is_symlink() or old.is_file():
                 self.steps.append((f'move ~/.local/bin/{name} into the backup (it would shadow /usr/bin/{name})', lambda p=old: self.keep(p)))
+        wc_lib = self.home / '.local/lib/wc-suite'
+        wc_moved = []
+        for old in sorted((self.home / '.local/bin').glob('wc-*')):
+            if (old.is_symlink() or old.is_file()) and self._is_packaged_wc_wrapper(old):
+                self.steps.append((f'move ~/.local/bin/{old.name} into the backup (it would shadow /usr/bin/{old.name})', lambda p=old: self.keep(p)))
+                wc_moved.append(old.name)
+        if wc_lib.is_dir():
+            self.steps.append(('move ~/.local/lib/wc-suite into the backup (the package installs wc-*)', lambda: self.keep(wc_lib)))
+        if wc_lib.is_dir() or wc_moved:
+            zsh_comp = self.home / '.local/share/zsh/site-functions/_wc'
+            if zsh_comp.is_symlink() or zsh_comp.is_file():
+                self.steps.append(('move ~/.local/share/zsh/site-functions/_wc into the backup', lambda p=zsh_comp: self.keep(p)))
+            for comp in sorted((self.home / '.local/share/bash-completion/completions').glob('wc-*')):
+                if comp.name in wc_moved or (self.at('usr/bin') / comp.name).exists():
+                    self.steps.append((f'move ~/.local/share/bash-completion/completions/{comp.name} into the backup', lambda p=comp: self.keep(p)))
+            for comp in sorted((self.home / '.config/fish/completions').glob('wc-*.fish')):
+                cmd_name = comp.stem
+                if cmd_name in wc_moved or (self.at('usr/bin') / cmd_name).exists():
+                    self.steps.append((f'move ~/.config/fish/completions/{comp.name} into the backup', lambda p=comp: self.keep(p)))
         schemas = self.home / '.local/share/whitecube/schemas'
         if schemas.is_dir():
             self.steps.append(('move ~/.local/share/whitecube/schemas into the backup (the package ships the schema)', lambda: self.keep(schemas)))
@@ -129,50 +233,59 @@ class Migration:
         for old in sorted((self.home / '.local/share/icons/hicolor/scalable/apps').glob('cube-*.svg')):
             self.steps.append((f'move ~/.local/share/icons/.../{old.name} into the backup', lambda p=old: self.keep(p)))
         sudoers = self.at('etc/sudoers.d/whitecube-settings')
-        if sudoers.is_file() and OLD_HELPER in sudoers.read_text():
-            self.steps.append((f'sudoers: point /etc/sudoers.d/whitecube-settings at {NEW_HELPER} (rules unchanged, visudo-checked)',
-                               lambda: self.edit_sudoers(sudoers)))
+        if sudoers.exists() or sudoers.is_symlink():
+            sudoers_text = self._safe_read(sudoers, '/etc/sudoers.d/whitecube-settings')
+            if sudoers_text is not None and OLD_HELPER in sudoers_text:
+                self.steps.append((f'sudoers: point /etc/sudoers.d/whitecube-settings at {NEW_HELPER} (rules unchanged, visudo-checked)',
+                                   lambda: self.edit_sudoers(sudoers)))
         profile = self.home / '.bash_profile'
-        if profile.is_file() and re.search(r'\.local/bin/whitecube-session', profile.read_text()):
-            self.steps.append(('~/.bash_profile: start /usr/bin/whitecube-session', lambda: self.edit_text(
-                profile, lambda t: re.sub(r'"?(?:\$HOME|~|/home/[^/\s"]+)/\.local/bin/whitecube-session"?', '/usr/bin/whitecube-session', t))))
+        if profile.exists() or profile.is_symlink():
+            profile_text = self._safe_read(profile, '~/.bash_profile')
+            if profile_text is not None and re.search(r'\.local/bin/whitecube-session', profile_text):
+                self.steps.append(('~/.bash_profile: start /usr/bin/whitecube-session', lambda: self.edit_text(
+                    profile, lambda t: re.sub(r'"?(?:\$HOME|~|/home/[^/\s"]+)/\.local/bin/whitecube-session"?', '/usr/bin/whitecube-session', t))))
         config = self.home / '.config/whitecube/config'
-        if config.is_file() and re.search(r'/usr/local/bin/|\.local/bin/', config.read_text()):
-            self.steps.append(('~/.config/whitecube/config: rewrite old absolute command paths', lambda: self.edit_text(config, self.rewrite_config)))
+        if config.exists() or config.is_symlink():
+            config_text = self._safe_read(config, '~/.config/whitecube/config')
+            if config_text is not None and re.search(r'/usr/local/bin/|\.local/bin/', config_text):
+                self.steps.append(('~/.config/whitecube/config: rewrite old absolute command paths', lambda: self.edit_text(config, self.rewrite_config)))
         return self.steps
 
     @staticmethod
     def rewrite_config(text):
         text = text.replace('/usr/local/bin/', '/usr/bin/')
-        return re.sub(r'(?:/home/[^/\s]+|\$HOME|~)/\.local/bin/(cube-[a-z-]+|whitecube[a-z-]*|desktop-chat)', r'/usr/bin/\1', text)
+        return re.sub(r'(?:/home/[^/\s]+|\$HOME|~)/\.local/bin/(cube-[a-z-]+|whitecube[a-z-]*|desktop-chat|wc-[a-z-]+)', r'/usr/bin/\1', text)
 
     # ----- actions
     def edit_text(self, path, transform):
+        old = read_regular_text(path)
         self.keep_copy(path)
-        old = path.read_text()
         new = transform(old)
         if new != old:
-            mode = path.stat().st_mode & 0o7777
-            temporary = path.with_name(path.name + f'.new-{os.getpid()}')
-            temporary.write_text(new)
-            temporary.chmod(mode)
-            os.replace(temporary, path)
+            mode = stat.S_IMODE(path.stat().st_mode)
+            atomic_write_text(path, new, mode)
 
     def edit_sudoers(self, path):
-        new = path.read_text().replace(OLD_HELPER, NEW_HELPER)
-        temporary = path.with_name(path.name + f'.new-{os.getpid()}')
-        temporary.write_text(new)
-        temporary.chmod(0o440)
-        if not self.visudo(temporary):
-            temporary.unlink()
-            raise RuntimeError('the edited sudoers rule does not parse; left unchanged')
-        self.keep_copy(path)
-        os.replace(temporary, path)
+        new = read_regular_text(path).replace(OLD_HELPER, NEW_HELPER)
+        fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+        temporary = Path(tmp_name)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as out:
+                out.write(new)
+                out.flush()
+                os.fsync(out.fileno())
+                os.fchmod(out.fileno(), 0o440)
+            if not self.visudo(temporary):
+                raise RuntimeError('the edited sudoers rule does not parse; left unchanged')
+            self.keep_copy(path)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def swap_unit(self, restart):
         have = self.at(UNIT)
+        old_text = read_regular_text(have)
         self.keep_copy(have)
-        old_text = have.read_text()
         was_enabled = self.run(['systemctl', 'is-enabled', 'whitecube-network.service']).stdout.strip() == 'enabled'
         have.unlink()
         self.run(['systemctl', 'daemon-reload'])
@@ -184,7 +297,7 @@ class Migration:
             return
         self.run(['systemctl', 'restart', 'whitecube-network.service'])
         if not self.wait(90):
-            have.write_text(old_text)
+            atomic_write_text(have, old_text, 0o644)
             self.run(['systemctl', 'daemon-reload'])
             self.run(['systemctl', 'restart', 'whitecube-network.service'])
             raise RuntimeError('Wi-Fi did not return with the packaged unit; the old unit was restored and the service restarted')
@@ -199,29 +312,51 @@ class Migration:
                 action()
                 done.append(description)
         finally:
-            (self.backup / 'manifest.json').write_text(json.dumps({'done': done, 'log': self.log, 'user': self.user,
-                                                                  'home': str(self.home)}, indent=2) + '\n')
+            atomic_write_text(self.backup / 'manifest.json',
+                              json.dumps({'done': done, 'log': self.log, 'warnings': self.warnings,
+                                          'user': self.user, 'home': str(self.home)}, indent=2) + '\n',
+                              0o600)
         return done
 
     def rollback(self, backup):
         backup = Path(backup)
-        manifest = json.loads((backup / 'manifest.json').read_text())
+        if not backup.is_dir() or backup.is_symlink():
+            raise RuntimeError(f'backup directory is missing or invalid: {backup}')
+        backup_root = backup.resolve()
+        manifest = json.loads(read_regular_text(backup / 'manifest.json'))
         restored = []
-        for entry in reversed(manifest['log']):
+        for entry in reversed(manifest.get('log', [])):
             if 'moved' in entry:
                 src, dst = Path(entry['to']), Path(entry['moved'])
-                if src.exists() and not dst.exists():
+                src_resolved = src.resolve(strict=False)
+                if backup_root not in src_resolved.parents:
+                    raise RuntimeError(f'unsafe backup source outside backup directory: {src}')
+                if not self._is_within_sandbox(dst):
+                    raise RuntimeError(f'unsafe rollback destination outside target tree: {dst}')
+                if (src.exists() or src.is_symlink()) and not dst.exists() and not dst.is_symlink():
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.move(str(src), str(dst))
                     restored.append(str(dst))
             elif 'edited' in entry:
                 src, dst = Path(entry['copy']), Path(entry['edited'])
-                if src.exists():
-                    temporary = dst.with_name(dst.name + f'.restore-{os.getpid()}')
-                    shutil.copy2(src, temporary, follow_symlinks=False)   # atomic replace: works on 0440 files too
-                    os.replace(temporary, dst)
+                src_resolved = src.resolve(strict=False)
+                if backup_root not in src_resolved.parents:
+                    raise RuntimeError(f'unsafe backup copy outside backup directory: {src}')
+                if not self._is_within_sandbox(dst):
+                    raise RuntimeError(f'unsafe rollback destination outside target tree: {dst}')
+                if src.is_file() and not src.is_symlink():
+                    if dst.is_symlink():
+                        raise RuntimeError(f'refusing to overwrite symlink: {dst}')
+                    fd, tmp_name = tempfile.mkstemp(prefix='.' + dst.name + '-', dir=dst.parent)
+                    temporary = Path(tmp_name)
+                    try:
+                        os.close(fd)
+                        shutil.copy2(src, temporary, follow_symlinks=False)   # atomic replace: works on 0440 files too
+                        os.replace(temporary, dst)
+                    finally:
+                        temporary.unlink(missing_ok=True)
                     restored.append(str(dst))
-        if any(e.get('unit') for e in manifest['log']):
+        if any(e.get('unit') for e in manifest.get('log', [])):
             self.run(['systemctl', 'daemon-reload'])
         return restored
 
@@ -233,6 +368,8 @@ def main(argv=None, migration=None):
     parser.add_argument('--user')
     parser.add_argument('--root', type=Path, default=Path('/'))
     parser.add_argument('--restart-network', action='store_true', help='restart Wi-Fi now, with automatic rollback if it does not return')
+    parser.add_argument('--json', action='store_true', help='emit structured JSON output')
+    parser.add_argument('--version', action='version', version=f'whitecube-migrate {tool_version()}')
     args = parser.parse_args(argv)
     if migration is None:
         name = args.user or os.environ.get('SUDO_USER') or pwd.getpwuid(os.getuid()).pw_name
@@ -241,22 +378,37 @@ def main(argv=None, migration=None):
     if args.rollback:
         if os.geteuid() != 0 and args.root == Path('/'):
             parser.error('--rollback needs root: sudo whitecube-migrate --rollback DIR')
-        for path in migration.rollback(args.rollback):
+        restored = migration.rollback(args.rollback)
+        if args.json:
+            print(json.dumps({'mode': 'rollback', 'backup': str(args.rollback), 'restored': restored}, indent=2))
+            return 0
+        for path in restored:
             print('restored', path)
         print('Rolled back. Log out and back in if the desktop was affected.')
         return 0
     version = migration.installed_version()
     if version is None:
+        if args.json:
+            print(json.dumps({'mode': 'error', 'package': PACKAGE, 'installed': False,
+                              'error': f'The {PACKAGE} package is not installed, so there is nothing to migrate to yet.'}, indent=2))
+            return 1
         print(f'The {PACKAGE} package is not installed, so there is nothing to migrate to yet.\n'
               f'Build and install it first:  packaging/build-deb.sh && sudo apt install ./packaging/out/{PACKAGE}_*.deb')
         return 1
     steps = migration.plan(args.restart_network)
-    print(f'{PACKAGE} {version} is installed. Migration plan for {migration.user}:')
-    for description, _ in steps:
-        print('  -', description)
-    if not steps:
-        print('  (nothing to do: this machine already runs only the package)')
+    descriptions = [description for description, _ in steps]
     if not args.apply:
+        if args.json:
+            print(json.dumps({'mode': 'dry-run', 'package': PACKAGE, 'version': version, 'user': migration.user,
+                              'steps': descriptions, 'warnings': migration.warnings}, indent=2))
+            return 0
+        print(f'{PACKAGE} {version} is installed. Migration plan for {migration.user}:')
+        for description in descriptions:
+            print('  -', description)
+        if not descriptions:
+            print('  (nothing to do: this machine already runs only the package)')
+        for warning in migration.warnings:
+            print('  warning:', warning)
         print('\nDry run. Apply with:  sudo whitecube-migrate --apply' + ('' if args.restart_network else '   (add --restart-network to restart Wi-Fi too)'))
         return 0
     if os.geteuid() != 0 and args.root == Path('/'):
@@ -264,9 +416,17 @@ def main(argv=None, migration=None):
     try:
         done = migration.apply(args.restart_network)
     except RuntimeError as exc:
+        if args.json:
+            print(json.dumps({'mode': 'apply', 'ok': False, 'error': str(exc),
+                              'backup': str(migration.backup)}, indent=2))
+            return 1
         print('STOPPED:', exc, file=sys.stderr)
         print(f'Undo what was done with:  sudo whitecube-migrate --rollback {migration.backup}', file=sys.stderr)
         return 1
+    if args.json:
+        print(json.dumps({'mode': 'apply', 'ok': True, 'package': PACKAGE, 'version': version,
+                          'backup': str(migration.backup), 'done': done, 'warnings': migration.warnings}, indent=2))
+        return 0
     print(f'\nDone: {len(done)} step(s). Backup: {migration.backup}')
     print(f'Undo with:  sudo whitecube-migrate --rollback {migration.backup}')
     print('Log out and back in (Alt+Shift+Esc) to start the packaged desktop.')

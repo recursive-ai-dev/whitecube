@@ -13,6 +13,42 @@ import shutil
 import stat
 import tempfile
 
+MAX_CONFIG_BYTES = 1024 * 1024
+
+
+def read_regular_text(path, max_bytes=MAX_CONFIG_BYTES):
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f'refusing non-regular file: {path}')
+        if st.st_size > max_bytes:
+            raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+            chunks.append(chunk)
+        return b''.join(chunks).decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def tool_version(project):
+    try:
+        text = read_regular_text(project / 'packaging/VERSION', 128).strip()
+        if text:
+            return text
+    except (OSError, ValueError):
+        pass
+    return '0.12.0'
+
 
 def atomic(path, data, mode):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -32,6 +68,7 @@ def atomic(path, data, mode):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--version', action='version', version=f'INSTALL-USER {tool_version(Path(__file__).resolve().parent.parent)}')
     args = parser.parse_args()
     project = Path(__file__).resolve().parent.parent
     user_dir = Path.home()
@@ -55,7 +92,12 @@ def main():
     config = user_dir / '.config/whitecube/config'
     if config.is_symlink():
         parser.error('config is a symlink; resolve its install destination explicitly')
-    old_config = config.read_text() if config.exists() else ''
+    old_config = ''
+    if config.exists():
+        try:
+            old_config = read_regular_text(config)
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            parser.error(f'cannot read existing config safely: {exc}')
     lines = old_config.splitlines(keepends=True)
     lines = [line for line in lines if not line.startswith('settings_cmd=')]
     next_config = ''.join(lines)

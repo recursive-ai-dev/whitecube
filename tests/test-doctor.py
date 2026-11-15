@@ -147,6 +147,10 @@ class OtherChecks(Fixture):
         self.assertIn('whitecube-migrate', found['fix'])
         (self.root / 'usr/local/bin/cube-status').unlink()
         self.assertEqual(doctor.check_shadowing(self.env)[0]['level'], 'ok')
+        (self.home / '.local/lib/wc-suite').mkdir(parents=True)
+        wc_found = doctor.check_shadowing(self.env)[0]
+        self.assertEqual(wc_found['level'], 'WARN')
+        self.assertIn('wc-suite', wc_found['detail'])
 
     def test_leftover_wpa_supplicant_is_advice_not_an_alarm(self):
         self.assertEqual(doctor.check_wpa_leftovers(self.env)[0]["level"], "ok")

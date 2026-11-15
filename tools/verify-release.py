@@ -9,18 +9,73 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def read_regular_text(path, max_bytes=2 * 1024 * 1024):
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f'refusing non-regular file: {path}')
+        if st.st_size > max_bytes:
+            raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError(f'file exceeds {max_bytes} bytes: {path}')
+            chunks.append(chunk)
+        return b''.join(chunks).decode('utf-8')
+    finally:
+        os.close(fd)
+
+
+def atomic_write_text(path, text, mode=0o644):
+    fd, tmp_name = tempfile.mkstemp(prefix='.' + path.name + '-', dir=path.parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+            os.fchmod(out.fileno(), mode)
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def tool_version(root=ROOT):
+    try:
+        text = read_regular_text(root / 'packaging/VERSION', 128).strip()
+        if text:
+            return text
+    except (OSError, ValueError):
+        pass
+    return '0.12.0'
+
+
 def validate_release_source(manifest, expected):
-    source = (manifest.get('build_provenance') or {}).get('source') or {}
+    provenance = manifest.get('build_provenance') or {}
+    source = provenance.get('source') or {}
     if (manifest.get('version') != expected['version'] or source.get('commit') != expected['commit']
             or source.get('dirty') is not False):
         raise RuntimeError('archive provenance must match the clean release source commit and package version')
+    if 'builder_recipe_sha256' in provenance and not provenance['builder_recipe_sha256']:
+        raise RuntimeError('archive provenance has empty builder_recipe_sha256')
+    if 'inputs_sha256' in provenance and not isinstance(provenance['inputs_sha256'], dict):
+        raise RuntimeError('archive provenance inputs_sha256 must be a mapping')
 
 
 def checks(root, package, rootfs, output, previous=None):
@@ -58,7 +113,7 @@ def run_checks(steps, output, report, env=None):
                                         text=True, timeout=timeout)
                 entry['returncode'] = result.returncode
                 if name == 'archive' and result.returncode == 0 and report.get('expected_source'):
-                    validate_release_source(json.loads((output / 'archive.json').read_text()), report['expected_source'])
+                    validate_release_source(json.loads(read_regular_text(output / 'archive.json')), report['expected_source'])
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
                 entry['returncode'] = 1
                 entry['error'] = str(error)
@@ -69,7 +124,7 @@ def run_checks(steps, output, report, env=None):
             report['failed_check'] = name
         elif len(report['checks']) == len(steps):
             report['verification'] = 'passed'
-        (output / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
+        atomic_write_text(output / 'report.json', json.dumps(report, indent=2) + '\n', 0o644)
         print(f'{name}: {"passed" if entry["returncode"] == 0 else "FAILED"} ({output / entry["log"]})', flush=True)
         if entry['returncode']:
             return 1
@@ -83,6 +138,7 @@ def main():
     parser.add_argument('--rootfs', type=Path, default=ROOT / 'build/debian-builder/rootfs')
     parser.add_argument('--output', type=Path, required=True, help='new or empty report directory')
     parser.add_argument('--list', action='store_true', help='print commands without executing or writing files')
+    parser.add_argument('--version', action='version', version=f'verify-release {tool_version()}')
     args = parser.parse_args()
     package, rootfs, output = args.deb.absolute(), args.rootfs.absolute(), args.output.absolute()
     previous = args.previous_deb.absolute() if args.previous_deb else None

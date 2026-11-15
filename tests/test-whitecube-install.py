@@ -121,6 +121,15 @@ class UserRollback(Tree):
         with mock.patch.object(wi.Path, "home", return_value=self.home), self.assertRaisesRegex(SystemExit, "symlink"):
             wi.rollback_user(self.project)
 
+    def test_symlinked_user_manifest_is_refused(self):
+        state = self.home / ".local/state/whitecube"
+        state.mkdir(parents=True)
+        target = self.home / "real.json"
+        target.write_text('{"files": []}')
+        (state / "privacy-install.json").symlink_to(target)
+        with mock.patch.object(wi.Path, "home", return_value=self.home), self.assertRaisesRegex(SystemExit, "no user install record"):
+            wi.rollback_user(self.project)
+
 
 class SystemInstall(Tree):
     def setUp(self):
@@ -209,6 +218,20 @@ class Cli(Tree):
                 contextlib.redirect_stdout(io.StringIO()) as out:
             wi.main(["--system"])
         self.assertIn("Dry run", out.getvalue())
+
+    def test_json_dry_run_and_version_flag(self):
+        runner = Recorder()
+        with mock.patch.object(wi, "run", runner), mock.patch.object(wi, "PROJECT", self.project), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            wi.main(["--json"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["mode"], "dry-run")
+        self.assertEqual(payload["scope"], "user")
+        self.assertTrue(isinstance(payload["steps"], list) and len(payload["steps"]) >= 3)
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stdout(io.StringIO()) as ver:
+            wi.main(["--version"])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn("whitecube-install ", ver.getvalue())
 
     def test_the_script_uses_the_isolated_interpreter_and_never_calls_sudo_or_systemctl_restart_itself(self):
         source = (HERE / "tools" / "whitecube-install").read_text()

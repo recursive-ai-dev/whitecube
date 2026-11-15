@@ -2,6 +2,7 @@
 """whitecube-migrate against a fake root and home: dry run, apply, exact rollback, and the failure paths."""
 import importlib.machinery
 import importlib.util
+import json
 from pathlib import Path
 import os
 import subprocess
@@ -205,6 +206,93 @@ class Rewrites(unittest.TestCase):
         self.assertIn('b=/usr/bin/cube-status', out)
         self.assertIn('c=/usr/bin/desktop-chat --toggle', out)
         self.assertIn('d=/home/anyone/.local/bin/claude', out, 'tools that are not Whitecube are left alone')
+        wc_out = migrate.Migration.rewrite_config('check=~/.local/bin/wc-doctor\n')
+        self.assertEqual(wc_out, 'check=/usr/bin/wc-doctor\n')
+
+    def test_newer_apps_and_wc_suite_are_migrated_and_json_cli_works(self):
+        import io
+        from contextlib import redirect_stdout
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name) / 'root'
+        home = Path(tmp.name) / 'home'
+        (root / 'usr/bin').mkdir(parents=True)
+        (root / 'usr/bin/wc-ls').write_text('#!/bin/sh\n')
+        (home / '.local/bin').mkdir(parents=True)
+        (home / '.local/bin/cube-prompts').write_text('#!/bin/sh\n')
+        (home / '.local/bin/wc-ls').write_text('#!/bin/sh\nexec python3 "$HOME/.local/lib/wc-suite/wc_suite.py" "ls"\n')
+        (home / '.local/bin/wc-custom').write_text('#!/bin/sh\necho user-tool\n')
+        (home / '.local/lib/wc-suite').mkdir(parents=True)
+        (home / '.local/lib/wc-suite/wc_suite.py').write_text('# stub\n')
+        (home / '.local/share/bash-completion/completions').mkdir(parents=True)
+        (home / '.local/share/bash-completion/completions/wc-ls').write_text('# comp\n')
+        (home / '.local/share/zsh/site-functions').mkdir(parents=True)
+        (home / '.local/share/zsh/site-functions/_wc').write_text('#compdef _wc\n')
+        (home / '.config/fish/completions').mkdir(parents=True)
+        (home / '.config/fish/completions/wc-ls.fish').write_text('complete -c wc-ls\n')
+        (home / '.local/share/applications').mkdir(parents=True)
+        (home / '.local/share/applications/cube-prompts.desktop').write_text('[Desktop Entry]\n')
+        # FIFO / symlink dotfile should be skipped cleanly with a warning instead of hanging.
+        os.mkfifo(home / '.bash_profile')
+
+        runner = Runner()
+        migration = migrate.Migration(root, home, 'woez', run=runner)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = migrate.main(['--json', '--root', str(root)], migration)
+        self.assertEqual(code, 0)
+        plan_payload = json.loads(buf.getvalue())
+        self.assertEqual(plan_payload['mode'], 'dry-run')
+        self.assertTrue(any('cube-prompts' in s for s in plan_payload['steps']))
+        self.assertTrue(any('wc-suite' in s for s in plan_payload['steps']))
+        self.assertTrue(any('wc-ls' in s for s in plan_payload['steps']))
+        self.assertTrue(plan_payload['warnings'])
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = migrate.main(['--apply', '--json', '--root', str(root)], migration)
+        self.assertEqual(code, 0)
+        apply_payload = json.loads(buf.getvalue())
+        self.assertTrue(apply_payload['ok'])
+        self.assertFalse((home / '.local/bin/cube-prompts').exists())
+        self.assertFalse((home / '.local/bin/wc-ls').exists())
+        self.assertFalse((home / '.local/lib/wc-suite').exists())
+        self.assertTrue((home / '.local/bin/wc-custom').exists(), 'unrelated wc-* user script stays')
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = migrate.main(['--rollback', apply_payload['backup'], '--json', '--root', str(root)], migration)
+        self.assertEqual(code, 0)
+        rb_payload = json.loads(buf.getvalue())
+        self.assertEqual(rb_payload['mode'], 'rollback')
+        self.assertTrue((home / '.local/bin/cube-prompts').exists())
+        self.assertTrue((home / '.local/lib/wc-suite/wc_suite.py').exists())
+
+    def test_rollback_rejects_path_traversal_outside_sandbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'root'
+            home = Path(tmp) / 'home'
+            backup = Path(tmp) / 'backup'
+            root.mkdir()
+            home.mkdir()
+            (backup / 'files').mkdir(parents=True)
+            stolen = backup / 'files/evil'
+            stolen.write_text('x')
+            (backup / 'manifest.json').write_text(json.dumps({
+                'log': [{'moved': str(Path(tmp) / 'outside/target'), 'to': str(stolen)}]
+            }))
+            migration = migrate.Migration(root, home, 'woez')
+            with self.assertRaisesRegex(RuntimeError, 'outside target tree'):
+                migration.rollback(backup)
+
+    def test_version_flag_outputs_package_version(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, redirect_stdout(buf):
+            migrate.main(['--version'])
+        self.assertEqual(ctx.exception.code, 0)
+        self.assertIn('whitecube-migrate ', buf.getvalue())
 
 
 if __name__ == '__main__':
