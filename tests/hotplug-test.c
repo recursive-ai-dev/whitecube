@@ -189,9 +189,26 @@ static void test_grouped_tabs(struct wc_server *s) {
 	assert(wc_panel_key(s, XKB_KEY_Page_Down) && o->panel_selected > 1);
 	assert(wc_panel_key(s, XKB_KEY_End) && o->panel_selected == 19);
 	assert(!wc_panel_key(s, XKB_KEY_a));
-	wc_panel_key(s, XKB_KEY_Escape);
+	/* Clicking the panel scrollbar track updates panel_scroll and keeps the panel open. */
+	struct wc_panel_geom g = wc_panel_geom(1280, 300, g_tab_w, g_tab_h, o->more_x, 20);
+	o->panel_scroll = 0;
+	assert(wc_more_press(s, o, 1280, 300, g.x + g.w - g.pad - 2, g.y + g.h - g.pad - 1, BTN_LEFT));
+	assert(o->panel_open && o->panel_scroll == wc_panel_max_scroll(&g, 20));
+	/* Locking the session closes an open panel on real outputs. */
+	s->seat = wlr_seat_create(s->wl_display, "hotplug-lock"); assert(s->seat);
+	s->cursor = wlr_cursor_create(); assert(s->cursor);
+	s->cursor_mgr = wlr_xcursor_manager_create(NULL, 24); assert(s->cursor_mgr);
+	struct wlr_session_lock_v1 lock = {0};
+	wl_signal_init(&lock.events.new_surface); wl_signal_init(&lock.events.unlock); wl_signal_init(&lock.events.destroy);
+	server_new_lock(&s->new_lock, &lock);
+	assert(s->locked && !o->panel_open && !o->panel_buf->node.enabled);
 	for (int i = 0; i < 20; i++) wl_list_remove(&tabs[i].link);
 	s->focused = NULL;
+	wl_signal_emit_mutable(&lock.events.unlock, NULL);
+	wl_signal_emit_mutable(&lock.events.destroy, NULL);
+	wlr_cursor_destroy(s->cursor); s->cursor = NULL;
+	wlr_xcursor_manager_destroy(s->cursor_mgr); s->cursor_mgr = NULL;
+	wlr_seat_destroy(s->seat); s->seat = NULL;
 	wlr_output_destroy(screen); spin(s, 20);
 }
 
@@ -225,11 +242,14 @@ static void test_unplug_while_dragging_and_retiling(struct wc_server *s) {
 	assert(win.scene_tree->node.enabled && win.configured_w > 0 && win.configured_w < 1280);
 	if (base.configure_idle) { wl_event_source_remove(base.configure_idle); base.configure_idle = NULL; }
 	assert(win.output == oa && win.tab_border && win.tab_cube && win.tab_label);
+	struct wc_output *ob_initial = NULL, *oi;
+	wl_list_for_each(oi, &s->outputs, link) if (oi != oa) ob_initial = oi;
+	assert(ob_initial && oa->tab_tree->node.enabled && !ob_initial->tab_tree->node.enabled);
 	wlr_output_destroy(oa->wlr_output);
 	if (base.configure_idle) { wl_event_source_remove(base.configure_idle); base.configure_idle = NULL; }
 	spin(s, 20);
 	struct wc_output *ob = server_first_output(s);
-	assert(ob && ob != oa && win.output == ob && win.tab_border && win.tab_cube && win.tab_label);
+	assert(ob && ob != oa && win.output == ob && ob->tab_tree->node.enabled && win.tab_border && win.tab_cube && win.tab_label);
 	wlr_output_destroy(ob->wlr_output); spin(s, 20);
 	wc_retile(s);                                  /* retiling after removal must not touch freed output */
 	assert(!win.output && !win.tab_border && !win.tab_cube && !win.tab_label);

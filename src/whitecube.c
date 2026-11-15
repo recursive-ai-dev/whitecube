@@ -49,6 +49,9 @@
 #ifndef DRM_FORMAT_ARGB8888
 #define DRM_FORMAT_ARGB8888 0x34325241 // 'AR24', cairo's ARGB32 layout on little-endian
 #endif
+#ifndef WHITECUBE_VERSION
+#define WHITECUBE_VERSION "0.12.0"
+#endif
 #include "desktop-state.h"
 #include <wlr/types/wlr_fractional_scale_v1.h>
 #include <wlr/types/wlr_idle_inhibit_v1.h>
@@ -627,6 +630,14 @@ static void wc_retile(struct wc_server *server) {
 	int work_y = full ? 0 : bounded(g_tab_h, 0, H - 1), work_h = H - work_y;
 	fullscreen_hint(full != NULL || server->locked);
 	wlr_scene_node_set_enabled(&server->top->node, !full && !server->locked);
+	struct wc_output *other;
+	wl_list_for_each(other, &server->outputs, link) {
+		if (other->tab_tree) wlr_scene_node_set_enabled(&other->tab_tree->node, other == out);
+		if (other != out && other->panel_open) {
+			other->panel_open = false; other->panel_scroll = 0; other->panel_key[0] = 0;
+			if (other->panel_buf) wlr_scene_node_set_enabled(&other->panel_buf->node, false);
+		}
+	}
 	wlr_scene_rect_set_size(out->tab_bg, W, g_tab_h);
 	wlr_scene_node_set_position(&out->tab_tree->node, box.x, box.y);
 	for (unsigned i = 0; i < WORKSPACES; i++) {
@@ -801,6 +812,41 @@ static void wc_adjust_window(struct wc_server *s, xkb_keysym_t sym, bool resize)
 		if (t->layout_x + t->layout_w > 1000) t->layout_x = 1000 - t->layout_w;
 		if (t->layout_y + t->layout_h > 1000) t->layout_y = 1000 - t->layout_h;
 	}
+	wc_retile(s);
+}
+static void wc_snap_window(struct wc_server *s, xkb_keysym_t sym) {
+	if (!s || s->drag.toplevel) return;
+	struct wc_toplevel *t = s->focused;
+	if (!t || t->fullscreen) return;
+	if (t->maximized) {
+		t->maximized = false;
+		wlr_xdg_toplevel_set_maximized(t->xdg_toplevel, false);
+	}
+	if (sym == XKB_KEY_Left) { t->layout_x = 0; t->layout_y = 0; t->layout_w = 500; t->layout_h = 1000; }
+	else if (sym == XKB_KEY_Right) { t->layout_x = 500; t->layout_y = 0; t->layout_w = 500; t->layout_h = 1000; }
+	else if (sym == XKB_KEY_Up) { t->layout_x = 0; t->layout_y = 0; t->layout_w = 1000; t->layout_h = 500; }
+	else if (sym == XKB_KEY_Down) { t->layout_x = 0; t->layout_y = 500; t->layout_w = 1000; t->layout_h = 500; }
+	else return;
+	wc_retile(s);
+}
+static void wc_center_window(struct wc_server *s) {
+	if (!s || s->drag.toplevel) return;
+	struct wc_toplevel *t = s->focused;
+	if (!t || t->fullscreen || t->maximized) return;
+	if (!t->layout_w || !t->layout_h) {
+		t->layout_w = is_scripts(t) ? 880 : 760;
+		t->layout_h = is_scripts(t) ? 470 : 780;
+	}
+	t->layout_x = (1000 - t->layout_w) / 2;
+	t->layout_y = (1000 - t->layout_h) / 2;
+	wc_retile(s);
+}
+static void wc_toggle_maximize(struct wc_server *s) {
+	if (!s || s->drag.toplevel) return;
+	struct wc_toplevel *t = s->focused;
+	if (!t || t->fullscreen) return;
+	t->maximized = !t->maximized;
+	wlr_xdg_toplevel_set_maximized(t->xdg_toplevel, t->maximized);
 	wc_retile(s);
 }
 static void wc_focus_nth(struct wc_server *s, int n) {
@@ -995,10 +1041,12 @@ static bool wc_out_size(struct wc_output *o, int *W, int *H) {
 	return *W > 0 && *H > 0;
 }
 static void wc_panel_close(struct wc_server *s) {
-	struct wc_output *o = server_first_output(s);
-	if (!o || !o->panel_buf) return;
-	o->panel_open = false; o->panel_scroll = 0; o->panel_key[0] = 0;
-	wlr_scene_node_set_enabled(&o->panel_buf->node, false);
+	if (!s) return;
+	struct wc_output *o;
+	wl_list_for_each(o, &s->outputs, link) {
+		o->panel_open = false; o->panel_scroll = 0; o->panel_key[0] = 0;
+		if (o->panel_buf) wlr_scene_node_set_enabled(&o->panel_buf->node, false);
+	}
 }
 static void wc_panel_refresh(struct wc_server *s) {
 	struct wc_output *o = server_first_output(s);
@@ -1123,7 +1171,16 @@ static bool wc_panel_key(struct wc_server *s, xkb_keysym_t sym) {
 		if (t) wlr_xdg_toplevel_send_close(t->xdg_toplevel);
 		return true;
 	}
-	default: return false;
+	default:
+		if ((sym >= XKB_KEY_1 && sym <= XKB_KEY_9) || (sym >= XKB_KEY_KP_1 && sym <= XKB_KEY_KP_9)) {
+			int idx = (sym >= XKB_KEY_KP_1 && sym <= XKB_KEY_KP_9) ? (int)(sym - XKB_KEY_KP_1) : (int)(sym - XKB_KEY_1);
+			if (idx < n) {
+				struct wc_toplevel *t = wc_nth_tab(s, idx);
+				wc_panel_close(s); if (t) wc_focus(t);
+			}
+			return true;
+		}
+		return false;
 	}
 	if (o->panel_selected >= n) o->panel_selected = n - 1;
 	if (o->panel_selected < 0) o->panel_selected = 0;
@@ -1141,10 +1198,15 @@ static bool wc_more_press(struct wc_server *s, struct wc_output *o, int W, int H
 	int n = wc_count_tabs(s);
 	struct wc_panel_geom g = wc_panel_geom(W, H, g_tab_w, g_tab_h, o->more_x, n);
 	if (wc_panel_contains(&g, px, py)) {
+		if (button == BTN_LEFT && wc_panel_on_scrollbar(&g, n, px)) {
+			o->panel_scroll = wc_panel_scroll_at(&g, n, py);
+			wc_panel_refresh(s);
+			return true;
+		}
 		int row = wc_panel_row_at(&g, n, o->panel_scroll, px, py);
 		struct wc_toplevel *t = row >= 0 ? wc_nth_tab(s, row) : NULL;
 		if (!t) return true;
-		if (button == BTN_MIDDLE || (button == BTN_LEFT && wc_panel_on_close(&g, tab_close_w(), px)))
+		if (button == BTN_MIDDLE || (button == BTN_LEFT && wc_panel_on_close_for_count(&g, n, tab_close_w(), px)))
 			wlr_xdg_toplevel_send_close(t->xdg_toplevel);
 		else if (button == BTN_LEFT) { wc_panel_close(s); wc_focus(t); }
 		return true;
@@ -1156,6 +1218,8 @@ static bool wc_more_press(struct wc_server *s, struct wc_output *o, int W, int H
 // immediate compositor shutdown from racing the child's setsid().
 static pid_t spawn(const char *cmd) {
 	if (!cmd) return -1;
+	while (*cmd && isspace((unsigned char)*cmd)) cmd++;
+	if (!*cmd) return -1;
 	int ready[2];
 	if (pipe(ready) < 0) return -1;
 	fcntl(ready[0], F_SETFD, FD_CLOEXEC);
@@ -1314,12 +1378,16 @@ static bool handle_keybinding(struct wc_server *server, xkb_keysym_t sym, uint32
 	if (server->locked) return false;
 	sym = xkb_keysym_to_lower(sym);
 	if (sym >= XKB_KEY_F1 && sym <= XKB_KEY_F4) {
+		wc_panel_close(server);
 		wc_workspace(server, sym - XKB_KEY_F1, (mods & WLR_MODIFIER_SHIFT) != 0);
 		return true;
 	}
 	if (sym == XKB_KEY_Left || sym == XKB_KEY_Right || sym == XKB_KEY_Up || sym == XKB_KEY_Down) {
 		if (!(mods & (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL))) return false;
-		wc_adjust_window(server, sym, (mods & WLR_MODIFIER_CTRL) != 0); return true;
+		if ((mods & (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL)) == (WLR_MODIFIER_SHIFT | WLR_MODIFIER_CTRL))
+			wc_snap_window(server, sym);
+		else wc_adjust_window(server, sym, (mods & WLR_MODIFIER_CTRL) != 0);
+		return true;
 	}
 	switch (sym) {
 	case XKB_KEY_Escape: // Alt+Shift+Esc: plain Alt+Esc is too easy to hit and ends the session
@@ -1358,6 +1426,8 @@ static bool handle_keybinding(struct wc_server *server, xkb_keysym_t sym, uint32
 	}
 	case XKB_KEY_w: spawn(g_browser_cmd); break;
 	case XKB_KEY_s: spawn(g_settings_cmd); break;
+	case XKB_KEY_m: wc_toggle_maximize(server); break;
+	case XKB_KEY_0: wc_center_window(server); break;
 	case XKB_KEY_v:
 		wc_cancel_drag(server);
 		server->desktop_visible = !server->desktop_visible;
@@ -1446,6 +1516,7 @@ static void kb_destroy(struct wl_listener *l, void *data) {
 static void server_new_keyboard(struct wc_server *s, struct wlr_input_device *dev) {
 	struct wlr_keyboard *wk = wlr_keyboard_from_input_device(dev);
 	struct wc_keyboard *kb = calloc(1, sizeof(*kb));
+	if (!wk || !kb) { free(kb); return; }
 	kb->server = s; kb->wlr_keyboard = wk;
 	wc_apply_keymap(wk);
 	kb->modifiers.notify = kb_modifiers; wl_signal_add(&wk->events.modifiers, &kb->modifiers);
@@ -1519,7 +1590,7 @@ static void activation_req(struct wl_listener *l, void *data) {
 	struct wlr_xdg_toplevel *x = wlr_xdg_toplevel_try_from_wlr_surface(ev->surface);
 	struct wc_toplevel *t = x ? wc_toplevel_of(x) : NULL;
 	if (!t || !t->mapped) return;
-	if (t->workspace != s->workspace) wc_workspace(s, t->workspace, false);
+	if (t->workspace != s->workspace) { wc_panel_close(s); wc_workspace(s, t->workspace, false); }
 	t->hidden = false;
 	wc_focus(t);
 }
@@ -1529,6 +1600,7 @@ static bool wc_idle_inhibited(struct wc_server *s) {
 	if (!s->idle_inhibit || s->locked) return false;
 	struct wlr_idle_inhibitor_v1 *inhibitor;
 	wl_list_for_each(inhibitor, &s->idle_inhibit->inhibitors, link) {
+		if (!inhibitor || !inhibitor->surface) continue;
 		struct wlr_xdg_toplevel *x = wlr_xdg_toplevel_try_from_wlr_surface(wlr_surface_get_root_surface(inhibitor->surface));
 		struct wc_toplevel *t = x ? wc_toplevel_of(x) : NULL;
 		if (t && t->mapped && t->scene_tree->node.enabled) return true;
@@ -1694,7 +1766,7 @@ static void cursor_button(struct wl_listener *l, void *data) {
 		double sx, sy;
 		struct wlr_scene_node *node = wlr_scene_node_at(&s->scene->tree.node, s->cursor->x, s->cursor->y, &sx, &sy);
 		while (node && !node->data) node = node->parent ? &node->parent->node : NULL;
-		if (node && node->data) {
+		if (node && node->parent == s->windows && node->data) {
 			struct wc_toplevel *t = node->data;
 			wc_focus(t);
 			struct wlr_keyboard *kb = wlr_seat_get_keyboard(s->seat);
@@ -1961,6 +2033,7 @@ static void server_new_output(struct wl_listener *l, void *data) {
 	}
 	wlr_output_state_finish(&st);
 	struct wc_output *o = calloc(1, sizeof(*o));
+	if (!o) return;
 	o->server = s; o->wlr_output = wo;
 	o->frame_retry_timer = wl_event_loop_add_timer(wl_display_get_event_loop(s->wl_display), output_retry_frame, o);
 	if (!o->frame_retry_timer) wlr_log(WLR_ERROR, "could not create frame retry timer for %s", wo->name);
@@ -1973,26 +2046,28 @@ static void server_new_output(struct wl_listener *l, void *data) {
 	else {
 		struct wlr_output_layout_output *lo = wlr_output_layout_add_auto(s->output_layout, wo);
 		struct wlr_scene_output *so = wlr_scene_output_create(s->scene, wo);
-		wlr_scene_output_layout_add_output(s->scene_layout, lo, so);
+		if (lo && so) wlr_scene_output_layout_add_output(s->scene_layout, lo, so);
 	}
 	o->bg_tree = wlr_scene_tree_create(s->background);
-	wlr_scene_node_lower_to_bottom(&o->bg_tree->node);
+	if (o->bg_tree) wlr_scene_node_lower_to_bottom(&o->bg_tree->node);
 	o->tab_tree = wlr_scene_tree_create(s->top);
 	o->lock_bg = wlr_scene_rect_create(s->lock_tree, 1, 1, (float[4]){0, 0, 0, 1});
-	wlr_scene_node_lower_to_bottom(&o->lock_bg->node);
-	o->tab_bg = wlr_scene_rect_create(o->tab_tree, 1, g_tab_h, g_tabbar);
-	wlr_scene_node_set_position(&o->tab_bg->node, 0, 0);
-	for (unsigned i = 0; i < WORKSPACES; i++)
-		o->workspace_cube[i] = wlr_scene_rect_create(o->tab_tree, 18, 18, g_grid_c);
-	o->more_border = wlr_scene_rect_create(o->tab_tree, 1, 1, g_border);
-	o->more_cube = wlr_scene_rect_create(o->tab_tree, 1, 1, g_unfocused);
-	o->more_label = wlr_scene_buffer_create(o->tab_tree, NULL);
-	o->panel_buf = wlr_scene_buffer_create(o->tab_tree, NULL);
-	wlr_scene_node_set_enabled(&o->more_border->node, false);
-	wlr_scene_node_set_enabled(&o->more_cube->node, false);
-	wlr_scene_node_set_enabled(&o->more_label->node, false);
-	wlr_scene_node_set_enabled(&o->panel_buf->node, false);
-	wlr_scene_node_raise_to_top(&o->tab_tree->node);
+	if (o->lock_bg) wlr_scene_node_lower_to_bottom(&o->lock_bg->node);
+	if (o->tab_tree) {
+		o->tab_bg = wlr_scene_rect_create(o->tab_tree, 1, g_tab_h, g_tabbar);
+		if (o->tab_bg) wlr_scene_node_set_position(&o->tab_bg->node, 0, 0);
+		for (unsigned i = 0; i < WORKSPACES; i++)
+			o->workspace_cube[i] = wlr_scene_rect_create(o->tab_tree, 18, 18, g_grid_c);
+		o->more_border = wlr_scene_rect_create(o->tab_tree, 1, 1, g_border);
+		o->more_cube = wlr_scene_rect_create(o->tab_tree, 1, 1, g_unfocused);
+		o->more_label = wlr_scene_buffer_create(o->tab_tree, NULL);
+		o->panel_buf = wlr_scene_buffer_create(o->tab_tree, NULL);
+		if (o->more_border) wlr_scene_node_set_enabled(&o->more_border->node, false);
+		if (o->more_cube) wlr_scene_node_set_enabled(&o->more_cube->node, false);
+		if (o->more_label) wlr_scene_node_set_enabled(&o->more_label->node, false);
+		if (o->panel_buf) wlr_scene_node_set_enabled(&o->panel_buf->node, false);
+		wlr_scene_node_raise_to_top(&o->tab_tree->node);
+	}
 	wc_output_refresh(o);
 	output_manager_update(s);
 	wc_retile(s);
@@ -2132,8 +2207,10 @@ static void server_new_toplevel(struct wl_listener *l, void *data) {
 	struct wc_server *s = wl_container_of(l, s, new_xdg_toplevel);
 	struct wlr_xdg_toplevel *x = data;
 	struct wc_toplevel *t = calloc(1, sizeof(*t));
+	if (!t) { if (x->resource) wl_resource_post_no_memory(x->resource); return; }
 	t->server = s; t->xdg_toplevel = x; t->workspace = s->workspace; t->saved_index = -1;
 	t->scene_tree = wlr_scene_xdg_surface_create(s->windows, x->base);
+	if (!t->scene_tree) { free(t); if (x->resource) wl_resource_post_no_memory(x->resource); return; }
 	t->scene_tree->node.data = t; x->base->data = t->scene_tree;
 	t->map.notify = t_map; wl_signal_add(&x->base->surface->events.map, &t->map);
 	t->unmap.notify = t_unmap; wl_signal_add(&x->base->surface->events.unmap, &t->unmap);
@@ -2344,6 +2421,7 @@ static void server_new_lock(struct wl_listener *l, void *data) {
 	struct wlr_session_lock_v1 *lock = data;
 	if (s->lock) { wlr_session_lock_v1_destroy(lock); return; }
 	s->lock = lock; s->locked = true;
+	wc_panel_close(s);
 	wc_cancel_drag(s); s->drag = (struct wc_drag){0};
 	wc_cancel_data_drag(s);
 	wlr_seat_keyboard_end_grab(s->seat); wlr_seat_pointer_end_grab(s->seat);
@@ -2383,6 +2461,7 @@ static void server_new_layer(struct wl_listener *l, void *data) {
 	if (!out) return;
 	ls->output = out->wlr_output;
 	struct wc_layer_surface *obj = calloc(1, sizeof(*obj));
+	if (!obj) { if (ls->resource) wl_resource_post_no_memory(ls->resource); return; }
 	obj->server = s; obj->layer_surface = ls; obj->output = out;
 	struct wlr_scene_tree *parent = s->top;
 	switch (ls->pending.layer) {
@@ -2392,7 +2471,8 @@ static void server_new_layer(struct wl_listener *l, void *data) {
 	default: break;
 	}
 	obj->scene = wlr_scene_layer_surface_v1_create(parent, ls);
-	if (obj->scene) ls->data = obj->scene->tree; // popups of this surface attach here
+	if (!obj->scene) { free(obj); if (ls->resource) wl_resource_post_no_memory(ls->resource); return; }
+	ls->data = obj->scene->tree; // popups of this surface attach here
 	struct wlr_box box; wlr_output_layout_get_box(s->output_layout, out->wlr_output, &box);
 	wlr_scene_node_set_position(&obj->scene->tree->node, box.x, box.y);
 	obj->map.notify = layer_map; wl_signal_add(&ls->surface->events.map, &obj->map);
@@ -2400,13 +2480,70 @@ static void server_new_layer(struct wl_listener *l, void *data) {
 	obj->destroy.notify = layer_destroy; wl_signal_add(&ls->events.destroy, &obj->destroy);
 	obj->commit.notify = layer_commit; wl_signal_add(&ls->surface->events.commit, &obj->commit);
 }
+static int validate_config_syntax(const char *path) {
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
+	int issues = 0, lineno = 0;
+	char *line = NULL; size_t cap = 0;
+	while (getline(&line, &cap, f) >= 0) {
+		lineno++;
+		char *k = line;
+		while (*k == ' ' || *k == '\t') k++;
+		if (*k == '#' || *k == '\n' || *k == '\r' || !*k) continue;
+		if (!strchr(k, '=')) {
+			fprintf(stderr, "whitecube: %s:%d: expected key=value\n", path, lineno);
+			issues++;
+		}
+	}
+	free(line);
+	fclose(f);
+	return issues;
+}
+static int run_check_config(void) {
+	int issues = validate_config_syntax("/etc/whitecube/config");
+	const char *home = getenv("HOME");
+	if (home && *home) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s/.config/whitecube/config", home);
+		issues += validate_config_syntax(path);
+	}
+	load_config();
+	char state_dir[512] = "";
+	bool has_state = wc_state_directory(state_dir, sizeof(state_dir));
+	if (has_state) {
+		char acc[600];
+		snprintf(acc, sizeof(acc), "%s/accessibility.json", state_dir);
+		wc_accessibility_load(acc, &g_accessibility);
+	}
+	if (issues > 0) return 1;
+	printf("whitecube %s: config ok (tab_w=%d tab_h=%d grid_step=%d repeat_rate=%d repeat_delay=%d lock_minutes=%d remember_layout=%s)\n",
+		WHITECUBE_VERSION, g_tab_w, g_tab_h, g_grid, g_repeat_rate, g_repeat_delay,
+		g_lock_minutes, g_remember_layout ? "true" : "false");
+	return 0;
+}
+static void print_usage(FILE *out, const char *argv0) {
+	fprintf(out, "Usage: %s [-s command] [-c|--check-config] [-v|--version] [-h|--help]\n", argv0);
+}
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_INFO, NULL);
-	char *startup = NULL; int c;
-	while ((c = getopt(argc, argv, "s:h")) != -1) {
+	char *startup = NULL;
+	bool check_config = false;
+	static const struct option long_opts[] = {
+		{"startup", required_argument, NULL, 's'},
+		{"check-config", no_argument, NULL, 'c'},
+		{"version", no_argument, NULL, 'v'},
+		{"help", no_argument, NULL, 'h'},
+		{NULL, 0, NULL, 0},
+	};
+	int c;
+	while ((c = getopt_long(argc, argv, "s:cvh", long_opts, NULL)) != -1) {
 		if (c == 's') startup = optarg;
-		else { printf("Usage: %s [-s startup command]\n", argv[0]); return 0; }
+		else if (c == 'c') check_config = true;
+		else if (c == 'v') { printf("whitecube %s\n", WHITECUBE_VERSION); return 0; }
+		else if (c == 'h') { print_usage(stdout, argv[0]); return 0; }
+		else { print_usage(stderr, argv[0]); return 2; }
 	}
+	if (check_config) return run_check_config();
 	signal(SIGCHLD, SIG_IGN);
 	load_config();
 	struct wc_server server = {0};

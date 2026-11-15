@@ -33,7 +33,7 @@ settings_sources = [xdg, 'src/protocols/wlr-output-management-protocol.c']
 # compatibility name build/whitecube is staged by BUILD.sh; installs use the
 # namespaced public command to coexist with the unrelated whitecube image tool.
 compositor = executable('whitecube-compositor', 'src/whitecube.c',
-  c_args: ['-DWLR_USE_UNSTABLE'], dependencies: compositor_deps,
+  c_args: ['-DWLR_USE_UNSTABLE', '-DWHITECUBE_VERSION="' + meson.project_version() + '"'], dependencies: compositor_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 ca = executable('cube-ca', ['src/cube-ca.c', layer, xdg], dependencies: [wayland_client, m],
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
@@ -103,6 +103,9 @@ test('workspace-state', workspace_test, suite: 'core')
 test('wallpaper-state', ca, args: ['--self-test'], suite: 'core')
 test('wallpaper-preview', ca, args: ['--preview', meson.current_build_dir() / 'cube-space.ppm'], suite: 'core')
 test('status-preview', status, args: ['--render', meson.current_build_dir()], env: schema_env, suite: 'core')
+test('compositor-cli-help', compositor, args: ['--help'], suite: 'core')
+test('compositor-cli-version', compositor, args: ['--version'], suite: 'core')
+test('compositor-check-config', compositor, args: ['--check-config'], env: schema_env, suite: 'core')
 
 foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'test-install.py'],
                 ['native-preference-validation', 'test-preferences.py'],

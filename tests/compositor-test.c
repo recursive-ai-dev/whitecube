@@ -332,6 +332,15 @@ static void test_tab_overflow(void) {
 	assert(wc_panel_reveal(&g, 50, 40, 0) == 0);
 	g = wc_panel_geom(1920, 1080, 180, 40, 104, 0);
 	assert(g.rows == 1 && g.h > 0 && wc_panel_row_at(&g, 0, 0, 120, 48) == -1);
+	/* Scrollbar track and adjusted close-button bounds when scrolling. */
+	g = wc_panel_geom(1920, 300, 180, 40, 500, 20);
+	assert(wc_panel_has_scrollbar(&g, 20));
+	assert(wc_panel_on_scrollbar(&g, 20, g.x + g.w - g.pad - 3));
+	assert(!wc_panel_on_scrollbar(&g, 4, g.x + g.w - g.pad - 3));
+	assert(!wc_panel_on_close_for_count(&g, 20, 24, g.x + g.w - g.pad - 3));
+	assert(wc_panel_on_close_for_count(&g, 20, 24, g.x + g.w - g.pad - 6 - 10));
+	assert(wc_panel_scroll_at(&g, 20, g.y + g.pad) == 0);
+	assert(wc_panel_scroll_at(&g, 20, g.y + g.h - g.pad) == wc_panel_max_scroll(&g, 20));
 }
 
 static void test_reopened_window_is_visible(void) {
@@ -666,6 +675,102 @@ static void test_client_drag_validation_and_edges(void) {
 	window_fixture_finish(&f);
 }
 
+static void test_window_snap_center_maximize(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	struct test_window win;
+	test_window_init(&f, &win, "editor", NULL);
+	t_map(&win.window.map, NULL);
+	assert(f.server.focused == &win.window && !win.window.maximized);
+	/* Alt+Ctrl+Shift+Arrows snap to 50% screen halves cleanly. */
+	uint32_t snap_mods = WLR_MODIFIER_ALT | WLR_MODIFIER_CTRL | WLR_MODIFIER_SHIFT;
+	assert(handle_keybinding(&f.server, XKB_KEY_Left, snap_mods));
+	assert(win.window.layout_x == 0 && win.window.layout_y == 0 && win.window.layout_w == 500 && win.window.layout_h == 1000);
+	assert(handle_keybinding(&f.server, XKB_KEY_Right, snap_mods));
+	assert(win.window.layout_x == 500 && win.window.layout_y == 0 && win.window.layout_w == 500 && win.window.layout_h == 1000);
+	assert(handle_keybinding(&f.server, XKB_KEY_Up, snap_mods));
+	assert(win.window.layout_x == 0 && win.window.layout_y == 0 && win.window.layout_w == 1000 && win.window.layout_h == 500);
+	assert(handle_keybinding(&f.server, XKB_KEY_Down, snap_mods));
+	assert(win.window.layout_x == 0 && win.window.layout_y == 500 && win.window.layout_w == 1000 && win.window.layout_h == 500);
+	/* Alt+M toggles maximize while preserving floating layout bounds, and snapping unmaximizes. */
+	assert(handle_keybinding(&f.server, XKB_KEY_m, WLR_MODIFIER_ALT));
+	assert(win.window.maximized && win.window.configured_w == 1280);
+	assert(handle_keybinding(&f.server, XKB_KEY_m, WLR_MODIFIER_ALT));
+	assert(!win.window.maximized && win.window.layout_y == 500 && win.window.layout_h == 500);
+	assert(handle_keybinding(&f.server, XKB_KEY_m, WLR_MODIFIER_ALT));
+	assert(handle_keybinding(&f.server, XKB_KEY_Left, snap_mods));
+	assert(!win.window.maximized && win.window.layout_w == 500 && win.window.layout_h == 1000);
+	/* Alt+0 centers floating window inside the work area. */
+	win.window.layout_x = 10; win.window.layout_y = 20; win.window.layout_w = 600; win.window.layout_h = 400;
+	assert(handle_keybinding(&f.server, XKB_KEY_0, WLR_MODIFIER_ALT));
+	assert(win.window.layout_x == 200 && win.window.layout_y == 300);
+	window_fixture_finish(&f);
+}
+
+static void test_idle_inhibit_and_config_syntax(void) {
+	struct wc_server server = {0};
+	struct wlr_idle_inhibit_manager_v1 mgr = {0};
+	wl_list_init(&mgr.inhibitors);
+	server.idle_inhibit = &mgr;
+	struct wlr_idle_inhibitor_v1 orphan = {.surface = NULL};
+	wl_list_insert(&mgr.inhibitors, &orphan.link);
+	assert(!wc_idle_inhibited(&server));
+	wl_list_remove(&orphan.link);
+
+	char valid_path[] = "/tmp/whitecube-valid-XXXXXX";
+	int fd1 = mkstemp(valid_path); assert(fd1 >= 0);
+	FILE *f1 = fdopen(fd1, "w"); assert(f1 && fputs("# ok\ntab_w = 200\n", f1) >= 0 && !fclose(f1));
+	assert(validate_config_syntax(valid_path) == 0);
+	assert(unlink(valid_path) == 0);
+
+	char bad_path[] = "/tmp/whitecube-bad-XXXXXX";
+	int fd2 = mkstemp(bad_path); assert(fd2 >= 0);
+	FILE *f2 = fdopen(fd2, "w"); assert(f2 && fputs("not_a_pair\n", f2) >= 0 && !fclose(f2));
+	assert(validate_config_syntax(bad_path) == 1);
+	assert(unlink(bad_path) == 0);
+
+	assert(spawn("") == -1 && spawn("   \t ") == -1);
+}
+
+static void test_panel_digit_shortcuts_and_lock(void) {
+	struct window_fixture f; window_fixture_init(&f);
+	f.server.background = wlr_scene_tree_create(&f.server.scene->tree);
+	f.server.bottom = wlr_scene_tree_create(&f.server.scene->tree);
+	f.server.overlay = wlr_scene_tree_create(&f.server.scene->tree);
+	f.server.lock_tree = wlr_scene_tree_create(&f.server.scene->tree);
+	f.server.cursor = wlr_cursor_create();
+	f.server.cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
+	wl_list_init(&f.server.lock_surfaces);
+	f.output.lock_bg = wlr_scene_rect_create(f.server.lock_tree, 1, 1, (float[4]){0, 0, 0, 1});
+	f.output.more_border = wlr_scene_rect_create(f.output.tab_tree, 1, 1, g_border);
+	f.output.more_cube = wlr_scene_rect_create(f.output.tab_tree, 1, 1, g_unfocused);
+	f.output.more_label = wlr_scene_buffer_create(f.output.tab_tree, NULL);
+	f.output.panel_buf = wlr_scene_buffer_create(f.output.tab_tree, NULL);
+	struct test_window w1, w2, w3;
+	test_window_init(&f, &w1, "app1", NULL);
+	test_window_init(&f, &w2, "app2", NULL);
+	test_window_init(&f, &w3, "app3", NULL);
+	t_map(&w1.window.map, NULL);
+	t_map(&w2.window.map, NULL);
+	t_map(&w3.window.map, NULL);
+	assert(f.output.more_on && f.server.focused == &w3.window);
+	wc_panel_toggle(&f.server);
+	assert(f.output.panel_open);
+	assert(wc_panel_key(&f.server, XKB_KEY_2) && !f.output.panel_open && f.server.focused == &w2.window);
+	wc_panel_toggle(&f.server);
+	assert(f.output.panel_open);
+	assert(wc_panel_key(&f.server, XKB_KEY_KP_1) && !f.output.panel_open && f.server.focused == &w3.window);
+	wc_panel_toggle(&f.server);
+	assert(f.output.panel_open);
+	assert(wc_panel_key(&f.server, XKB_KEY_3) && !f.output.panel_open && f.server.focused == &w1.window);
+	/* Closing panel via wc_panel_close disables the panel buffer and resets state cleanly. */
+	wc_panel_toggle(&f.server);
+	assert(f.output.panel_open && f.output.panel_buf->node.enabled);
+	wc_panel_close(&f.server);
+	assert(!f.output.panel_open && !f.output.panel_buf->node.enabled);
+	wlr_cursor_destroy(f.server.cursor); wlr_xcursor_manager_destroy(f.server.cursor_mgr);
+	window_fixture_finish(&f);
+}
+
 int main(void) {
 	test_applied_keyboard();
 	test_reload_defaults();
@@ -683,6 +788,9 @@ int main(void) {
 	test_idle_lock();
 	test_lock_output_geometry();
 	test_tab_overflow();
+	test_window_snap_center_maximize();
+	test_idle_inhibit_and_config_syntax();
+	test_panel_digit_shortcuts_and_lock();
 	puts("compositor: configuration, shortcuts, placement, privacy persistence and fail-closed lock isolation passed");
 	return 0;
 }

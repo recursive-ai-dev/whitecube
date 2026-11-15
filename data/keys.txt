@@ -6,8 +6,8 @@ launch, Esc to close. Click the Wi-Fi box (top right) for network settings, the 
 settings (volume, brightness, Wi-Fi, lock, power). Super or Alt+Space opens the
 app menu. The "N windows" button lists the floating windows on this workspace.
 Click it or press Alt+G to list every window: click a row to switch, its x or middle-click
-to close, wheel to scroll, Escape or a click elsewhere to dismiss. Arrow keys,
-Tab/Shift+Tab, Home/End and PageUp/PageDown select rows; Enter switches, Delete closes.
+to close, wheel or click the scrollbar track to scroll, Escape or a click elsewhere to dismiss. Arrow keys,
+Tab/Shift+Tab, Home/End, PageUp/PageDown and 1..9 select rows; Enter switches, Delete closes.
 The list opens at the focused window; hidden windows are marked. Empty workspaces show "0 windows".
 
 Hold Alt with a key:
@@ -27,8 +27,11 @@ Hold Alt with a key:
   a       keyboard display preferences, native workspace names and recovery
   Tab / Shift+Tab  next / previous visible window
   1..9    jump to a window in this workspace (also reveals hidden panels)
-  Shift+arrows  move focused window within the work area
-  Ctrl+arrows   resize focused window within the work area
+  m       toggle maximize for the focused window
+  0       center the focused floating window in the work area
+  Shift+arrows       move focused window within the work area
+  Ctrl+arrows        resize focused window within the work area
+  Ctrl+Shift+arrows  snap focused window to left / right / top / bottom half
   left-drag    move the window under the pointer (hold Alt)
   right-drag   resize the window under the pointer (hold Alt)
   q       close focused window

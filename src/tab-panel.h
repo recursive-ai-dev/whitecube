@@ -58,6 +58,31 @@ static inline int wc_panel_row_at(const struct wc_panel_geom *g, int n, int scro
 static inline int wc_panel_on_close(const struct wc_panel_geom *g, int close_w, double px) {
 	return px >= g->x + g->w - g->pad - close_w - 6;
 }
+// True when the dropdown panel shows a vertical scrollbar track.
+static inline int wc_panel_has_scrollbar(const struct wc_panel_geom *g, int n) {
+	return n > g->rows && g->rows > 0;
+}
+// True when the pointer hits the 6px right-edge scrollbar column inside the panel.
+static inline int wc_panel_on_scrollbar(const struct wc_panel_geom *g, int n, double px) {
+	return wc_panel_has_scrollbar(g, n) && px >= g->x + g->w - g->pad - 6 && px < g->x + g->w;
+}
+// Map a vertical click coordinate inside the panel to a clamped scroll offset.
+static inline int wc_panel_scroll_at(const struct wc_panel_geom *g, int n, double py) {
+	int max = wc_panel_max_scroll(g, n);
+	if (max <= 0 || g->rows <= 0 || g->pitch <= 0) return 0;
+	double track = (double)(g->rows * g->pitch);
+	double rel = (py - (double)(g->y + g->pad)) / track;
+	if (rel <= 0.0) return 0;
+	if (rel >= 1.0) return max;
+	int scroll = (int)(rel * (double)max + 0.5);
+	return wc_panel_clamp_scroll(g, n, scroll);
+}
+// Close button hit-test accounting for the 6px scrollbar reserve when scrolling.
+static inline int wc_panel_on_close_for_count(const struct wc_panel_geom *g, int n, int close_w, double px) {
+	if (wc_panel_on_scrollbar(g, n, px)) return 0;
+	int reserve = wc_panel_has_scrollbar(g, n) ? 6 : 0;
+	return px >= g->x + g->w - g->pad - reserve - close_w - 6;
+}
 
 // Keep a keyboard-selected row in view, including when the list shrinks.
 static inline int wc_panel_reveal(const struct wc_panel_geom *g, int n, int scroll, int selected) {
