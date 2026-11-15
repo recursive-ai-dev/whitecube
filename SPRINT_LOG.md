@@ -28,3 +28,11 @@
   - Build/Tests: updated `meson.build` (`-DWHITECUBE_VERSION` for `cube-settings`/`settings-test`, `settings-cli-help`, `settings-cli-version`), extended `tests/settings-test.c` (`Ctrl+W`, `Delete`, CLI exit checks), and added `HelperPowerAndSystem` tests in `tests/test-settings-transactions.py`.
 - **Tests & Verification**:
   - Full `./BUILD.sh` and `packaging/check-tree.py packaging/out/stage --sources src` passed inside `bwrap` with zero warnings or failures.
+
+## [2026-11-15] src/cube-audio/ | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - `src/cube-audio/cube-audio.c`: added `-h|--help`, `-v|--version` (`WHITECUBE_VERSION`), `--json` output across `cards`/`status`/`volume`/`mute`/`info`, `-c|--control CTL` selector, hardware-free `info [--json] FILE.wav` metadata subcommand, 64-bit IEEE float WAV decoding (`wav_frame()`/`wav_open()`), resampler EOF tail flushing (`conv_flush()`), container-aware TLV dB parsing (`tlv_parse_db()` with `SNDRV_CTL_TLVT_CONTAINER` recursion), multi-channel percentage averaging in `volume_get()`, and strict bounds/OOM/overflow guards (`MAX_ELEMS`, channel cap `<= 128`, period/buffer checks, fd cleanup on error paths).
+  - Build & Packaging Sync: added PIE/stack-protector/`_FORTIFY_SOURCE`/RELRO flags in `src/cube-audio/build.sh`; integrated `cube-audio` and `test-cube-audio` into `meson.build`, `BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, `packaging/check-libraries.py`, `packaging/verify-deb.py`, `packaging/build-deb.sh`, `packaging/arch/PKGBUILD`, and `tests/test-packaging.py`.
+- **Tests & Verification**:
+  - Extended `src/cube-audio/test-cube-audio.c` (self-contained non-WAV fixture, 64-bit float WAV decoding, duplicate `fmt ` rejection, `parse_target()`, `tlv_parse_db()` container/overflow cases, `conv_flush()` same-rate and resampled tail flushing).
+  - Verified ASan/UBSan standalone test suite, `./BUILD.sh`, `packaging/check-tree.py` (233 paths ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

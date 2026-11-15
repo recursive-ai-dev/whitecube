@@ -89,7 +89,15 @@ int main(void) {
 	CHECK(fabsf(L - 0.5f) < 1e-4f);
 	fclose(w.f);
 
-	CHECK(!wav_open(&w, "../cube-audio.c", err, sizeof err) && strstr(err, "RIFF"));
+	double f64[2] = { 0.5, -0.25 };
+	write_wav("t64.wav", 3, 2, 48000, 64, f64, sizeof f64);
+	CHECK(wav_open(&w, "t64.wav", err, sizeof err) && w.fmt == 3 && w.bits == 64 && w.channels == 2);
+	wav_frame(&w, (uint8_t *)f64, &L, &R);
+	CHECK(fabsf(L - 0.5f) < 1e-6f && fabsf(R + 0.25f) < 1e-6f);
+	fclose(w.f);
+
+	FILE *nw = fopen("tnonwav.bin", "wb"); fputs("NOT_A_WAVE_FILE", nw); fclose(nw);
+	CHECK(!wav_open(&w, "tnonwav.bin", err, sizeof err) && strstr(err, "RIFF"));
 	write_wav("tbad.wav", 2, 2, 48000, 4, s16, 8);          // ADPCM
 	CHECK(!wav_open(&w, "tbad.wav", err, sizeof err) && strstr(err, "unsupported"));
 	FILE *tr = fopen("ttrunc.wav", "wb"); fwrite("RIFF\0\0\0\0WAVE", 1, 12, tr); fclose(tr);
@@ -99,6 +107,32 @@ int main(void) {
 	const uint8_t bad_chunk[20] = { 'R','I','F','F', 12,0,0,0, 'W','A','V','E', 'J','U','N','K', 0xff,0xff,0xff,0xff };
 	fwrite(bad_chunk, 1, sizeof bad_chunk, ovf); fclose(ovf);
 	CHECK(!wav_open(&w, "tovf.wav", err, sizeof err) && strstr(err, "truncated"));
+	// Duplicate fmt chunk must be rejected cleanly.
+	FILE *dupf = fopen("tdupfmt.wav", "wb");
+	uint8_t dh[48] = "RIFFxxxxWAVEfmt ";
+	put32(dh + 4, 40); put32(dh + 16, 16); put16(dh + 20, 1); put16(dh + 22, 1); put32(dh + 24, 48000);
+	put32(dh + 28, 96000); put16(dh + 32, 2); put16(dh + 34, 16);
+	memcpy(dh + 36, "fmt ", 4); put32(dh + 40, 16);
+	fwrite(dh, 1, 36, dupf); fwrite(dh + 36, 1, 8, dupf); fwrite(dh + 20, 1, 16, dupf);
+	fclose(dupf);
+	CHECK(!wav_open(&w, "tdupfmt.wav", err, sizeof err) && strstr(err, "bad fmt"));
+
+	// parse_target validation
+	struct target tgt = {0};
+	CHECK(parse_target("0,0", &tgt) && tgt.card == 0 && tgt.dev == 0);
+	CHECK(parse_target("12,3", &tgt) && tgt.card == 12 && tgt.dev == 3);
+	CHECK(!parse_target("", &tgt) && !parse_target("0", &tgt) && !parse_target("0,", &tgt));
+	CHECK(!parse_target(",0", &tgt) && !parse_target("0,0x", &tgt) && !parse_target("-1,0", &tgt));
+
+	// TLV container + DB_SCALE + overflow/malformed bounds checks
+	unsigned tlv_scale[4] = { SNDRV_CTL_TLVT_DB_SCALE, 8, (unsigned)-6525, 75 };
+	struct db_range db = tlv_parse_db(tlv_scale, 4, 0, 87, 0);
+	CHECK(db.ok && db.min == -6525 && db.max == 0 && db.step == 75);
+	unsigned tlv_cont[6] = { SNDRV_CTL_TLVT_CONTAINER, 16, SNDRV_CTL_TLVT_DB_SCALE, 8, (unsigned)-6525, 75 };
+	db = tlv_parse_db(tlv_cont, 6, 0, 87, 0);
+	CHECK(db.ok && db.min == -6525 && db.max == 0 && db.step == 75);
+	unsigned tlv_bad[4] = { SNDRV_CTL_TLVT_CONTAINER, 12, SNDRV_CTL_TLVT_DB_SCALE, 0xffffff00u };
+	CHECK(!tlv_parse_db(tlv_bad, 4, 0, 87, 0).ok);
 
 	// Resampler: 1 s of 24 kHz constant becomes ~48000 frames; 96 kHz becomes ~48000; equal rate is 1:1.
 	struct conv c;
@@ -113,6 +147,13 @@ int main(void) {
 	conv_init(&c, 48000, 48000);
 	for (int i = 0; i < 100; i++) same += conv_push(&c, 0.0f, 0.0f, out);
 	CHECK(same == 100);
+	int16_t tail[2];
+	conv_init(&c, 48000, 48000);
+	conv_push(&c, 0.25f, -0.25f, out);
+	CHECK(conv_flush(&c, tail) == 0);
+	conv_init(&c, 44100, 48000);
+	CHECK(conv_push(&c, 0.25f, -0.25f, out) == 0);
+	CHECK(conv_flush(&c, tail) == 1 && abs(tail[0] - 8192) <= 2 && abs(tail[1] + 8192) <= 2);
 	// Extreme 96x upsampling (4000 Hz -> 384000 Hz) fits within CONV_MAX_FRAMES without stack overflow.
 	conv_init(&c, 4000, 384000);
 	for (int i = 0; i < 101; i++) {
@@ -131,7 +172,8 @@ int main(void) {
 	CHECK(n == 2 && out[0] == 0 && abs(out[2] - 16384) <= 1);
 	CHECK(to_s16(2.0f) == 32767 && to_s16(-2.0f) == -32767 && to_s16(NAN) == 0);
 
-	remove("t16.wav"); remove("t8.wav"); remove("tf.wav"); remove("t24.wav"); remove("tbad.wav"); remove("ttrunc.wav"); remove("tovf.wav");
+	remove("t16.wav"); remove("t8.wav"); remove("tf.wav"); remove("t24.wav"); remove("t64.wav");
+	remove("tnonwav.bin"); remove("tbad.wav"); remove("ttrunc.wav"); remove("tovf.wav"); remove("tdupfmt.wav");
 	if (fails) { fprintf(stderr, "%d failure(s)\n", fails); return 1; }
 	puts("cube-audio: volume mapping, WAV decoding and resampling passed");
 	return 0;

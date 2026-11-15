@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 
-NATIVE = ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
+NATIVE = ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca', 'usr/bin/cube-audio',
           'usr/libexec/whitecube/cube-browser/cube-browser', 'usr/libexec/whitecube/cube-browser/cube-renderd',
           'usr/libexec/whitecube/cube-browser/cube-netd')
 # cube-player is not listed: libmpv (Depends: libmpv2) reaches X11 and is not on the build host.

@@ -70,6 +70,8 @@ if [[ -n $sysroot ]]; then
   "$cc" "${flags[@]}" src/cube-ca.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-ca "${client_flags[@]}" -lm
   "$cc" "${flags[@]}" src/cube-settings.c src/protocols/xdg-shell-protocol.c src/protocols/wlr-output-management-protocol.c -o $out/cube-settings "${settings_flags[@]}" -lm
   "$cc" "${flags[@]}" src/cube-status.c src/protocols/wlr-layer-shell-protocol.c src/protocols/xdg-shell-protocol.c -o $out/cube-status "${settings_flags[@]}" -lm
+  "$cc" "${flags[@]}" src/cube-audio/cube-audio.c -o $out/cube-audio -lm
+  "$cc" "${flags[@]}" -Wno-unused-function src/cube-audio/test-cube-audio.c -o $out/test-cube-audio -lm
   "$cc" "${flags[@]}" -D_GNU_SOURCE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -Wl,-z,noexecstack -Isrc/bus/include \
     src/bus/src/main.c src/bus/src/wire.c src/bus/src/bus.c src/bus/src/seccomp.c -o $out/whitecube-bus
   "$cc" "${flags[@]}" -D_GNU_SOURCE -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3 -DWC_DEFAULT_PICKER=\"/usr/bin/wc-pick\" -Wl,-z,noexecstack -Isrc/portal/include \
@@ -91,7 +93,7 @@ else
   CC="$cc" meson setup "${setup_args[@]}"
   meson compile -C "$core" -j "${JOBS:-4}"
   install -m 0755 "$core/whitecube-compositor" "$out/whitecube"
-  for native in cube-ca cube-settings cube-status whitecube-bus whitecube-portal portal-probe compositor-test hotplug-test status-theme-test settings-test status-apps-test status-jobs-test native-input-test workspace-test desktop-state-test; do
+  for native in cube-ca cube-settings cube-status cube-audio whitecube-bus whitecube-portal portal-probe compositor-test hotplug-test status-theme-test settings-test status-apps-test status-jobs-test native-input-test workspace-test desktop-state-test test-cube-audio; do
     install -m 0755 "$core/$native" "$out/$native"
   done
   install -m 0755 src/portal/scripts/wc-pick "$out/wc-pick"
@@ -101,7 +103,7 @@ fi
 # REQUIRE_XFREE=1 makes it fatal. Fix: tools/build-xfree-cairo.sh stages an X-free cairo (no root needed to build).
 if [[ -z $sysroot ]]; then
   xlinked=()
-  for bin in whitecube cube-ca cube-settings cube-status whitecube-bus whitecube-portal; do
+  for bin in whitecube cube-ca cube-settings cube-status cube-audio whitecube-bus whitecube-portal; do
     if ldd "$out/$bin" | grep -qi -E 'libX11|libxcb'; then xlinked+=("$bin"); fi
   done
   if (( ${#xlinked[@]} )); then
@@ -134,6 +136,7 @@ if [[ -n $sysroot ]]; then
   "$loader" --library-path "$libpath" $out/workspace-test
   "$loader" --library-path "$libpath" $out/desktop-state-test
   "$loader" --library-path "$libpath" $out/cube-ca --self-test
+  "$loader" --library-path "$libpath" $out/test-cube-audio
   "$loader" --library-path "$libpath" $out/cube-ca --preview $out/cube-space.ppm
   "$loader" --library-path "$libpath" $out/cube-status --render "$out" >/dev/null
 else

@@ -96,7 +96,7 @@ display_resolution=$(env -u LD_LIBRARY_PATH ldd "$priv/$(basename "$(readlink -f
 [[ $display_resolution == "$priv/"* ]] || { echo 'build-deb.sh: bundled wlroots cannot resolve its private display-info library' >&2; exit 1; }
 
 # --- strip (also removes the build directory recorded in the debug info)
-strip --strip-unneeded "$stage"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player,whitecube-bus,whitecube-portal} \
+strip --strip-unneeded "$stage"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-audio,cube-player,whitecube-bus,whitecube-portal} \
   "$stage"/usr/libexec/whitecube/cube-browser/cube-{browser,renderd,netd} "$priv"/*.so* 2>/dev/null || true
 python3 -I packaging/check-libraries.py "$stage"
 

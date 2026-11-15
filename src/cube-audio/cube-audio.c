@@ -6,16 +6,18 @@
 // no PulseAudio, no WirePlumber. The kernel driver (snd_hda_intel, snd-usb-audio...)
 // is the only thing between this program and the hardware.
 //
-//   cube-audio cards                          list cards and playback/capture devices
-//   cube-audio status                         key=value report (volume, mute, device)
-//   cube-audio volume [--input] [N|+N|-N]     get/set volume in percent
-//   cube-audio mute   [--input] [on|off|toggle]   (no argument: report only)
-//   cube-audio play [-D card,dev] FILE.wav    play 8/16/24/32-bit PCM or float WAV
+//   cube-audio cards [--json]                 list cards and playback/capture devices
+//   cube-audio status [-D card,dev] [-c CTL] [--input] [--json]
+//   cube-audio volume [-D card,dev] [-c CTL] [--input] [--json] [N|+N|-N]
+//   cube-audio mute   [-D card,dev] [-c CTL] [--input] [--json] [on|off|toggle]
+//   cube-audio info   [--json] FILE.wav       inspect WAV metadata without hardware
+//   cube-audio play   [-D card,dev] FILE.wav  play 8/16/24/32 PCM or 32/64 float WAV
 //   cube-audio selftest [-D card,dev]         probe hardware; plays 250 ms of silence
 //
 // Device choice: -D card,dev, else $CUBE_AUDIO_DEVICE, else the first card that has
 // a playback volume control and a playback PCM.
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -35,7 +37,11 @@
 #include <sound/tlv.h>
 
 #define PROG "cube-audio"
+#ifndef WHITECUBE_VERSION
+#define WHITECUBE_VERSION "0.12.0"
+#endif
 #define MAX_CARDS 32
+#define MAX_ELEMS 65536u
 
 static volatile sig_atomic_t g_stop;
 static void on_signal(int s) { (void)s; g_stop = 1; }
@@ -54,6 +60,19 @@ static int die(const char *fmt, ...) {
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static double clampd(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+static void json_print_str(const char *s) {
+	putchar('"');
+	for (const unsigned char *p = (const unsigned char *)(s ? s : ""); *p; p++) {
+		if (*p == '"' || *p == '\\') { putchar('\\'); putchar(*p); }
+		else if (*p == '\n') fputs("\\n", stdout);
+		else if (*p == '\r') fputs("\\r", stdout);
+		else if (*p == '\t') fputs("\\t", stdout);
+		else if (*p < 0x20) printf("\\u%04x", *p);
+		else putchar(*p);
+	}
+	putchar('"');
+}
+
 // ------------------------------------------------------------------- mixer
 
 struct ctl_elem {
@@ -71,6 +90,7 @@ struct mixer {
 
 static int mixer_open(struct mixer *m, int card) {
 	memset(m, 0, sizeof *m);
+	m->fd = -1;
 	char path[48];
 	snprintf(path, sizeof path, "/dev/snd/controlC%d", card);
 	m->fd = open(path, O_RDWR | O_CLOEXEC);
@@ -79,18 +99,21 @@ static int mixer_open(struct mixer *m, int card) {
 	struct snd_ctl_card_info ci;
 	memset(&ci, 0, sizeof ci);
 	if (ioctl(m->fd, SNDRV_CTL_IOCTL_CARD_INFO, &ci) == 0) {
-		snprintf(m->name, sizeof m->name, "%s", (char *)ci.id);
-		snprintf(m->longname, sizeof m->longname, "%s", (char *)ci.name);
+		snprintf(m->name, sizeof m->name, "%.*s", (int)sizeof ci.id, (const char *)ci.id);
+		snprintf(m->longname, sizeof m->longname, "%.*s", (int)sizeof ci.name, (const char *)ci.name);
 	}
 	struct snd_ctl_elem_list l;
 	memset(&l, 0, sizeof l);
-	if (ioctl(m->fd, SNDRV_CTL_IOCTL_ELEM_LIST, &l) < 0) { int e = errno; close(m->fd); return -e; }
+	if (ioctl(m->fd, SNDRV_CTL_IOCTL_ELEM_LIST, &l) < 0) { int e = errno; close(m->fd); m->fd = -1; return -e; }
+	if (l.count > MAX_ELEMS) { close(m->fd); m->fd = -1; return -E2BIG; }
 	if (l.count) {
 		m->ids = calloc(l.count, sizeof *m->ids);
-		if (!m->ids) { close(m->fd); return -ENOMEM; }
+		if (!m->ids) { close(m->fd); m->fd = -1; return -ENOMEM; }
 		l.space = l.count; l.pids = m->ids;
-		if (ioctl(m->fd, SNDRV_CTL_IOCTL_ELEM_LIST, &l) < 0) { int e = errno; free(m->ids); close(m->fd); return -e; }
-		m->n = l.used;
+		if (ioctl(m->fd, SNDRV_CTL_IOCTL_ELEM_LIST, &l) < 0) {
+			int e = errno; free(m->ids); m->ids = NULL; close(m->fd); m->fd = -1; return -e;
+		}
+		m->n = l.used < l.count ? l.used : l.count;
 	}
 	return 0;
 }
@@ -98,13 +121,16 @@ static int mixer_open(struct mixer *m, int card) {
 static void mixer_close(struct mixer *m) { if (m->fd >= 0) close(m->fd); free(m->ids); m->ids = NULL; m->fd = -1; }
 
 static bool mixer_find(const struct mixer *m, const char *name, struct ctl_elem *out) {
+	size_t namelen = strlen(name);
 	for (unsigned i = 0; i < m->n; i++) {
 		const struct snd_ctl_elem_id *id = &m->ids[i];
-		if (id->iface != SNDRV_CTL_ELEM_IFACE_MIXER || strcmp((const char *)id->name, name)) continue;
+		size_t idlen = strnlen((const char *)id->name, sizeof id->name);
+		if (id->iface != SNDRV_CTL_ELEM_IFACE_MIXER || idlen != namelen || memcmp(id->name, name, namelen)) continue;
 		struct snd_ctl_elem_info inf;
 		memset(&inf, 0, sizeof inf);
 		inf.id.numid = id->numid;
 		if (ioctl(m->fd, SNDRV_CTL_IOCTL_ELEM_INFO, &inf) < 0) continue;
+		if (inf.count == 0 || inf.count > 128) continue;
 		memset(out, 0, sizeof *out);
 		out->id = inf.id; out->type = inf.type; out->count = inf.count; out->access = inf.access;
 		if (inf.type == SNDRV_CTL_ELEM_TYPE_INTEGER) {
@@ -149,6 +175,36 @@ static struct db_range db_scale_range(int min_db, int step_db, long raw_min, lon
 	return d;
 }
 
+static struct db_range tlv_parse_db(const unsigned *tlv, size_t nwords, long raw_min, long raw_max, int depth) {
+	struct db_range d = {0};
+	if (!tlv || depth > 2 || nwords < 2) return d;
+	unsigned type = tlv[0];
+	unsigned bytes = tlv[1];
+	size_t payload_words = bytes / sizeof(unsigned);
+	if ((bytes % sizeof(unsigned)) != 0 || payload_words > nwords - 2) return d;
+	if (type == SNDRV_CTL_TLVT_CONTAINER) {
+		size_t off = 2;
+		while (off + 2 <= 2 + payload_words) {
+			unsigned sub_bytes = tlv[off + 1];
+			size_t sub_words = 2 + (((size_t)sub_bytes + sizeof(unsigned) - 1) / sizeof(unsigned));
+			if (sub_words < 2 || sub_words > (2 + payload_words) - off) break;
+			d = tlv_parse_db(tlv + off, sub_words, raw_min, raw_max, depth + 1);
+			if (d.ok) return d;
+			off += sub_words;
+		}
+		return d;
+	}
+	if (payload_words < 2) return d;
+	if (type == SNDRV_CTL_TLVT_DB_SCALE) {
+		d = db_scale_range((int)tlv[2], (int)(tlv[3] & 0xffff), raw_min, raw_max);
+	} else if (type == SNDRV_CTL_TLVT_DB_MINMAX || type == SNDRV_CTL_TLVT_DB_MINMAX_MUTE ||
+	           type == SNDRV_CTL_TLVT_DB_LINEAR) {
+		d.min = (int)tlv[2]; d.max = (int)tlv[3];
+		d.ok = d.max > d.min && d.min >= -1000000 && d.max <= 1000000;
+	}
+	return d;
+}
+
 static struct db_range elem_db(const struct mixer *m, const struct ctl_elem *e) {
 	struct db_range d = {0};
 	if (!(e->access & SNDRV_CTL_ELEM_ACCESS_TLV_READ)) return d;
@@ -156,16 +212,8 @@ static struct db_range elem_db(const struct mixer *m, const struct ctl_elem *e) 
 	struct snd_ctl_tlv *t = (struct snd_ctl_tlv *)buf;
 	memset(buf, 0, sizeof buf);
 	t->numid = e->id.numid; t->length = sizeof buf - sizeof *t;
-	if (ioctl(m->fd, SNDRV_CTL_IOCTL_TLV_READ, t) < 0 || t->length < 16) return d;
-	unsigned type = t->tlv[0];
-	if (type == SNDRV_CTL_TLVT_DB_SCALE) {
-		d = db_scale_range((int)t->tlv[2], (int)(t->tlv[3] & 0xffff), e->min, e->max);
-	} else if (type == SNDRV_CTL_TLVT_DB_MINMAX || type == SNDRV_CTL_TLVT_DB_MINMAX_MUTE ||
-	           type == SNDRV_CTL_TLVT_DB_LINEAR) {
-		d.min = (int)t->tlv[2]; d.max = (int)t->tlv[3];
-		d.ok = d.max > d.min && d.min >= -1000000 && d.max <= 1000000;
-	}
-	return d;
+	if (ioctl(m->fd, SNDRV_CTL_IOCTL_TLV_READ, t) < 0 || t->length < 16 || t->length > sizeof buf - sizeof *t) return d;
+	return tlv_parse_db(t->tlv, t->length / sizeof(unsigned), e->min, e->max, 0);
 }
 
 // A user-facing volume: one integer control plus its optional on/off switch.
@@ -211,29 +259,57 @@ static long raw_from_pct(const struct volume *v, int pct) {
 static const char *const OUT_CONTROLS[] = { "Master", "PCM", "Speaker", "Headphone", NULL };
 static const char *const IN_CONTROLS[]  = { "Capture", "Mic", NULL };
 
-static bool volume_bind(struct volume *v, int card, bool input) {
+static bool volume_match(const struct mixer *m, const char *ctl, const char *dir, struct volume *v) {
+	char name[64];
+	if (mixer_find(m, ctl, &v->vol) && v->vol.type == SNDRV_CTL_ELEM_TYPE_INTEGER) {
+		snprintf(v->label, sizeof v->label, "%s", ctl);
+		char *p = strstr(v->label, " Volume");
+		if (p) *p = 0;
+		snprintf(name, sizeof name, "%s", ctl);
+		char *vp = strstr(name, " Volume");
+		if (vp) memcpy(vp, " Switch", 8);
+		else snprintf(name, sizeof name, "%s %s Switch", ctl, dir);
+		v->has_sw = mixer_find(m, name, &v->sw) && v->sw.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+		v->db = elem_db(m, &v->vol);
+		return true;
+	}
+	snprintf(name, sizeof name, "%s %s Volume", ctl, dir);
+	if (!strcmp(dir, "Capture") && !strcmp(ctl, "Capture")) snprintf(name, sizeof name, "Capture Volume");
+	if (!mixer_find(m, name, &v->vol) || v->vol.type != SNDRV_CTL_ELEM_TYPE_INTEGER) return false;
+	snprintf(v->label, sizeof v->label, "%s", ctl);
+	snprintf(name, sizeof name, "%s %s Switch", ctl, dir);
+	if (!strcmp(dir, "Capture") && !strcmp(ctl, "Capture")) snprintf(name, sizeof name, "Capture Switch");
+	v->has_sw = mixer_find(m, name, &v->sw) && v->sw.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN;
+	v->db = elem_db(m, &v->vol);
+	return true;
+}
+
+static bool volume_bind_control(struct volume *v, int card, bool input, const char *control) {
 	if (mixer_open(&v->mx, card) < 0) return false;
 	const char *dir = input ? "Capture" : "Playback";
+	if (control && *control) {
+		if (volume_match(&v->mx, control, dir, v)) return true;
+		mixer_close(&v->mx);
+		return false;
+	}
 	for (const char *const *b = input ? IN_CONTROLS : OUT_CONTROLS; *b; b++) {
-		char name[64];
-		snprintf(name, sizeof name, "%s %s Volume", *b, dir);
-		if (input && !strcmp(*b, "Capture")) snprintf(name, sizeof name, "Capture Volume");
-		if (!mixer_find(&v->mx, name, &v->vol) || v->vol.type != SNDRV_CTL_ELEM_TYPE_INTEGER) continue;
-		snprintf(v->label, sizeof v->label, "%s", *b);
-		snprintf(name, sizeof name, "%s %s Switch", *b, dir);
-		if (input && !strcmp(*b, "Capture")) snprintf(name, sizeof name, "Capture Switch");
-		v->has_sw = mixer_find(&v->mx, name, &v->sw) && v->sw.type == SNDRV_CTL_ELEM_TYPE_BOOLEAN;
-		v->db = elem_db(&v->mx, &v->vol);
-		return true;
+		if (volume_match(&v->mx, *b, dir, v)) return true;
 	}
 	mixer_close(&v->mx);
 	return false;
 }
 
+static bool volume_bind(struct volume *v, int card, bool input) {
+	return volume_bind_control(v, card, input, NULL);
+}
+
 static int volume_get(const struct volume *v) {
 	long vals[128] = {0};
-	if (elem_read(&v->mx, &v->vol, vals) < 0) return -1;
-	return pct_from_raw(v, vals[0]);
+	unsigned n = v->vol.count < 128 ? v->vol.count : 128;
+	if (!n || elem_read(&v->mx, &v->vol, vals) < 0) return -1;
+	long long sum = 0;
+	for (unsigned i = 0; i < n; i++) sum += pct_from_raw(v, vals[i]);
+	return (int)(sum / n);
 }
 
 static int volume_set(const struct volume *v, int pct) { return elem_write_all(&v->mx, &v->vol, raw_from_pct(v, pct)); }
@@ -291,13 +367,22 @@ static bool default_target(struct target *t, bool capture) {
 	return false;
 }
 
-static int cmd_cards(void) {
+static int cmd_cards(bool json) {
 	int found = 0;
+	if (json) putchar('[');
 	for (int c = 0; c < MAX_CARDS; c++) {
 		struct mixer m;
 		if (mixer_open(&m, c) < 0) continue;
+		if (json) {
+			if (found) putchar(',');
+			printf("{\"card\":%d,\"name\":", c); json_print_str(m.name);
+			printf(",\"longname\":"); json_print_str(m.longname);
+			printf(",\"devices\":[");
+		} else {
+			printf("card %d: %s (%s)\n", c, m.name, m.longname);
+		}
 		found++;
-		printf("card %d: %s (%s)\n", c, m.name, m.longname);
+		int ndev = 0;
 		for (int pass = 0; pass < 2; pass++)
 			for (int d = 0; d < 64; d++) {
 				if (!pcm_exists(c, d, pass)) continue;
@@ -305,10 +390,18 @@ static int cmd_cards(void) {
 				memset(&pi, 0, sizeof pi);
 				pi.device = d; pi.stream = pass; pi.subdevice = 0;
 				const char *name = ioctl(m.fd, SNDRV_CTL_IOCTL_PCM_INFO, &pi) == 0 ? (const char *)pi.name : "?";
-				printf("  %s %d,%d: %s\n", pass ? "capture " : "playback", c, d, name);
+				if (json) {
+					if (ndev++) putchar(',');
+					printf("{\"type\":\"%s\",\"card\":%d,\"device\":%d,\"name\":", pass ? "capture" : "playback", c, d);
+					json_print_str(name); putchar('}');
+				} else {
+					printf("  %s %d,%d: %s\n", pass ? "capture " : "playback", c, d, name);
+				}
 			}
+		if (json) printf("]}");
 		mixer_close(&m);
 	}
+	if (json) { printf("]\n"); return found ? 0 : 1; }
 	if (!found) return die("no sound cards found under /dev/snd (is a driver loaded, are you in the 'audio' group?)");
 	return 0;
 }
@@ -337,7 +430,7 @@ static void hw_any(struct snd_pcm_hw_params *p) {
 static void hw_set_mask(struct snd_pcm_hw_params *p, int var, unsigned bit) {
 	struct snd_mask *m = pm(p, var);
 	memset(m->bits, 0, sizeof m->bits);
-	m->bits[bit >> 5] = 1u << (bit & 31);
+	if (bit < sizeof(m->bits) * 8) m->bits[bit >> 5] = 1u << (bit & 31);
 }
 
 static void hw_set_interval(struct snd_pcm_hw_params *p, int var, unsigned lo, unsigned hi) {
@@ -372,13 +465,14 @@ static const char *pcm_strerror(int e) {
 
 static int pcm_open_playback(struct pcm *pcm, struct target t, unsigned rate, unsigned channels) {
 	memset(pcm, 0, sizeof *pcm);
+	pcm->fd = -1;
 	char path[64];
 	snprintf(path, sizeof path, "/dev/snd/pcmC%dD%dp", t.card, t.dev);
 	pcm->fd = open(path, O_WRONLY | O_CLOEXEC);
 	if (pcm->fd < 0) return -errno;
 	int proto = 0;
 	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_PVERSION, &proto) < 0 || SNDRV_PROTOCOL_MAJOR(proto) != SNDRV_PROTOCOL_MAJOR(SNDRV_PCM_VERSION)) {
-		close(pcm->fd); return -EPROTO;
+		close(pcm->fd); pcm->fd = -1; return -EPROTO;
 	}
 	struct snd_pcm_hw_params hp;
 	unsigned rates[3] = { rate, 48000, 44100 };
@@ -393,18 +487,21 @@ static int pcm_open_playback(struct pcm *pcm, struct target t, unsigned rate, un
 		err = hw_refine(pcm->fd, &hp);
 		if (!err) pcm->rate = rates[k];
 	}
-	if (err) { close(pcm->fd); return err; }
+	if (err) { close(pcm->fd); pcm->fd = -1; return err; }
 	pcm->channels = channels;
 	// ~20 ms periods, four of them: low enough latency for a bell, safe against scheduling jitter.
 	if ((err = hw_pin(pcm->fd, &hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, pcm->rate / 50)) ||
 	    (err = hw_pin(pcm->fd, &hp, SNDRV_PCM_HW_PARAM_PERIODS, 4)) ||
 	    (err = hw_pin(pcm->fd, &hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, pi_(&hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min))) {
-		close(pcm->fd); return err;
+		close(pcm->fd); pcm->fd = -1; return err;
 	}
 	hp.rmask = ~0u;
-	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) < 0) { err = -errno; close(pcm->fd); return err; }
+	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hp) < 0) { err = -errno; close(pcm->fd); pcm->fd = -1; return err; }
 	pcm->period = pi_(&hp, SNDRV_PCM_HW_PARAM_PERIOD_SIZE)->min;
 	pcm->buffer = pi_(&hp, SNDRV_PCM_HW_PARAM_BUFFER_SIZE)->min;
+	if (pcm->period == 0 || pcm->period > 262144 || pcm->buffer < pcm->period) {
+		close(pcm->fd); pcm->fd = -1; return -EINVAL;
+	}
 
 	struct snd_pcm_sw_params sp;
 	memset(&sp, 0, sizeof sp);
@@ -415,8 +512,8 @@ static int pcm_open_playback(struct pcm *pcm, struct target t, unsigned rate, un
 	sp.start_threshold = pcm->period * 2 < pcm->buffer ? pcm->period * 2 : pcm->buffer;
 	sp.stop_threshold = pcm->buffer;       // an empty buffer is an underrun, reported as EPIPE
 	sp.proto = SNDRV_PCM_VERSION;
-	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sp) < 0) { err = -errno; close(pcm->fd); return err; }
-	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_PREPARE) < 0) { err = -errno; close(pcm->fd); return err; }
+	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sp) < 0) { err = -errno; close(pcm->fd); pcm->fd = -1; return err; }
+	if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_PREPARE) < 0) { err = -errno; close(pcm->fd); pcm->fd = -1; return err; }
 	return 0;
 }
 
@@ -500,15 +597,16 @@ static bool wav_open(struct wav *w, const char *path, char *err, size_t errn) {
 		} else {
 			int64_t skip = (int64_t)len + (len & 1), pos = ftello(w->f);
 			struct stat st;
-			if (pos < 0 || (fstat(fileno(w->f), &st) == 0 && S_ISREG(st.st_mode) && pos + skip > st.st_size) ||
+			if (pos < 0 || (fstat(fileno(w->f), &st) == 0 && S_ISREG(st.st_mode) &&
+			                (pos > st.st_size || (uint64_t)skip > (uint64_t)(st.st_size - pos))) ||
 			    fseeko(w->f, skip, SEEK_CUR) != 0) {
 				snprintf(err, errn, "%s: truncated", path); goto bad;
 			}
 		}
 	}
 	bool pcm_ok = w->fmt == 1 && (w->bits == 8 || w->bits == 16 || w->bits == 24 || w->bits == 32);
-	bool flt_ok = w->fmt == 3 && w->bits == 32;
-	if (!pcm_ok && !flt_ok) { snprintf(err, errn, "%s: unsupported format %u/%u-bit (need PCM 8/16/24/32 or float32)", path, w->fmt, w->bits); goto bad; }
+	bool flt_ok = w->fmt == 3 && (w->bits == 32 || w->bits == 64);
+	if (!pcm_ok && !flt_ok) { snprintf(err, errn, "%s: unsupported format %u/%u-bit (need PCM 8/16/24/32 or float 32/64)", path, w->fmt, w->bits); goto bad; }
 	if (w->channels < 1 || w->channels > 8 || w->rate < 4000 || w->rate > 384000 || w->align != w->channels * (w->bits / 8)) {
 		snprintf(err, errn, "%s: unsupported layout (%u ch, %u Hz)", path, w->channels, w->rate); goto bad;
 	}
@@ -527,7 +625,10 @@ static void wav_frame(const struct wav *w, const uint8_t *p, float *l, float *r)
 	unsigned bytes = w->bits / 8;
 	for (int c = 0; c < 2; c++) {
 		const uint8_t *q = p + (w->channels > 1 ? c : 0) * bytes;
-		if (w->fmt == 3) { uint32_t u = le32(q); float f; memcpy(&f, &u, 4); s[c] = f; }
+		if (w->fmt == 3 && w->bits == 64) {
+			uint64_t u = (uint64_t)le32(q) | ((uint64_t)le32(q + 4) << 32);
+			double d; memcpy(&d, &u, 8); s[c] = (float)d;
+		} else if (w->fmt == 3) { uint32_t u = le32(q); float f; memcpy(&f, &u, 4); s[c] = f; }
 		else if (w->bits == 8) s[c] = ((int)q[0] - 128) / 128.0f;
 		else if (w->bits == 16) s[c] = (int16_t)le16(q) / 32768.0f;
 		else if (w->bits == 24) s[c] = ((int32_t)((uint32_t)q[0] << 8 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 24)) / 2147483648.0f;
@@ -576,6 +677,31 @@ static unsigned conv_push(struct conv *c, float l, float r, int16_t *out) {
 	return n;
 }
 
+static unsigned conv_flush(const struct conv *c, int16_t *out) {
+	if (c->same_rate || !c->have_prev || c->pos >= 1.0) return 0;
+	out[0] = to_s16(c->pl);
+	out[1] = to_s16(c->pr);
+	return 1;
+}
+
+static int cmd_info(const char *path, bool json) {
+	struct wav w;
+	char err[200];
+	if (!wav_open(&w, path, err, sizeof err)) return die("%s", err);
+	uint64_t frames = w.data_left / w.align;
+	double duration = (double)frames / (double)w.rate;
+	const char *fmt_name = w.fmt == 3 ? "float" : "pcm";
+	fclose(w.f);
+	if (json) {
+		printf("{\"format\":\"%s\",\"bits\":%u,\"channels\":%u,\"rate\":%u,\"frames\":%llu,\"duration_s\":%.6f,\"bytes\":%llu}\n",
+		       fmt_name, w.bits, w.channels, w.rate, (unsigned long long)frames, duration, (unsigned long long)w.data_left);
+	} else {
+		printf("format=%s\nbits=%u\nchannels=%u\nrate=%u\nframes=%llu\nduration=%.3fs\nbytes=%llu\n",
+		       fmt_name, w.bits, w.channels, w.rate, (unsigned long long)frames, duration, (unsigned long long)w.data_left);
+	}
+	return 0;
+}
+
 static int cmd_play(struct target t, const char *path) {
 	struct wav w;
 	char err[200];
@@ -590,6 +716,7 @@ static int cmd_play(struct target t, const char *path) {
 	conv_init(&cv, w.rate, pcm.rate);
 	size_t chunk_frames = 4096;
 	size_t period_frames = pcm.period > CONV_MAX_FRAMES ? pcm.period : CONV_MAX_FRAMES;
+	if (period_frames > SIZE_MAX / 8) { pcm_close(&pcm); fclose(w.f); return die("period size overflow"); }
 	size_t bufn = period_frames * 2 * 4;
 	uint8_t *in = malloc(chunk_frames * w.align);
 	int16_t *out = malloc(bufn * sizeof *out);
@@ -612,6 +739,11 @@ static int cmd_play(struct target t, const char *path) {
 			if (filled >= flush_at || filled + CONV_MAX_FRAMES > out_cap) { rc = pcm_write(&pcm, out, filled); filled = 0; }
 		}
 	}
+	if (!rc && !g_stop) {
+		int16_t tail[2];
+		unsigned fn = conv_flush(&cv, tail);
+		if (fn && filled + fn <= out_cap) { out[filled * 2] = tail[0]; out[filled * 2 + 1] = tail[1]; filled += fn; }
+	}
 	if (!rc && filled) rc = pcm_write(&pcm, out, filled);
 	if (!rc) rc = pcm_finish(&pcm);
 	pcm_close(&pcm); fclose(w.f); free(in); free(out);
@@ -625,45 +757,78 @@ static const char *volume_backend(const struct volume *v, char *buf, size_t n) {
 	return buf;
 }
 
-static int cmd_status(struct target t) {
+static int cmd_status(struct target t, const char *control, bool json) {
 	struct volume v;
 	char be[96];
-	printf("device=%d,%d\n", t.card, t.dev);
-	if (volume_bind(&v, t.card, false)) {
-		printf("volume=%d\nmuted=%s\nbackend=%s\n", volume_get(&v), volume_muted(&v) == 1 ? "yes" : "no", volume_backend(&v, be, sizeof be));
-		printf("db=%s\n", v.db.ok ? "yes" : "no");
-		mixer_close(&v.mx);
-	} else {
-		printf("volume=none\nmuted=no\nbackend=no volume control on card %d\n", t.card);
+	bool has_out = volume_bind_control(&v, t.card, false, control);
+	int out_vol = has_out ? volume_get(&v) : -1;
+	int out_mute = has_out ? volume_muted(&v) : -1;
+	bool out_db = has_out ? v.db.ok : false;
+	if (has_out) volume_backend(&v, be, sizeof be);
+	else snprintf(be, sizeof be, "no volume control on card %d", t.card);
+	if (has_out) mixer_close(&v.mx);
+
+	struct volume iv;
+	bool has_in = volume_bind_control(&iv, t.card, true, control);
+	int in_vol = has_in ? volume_get(&iv) : -1;
+	int in_mute = has_in ? volume_muted(&iv) : -1;
+	if (has_in) mixer_close(&iv.mx);
+
+	if (json) {
+		printf("{\"device\":\"%d,%d\",\"volume\":%s", t.card, t.dev, has_out && out_vol >= 0 ? "" : "null");
+		if (has_out && out_vol >= 0) printf("%d", out_vol);
+		printf(",\"muted\":%s,\"backend\":", out_mute == 1 ? "true" : out_mute == 0 ? "false" : "null");
+		json_print_str(be);
+		printf(",\"db\":%s", has_out ? (out_db ? "true" : "false") : "false");
+		if (has_in) {
+			printf(",\"input_volume\":%d,\"input_muted\":%s", in_vol, in_mute == 1 ? "true" : "false");
+		}
+		printf("}\n");
+		return 0;
 	}
-	if (volume_bind(&v, t.card, true)) {
-		printf("input_volume=%d\ninput_muted=%s\n", volume_get(&v), volume_muted(&v) == 1 ? "yes" : "no");
-		mixer_close(&v.mx);
+	printf("device=%d,%d\n", t.card, t.dev);
+	if (has_out) {
+		printf("volume=%d\nmuted=%s\nbackend=%s\n", out_vol, out_mute == 1 ? "yes" : "no", be);
+		printf("db=%s\n", out_db ? "yes" : "no");
+	} else {
+		printf("volume=none\nmuted=no\nbackend=%s\n", be);
+	}
+	if (has_in) {
+		printf("input_volume=%d\ninput_muted=%s\n", in_vol, in_mute == 1 ? "yes" : "no");
 	}
 	return 0;
 }
 
-static int cmd_volume(struct target t, bool input, const char *arg) {
+static int cmd_volume(struct target t, bool input, const char *control, const char *arg, bool json) {
 	struct volume v;
-	if (!volume_bind(&v, t.card, input)) return die("card %d has no %s volume control", t.card, input ? "capture" : "playback");
+	if (!volume_bind_control(&v, t.card, input, control)) return die("card %d has no %s volume control", t.card, input ? "capture" : "playback");
 	if (arg) {
 		char *end;
 		long n = strtol(arg, &end, 10);
 		if (*end || end == arg || n < -100 || n > 100) { mixer_close(&v.mx); return die("volume must be 0-100, +N or -N"); }
 		int cur = volume_get(&v);
+		if (cur < 0) { mixer_close(&v.mx); return die("cannot read current volume"); }
 		int want = (arg[0] == '+' || arg[0] == '-') ? cur + (int)n : (int)n;
 		if (arg[0] != '+' && arg[0] != '-' && n < 0) { mixer_close(&v.mx); return die("volume must be 0-100"); }
 		int r = volume_set(&v, clampi(want, 0, 100));
 		if (r) { mixer_close(&v.mx); return die("cannot set volume: %s", strerror(-r)); }
 	}
-	printf("%d\n", volume_get(&v));
+	int pct = volume_get(&v);
+	if (pct < 0) { mixer_close(&v.mx); return die("cannot read volume"); }
+	if (json) {
+		printf("{\"card\":%d,\"input\":%s,\"control\":", t.card, input ? "true" : "false");
+		json_print_str(v.label);
+		printf(",\"volume\":%d}\n", pct);
+	} else {
+		printf("%d\n", pct);
+	}
 	mixer_close(&v.mx);
 	return 0;
 }
 
-static int cmd_mute(struct target t, bool input, const char *arg) {
+static int cmd_mute(struct target t, bool input, const char *control, const char *arg, bool json) {
 	struct volume v;
-	if (!volume_bind(&v, t.card, input)) return die("card %d has no %s volume control", t.card, input ? "capture" : "playback");
+	if (!volume_bind_control(&v, t.card, input, control)) return die("card %d has no %s volume control", t.card, input ? "capture" : "playback");
 	int cur = volume_muted(&v);
 	if (cur < 0) { mixer_close(&v.mx); return die("%s has no mute switch", v.label); }
 	int want = cur;
@@ -676,7 +841,14 @@ static int cmd_mute(struct target t, bool input, const char *arg) {
 		int r = volume_set_muted(&v, want);
 		if (r) { mixer_close(&v.mx); return die("cannot change mute: %s", strerror(-r)); }
 	}
-	printf("%s\n", volume_muted(&v) == 1 ? "muted" : "audible");
+	int now_muted = volume_muted(&v);
+	if (json) {
+		printf("{\"card\":%d,\"input\":%s,\"control\":", t.card, input ? "true" : "false");
+		json_print_str(v.label);
+		printf(",\"muted\":%s}\n", now_muted == 1 ? "true" : "false");
+	} else {
+		printf("%s\n", now_muted == 1 ? "muted" : "audible");
+	}
 	mixer_close(&v.mx);
 	return 0;
 }
@@ -711,6 +883,7 @@ static int cmd_selftest(struct target t) {
 	printf("       rate %u Hz, period %lu frames, buffer %lu frames\n", pcm.rate, pcm.period, pcm.buffer);
 	unsigned long total = pcm.rate / 4;
 	int16_t *z = calloc(pcm.period * 2, sizeof *z);
+	if (!z) { pcm_close(&pcm); return die("out of memory"); }
 	double t0 = now_s();
 	int wr = 0;
 	for (unsigned long done = 0; done < total && !wr;) {
@@ -738,34 +911,52 @@ static int cmd_selftest(struct target t) {
 // --------------------------------------------------------------------- main
 
 #ifndef CUBE_AUDIO_NO_MAIN
-static int usage(void) {
-	fputs("usage: " PROG " cards | status | volume [--input] [N|+N|-N] | mute [--input] [on|off|toggle]\n"
-	      "       " PROG " play [-D card,dev] FILE.wav | selftest [-D card,dev]\n", stderr);
-	return 2;
+static int usage(FILE *out) {
+	fputs("usage: " PROG " [--help] [--version] cards [--json]\n"
+	      "       " PROG " status [-D card,dev] [-c CTL] [--input] [--json]\n"
+	      "       " PROG " volume [-D card,dev] [-c CTL] [--input] [--json] [N|+N|-N]\n"
+	      "       " PROG " mute   [-D card,dev] [-c CTL] [--input] [--json] [on|off|toggle]\n"
+	      "       " PROG " info   [--json] FILE.wav\n"
+	      "       " PROG " play   [-D card,dev] FILE.wav | selftest [-D card,dev]\n", out);
+	return out == stdout ? 0 : 2;
 }
 
 int main(int argc, char **argv) {
-	if (argc < 2) return usage();
-	const char *cmd = argv[1];
 	struct target t = {0};
-	bool have_t = false, input = false;
-	const char *pos = NULL, *extra = NULL;
-	for (int i = 2; i < argc; i++) {
-		if (!strcmp(argv[i], "-D") && i + 1 < argc) {
+	bool have_t = false, input = false, json = false;
+	const char *cmd = NULL, *control = NULL, *pos = NULL, *extra = NULL;
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) return usage(stdout);
+		if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+			printf("%s %s\n", PROG, WHITECUBE_VERSION);
+			return 0;
+		}
+		if (!strcmp(argv[i], "-D")) {
+			if (i + 1 >= argc) return die("-D requires card,dev");
 			if (!parse_target(argv[++i], &t)) return die("device must look like 0,0");
 			have_t = true;
+		} else if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--control")) {
+			if (i + 1 >= argc) return die("%s requires a control name", argv[i]);
+			control = argv[++i];
 		} else if (!strcmp(argv[i], "--input")) input = true;
+		else if (!strcmp(argv[i], "--json")) json = true;
+		else if (!cmd) cmd = argv[i];
+		else if (argv[i][0] == '-' && (!strcmp(cmd, "volume") ? !isdigit((unsigned char)argv[i][1]) : 1))
+			return die("unknown option: %s", argv[i]);
 		else if (!pos) pos = argv[i];
 		else if (!extra) extra = argv[i];
-		else return usage();
+		else return usage(stderr);
 	}
-	if (!strcmp(cmd, "cards")) return cmd_cards();
+	if (!cmd) return usage(stderr);
+	if (!strcmp(cmd, "cards") && !pos) return cmd_cards(json);
+	if (!strcmp(cmd, "info") && pos && !extra) return cmd_info(pos, json);
+	if (!strcmp(cmd, "cards") || !strcmp(cmd, "info")) return usage(stderr);
 	if (!have_t && !default_target(&t, input)) return die("no usable sound device (try '" PROG " cards')");
-	if (!strcmp(cmd, "status")) return cmd_status(t);
-	if (!strcmp(cmd, "volume")) return cmd_volume(t, input, pos);
-	if (!strcmp(cmd, "mute")) return cmd_mute(t, input, pos);
-	if (!strcmp(cmd, "selftest")) return cmd_selftest(t);
+	if (!strcmp(cmd, "status") && !pos) return cmd_status(t, control, json);
+	if (!strcmp(cmd, "volume") && !extra) return cmd_volume(t, input, control, pos, json);
+	if (!strcmp(cmd, "mute") && !extra) return cmd_mute(t, input, control, pos, json);
+	if (!strcmp(cmd, "selftest") && !pos) return cmd_selftest(t);
 	if (!strcmp(cmd, "play") && pos && !extra) return cmd_play(t, pos);
-	return usage();
+	return usage(stderr);
 }
 #endif

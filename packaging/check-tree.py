@@ -139,7 +139,7 @@ def main():
             for m in FORBIDDEN.finditer(text):
                 if not any(text[m.start():].startswith(a) for a in SEARCH_DIRS):
                     problems.append(f'{src.name}: machine-specific path {text[m.start():m.start() + 40]!r}')
-    for rel in ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/whitecube-session',
+    for rel in ('usr/bin/whitecube-compositor', 'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-audio', 'usr/bin/whitecube-session',
                 'usr/bin/cube-editor', 'usr/share/whitecube/cube-editor/app.py',
                 'usr/share/whitecube/cube-editor/worker.py', 'usr/share/applications/cube-editor.desktop',
                 'usr/share/icons/hicolor/scalable/apps/cube-editor.svg',

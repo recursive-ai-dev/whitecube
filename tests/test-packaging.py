@@ -46,7 +46,7 @@ class Tree(unittest.TestCase):
                 self.assertEqual(path.stat().st_mode & 0o005, 0o005, str(path.relative_to(self.stage)))
 
     def test_every_command_is_executable_and_in_usr_bin(self):
-        for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
+        for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-audio', 'cube-net', 'whitecube-session', 'whitecube-terminal',
                      'whitecube-bus', 'whitecube-portal', 'wc-pick',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
                      'cube-chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'whitecube-vm', 'net-off', 'net-on'):

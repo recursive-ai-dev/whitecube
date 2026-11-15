@@ -21,7 +21,7 @@ dest=${1:?usage: install-tree.sh DESTDIR}
 [[ -d $dest && -z $(ls -A "$dest") ]] || { echo "install-tree.sh: $dest must be an existing, empty directory" >&2; exit 1; }
 cd "$root"
 
-for b in whitecube cube-status cube-settings cube-ca whitecube-bus whitecube-portal; do
+for b in whitecube cube-status cube-settings cube-ca cube-audio whitecube-bus whitecube-portal; do
   [[ -x build/$b ]] || { echo "install-tree.sh: build/$b is missing; run ./BUILD.sh first" >&2; exit 1; }
 done
 [[ -x build/native-apps-root/usr/bin/cube-player && -x build/native-apps-root/usr/libexec/whitecube/cube-browser/cube-browser ]] || {
@@ -32,7 +32,7 @@ bin=$dest/usr/bin lib=$dest/usr/libexec/whitecube share=$dest/usr/share/whitecub
 install -d -m 0755 "$bin" "$lib" "$share" "$doc" "$dest/etc/whitecube/network" "$dest/usr/lib/systemd/system"
 
 # --- compiled programs
-for b in cube-status cube-settings cube-ca whitecube-bus whitecube-portal; do install -m 0755 "build/$b" "$bin/$b"; done
+for b in cube-status cube-settings cube-ca cube-audio whitecube-bus whitecube-portal; do install -m 0755 "build/$b" "$bin/$b"; done
 # not /usr/bin/whitecube: the "whitecube" package (image tool) already owns that name
 install -m 0755 build/whitecube "$bin/whitecube-compositor"
 

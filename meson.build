@@ -73,6 +73,9 @@ status = executable('cube-status', ['src/cube-status.c', layer, xdg],
   c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
   dependencies: client_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
+audio = executable('cube-audio', 'src/cube-audio/cube-audio.c',
+  c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
+  dependencies: [m], install: true)
 
 compositor_test = executable('compositor-test', 'tests/compositor-test.c', c_args: ['-DWLR_USE_UNSTABLE'],
   dependencies: compositor_deps, build_rpath: native_rpath)
@@ -118,6 +121,11 @@ test('status-cli-help', status, args: ['--help'], suite: 'core')
 test('status-cli-version', status, args: ['--version'], suite: 'core')
 test('settings-cli-help', settings, args: ['--help'], suite: 'core')
 test('settings-cli-version', settings, args: ['--version'], suite: 'core')
+audio_test = executable('test-cube-audio', 'src/cube-audio/test-cube-audio.c', dependencies: [m])
+test('audio-unit-tests', audio_test, suite: 'core')
+test('audio-cli-help', audio, args: ['--help'], suite: 'core')
+test('audio-cli-version', audio, args: ['--version'], suite: 'core')
+test('audio-cli-info-bad', audio, args: ['info', '/nonexistent-audio-test.wav'], should_fail: true, suite: 'core')
 
 foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'test-install.py'],
                 ['native-preference-validation', 'test-preferences.py'],

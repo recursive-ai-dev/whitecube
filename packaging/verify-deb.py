@@ -25,7 +25,7 @@ PROVENANCE = 'usr/share/doc/whitecube-desktop/build-provenance.json'
 SANDBOX = 'usr/lib/whitecube/desktop-chat-runtime/chrome-sandbox'
 HARDENED = {
     'usr/bin/' + name for name in
-    ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-player', 'whitecube-bus', 'whitecube-portal')
+    ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-audio', 'cube-player', 'whitecube-bus', 'whitecube-portal')
 } | {
     'usr/libexec/whitecube/cube-browser/' + name for name in
     ('cube-browser', 'cube-renderd', 'cube-netd')
