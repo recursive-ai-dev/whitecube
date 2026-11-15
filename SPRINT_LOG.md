@@ -20,3 +20,11 @@
   - Build/Tests: updated `meson.build` (`-DWHITECUBE_VERSION` for `cube-ca`/`cube-status` plus CLI help/version tests), `field_self_test()`, `status_selftest()` (temp sysfs multi-battery/HID test), and `tests/status-jobs-test.c` (`Ctrl+W`/`Delete`/scroll-reset checks).
 - **Tests & Verification**:
   - Full `./BUILD.sh` and `packaging/check-tree.py packaging/out/stage --sources src` passed inside `bwrap` with zero warnings or failures.
+
+## [2026-11-15] src/cube-settings.c & libexec/cube-settings-helper | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - `libexec/cube-settings-helper`: filtered out `scope=Device` peripheral batteries in `power()`, clamped reported backlight percentage to `[0, 100]`, updated `brightness()` to pick the first sysfs backlight with `max_brightness > 0` and clamp written brightness to `[1, max]`, unified `system()` to read `HOSTNAME`/`LOCALTIME`/`TIMEZONE` constants, and added `-h|--help` and `-v|--version` CLI flags.
+  - `src/cube-settings.c`: added `-v|--version` (`WHITECUBE_VERSION`), bounds-safe `-h|--help` handling via `settings_usage()`, UTF-8-aware `Ctrl+W` (`erase_last_word()`) and `Delete` clear shortcuts in text inputs (`key_press()`/`handle_key()`), multi-battery label disambiguation and `[0, 100]` percent clamping in `page_power()`, `signalfd` (`SIGTERM`/`SIGINT`/`SIGHUP`) handling with full `cleanup_settings()` teardown (passwords, jobs, tables, font cache, Wayland/xdg/xkb/output-manager objects), and OOM/status guards in `outputs_apply()`, `get_buffer()`, `redraw()`, and `render_png()`.
+  - Build/Tests: updated `meson.build` (`-DWHITECUBE_VERSION` for `cube-settings`/`settings-test`, `settings-cli-help`, `settings-cli-version`), extended `tests/settings-test.c` (`Ctrl+W`, `Delete`, CLI exit checks), and added `HelperPowerAndSystem` tests in `tests/test-settings-transactions.py`.
+- **Tests & Verification**:
+  - Full `./BUILD.sh` and `packaging/check-tree.py packaging/out/stage --sources src` passed inside `bwrap` with zero warnings or failures.

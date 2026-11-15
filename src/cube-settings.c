@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 #include <sys/wait.h>
@@ -43,6 +44,9 @@
 #define HELPER "/usr/libexec/whitecube/cube-settings-helper"
 #define SUDO "/usr/bin/sudo"
 #define SUSPEND_COMMAND "/usr/bin/whitecube-suspend"
+#ifndef WHITECUBE_VERSION
+#define WHITECUBE_VERSION "0.12.0"
+#endif
 #define MAXF 10
 #define MAXJOBS 24
 #define MAXHITS 768
@@ -712,20 +716,22 @@ static const struct zwlr_output_configuration_v1_listener config_listener = { co
 static void outputs_apply(void) {
 	if (!om.mgr || !om.have_serial || om.pending_config) return;
 	if (!outputs_valid()) return;
-	om.submitted_n = om.n; memcpy(om.submitted, om.heads, sizeof(om.heads));
 	struct zwlr_output_configuration_v1 *c = zwlr_output_manager_v1_create_configuration(om.mgr, om.serial);
+	if (!c) { toast("Out of memory applying display settings"); return; }
 	zwlr_output_configuration_v1_add_listener(c, &config_listener, NULL);
 	for (int i = 0; i < om.n; i++) {
 		struct ohead *hd = &om.heads[i];
 		if (!hd->live) continue;
 		if (!hd->p_enabled) { zwlr_output_configuration_v1_disable_head(c, hd->h); continue; }
 		struct zwlr_output_configuration_head_v1 *ch = zwlr_output_configuration_v1_enable_head(c, hd->h);
+		if (!ch) { zwlr_output_configuration_v1_destroy(c); toast("Out of memory configuring display"); return; }
 		if (hd->p_mode >= 0 && hd->p_mode < hd->nmodes && hd->modes[hd->p_mode].m)
 			zwlr_output_configuration_head_v1_set_mode(ch, hd->modes[hd->p_mode].m);
 		zwlr_output_configuration_head_v1_set_position(ch, atoi(hd->fx.buf), atoi(hd->fy.buf));
 		zwlr_output_configuration_head_v1_set_transform(ch, hd->p_transform);
 		zwlr_output_configuration_head_v1_set_scale(ch, wl_fixed_from_double(hd->p_scale));
 	}
+	om.submitted_n = om.n; memcpy(om.submitted, om.heads, sizeof(om.heads));
 	zwlr_output_configuration_v1_apply(c);
 	om.pending_config = c;
 }
@@ -753,19 +759,22 @@ static void request_redraw(void) { g.dirty = true; }
 static void buffer_release(void *d, struct wl_buffer *b) { ((struct buffer *)d)->busy = false; }
 static const struct wl_buffer_listener buffer_listener = { buffer_release };
 static struct buffer *get_buffer(void) {
+	if (!g.shm || g.w <= 0 || g.h <= 0 || g.w > INT_MAX / 4 || (size_t)g.h > SIZE_MAX / (size_t)(g.w * 4)) return NULL;
 	for (int i = 0; i < 2; i++) {
 		struct buffer *b = &g.bufs[i];
 		if (b->busy) continue;
-		if (b->wb && (b->w != g.w || b->h != g.h)) { wl_buffer_destroy(b->wb); munmap(b->data, (size_t)b->w * b->h * 4); b->wb = NULL; }
+		if (b->wb && (b->w != g.w || b->h != g.h)) { wl_buffer_destroy(b->wb); munmap(b->data, (size_t)b->w * b->h * 4); b->wb = NULL; b->data = NULL; }
 		if (!b->wb) {
 			int stride = g.w * 4; size_t size = (size_t)stride * g.h;
 			int fd = memfd_create("cube-settings", MFD_CLOEXEC);
-			if (fd < 0 || ftruncate(fd, size) < 0) { if (fd >= 0) close(fd); return NULL; }
+			if (fd < 0 || ftruncate(fd, (off_t)size) < 0) { if (fd >= 0) close(fd); return NULL; }
 			b->data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-			if (b->data == MAP_FAILED) { close(fd); return NULL; }
-			struct wl_shm_pool *pool = wl_shm_create_pool(g.shm, fd, size);
+			if (b->data == MAP_FAILED) { b->data = NULL; close(fd); return NULL; }
+			struct wl_shm_pool *pool = wl_shm_create_pool(g.shm, fd, (int32_t)size);
+			if (!pool) { munmap(b->data, size); b->data = NULL; close(fd); return NULL; }
 			b->wb = wl_shm_pool_create_buffer(pool, 0, g.w, g.h, stride, WL_SHM_FORMAT_ARGB8888);
 			wl_shm_pool_destroy(pool); close(fd);
+			if (!b->wb) { munmap(b->data, size); b->data = NULL; return NULL; }
 			wl_buffer_add_listener(b->wb, &buffer_listener, b);
 			b->w = g.w; b->h = g.h;
 		}
@@ -860,16 +869,22 @@ static void settings_palette(void) {
 }
 static void set_rgb(const double c[3]) { cairo_set_source_rgb(ui.cr, c[0], c[1], c[2]); }
 
+static PangoFontDescription *font_cache[3][2];
+static double font_cached_px[3][2];
 static PangoFontDescription *font_for(double px, bool bold, bool mono) {
-	static PangoFontDescription *cache[3][2]; static double cached_px[3][2];
 	int fam = mono ? 2 : 0;
-	if (cache[fam][bold] && cached_px[fam][bold] == px) return cache[fam][bold];
-	if (cache[fam][bold]) pango_font_description_free(cache[fam][bold]);
+	if (font_cache[fam][bold] && font_cached_px[fam][bold] == px) return font_cache[fam][bold];
+	if (font_cache[fam][bold]) pango_font_description_free(font_cache[fam][bold]);
 	PangoFontDescription *d = pango_font_description_from_string(mono ? "DejaVu Sans Mono" : "DejaVu Sans");
 	pango_font_description_set_absolute_size(d, px * PANGO_SCALE);
 	pango_font_description_set_weight(d, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
-	cache[fam][bold] = d; cached_px[fam][bold] = px;
+	font_cache[fam][bold] = d; font_cached_px[fam][bold] = px;
 	return d;
+}
+static void fonts_free(void) {
+	for (int f = 0; f < 3; f++)
+		for (int b = 0; b < 2; b++)
+			if (font_cache[f][b]) { pango_font_description_free(font_cache[f][b]); font_cache[f][b] = NULL; font_cached_px[f][b] = 0; }
 }
 // Draw (or just measure, when color is NULL) text; returns height; *w_out gets width.
 static double text_ex(double x, double y, const char *s, double px, bool bold, bool mono, const double *color,
@@ -1628,15 +1643,22 @@ static void page_sound(void) {
 static void page_power(void) {
 	heading("Battery");
 	status_line(T_POWER);
+	int nbatteries = 0;
+	for (int i = 0; i < tables[T_POWER].n; i++)
+		if (!strcmp(tables[T_POWER].rows[i].f[0], "battery")) nbatteries++;
 	for (int i = 0; i < tables[T_POWER].n; i++) {
 		struct row *r = &tables[T_POWER].rows[i];
 		if (!strcmp(r->f[0], "battery")) {
 			int pct = atoi(r->f[2]);
+			if (pct < 0) pct = 0;
+			if (pct > 100) pct = 100;
 			flow_newline();
 			double w = fmin(ui.cw, 520 * S), h = 30 * S;
 			frame_rect(ui.cx, ui.cy, w, h, C_INK, 1.5);
 			rect(ui.cx + 4, ui.cy + 4, (w - 8) * pct / 100.0, h - 8, pct < 15 ? C_BAD : C_INK);
-			char t[64]; snprintf(t, sizeof(t), "%d%%  %s", pct, r->f[3]);
+			char t[96];
+			if (nbatteries > 1 && r->f[1][0]) snprintf(t, sizeof(t), "%s: %d%%  %s", r->f[1], pct, r->f[3]);
+			else snprintf(t, sizeof(t), "%d%%  %s", pct, r->f[3]);
 			text(ui.cx + w + 14 * S, ui.cy + (h - F() * 1.25) / 2, t, F(), true, C_INK, 0);
 			ui.cy += h + 10 * S;
 			if (atof(r->f[5]) > 0) {
@@ -2103,11 +2125,15 @@ static void draw(cairo_t *cr, double W, double H) {
 }
 
 static void redraw(void) {
-	if (!g.configured || g.closed) return;
+	if (!g.configured || g.closed || !g.surface) return;
 	struct buffer *b = get_buffer();
 	if (!b) return; // both busy; the release will trigger another frame
 	cairo_surface_t *cs = cairo_image_surface_create_for_data(b->data, CAIRO_FORMAT_ARGB32, g.w, g.h, g.w * 4);
 	cairo_t *cr = cairo_create(cs);
+	if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS || cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+		cairo_destroy(cr); cairo_surface_destroy(cs);
+		return;
+	}
 	g.dirty = false;
 	draw(cr, g.w, g.h);
 	// A click consumed by a widget changes state drawn earlier in this frame: draw once more.
@@ -2154,6 +2180,15 @@ static struct hit *focused_hit(void) {
 	for (int i = 0; i < ui.nhits; i++) if (ui.hits[i].id == ui.focus) return &ui.hits[i];
 	return NULL;
 }
+static void erase_last_word(char *buf) {
+	size_t len = strlen(buf);
+	while (len > 0 && buf[len - 1] == ' ') len--;
+	while (len > 0 && buf[len - 1] != ' ') {
+		while (len > 0 && ((unsigned char)buf[len - 1] & 0xC0) == 0x80) len--;
+		if (len > 0) len--;
+	}
+	buf[len] = 0;
+}
 static void key_press(xkb_keysym_t sym, const char *utf8, bool ctrl, bool shift) {
 	struct hit *fh = focused_hit();
 	bool in_field = fh && fh->kind == H_FIELD && ui.edit;
@@ -2176,8 +2211,11 @@ static void key_press(xkb_keysym_t sym, const char *utf8, bool ctrl, bool shift)
 		else if (sym == XKB_KEY_BackSpace) {
 			if (ctrl) f->buf[0] = 0;
 			else { while (len > 0 && ((unsigned char)f->buf[len - 1] & 0xC0) == 0x80) len--; if (len > 0) len--; f->buf[len] = 0; }
-		} else if (ctrl && (sym == XKB_KEY_u || sym == XKB_KEY_U)) f->buf[0] = 0;
-		else if (utf8 && (unsigned char)utf8[0] >= 0x20 && utf8[0] != 0x7f && !ctrl) {
+		} else if (sym == XKB_KEY_Delete || (ctrl && (sym == XKB_KEY_u || sym == XKB_KEY_U))) {
+			f->buf[0] = 0;
+		} else if (ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W)) {
+			erase_last_word(f->buf);
+		} else if (utf8 && (unsigned char)utf8[0] >= 0x20 && utf8[0] != 0x7f && !ctrl) {
 			size_t add = strlen(utf8);
 			if (len + add < sizeof(f->buf)) memcpy(f->buf + len, utf8, add + 1);
 		}
@@ -2227,7 +2265,8 @@ static void handle_key(uint32_t key) {
 	bool shift = xkb_state_mod_name_is_active(g.xstate, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0;
 	struct hit *field = focused_hit();
 	if (field && field->kind == H_FIELD && !ctrl && sym != XKB_KEY_Tab && sym != XKB_KEY_ISO_Left_Tab &&
-	    sym != XKB_KEY_Escape && sym != XKB_KEY_Return && sym != XKB_KEY_BackSpace) {
+	    sym != XKB_KEY_Escape && sym != XKB_KEY_Return && sym != XKB_KEY_KP_Enter &&
+	    sym != XKB_KEY_BackSpace && sym != XKB_KEY_Delete) {
 		if (wc_compose_key(g.compose, sym, utf8, sizeof(utf8))) {
 			if (!utf8[0]) { request_redraw(); return; }
 			sym = XKB_KEY_NoSymbol;
@@ -2368,13 +2407,78 @@ static void pump_jobs(int timeout_ms) {
 	for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) job_read(&jobs[i]);
 }
 
+static void cleanup_settings(void) {
+	explicit_bzero(g_password, sizeof(g_password));
+	g_have_password = false;
+	explicit_bzero(modal.a.buf, sizeof(modal.a.buf));
+	explicit_bzero(modal.b.buf, sizeof(modal.b.buf));
+	explicit_bzero(&modal.pending, sizeof(modal.pending));
+	stop_repeat();
+	if (g.repeat_fd >= 0) { close(g.repeat_fd); g.repeat_fd = -1; }
+	for (int i = 0; i < MAXJOBS; i++) {
+		if (!jobs[i].used) continue;
+		if (jobs[i].out >= 0) close(jobs[i].out);
+		if (jobs[i].err >= 0) close(jobs[i].err);
+		if (jobs[i].pid > 0 && !jobs[i].reaped) {
+			kill(jobs[i].pid, SIGTERM);
+			waitpid(jobs[i].pid, NULL, WNOHANG);
+		}
+		free(jobs[i].obuf);
+		memset(&jobs[i], 0, sizeof(jobs[i]));
+	}
+	for (int i = 0; i < T_COUNT; i++) {
+		free(tables[i].data);
+		free(tables[i].rows);
+		tables[i].data = NULL; tables[i].rows = NULL; tables[i].n = 0;
+	}
+	fonts_free();
+	for (int i = 0; i < 2; i++) {
+		if (g.bufs[i].wb) wl_buffer_destroy(g.bufs[i].wb);
+		if (g.bufs[i].data) munmap(g.bufs[i].data, (size_t)g.bufs[i].w * g.bufs[i].h * 4);
+		memset(&g.bufs[i], 0, sizeof(g.bufs[i]));
+	}
+	for (int i = 0; i < om.n; i++) {
+		for (int k = 0; k < om.heads[i].nmodes; k++)
+			if (om.heads[i].modes[k].m) { zwlr_output_mode_v1_destroy(om.heads[i].modes[k].m); om.heads[i].modes[k].m = NULL; }
+		if (om.heads[i].h) { zwlr_output_head_v1_destroy(om.heads[i].h); om.heads[i].h = NULL; }
+	}
+	om.n = 0;
+	if (om.pending_config) { zwlr_output_configuration_v1_destroy(om.pending_config); om.pending_config = NULL; }
+	if (om.mgr) { zwlr_output_manager_v1_destroy(om.mgr); om.mgr = NULL; }
+	if (g.cursor_surface) { wl_surface_destroy(g.cursor_surface); g.cursor_surface = NULL; }
+	if (g.cursor_theme) { wl_cursor_theme_destroy(g.cursor_theme); g.cursor_theme = NULL; }
+	if (g.top) { xdg_toplevel_destroy(g.top); g.top = NULL; }
+	if (g.xsurf) { xdg_surface_destroy(g.xsurf); g.xsurf = NULL; }
+	if (g.surface) { wl_surface_destroy(g.surface); g.surface = NULL; }
+	if (g.kbd) { wl_keyboard_destroy(g.kbd); g.kbd = NULL; }
+	if (g.ptr) { wl_pointer_destroy(g.ptr); g.ptr = NULL; }
+	if (g.seat) { wl_seat_destroy(g.seat); g.seat = NULL; }
+	if (g.wm_base) { xdg_wm_base_destroy(g.wm_base); g.wm_base = NULL; }
+	if (g.shm) { wl_shm_destroy(g.shm); g.shm = NULL; }
+	if (g.compositor) { wl_compositor_destroy(g.compositor); g.compositor = NULL; }
+	if (g.registry) { wl_registry_destroy(g.registry); g.registry = NULL; }
+	if (g.compose) { xkb_compose_state_unref(g.compose); g.compose = NULL; }
+	if (g.xstate) { xkb_state_unref(g.xstate); g.xstate = NULL; }
+	if (g.keymap) { xkb_keymap_unref(g.keymap); g.keymap = NULL; }
+	if (g.xkb) { xkb_context_unref(g.xkb); g.xkb = NULL; }
+	if (g.display) { wl_display_disconnect(g.display); g.display = NULL; }
+}
+
+static void settings_usage(FILE *out) {
+	fprintf(out, "usage: cube-settings [--help] [--version] [--page NAME] [--section overview|desktop|activity|devices|browser] | [--section NAME] --render NAME FILE.png [WxH]\npages:");
+	for (int k = 0; k < PG_COUNT; k++) fprintf(out, " %s", page_keys[k]);
+	fprintf(out, "\n");
+}
+
 // Draw one page to a PNG without a window: lets layouts be checked headless.
 static int render_png(int page, const char *path, int W, int H) {
 	g.render_only = true;
 	if (getenv("WAYLAND_DISPLAY") && (g.display = wl_display_connect(NULL))) {
 		g.registry = wl_display_get_registry(g.display);
-		wl_registry_add_listener(g.registry, &reg_listener, NULL);
-		wl_display_roundtrip(g.display); wl_display_roundtrip(g.display);
+		if (g.registry) {
+			wl_registry_add_listener(g.registry, &reg_listener, NULL);
+			wl_display_roundtrip(g.display); wl_display_roundtrip(g.display);
+		}
 	}
 	ui.page = page;
 	refresh_page(true);
@@ -2383,13 +2487,21 @@ static int render_png(int page, const char *path, int W, int H) {
 	while (any_job() && now_s() < deadline) pump_jobs(200);
 	cairo_surface_t *cs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
 	cairo_t *cr = cairo_create(cs);
+	if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS || cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+		cairo_destroy(cr); cairo_surface_destroy(cs);
+		cleanup_settings();
+		fprintf(stderr, "cube-settings: cannot allocate render surface\n");
+		return 1;
+	}
 	g.h = H;
 	draw(cr, W, H); // first pass loads anything the page asks for (variants, ...)
 	while (any_job() && now_s() < deadline) pump_jobs(200);
 	draw(cr, W, H);
+	cairo_status_t cr_status = cairo_status(cr);
 	cairo_destroy(cr);
-	cairo_status_t s = cairo_surface_write_to_png(cs, path);
+	cairo_status_t s = cr_status == CAIRO_STATUS_SUCCESS ? cairo_surface_write_to_png(cs, path) : cr_status;
 	cairo_surface_destroy(cs);
+	cleanup_settings();
 	if (s != CAIRO_STATUS_SUCCESS) { fprintf(stderr, "cube-settings: cannot write %s\n", path); return 1; }
 	return 0;
 }
@@ -2411,7 +2523,13 @@ int main(int argc, char **argv) {
 	S = acc.ui_scale / 100.0;
 	int start_page = 0;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--section") && i + 1 < argc) {
+		if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+			settings_usage(stdout);
+			return 0;
+		} else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
+			printf("cube-settings %s\n", WHITECUBE_VERSION);
+			return 0;
+		} else if (!strcmp(argv[i], "--section") && i + 1 < argc) {
 			const char *section = argv[++i]; bool found = false;
 			for (int j = 0; j < 5; j++) if (!strcmp(section, privacy_section_keys[j])) { ui.privacy_section = j; found = true; }
 			if (!found) { fprintf(stderr, "unknown privacy section %s\n", section); return 2; }
@@ -2425,35 +2543,44 @@ int main(int argc, char **argv) {
 			if (W < 640 || H < 400 || W > 4096 || H > 8192) { fprintf(stderr, "render size out of range\n"); return 2; }
 			return render_png(p, argv[i + 2], W, H);
 		} else {
-			printf("usage: cube-settings [--page NAME] [--section overview|desktop|activity|devices|browser] | [--section NAME] --render NAME FILE.png [WxH]\npages:");
-			for (int k = 0; k < PG_COUNT; k++) printf(" %s", page_keys[k]);
-			printf("\n");
-			return argv[i][1] == 'h' || !strcmp(argv[i], "--help") ? 0 : 2;
+			settings_usage(stderr);
+			return 2;
 		}
 	}
+	int rc = 1, tick_fd = -1, sfd = -1;
 	ui.page = start_page;
 	g.display = wl_display_connect(NULL);
 	if (!g.display) { fprintf(stderr, "cube-settings: no Wayland display (run inside whitecube)\n"); return 1; }
 	g.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+	if (!g.xkb) { fprintf(stderr, "cube-settings: failed to create xkb context\n"); goto cleanup; }
 	g.compose = wc_compose_create(g.xkb);
 	g.registry = wl_display_get_registry(g.display);
+	if (!g.registry) { fprintf(stderr, "cube-settings: failed to get Wayland registry\n"); goto cleanup; }
 	wl_registry_add_listener(g.registry, &reg_listener, NULL);
 	wl_display_roundtrip(g.display);
-	if (!g.compositor || !g.shm || !g.wm_base) { fprintf(stderr, "cube-settings: compositor lacks xdg-shell/shm\n"); return 1; }
+	if (!g.compositor || !g.shm || !g.wm_base) { fprintf(stderr, "cube-settings: compositor lacks xdg-shell/shm\n"); goto cleanup; }
 	wl_display_roundtrip(g.display);
 	g.cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), 24, g.shm);
 	g.cursor_surface = wl_compositor_create_surface(g.compositor);
 	g.surface = wl_compositor_create_surface(g.compositor);
+	if (!g.surface) { fprintf(stderr, "cube-settings: failed to create Wayland surface\n"); goto cleanup; }
 	g.xsurf = xdg_wm_base_get_xdg_surface(g.wm_base, g.surface);
+	if (!g.xsurf) { fprintf(stderr, "cube-settings: failed to create xdg_surface\n"); goto cleanup; }
 	xdg_surface_add_listener(g.xsurf, &xsurf_listener, NULL);
 	g.top = xdg_surface_get_toplevel(g.xsurf);
+	if (!g.top) { fprintf(stderr, "cube-settings: failed to create xdg_toplevel\n"); goto cleanup; }
 	xdg_toplevel_add_listener(g.top, &top_listener, NULL);
 	xdg_toplevel_set_app_id(g.top, "cube-settings");
 	xdg_toplevel_set_title(g.top, "Whitecube Settings");
 	xdg_toplevel_set_min_size(g.top, (int)(680 * S), (int)(440 * S));
 	wl_surface_commit(g.surface);
 	g.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-	int tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	tick_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	if (g.repeat_fd < 0 || tick_fd < 0) { fprintf(stderr, "cube-settings: failed to create timers\n"); goto cleanup; }
+	sigset_t sigmask;
+	sigemptyset(&sigmask); sigaddset(&sigmask, SIGTERM); sigaddset(&sigmask, SIGINT); sigaddset(&sigmask, SIGHUP);
+	if (sigprocmask(SIG_BLOCK, &sigmask, NULL) == 0)
+		sfd = signalfd(-1, &sigmask, SFD_NONBLOCK | SFD_CLOEXEC);
 	struct itimerspec tick = { {2, 0}, {2, 0} };
 	timerfd_settime(tick_fd, 0, &tick, NULL);
 	refresh_page(true);
@@ -2462,11 +2589,13 @@ int main(int argc, char **argv) {
 		while (wl_display_prepare_read(g.display) != 0) wl_display_dispatch_pending(g.display);
 		if (g.dirty) { redraw(); }
 		wl_display_flush(g.display);
-		struct pollfd fds[3 + MAXJOBS * 2]; struct job *owner[3 + MAXJOBS * 2] = {0}; int n = 0;
+		struct pollfd fds[4 + MAXJOBS * 2]; struct job *owner[4 + MAXJOBS * 2] = {0}; int n = 0;
 		fds[n++] = (struct pollfd){wl_display_get_fd(g.display), POLLIN, 0};
 		fds[n++] = (struct pollfd){tick_fd, POLLIN, 0};
 		fds[n++] = (struct pollfd){g.repeat_fd, POLLIN, 0};
-		int poll_ms = -1;
+		int sig_idx = -1;
+		if (sfd >= 0) { sig_idx = n; fds[n++] = (struct pollfd){sfd, POLLIN, 0}; }
+		int poll_start = n, poll_ms = -1;
 		for (int i = 0; i < MAXJOBS; i++) {
 			if (!jobs[i].used) continue;
 			if (jobs[i].out >= 0) { fds[n] = (struct pollfd){jobs[i].out, POLLIN, 0}; owner[n++] = &jobs[i]; }
@@ -2487,11 +2616,19 @@ int main(int argc, char **argv) {
 		}
 		if (fds[2].revents & POLLIN && read(g.repeat_fd, &ticks, sizeof(ticks)) > 0 && g.repeat_key)
 			for (uint64_t i = 0; i < ticks && i < 8; i++) handle_key(g.repeat_key);
-		for (int i = 3; i < n; i++) if (fds[i].revents && owner[i] && owner[i]->used) job_read(owner[i]);
+		if (sig_idx >= 0 && (fds[sig_idx].revents & POLLIN)) {
+			struct signalfd_siginfo si;
+			while (read(sfd, &si, sizeof(si)) > 0) {}
+			g.closed = true;
+		}
+		for (int i = poll_start; i < n; i++) if (fds[i].revents && owner[i] && owner[i]->used) job_read(owner[i]);
 		for (int i = 0; i < MAXJOBS; i++) if (jobs[i].used) job_read(&jobs[i]);
 	}
-	explicit_bzero(g_password, sizeof(g_password));
+	rc = 0;
+cleanup:
 	(void)any_action_running;
-	wl_display_disconnect(g.display);
-	return 0;
+	if (tick_fd >= 0) close(tick_fd);
+	if (sfd >= 0) close(sfd);
+	cleanup_settings();
+	return rc;
 }

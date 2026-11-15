@@ -150,6 +150,15 @@ static void test_text_input(void) {
 	handle_key(xkb_keymap_key_by_name(g.keymap, "AD03") - 8);
 	assert(!strcmp(field.buf, "é"));
 	handle_key(xkb_keymap_key_by_name(g.keymap, "BKSP") - 8); assert(!field.buf[0]);
+	copy(field.buf, sizeof(field.buf), "café latte  ");
+	key_press(XKB_KEY_w, NULL, true, false);
+	assert(!strcmp(field.buf, "café "));
+	key_press(XKB_KEY_w, NULL, true, false);
+	assert(!field.buf[0]);
+	copy(field.buf, sizeof(field.buf), "clear-me");
+	uint32_t del = xkb_keymap_key_by_name(g.keymap, "DELE");
+	if (del != XKB_KEYCODE_INVALID) { handle_key(del - 8); assert(!field.buf[0]); }
+	field.buf[0] = 0;
 	handle_key(xkb_keymap_key_by_name(g.keymap, "RALT") - 8);
 	kb_leave(NULL, NULL, 0, NULL);
 	assert(xkb_compose_state_get_status(g.compose) == XKB_COMPOSE_NOTHING);
@@ -204,6 +213,12 @@ int main(int argc, char **argv) {
 	test_config(); test_navigation(); test_theme(); test_accessibility_and_display(); test_advanced();
 	test_text_input();
 	test_launch_errors();
+	char *ver_argv[] = {"cube-settings", "--version", NULL};
+	assert(settings_app_main(2, ver_argv) == 0);
+	char *help_argv[] = {"cube-settings", "--help", NULL};
+	assert(settings_app_main(2, help_argv) == 0);
+	char *bad_argv[] = {"cube-settings", "--no-such-option", NULL};
+	assert(settings_app_main(2, bad_argv) == 2);
 	char path[512]; user_config_path(path,sizeof(path)); unlink(path);
 	snprintf(path,sizeof(path),"%s/.config/whitecube",dir); rmdir(path);
 	snprintf(path,sizeof(path),"%s/.config",dir); rmdir(path);

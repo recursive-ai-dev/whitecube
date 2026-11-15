@@ -166,5 +166,92 @@ class Transactions(unittest.TestCase):
         lock.assert_not_called()
 
 
+class HelperPowerAndSystem(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for name, sub in [('POWER', 'power_supply'), ('BACKLIGHT', 'backlight'),
+                          ('HOSTNAME', 'hostname'), ('LOCALTIME', 'localtime'), ('TIMEZONE', 'timezone')]:
+            path = self.root / sub
+            if name in ('POWER', 'BACKLIGHT'):
+                path.mkdir()
+            patcher = mock.patch.object(helper, name, path)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_power_skips_device_batteries_and_clamps_backlight(self):
+        bat = helper.POWER / 'BAT0'
+        bat.mkdir()
+        (bat / 'type').write_text('Battery\n')
+        (bat / 'scope').write_text('System\n')
+        (bat / 'capacity').write_text('80\n')
+        (bat / 'status').write_text('Discharging\n')
+        hid = helper.POWER / 'hid-mouse'
+        hid.mkdir()
+        (hid / 'type').write_text('Battery\n')
+        (hid / 'scope').write_text('Device\n')
+        (hid / 'capacity').write_text('45\n')
+        ac = helper.POWER / 'AC'
+        ac.mkdir()
+        (ac / 'type').write_text('Mains\n')
+        (ac / 'online').write_text('1\n')
+        broken = helper.BACKLIGHT / '00_broken'
+        broken.mkdir()
+        (broken / 'max_brightness').write_text('0\n')
+        (broken / 'brightness').write_text('5\n')
+        bl = helper.BACKLIGHT / 'intel_backlight'
+        bl.mkdir()
+        (bl / 'max_brightness').write_text('200\n')
+        (bl / 'brightness').write_text('250\n')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            helper.power()
+        lines = buf.getvalue().splitlines()
+        self.assertIn('battery\tBAT0\t80\tDischarging\t\t', lines)
+        self.assertIn('ac\tAC\tonline', lines)
+        self.assertIn('backlight\tintel_backlight\t100', lines)
+        self.assertFalse(any('hid-mouse' in l for l in lines))
+        self.assertFalse(any('00_broken' in l for l in lines))
+
+    def test_brightness_picks_usable_backlight_and_rejects_all_zero(self):
+        broken = helper.BACKLIGHT / 'acpi_video0'
+        broken.mkdir()
+        (broken / 'max_brightness').write_text('0\n')
+        (broken / 'brightness').write_text('0\n')
+        bl = helper.BACKLIGHT / 'intel_backlight'
+        bl.mkdir()
+        (bl / 'max_brightness').write_text('400\n')
+        (bl / 'brightness').write_text('10\n')
+        with mock.patch.object(helper, 'require_root'), mock.patch.object(helper, 'emit') as emit:
+            helper.brightness('50')
+        self.assertEqual((bl / 'brightness').read_text(), '200')
+        self.assertEqual((broken / 'brightness').read_text(), '0\n')
+        emit.assert_called_once_with('ok', 'brightness', '50')
+        (bl / 'max_brightness').write_text('0\n')
+        with mock.patch.object(helper, 'require_root'), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                helper.brightness('50')
+
+    def test_system_reads_configured_paths_and_cli_flags(self):
+        helper.HOSTNAME.write_text('cube-box\n')
+        helper.TIMEZONE.write_text('America/Toronto\n')
+        buf = io.StringIO()
+        with mock.patch.object(helper, 'run', return_value=mock.Mock(stdout='')), contextlib.redirect_stdout(buf):
+            helper.system()
+        lines = buf.getvalue().splitlines()
+        self.assertIn('sys\thostname\tcube-box', lines)
+        self.assertIn('sys\ttimezone\tAmerica/Toronto', lines)
+        for flag, expected in (('--help', 'usage:'), ('--version', 'cube-settings-helper')):
+            out = io.StringIO()
+            with mock.patch.object(helper.sys, 'argv', ['cube-settings-helper', flag]), contextlib.redirect_stdout(out):
+                helper.main()
+            self.assertIn(expected, out.getvalue())
+        with mock.patch.object(helper.sys, 'argv', ['cube-settings-helper', 'no-such-cmd']), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                helper.main()
+            self.assertEqual(ctx.exception.code, 1)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

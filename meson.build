@@ -66,8 +66,9 @@ portal_wire_test = executable('portal-test-wire',
   include_directories: portal_inc,
   c_args: ['-D_GNU_SOURCE'])
 test('portal-dbus-wire', portal_wire_test, suite: 'core')
-settings = executable('cube-settings', ['src/cube-settings.c'] + settings_sources, dependencies: client_deps,
-  build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
+settings = executable('cube-settings', ['src/cube-settings.c'] + settings_sources,
+  c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
+  dependencies: client_deps, build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 status = executable('cube-status', ['src/cube-status.c', layer, xdg],
   c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
   dependencies: client_deps,
@@ -87,6 +88,7 @@ test('drag-and-drop', dnd_test, args: [dnd_client], env: ['WLR_RENDERER=pixman']
 status_theme_test = executable('status-theme-test', 'tests/status-theme-test.c', dependencies: [m])
 test('status-theme-palette', status_theme_test, suite: 'core')
 settings_test = executable('settings-test', ['tests/settings-test.c'] + settings_sources,
+  c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
   dependencies: client_deps, build_rpath: native_rpath)
 test('settings-privacy-and-navigation', settings_test, depends: compiled_schema, env: schema_env, suite: 'core')
 status_apps_test = executable('status-apps-test', ['tests/status-apps-test.c', layer, xdg],
@@ -114,6 +116,8 @@ test('wallpaper-cli-help', ca, args: ['--help'], suite: 'core')
 test('wallpaper-cli-version', ca, args: ['--version'], suite: 'core')
 test('status-cli-help', status, args: ['--help'], suite: 'core')
 test('status-cli-version', status, args: ['--version'], suite: 'core')
+test('settings-cli-help', settings, args: ['--help'], suite: 'core')
+test('settings-cli-version', settings, args: ['--version'], suite: 'core')
 
 foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'test-install.py'],
                 ['native-preference-validation', 'test-preferences.py'],

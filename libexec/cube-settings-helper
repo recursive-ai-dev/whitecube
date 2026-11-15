@@ -182,6 +182,8 @@ def power():
     for supply in sorted(POWER.glob("*")):
         kind = read(supply / "type")
         if kind == "Battery":
+            if read(supply / "scope") == "Device":
+                continue
             emit("battery", supply.name, read(supply / "capacity", "?"), read(supply / "status", "Unknown"),
                  read(supply / "energy_full", read(supply / "charge_full", "")),
                  read(supply / "energy_full_design", read(supply / "charge_full_design", "")))
@@ -194,7 +196,8 @@ def power():
         except ValueError:
             continue
         if maximum > 0:
-            emit("backlight", device.name, round(current * 100 / maximum))
+            pct = max(0, min(100, round(current * 100 / maximum)))
+            emit("backlight", device.name, pct)
 
 
 def audio_mode():
@@ -252,13 +255,13 @@ def sound():
 
 
 def system():
-    emit("sys", "hostname", read("/etc/hostname") or os.uname().nodename)
+    emit("sys", "hostname", read(HOSTNAME) or os.uname().nodename)
     zone = ""
     try:
-        target = os.readlink("/etc/localtime")
+        target = os.readlink(LOCALTIME)
         zone = target.split("zoneinfo/", 1)[1] if "zoneinfo/" in target else target
     except OSError:
-        zone = read("/etc/timezone")
+        zone = read(TIMEZONE)
     emit("sys", "timezone", zone or "UTC")
     emit("sys", "time", time.strftime("%Y-%m-%d %H:%M:%S %Z"))
     os_release = dict(line.split("=", 1) for line in read("/etc/os-release").splitlines() if "=" in line)
@@ -280,7 +283,7 @@ def system():
     emit("sys", "memory", f"{(mem.get('MemTotal', 0) - mem.get('MemAvailable', 0)) // 1024} MiB used of "
                           f"{mem.get('MemTotal', 0) // 1024} MiB")
     cpu = next((l.split(":", 1)[1].strip() for l in read("/proc/cpuinfo").splitlines() if l.startswith("model name")), "")
-    emit("sys", "cpu", f"{cpu} ({os.cpu_count()} threads)")
+    emit("sys", "cpu", f"{cpu} ({os.cpu_count() or 1} threads)")
     tracking = run("/usr/bin/chronyc", "-n", "tracking", timeout=3).stdout
     status = re.search(r"Leap status\s*:\s*(.*)", tracking)
     emit("sys", "time_sync", status.group(1) if status else "chrony not answering")
@@ -456,9 +459,21 @@ def brightness(percent):
     devices = sorted(BACKLIGHT.glob("*"))
     if not devices:
         fail("No backlight on this machine")
-    device = devices[0]
-    maximum = int(read(device / "max_brightness", "0"))
-    (device / "brightness").write_text(str(max(1, round(maximum * int(percent) / 100))))
+    chosen = None
+    chosen_max = 0
+    for device in devices:
+        try:
+            maximum = int(read(device / "max_brightness", "0") or 0)
+        except ValueError:
+            continue
+        if maximum > 0:
+            chosen = device
+            chosen_max = maximum
+            break
+    if chosen is None:
+        fail("No adjustable backlight on this machine")
+    value = max(1, min(chosen_max, round(chosen_max * int(percent) / 100)))
+    (chosen / "brightness").write_text(str(value))
     emit("ok", "brightness", percent)
 
 
@@ -710,6 +725,12 @@ COMMANDS = {
 
 
 def main():
+    if len(sys.argv) == 2 and sys.argv[1] in ("-h", "--help"):
+        print("usage: cube-settings-helper " + "|".join(sorted(COMMANDS)))
+        return
+    if len(sys.argv) == 2 and sys.argv[1] in ("-v", "--version"):
+        print("cube-settings-helper 0.12.0")
+        return
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
         fail("usage: cube-settings-helper " + "|".join(sorted(COMMANDS)))
     function, count = COMMANDS[sys.argv[1]]
