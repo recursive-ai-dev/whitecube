@@ -24,5 +24,5 @@
 - [x] `apps/wc-suite` & `apps/cube-apps` (CLI suite, completions, and native file utilities)
 
 ## Phase 4: Packaging & Release Readiness (`packaging/`, `tools/`)
-- [ ] `packaging/` (`install-tree.sh`, `check-tree.py`, `debian/`, ABI & conffile verification)
+- [x] `packaging/` (`install-tree.sh`, `check-tree.py`, `debian/`, ABI & conffile verification)
 - [ ] `tools/` (`whitecube-migrate` & developer scripts)

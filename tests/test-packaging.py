@@ -333,6 +333,26 @@ class Tree(unittest.TestCase):
             worker.write_text(original_worker)
             helper.write_text(original_helper)
 
+    def test_path_checker_verifies_conffiles_and_json_output(self):
+        conffiles = ROOT / 'packaging/debian/conffiles'
+        cmd = [sys.executable, '-I', str(ROOT / 'packaging/check-tree.py'), str(self.stage),
+               '--sources', str(ROOT / 'src'), '--conffiles', str(conffiles), '--json']
+        done = subprocess.run(cmd, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        payload = json.loads(done.stdout)
+        self.assertTrue(payload['ok'])
+        self.assertGreater(payload['checked'], 10)
+        extra = self.stage / 'etc/whitecube/unregistered.conf'
+        extra.write_text('test=1\n')
+        try:
+            bad = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(bad.returncode, 1)
+            bad_payload = json.loads(bad.stdout)
+            self.assertFalse(bad_payload['ok'])
+            self.assertTrue(any('etc/whitecube/unregistered.conf' in p for p in bad_payload['problems']))
+        finally:
+            extra.unlink()
+
     def test_comment_about_unrelated_whitecube_does_not_exempt_a_runtime_reference(self):
         session = self.stage / 'usr/bin/whitecube-session'
         original = session.read_text()
@@ -669,7 +689,7 @@ class ArchiveVerification(unittest.TestCase):
         if compiler is None:
             self.skipTest('a C compiler is required for ELF hardening fixtures')
         binary = self.stage / 'usr/bin/whitecube-compositor'
-        binary.parent.mkdir(parents=True)
+        binary.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run([compiler, '-x', 'c', '-o', str(binary), *flags, '-'],
                        input='int main(void) { return 0; }\n', text=True, capture_output=True, check=True)
         binary.chmod(0o755)
@@ -687,6 +707,14 @@ class ArchiveVerification(unittest.TestCase):
         self.assertIn('native executable is not PIE: usr/bin/whitecube-compositor', problems)
         self.assertIn('native executable lacks full RELRO: usr/bin/whitecube-compositor', problems)
         self.assertIn('native executable lacks a non-executable stack: usr/bin/whitecube-compositor', problems)
+
+    def test_leaked_build_rpath_is_rejected_and_private_rpath_allowed(self):
+        self.compile_core(['-fPIE', '-pie', '-Wl,-z,relro,-z,now,-z,noexecstack,-rpath,/usr/lib/whitecube'])
+        problems, _ = self.verify()
+        self.assertEqual(problems, [])
+        self.compile_core(['-fPIE', '-pie', '-Wl,-z,relro,-z,now,-z,noexecstack,-rpath,/tmp/leaked-build'])
+        problems, _ = self.verify()
+        self.assertTrue(any('/tmp/leaked-build' in item for item in problems), problems)
 
     def test_external_symlink_cannot_escape_installed_root(self):
         (self.config.parent / 'bad').symlink_to('../../../outside')

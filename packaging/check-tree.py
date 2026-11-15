@@ -9,8 +9,10 @@ It also rejects anything that would only work on one machine: /usr/local and /ho
 Exits 1 and lists every problem, so a path that drifted during a move cannot ship unnoticed.
 """
 import argparse
+import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -71,12 +73,41 @@ def rodata(path: Path) -> bytes:
         return out.read_bytes() if done.returncode == 0 and out.exists() else b''
 
 
+def check_conffiles(stage: Path, conffiles_path: Path) -> list[str]:
+    problems = []
+    if not conffiles_path.is_file():
+        return [f'conffiles manifest is missing: {conffiles_path}']
+    lines = conffiles_path.read_text().splitlines()
+    seen = set()
+    for line in lines:
+        if not line or line.startswith('#'):
+            continue
+        if line in seen:
+            problems.append(f'duplicate conffile entry: {line}')
+            continue
+        seen.add(line)
+        if not line.startswith('/etc/'):
+            problems.append(f'conffile entry is outside /etc: {line}')
+        elif not (stage / line.lstrip('/')).is_file():
+            problems.append(f'conffile {line} is missing from {stage}')
+    etc_dir = stage / 'etc'
+    if etc_dir.is_dir():
+        for item in sorted(etc_dir.rglob('*')):
+            if item.is_file() or item.is_symlink():
+                expected = '/' + item.relative_to(stage).as_posix()
+                if expected not in seen:
+                    problems.append(f'staged /etc file is not listed in conffiles: {expected[1:]}')
+    return problems
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('stage', type=Path)
     ap.add_argument('--host-root', type=Path, default=Path('/'))
     ap.add_argument('--sources', type=Path, help='directory of C sources whose string literals must also name only shipped paths')
     ap.add_argument('--allow-forbidden', action='append', default=[], help='extra path prefixes that may name /usr/local or /home')
+    ap.add_argument('--conffiles', type=Path, help='verify stage /etc files match this Debian conffiles list')
+    ap.add_argument('--json', action='store_true', help='emit machine-readable JSON output')
     args = ap.parse_args()
     stage, host = args.stage.resolve(), args.host_root
     allow_forbidden = ALLOW_FORBIDDEN_IN + tuple(args.allow_forbidden)
@@ -87,16 +118,28 @@ def main():
             if not os.path.lexists(target):
                 problems.append(f'{path.relative_to(stage)}: dangling symlink -> {os.readlink(path)}')
             continue
-        if not path.is_file():
+        lst = path.lstat()
+        if stat.S_ISDIR(lst.st_mode):
+            continue
+        if not stat.S_ISREG(lst.st_mode):
+            problems.append(f'{path.relative_to(stage)}: unexpected non-regular payload entry')
             continue
         rel = str(path.relative_to(stage))
         if rel.startswith('DEBIAN/'):
             continue
-        with path.open('rb') as stream:
-            prefix = stream.read(4096)
-            if is_elf(prefix) or b'\0' in prefix:
-                continue                               # native literals checked from sources; skip binary data early
-            data = prefix + stream.read()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            with os.fdopen(fd, 'rb') as stream:
+                prefix = stream.read(4096)
+                if is_elf(prefix) or b'\0' in prefix:
+                    continue                               # native literals checked from sources; skip binary data early
+                data = prefix + stream.read()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         if path.stat().st_mode & 0o111 and not data.startswith(b'#!'):
             problems.append(f'{rel}: executable without a #! line')
         strings = [data]
@@ -158,14 +201,20 @@ def main():
                 'usr/share/whitecube/cube-strap/deb-strap.sh', 'usr/libexec/whitecube/cube-strap-build',
                 'usr/share/applications/cube-strap.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-strap.svg',
                 'usr/bin/cube-prompts', 'usr/share/whitecube/cube-prompts/app.py',
+                'usr/share/whitecube/cube-prompts/prompt_manager/cli.py',
                 'usr/share/whitecube/cube-prompts/prompt_manager/storage/repository.py',
                 'usr/share/applications/cube-prompts.desktop', 'usr/share/icons/hicolor/scalable/apps/cube-prompts.svg',
+                'usr/bin/desktop-chat', 'usr/share/whitecube/desktop-chat/desktop-chat.sh',
+                'usr/share/whitecube/desktop-chat/src/cli.js',
+                'usr/bin/cube-hash', 'usr/bin/cube-lock', 'usr/bin/cube-pdf', 'usr/bin/cube-rename',
+                'usr/share/whitecube/cube-apps/cube_theme.py',
                 'usr/bin/whitecube-browser', 'usr/libexec/whitecube/cube-browser/cube-browser',
                 'usr/libexec/whitecube/cube-browser/cube-renderd', 'usr/libexec/whitecube/cube-browser/cube-netd',
                 'usr/share/applications/whitecube-browser.desktop', 'usr/share/icons/hicolor/scalable/apps/whitecube-browser.svg',
                 'usr/bin/cube-player', 'usr/share/applications/cube-player.desktop',
                 'usr/share/icons/hicolor/scalable/apps/cube-player.svg',
-                'usr/bin/wc-help', 'usr/bin/wc-doctor', 'usr/lib/wc-suite/wc_suite.py',
+                'usr/bin/wc-help', 'usr/bin/wc-doctor', 'usr/lib/wc-suite/wc_suite.py', 'usr/lib/wc-suite/README.txt',
+                'usr/share/bash-completion/completions/wc-help', 'usr/share/zsh/vendor-completions/_wc',
                 'usr/bin/cube-train', 'usr/bin/whitecube-train', 'usr/share/whitecube/cube-train/app.py',
                 'usr/share/whitecube/cube-train/engine.py', 'usr/share/whitecube/cube-train/worker.py',
                 'usr/share/whitecube/cube-train/pipeline/train_folder.py',
@@ -188,6 +237,11 @@ def main():
                 'usr/share/xdg-desktop-portal/portals/whitecube.portal'):
         if not (stage / rel).exists():
             problems.append(f'{rel}: required file is missing')
+    if args.conffiles:
+        problems.extend(check_conffiles(stage, args.conffiles))
+    if args.json:
+        print(json.dumps({'ok': not problems, 'checked': checked, 'problems': problems}, indent=2))
+        return 1 if problems else 0
     if problems:
         print(f'check-tree: {len(problems)} problem(s) in {stage}:')
         for p in problems:

@@ -173,3 +173,12 @@
 - **Tests & Verification**:
   - Extended `apps/wc-suite/test_suite.py` (`test_ls_group_filter_and_nonblocking_hardening`), `apps/cube-apps/tests/test_cube.py` (`TestCliAndHardening` for symlink/FIFO `last_folder()` safety and `--version`/`--cli` workflows), and `tests/test-doctor.py` (`test_suite_check_reports_staged_and_live_readiness`).
   - Verified `apps/cube-apps/tests`, `apps/wc-suite/test_suite.py` (53 tests ok), `tests/test-cube-apps-ui.py`, `tests/test-doctor.py` (56 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] packaging/ | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Updated `packaging/check-tree.py` with `--conffiles` stage verification (`check_conffiles()` ensuring bidirectional sync between shipped `/etc/` files and `packaging/debian/conffiles`), `--json` structured reporting, expanded required-file checks for the new CLI/utility deliverables (`prompt_manager/cli.py`, `desktop-chat/src/cli.js`, `cube-{hash,lock,pdf,rename}`), and non-blocking `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` regular-file opening.
+  - Wired `--conffiles packaging/debian/conffiles` into `packaging/build-deb.sh`.
+  - Extended `packaging/verify-deb.py:check_hardening()` to resolve `PT_LOAD` / `DT_STRTAB` and reject any `DT_RPATH`/`DT_RUNPATH` entries pointing outside `/usr/lib/whitecube`.
+- **Tests & Verification**:
+  - Extended `tests/test-packaging.py` (`test_path_checker_verifies_conffiles_and_json_output` and `test_leaked_build_rpath_is_rejected_and_private_rpath_allowed`).
+  - Verified `tests/test-packaging.py` (63 tests ok), `tests/test-arch-packaging.py` (4 tests ok), `tests/test-installed-conflicts.py` (11 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py --sources src --conffiles packaging/debian/conffiles`, and `tests/test-packaging.py` inside `bwrap`.

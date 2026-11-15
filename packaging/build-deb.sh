@@ -157,7 +157,7 @@ install -m 0644 packaging/debian/conffiles "$stage/DEBIAN/conffiles"
 find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
-python3 -I packaging/check-tree.py "$stage" --sources src
+python3 -I packaging/check-tree.py "$stage" --sources src --conffiles packaging/debian/conffiles
 python3 -I packaging/check-installed-conflicts.py --allow-replaced "$stage"
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"

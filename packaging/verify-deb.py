@@ -58,22 +58,49 @@ def check_hardening(data, name, problems):
         problems.append(f'invalid ELF program headers: {name}')
         return
     relro, bind_now, nonexec_stack = False, False, False
+    loads, dynamic_tables = [], []
+    strtab_vaddr, strsz = None, None
+    rpath_offsets = []
     for index in range(count):
-        kind, flags, start, _, _, length, _, _ = struct.unpack_from('<IIQQQQQQ', data, offset + index * size)
-        if kind == 0x6474e552 and length:  # PT_GNU_RELRO
+        kind, flags, start, vaddr, _, length, memsz, _ = struct.unpack_from('<IIQQQQQQ', data, offset + index * size)
+        if kind == 1:  # PT_LOAD
+            loads.append((vaddr, start, length))
+        elif kind == 0x6474e552 and length:  # PT_GNU_RELRO
             relro = True
-        if kind == 0x6474e551:  # PT_GNU_STACK
+        elif kind == 0x6474e551:  # PT_GNU_STACK
             nonexec_stack = not flags & 1
-        if kind == 2:  # PT_DYNAMIC
+        elif kind == 2:  # PT_DYNAMIC
             if start + length > len(data) or length % 16:
                 problems.append(f'invalid ELF dynamic table: {name}')
                 continue
+            dynamic_tables.append((start, length))
             for position in range(start, start + length, 16):
                 tag, value = struct.unpack_from('<QQ', data, position)
                 if not tag:
                     break
-                if tag == 24 or (tag == 30 and value & 8) or (tag == 0x6ffffffb and value & 1):
+                if tag == 5:  # DT_STRTAB
+                    strtab_vaddr = value
+                elif tag == 10:  # DT_STRSZ
+                    strsz = value
+                elif tag in (15, 29):  # DT_RPATH, DT_RUNPATH
+                    rpath_offsets.append(value)
+                elif tag == 24 or (tag == 30 and value & 8) or (tag == 0x6ffffffb and value & 1):
                     bind_now = True
+    if rpath_offsets and strtab_vaddr is not None and strsz:
+        strtab_off = None
+        for vaddr, start, length in loads:
+            if vaddr <= strtab_vaddr < vaddr + length:
+                strtab_off = start + (strtab_vaddr - vaddr)
+                break
+        if strtab_off is not None and strtab_off + strsz <= len(data):
+            dynstr = data[strtab_off:strtab_off + strsz]
+            for off in rpath_offsets:
+                if off < len(dynstr):
+                    end = dynstr.find(b'\x00', off)
+                    rpath = dynstr[off:(len(dynstr) if end == -1 else end)].decode(errors='replace')
+                    for part in rpath.split(':'):
+                        if part and part != '/usr/lib/whitecube' and not part.startswith('/usr/lib/whitecube/'):
+                            problems.append(f'native executable has non-packaged RPATH/RUNPATH ({part}): {name}')
     if not relro or not bind_now:
         problems.append(f'native executable lacks full RELRO: {name}')
     if not nonexec_stack:
