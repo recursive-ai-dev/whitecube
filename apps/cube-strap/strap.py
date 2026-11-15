@@ -395,12 +395,27 @@ def vm_meta(name: str) -> dict:
     }
 
 
+def _write_vm_meta(target: Path, meta: dict) -> None:
+    """Atomically write VM meta.json with private permissions."""
+    import json
+    tmp_meta = target / f'.meta.{os.getpid()}.json.tmp'
+    try:
+        fd = os.open(tmp_meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w') as out:
+            json.dump(meta, out, indent=2)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_meta, target / 'meta.json')
+    finally:
+        tmp_meta.unlink(missing_ok=True)
+
+
 def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
               recipe: str = '', memory_mib: int = 2048, cpus: int = 2,
               disk_format: str | None = None) -> dict:
     """Import a raw or qcow2 disk image into ~/.whitecube/images/<name>."""
     from datetime import datetime, timezone
-    import json
     valid_vm_name(name)
     source = Path(image)
     if not source.is_file():
@@ -457,18 +472,107 @@ def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
             'size_bytes': st.st_size,
             'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
         }
-        tmp_meta = target / f'.meta.{os.getpid()}.json.tmp'
-        try:
-            fd = os.open(tmp_meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, 'w') as out:
-                json.dump(meta, out, indent=2)
-                out.write('\n')
-                out.flush()
-                os.fsync(out.fileno())
-            os.replace(tmp_meta, target / 'meta.json')
-        finally:
-            tmp_meta.unlink(missing_ok=True)
+        _write_vm_meta(target, meta)
         return meta
+    finally:
+        os.close(lock_fd)
+
+
+def clone_vm(src: str, dst: str, *, memory_mib: int | None = None,
+             cpus: int | None = None) -> dict:
+    """Clone a non-running VM sparsely with fresh per-VM UEFI NVRAM."""
+    from datetime import datetime, timezone
+    valid_vm_name(src)
+    valid_vm_name(dst)
+    if src == dst:
+        raise ValueError(f'Source and destination VM names must differ: {dst!r}')
+    src_dir = vm_dir(src)
+    dst_dir = vm_dir(dst)
+    if not (src_dir / 'meta.json').is_file():
+        raise FileNotFoundError(f'Source VM {src!r} does not exist in {whitecube_store() / "images"}')
+    if dst_dir.exists():
+        raise FileExistsError(f'Destination VM {dst!r} already exists')
+
+    src_lock = _open_vm_lock(src_dir)
+    created_dst = False
+    try:
+        meta = vm_meta(src)
+        src_disk = Path(meta['disk_path'])
+        if not src_disk.is_file():
+            raise FileNotFoundError(f'Source VM disk image is missing: {src_disk}')
+        mem = max(512, min(int(memory_mib if memory_mib is not None else meta['memory_mib']), 131072))
+        smp = max(1, min(int(cpus if cpus is not None else meta['cpus']), 64))
+
+        dst_dir.mkdir(mode=0o700, parents=True)
+        created_dst = True
+        dst_disk = dst_dir / meta['disk']
+        _copy_sparse(src_disk, dst_disk)
+        if meta['format'] == 'raw':
+            sparsify(dst_disk)
+        os.chmod(dst_disk, 0o600)
+
+        ovmf = ovmf_pair()
+        if ovmf and ovmf[1] is not None:
+            ensure_vm_vars(dst_dir / 'vars.fd', ovmf[1])
+
+        new_meta = {
+            'schema': 1,
+            'name': dst,
+            'type': meta.get('type', 'ext4'),
+            'disk': meta['disk'],
+            'format': meta['format'],
+            'uefi': bool(meta.get('uefi', True)),
+            'memory_mib': mem,
+            'cpus': smp,
+            'suite': meta.get('suite', ''),
+            'arch': meta.get('arch', 'amd64'),
+            'recipe': meta.get('recipe', ''),
+            'size_bytes': dst_disk.stat().st_size,
+            'cloned_from': src,
+            'created_at': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        }
+        _write_vm_meta(dst_dir, new_meta)
+        return new_meta
+    except BaseException:
+        if created_dst:
+            shutil.rmtree(dst_dir, ignore_errors=True)
+        raise
+    finally:
+        os.close(src_lock)
+
+
+def compact_vm(name: str) -> dict:
+    """Reclaim sparse zero blocks on a stopped VM disk image."""
+    meta = vm_meta(name)
+    target = vm_dir(name)
+    disk_path = Path(meta['disk_path'])
+    if not disk_path.is_file():
+        raise FileNotFoundError(f'VM disk image is missing: {disk_path}')
+    lock_fd = _open_vm_lock(target)
+    try:
+        before = disk_path.stat().st_blocks * 512
+        fmt = meta['format']
+        if fmt == 'raw':
+            sparsify(disk_path)
+        elif fmt == 'qcow2' and shutil.which('qemu-img'):
+            tmp = disk_path.with_name(f'.{disk_path.name}.{os.getpid()}.compact')
+            try:
+                subprocess.run(
+                    ['qemu-img', 'convert', '-O', 'qcow2', '-c', str(disk_path), str(tmp)],
+                    check=True, capture_output=True, text=True, timeout=1800,
+                )
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, disk_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+        after = disk_path.stat().st_blocks * 512
+        return {
+            'name': name,
+            'format': fmt,
+            'before_bytes': before,
+            'after_bytes': after,
+            'reclaimed_bytes': max(0, before - after),
+        }
     finally:
         os.close(lock_fd)
 
@@ -476,7 +580,8 @@ def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
 def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = None,
                 forward_ssh: bool = False, ssh_port: int = 2222,
                 headless: bool = False, serial_stdio: bool = False,
-                snapshot: bool = False) -> list[str]:
+                snapshot: bool = False, cdrom: Path | None = None,
+                serial_log: Path | None = None) -> list[str]:
     """Build the native QEMU + OVMF command line to boot a stored VM."""
     meta = vm_meta(name)
     disk_path = Path(meta['disk_path'])
@@ -496,6 +601,8 @@ def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = Non
     port = int(ssh_port)
     if not 1 <= port <= 65535:
         raise ValueError(f'SSH forward port must be 1..65535, got {ssh_port!r}')
+    if serial_stdio and serial_log is not None:
+        raise ValueError('Choose either interactive serial console or --serial-log, not both')
 
     argv = [qemu, '-name', f'whitecube-{name}', '-machine', 'q35', '-m', str(mem), '-smp', str(smp)]
     if vm_can_kvm():
@@ -520,6 +627,14 @@ def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = Non
         drive += ',snapshot=on'
     argv += ['-drive', drive]
 
+    if cdrom is not None:
+        iso_path = Path(cdrom)
+        if not iso_path.is_file():
+            raise FileNotFoundError(f'CD-ROM image not found: {iso_path}')
+        if ',' in str(iso_path):
+            raise ValueError(f'QEMU CD-ROM path cannot contain commas: {iso_path}')
+        argv += ['-drive', f'file={iso_path},media=cdrom,readonly=on', '-boot', 'order=dc']
+
     net = 'user,model=virtio-net-pci'
     if forward_ssh:
         net += f',hostfwd=tcp:127.0.0.1:{port}-:22'
@@ -531,6 +646,14 @@ def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = Non
         argv += ['-vga', 'virtio', '-display', 'gtk']
     if serial_stdio:
         argv += ['-serial', 'mon:stdio']
+    elif serial_log is not None:
+        slog = Path(serial_log)
+        if slog.is_symlink():
+            raise OSError(f'Refusing symlinked serial log path: {slog}')
+        if ',' in str(slog):
+            raise ValueError(f'QEMU serial log path cannot contain commas: {slog}')
+        slog.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        argv += ['-serial', f'file:{slog}']
     return argv
 
 

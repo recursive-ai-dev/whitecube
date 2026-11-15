@@ -59,11 +59,114 @@ def clean_expected(text: str) -> str:
     return token.lower()
 
 
+_BSD_LINE = re.compile(r'^([A-Za-z0-9_-]+)\s+\((.+)\)\s+=\s+([a-fA-F0-9]+)$')
+_GNU_LINE = re.compile(r'^(\\)?([a-fA-F0-9]+)\s+[* ](.+)$')
+_LEN_TO_ALGO = {32: 'md5', 40: 'sha1', 64: 'sha256', 128: 'sha512'}
+_NAME_TO_ALGO = {
+    'md5': 'md5',
+    'sha1': 'sha1',
+    'sha-1': 'sha1',
+    'sha256': 'sha256',
+    'sha-256': 'sha256',
+    'sha512': 'sha512',
+    'sha-512': 'sha512',
+    'blake2b': 'blake2b',
+    'sha3-256': 'sha3_256',
+    'sha3_256': 'sha3_256',
+}
+
+
+def _unescape_gnu_name(name: str, escaped: bool) -> str:
+    if not escaped:
+        return name
+    out = []
+    i = 0
+    while i < len(name):
+        if name[i] == '\\' and i + 1 < len(name):
+            nxt = name[i + 1]
+            if nxt == 'n':
+                out.append('\n')
+            elif nxt == 'r':
+                out.append('\r')
+            elif nxt == '\\':
+                out.append('\\')
+            else:
+                out.append('\\' + nxt)
+            i += 2
+        else:
+            out.append(name[i])
+            i += 1
+    return ''.join(out)
+
+
+def parse_manifest(text: str, default_algo: str = 'sha256') -> dict[str, tuple[str, str]]:
+    """Parse GNU/BSD checksum manifest -> {normalized_target: (digest_lower, algo)}."""
+    entries: dict[str, tuple[str, str]] = {}
+    for raw in text.splitlines():
+        line = raw.rstrip('\r\n')
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        bsd = _BSD_LINE.fullmatch(stripped)
+        if bsd:
+            tag, target, digest = bsd.group(1).lower(), bsd.group(2), bsd.group(3).lower()
+            algo = _NAME_TO_ALGO.get(tag)
+            if not algo or len(digest) != hashlib.new(algo).digest_size * 2:
+                raise ValueError(f'Unsupported or invalid BSD checksum line: {line[:80]}')
+        else:
+            gnu = _GNU_LINE.fullmatch(line)
+            if not gnu:
+                raise ValueError(f'Unrecognized checksum line: {line[:80]}')
+            escaped = bool(gnu.group(1))
+            digest = gnu.group(2).lower()
+            target = _unescape_gnu_name(gnu.group(3), escaped)
+            if len(digest) == hashlib.new(default_algo).digest_size * 2:
+                algo = default_algo
+            else:
+                algo = _LEN_TO_ALGO.get(len(digest), '')
+            if not algo:
+                raise ValueError(f'Unsupported digest length ({len(digest)} hex chars) in manifest')
+        key = target.strip()
+        if key in entries and entries[key] != (digest, algo):
+            raise ValueError(f'Conflicting manifest entries for {key}')
+        entries[key] = (digest, algo)
+    if not entries:
+        raise ValueError('Manifest contains no checksum entries')
+    return entries
+
+
+def verify_manifest(paths, manifest: dict[str, tuple[str, str]]) -> dict[Path, tuple[bool | None, str, str]]:
+    """Compare hashed paths against manifest entries. Returns {path: (ok|None, expected, actual)}."""
+    by_exact = {k: v for k, v in manifest.items()}
+    by_base: dict[str, list[tuple[str, str]]] = {}
+    for target, pair in manifest.items():
+        base = Path(target).name
+        by_base.setdefault(base, []).append(pair)
+    out: dict[Path, tuple[bool | None, str, str]] = {}
+    for raw_path in paths:
+        p = Path(raw_path)
+        hit = by_exact.get(str(p)) or by_exact.get(p.name)
+        if hit is None:
+            candidates = by_base.get(p.name, [])
+            if len(candidates) == 1:
+                hit = candidates[0]
+            elif len(candidates) > 1:
+                raise ValueError(f'Ambiguous manifest entries match {p.name}')
+        if hit is None:
+            out[p] = (None, '', '')
+            continue
+        expected, algo = hit
+        actual = hash_file(p, algo)
+        out[p] = (actual == expected, expected, actual)
+    return out
+
+
 class HashWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Cube Hash",
                          default_width=620, default_height=780)
         self.results: list[tuple[Path, str]] = []
+        self.manifest: dict[str, tuple[str, str]] | None = None
         self.busy = False
         self.cancel = threading.Event()
         self.result_algo = 'sha256'
@@ -80,7 +183,7 @@ class HashWindow(Adw.ApplicationWindow):
         add.add_css_class("suggested-action")
         add.connect("clicked", lambda _b: ct.pick_files(self, "Choose files", self.add_files))
         clear = Gtk.Button(label="Clear", valign=Gtk.Align.CENTER)
-        clear.connect("clicked", lambda _b: self.files.clear() if not self.busy else None)
+        clear.connect("clicked", lambda _b: self.clear_all() if not self.busy else None)
         box = Gtk.Box(spacing=6)
         box.append(clear)
         box.append(add)
@@ -90,6 +193,9 @@ class HashWindow(Adw.ApplicationWindow):
         page.add(files)
 
         opts = Adw.PreferencesGroup(title="Algorithm")
+        self.load_manifest_btn = Gtk.Button(label="Verify manifest…", valign=Gtk.Align.CENTER)
+        self.load_manifest_btn.connect("clicked", self.on_load_manifest)
+        opts.set_header_suffix(self.load_manifest_btn)
         self.algo = Adw.ComboRow(title="Hash", model=Gtk.StringList.new([n for n, _ in ALGOS]))
         self.expected = Adw.EntryRow(title="Expected hash (optional, to verify)")
         opts.add(self.algo)
@@ -130,9 +236,46 @@ class HashWindow(Adw.ApplicationWindow):
         self.add_controller(ct.drop_target(self.add_files))
         self.on_change()
 
+    def clear_all(self):
+        self.manifest = None
+        self.files.clear()
+
     def add_files(self, paths):
         if not self.busy:
             self.files.add_paths(paths)
+
+    def on_load_manifest(self, _b):
+        if self.busy:
+            return
+
+        def chosen(paths):
+            if not paths:
+                return
+            mpath = Path(paths[0])
+            default_algo = ALGOS[self.algo.get_selected()][1]
+            try:
+                manifest = parse_manifest(mpath.read_text(encoding='utf-8'), default_algo=default_algo)
+            except (OSError, UnicodeError, ValueError) as exc:
+                self.status.set_text(f'Manifest error: {exc}')
+                return
+            self.manifest = manifest
+            if not self.files.paths:
+                resolved = []
+                base = mpath.parent.resolve()
+                for target in manifest:
+                    candidate = (base / target).resolve()
+                    if candidate.is_relative_to(base) and candidate.is_file():
+                        resolved.append(candidate)
+                if resolved:
+                    self.files.add_paths(resolved)
+            if self.results:
+                self.show_results()
+            elif self.files.paths:
+                self.compute()
+            else:
+                self.status.set_text(f'Loaded {len(manifest)} manifest entries; add files to verify.')
+
+        ct.pick_files(self, 'Choose checksum manifest', chosen, multiple=False)
 
     def invalidate(self, *_):
         if not self.busy:
@@ -214,6 +357,19 @@ class HashWindow(Adw.ApplicationWindow):
                 ok = digest == want
                 badge = Gtk.Label(label="MATCH" if ok else "NO MATCH", valign=Gtk.Align.CENTER)
                 badge.add_css_class("cube-ok" if ok else "cube-bad")
+                row.add_suffix(badge)
+            elif self.manifest and not digest.startswith("error"):
+                entry = self.manifest.get(str(path)) or self.manifest.get(path.name)
+                if entry is None:
+                    matches = [v for k, v in self.manifest.items() if Path(k).name == path.name]
+                    entry = matches[0] if len(matches) == 1 else None
+                if entry is None:
+                    badge = Gtk.Label(label="UNLISTED", valign=Gtk.Align.CENTER)
+                    badge.add_css_class("dim-label")
+                else:
+                    ok = (entry[1] == self.result_algo and digest == entry[0])
+                    badge = Gtk.Label(label="MATCH" if ok else "NO MATCH", valign=Gtk.Align.CENTER)
+                    badge.add_css_class("cube-ok" if ok else "cube-bad")
                 row.add_suffix(badge)
             cp = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copy hash")
             cp.add_css_class("flat")

@@ -1,0 +1,77 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# mock-picker - deterministic stand-in for scripts/wc-pick, used by the tests.
+# Speaks exactly the same argv ABI and records what it was handed, so the suite
+# can assert that no shell metacharacter was ever interpreted.
+#
+# Configuration is read at run time from $WC_MOCK_CONFIG (the daemon passes its
+# own environment down, so the test script cannot re-export into us):
+#   ACTION=select|cancel|empty|hang|crash
+#   DELAY=<seconds>
+#   PATHS_FILE=<file with newline separated absolute paths>
+#
+#   WC_MOCK_LOG    receives the full argv, one element per line
+#   WC_MOCK_STATE  receives START / DIR / TERM / EXIT markers
+
+set -u
+
+LOG=${WC_MOCK_LOG:-/dev/null}
+STATE=${WC_MOCK_STATE:-/dev/null}
+ACTION=select
+DELAY=0
+PATHS_FILE=
+
+if [ -n "${WC_MOCK_CONFIG:-}" ] && [ -r "${WC_MOCK_CONFIG}" ]; then
+    . "$WC_MOCK_CONFIG"
+fi
+
+{
+    printf 'ARGV_BEGIN\n'
+    for a in "$@"; do printf 'ARG %s\n' "$a"; done
+    printf 'ARGV_END\n'
+} >> "$LOG"
+
+printf 'START %s\n' "$$" >> "$STATE"
+trap 'printf "TERM %s\n" "$$" >> "$STATE"; exit 143' TERM INT
+
+CHOOSER=
+DIR=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --chooser-file) CHOOSER=$2; shift 2 ;;
+        --dir)          DIR=$2; shift 2 ;;
+        *)              shift ;;
+    esac
+done
+
+if [ "$DELAY" != 0 ]; then
+    sleep "$DELAY" &
+    wait $!
+fi
+
+case "$ACTION" in
+    cancel)
+        printf 'EXIT %s 1\n' "$$" >> "$STATE"
+        exit 1 ;;
+    crash)
+        printf 'EXIT %s 9\n' "$$" >> "$STATE"
+        kill -KILL $$ ;;
+    hang)
+        sleep 3600 &
+        wait $!
+        exit 0 ;;
+    empty)
+        : > "$CHOOSER"
+        printf 'EXIT %s 0\n' "$$" >> "$STATE"
+        exit 0 ;;
+esac
+
+printf 'DIR %s\n' "$DIR" >> "$STATE"
+if [ -n "$PATHS_FILE" ] && [ -r "$PATHS_FILE" ] && [ -s "$PATHS_FILE" ]; then
+    cat "$PATHS_FILE" > "$CHOOSER"
+elif [ -n "$DIR" ]; then
+    printf '%s/plain.txt\n' "$DIR" > "$CHOOSER"
+fi
+printf 'EXIT %s 0\n' "$$" >> "$STATE"
+exit 0

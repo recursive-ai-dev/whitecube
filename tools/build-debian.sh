@@ -179,5 +179,5 @@ if [[ $mode == build ]]; then
   version=$(tr -d '[:space:]' < "$root/packaging/VERSION")
   # The builder's dpkg database cannot reveal file collisions on the host.
   # Check the delivered archive against that host too, without changing it.
-  python3 -I "$root/packaging/check-installed-conflicts.py" "$root/packaging/out/whitecube-desktop_${version}_amd64.deb"
+  python3 -I "$root/packaging/check-installed-conflicts.py" --allow-replaced "$root/packaging/out/whitecube-desktop_${version}_amd64.deb"
 fi

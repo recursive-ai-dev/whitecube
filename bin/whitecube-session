@@ -197,8 +197,48 @@ def apply_gpu_power_save(env):
         env['WLR_DRM_DEVICES'] = devices
 
 
+def find_session_bus(script):
+    candidate = Path(script).resolve().parent / 'whitecube-bus'
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return candidate
+    return None
+
+
+def start_session_bus(env, runtime, script, stream):
+    """Start whitecube-bus when no session bus is already listening on runtime/bus."""
+    if 'DBUS_SESSION_BUS_ADDRESS' in env:
+        return None
+    bus_sock = Path(runtime) / 'bus'
+    if _is_unix_socket(bus_sock):
+        env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={bus_sock}'
+        return None
+    bus_bin = find_session_bus(script)
+    if bus_bin is None:
+        return None
+    proc = subprocess.Popen(
+        [str(bus_bin), '--seccomp=kill', '--socket', str(bus_sock)],
+        env=env,
+        stdout=stream,
+        stderr=subprocess.STDOUT,
+    )
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if _is_unix_socket(bus_sock):
+            env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={bus_sock}'
+            return proc
+        if proc.poll() is not None:
+            return None
+        time.sleep(0.02)
+    proc.terminate()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=1)
+    return None
+
+
 def startup_command(audio):
-    clients = ('for app in cube-ca cube-status; do '
+    clients = ('if command -v whitecube-portal >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then '
+               'whitecube-portal --cancel-on-disconnect & fi; '
+               'for app in cube-ca cube-status; do '
                'if command -v "$app" >/dev/null 2>&1; then "$app" & fi; done; '
                'if command -v cube-check >/dev/null 2>&1; then cube-check --first-boot & fi')
     if audio == 'pipewire':
@@ -297,9 +337,12 @@ def main(argv=None):
             apply_gpu_power_save(env)
         if args.check:
             compositor = find_compositor(__file__)
+            bus_bin = find_session_bus(__file__)
             print(json.dumps({'compositor': str(compositor), 'runtime': str(runtime),
                               'state': str(state), 'audio': audio,
                               'drm_devices': env.get('WLR_DRM_DEVICES'),
+                              'session_bus': str(bus_bin) if bus_bin else None,
+                              'dbus_address': env.get('DBUS_SESSION_BUS_ADDRESS'),
                               'recent_failures': len(recent_failures(failures, int(time.time())))}, indent=2))
             return 0
         # The lock is account-wide even if callers choose different runtime dirs.
@@ -336,7 +379,9 @@ def main(argv=None):
             with os.fdopen(private_file(log, os.O_WRONLY | os.O_CREAT | os.O_TRUNC), 'w', buffering=1) as stream:
                 stream.write(f'=== whitecube session {time.strftime("%Y-%m-%dT%H:%M:%S%z")} runtime={runtime} audio={audio} safe_mode={args.safe_mode}\n')
                 started = time.monotonic()
+                bus_proc = None
                 try:
+                    bus_proc = start_session_bus(env, runtime, __file__, stream)
                     command = [str(find_compositor(__file__))]
                     if not args.safe_mode:
                         command.extend(['-s', startup_command(audio)])
@@ -346,6 +391,11 @@ def main(argv=None):
                     # guard instead of creating a getty autologin loop.
                     stream.write(f'whitecube-session: {exc}\n')
                     status, interrupted = 1, False
+                finally:
+                    if bus_proc is not None and bus_proc.poll() is None:
+                        bus_proc.terminate()
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            bus_proc.wait(timeout=2)
                 stream.write(f'=== whitecube exited with status {status} at {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
             records = recent_failures(failures, int(time.time()))
             if status and not interrupted and time.monotonic() - started < 60:

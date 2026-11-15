@@ -144,6 +144,42 @@ class TestPdf(Base):
         src.write_text("x")
         self.assertEqual(cl.output_path(src, None).name, "a-locked.pdf")
 
+    def test_ranges_odd_even_and_locked_error_handling(self):
+        self.assertEqual(cp.parse_ranges("odd", 5), [(1, 1), (3, 3), (5, 5)])
+        self.assertEqual(cp.parse_ranges("even", 5), [(2, 2), (4, 4)])
+        with self.assertRaises(ValueError):
+            cp.parse_ranges("even", 1)
+
+        src = make_pdf(self.d / "secret.pdf", 2)
+        locked = self.d / "secret-locked.pdf"
+        with pikepdf.open(src) as pdf:
+            pdf.save(locked, encryption=pikepdf.Encryption(user="u", owner="o", R=6))
+        with self.assertRaisesRegex(ValueError, "password-protected"):
+            cp.page_count(locked)
+        with self.assertRaisesRegex(ValueError, "password-protected"):
+            cp.split(locked, [(1, 1)], self.d / "out")
+        with self.assertRaisesRegex(ValueError, "password-protected"):
+            cp.rotate(locked, 90, "1", self.d / "rot.pdf")
+        self.assertEqual(cp.page_count(locked, password="u"), 2)
+
+    def test_clean_pdf_strips_metadata_and_linearizes(self):
+        src = self.d / "dirty.pdf"
+        with pikepdf.new() as pdf:
+            pdf.add_blank_page()
+            pdf.docinfo["/Author"] = "Alice"
+            pdf.docinfo["/Title"] = "Draft"
+            pdf.Root["/Metadata"] = pdf.make_stream(b"<x:xmpmeta/>")
+            pdf.save(src)
+        out = self.d / "clean.pdf"
+        stats = cp.clean_pdf(src, out, strip_metadata=True, linearize=True)
+        self.assertTrue(stats["metadata_stripped"])
+        self.assertTrue(stats["dest"].is_file())
+        with pikepdf.open(stats["dest"]) as cleaned:
+            self.assertEqual(len(cleaned.pages), 1)
+            self.assertEqual(len(cleaned.docinfo), 0)
+            self.assertNotIn("/Metadata", cleaned.Root)
+            self.assertTrue(cleaned.is_linearized)
+
 
 class TestHash(Base):
     def test_hash_matches_hashlib(self):
@@ -164,6 +200,38 @@ class TestHash(Base):
         for text in (h, h.upper(), f"  {h}  file.iso", f"sha256: {h}"):
             self.assertEqual(ch.clean_expected(text), h)
         self.assertEqual(ch.clean_expected("  "), "")
+
+    def test_parse_and_verify_manifest(self):
+        a = self.d / "alpha.bin"
+        b = self.d / "beta\\file.bin"
+        extra = self.d / "unlisted.bin"
+        a.write_bytes(b"alpha-payload")
+        b.write_bytes(b"beta-payload")
+        extra.write_bytes(b"extra")
+        ha = hashlib.sha256(b"alpha-payload").hexdigest()
+        hb = hashlib.sha512(b"beta-payload").hexdigest()
+        manifest_text = "\n".join([
+            "# comment line",
+            f"{ha} *alpha.bin",
+            f"SHA512 (sub/{b.name}) = {hb}",
+            f"\\{'00' * 32}  wrong\\nname",
+        ])
+        parsed = ch.parse_manifest(manifest_text)
+        self.assertEqual(parsed["alpha.bin"], (ha, "sha256"))
+        self.assertEqual(parsed[f"sub/{b.name}"], (hb, "sha512"))
+        self.assertIn("wrong\nname", parsed)
+
+        results = ch.verify_manifest([a, b, extra], parsed)
+        self.assertEqual(results[a], (True, ha, ha))
+        self.assertEqual(results[b], (True, hb, hb))
+        self.assertEqual(results[extra], (None, "", ""))
+
+        b.write_bytes(b"tampered")
+        bad_results = ch.verify_manifest([b], parsed)
+        self.assertFalse(bad_results[b][0])
+
+        with self.assertRaisesRegex(ValueError, "no checksum entries"):
+            ch.parse_manifest("# empty\n\n")
 
 
 class TestRename(Base):

@@ -5,6 +5,11 @@
 set -e
 case "$1" in
 configure)
+    mkdir -p /etc/systemd/user
+    ln -sfn /dev/null /etc/systemd/user/dbus.socket
+    rm -f /etc/systemd/user/whitecube-bus.service \
+          /etc/systemd/user/dbus.service \
+          /etc/systemd/user/default.target.wants/whitecube-bus.service
     if [ -d /run/systemd/system ]; then systemctl daemon-reload || true; fi
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true; fi
     if command -v update-desktop-database >/dev/null 2>&1; then update-desktop-database -q /usr/share/applications 2>/dev/null || true; fi

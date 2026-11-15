@@ -96,7 +96,7 @@ display_resolution=$(env -u LD_LIBRARY_PATH ldd "$priv/$(basename "$(readlink -f
 [[ $display_resolution == "$priv/"* ]] || { echo 'build-deb.sh: bundled wlroots cannot resolve its private display-info library' >&2; exit 1; }
 
 # --- strip (also removes the build directory recorded in the debug info)
-strip --strip-unneeded "$stage"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player} \
+strip --strip-unneeded "$stage"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player,whitecube-bus,whitecube-portal} \
   "$stage"/usr/libexec/whitecube/cube-browser/cube-{browser,renderd,netd} "$priv"/*.so* 2>/dev/null || true
 python3 -I packaging/check-libraries.py "$stage"
 
@@ -158,7 +158,7 @@ find "$stage" -type d -exec chmod 0755 {} +
 find "$stage" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 python3 -I packaging/check-tree.py "$stage" --sources src
-python3 -I packaging/check-installed-conflicts.py "$stage"
+python3 -I packaging/check-installed-conflicts.py --allow-replaced "$stage"
 python3 -I packaging/check-libraries.py "$stage"
 python3 -I packaging/check-chat-runtime.py "$stage"
 python3 -I apps/cube-train/packaging/parquet-runtime.py check "$stage/usr/lib/whitecube/trainer-parquet-runtime"

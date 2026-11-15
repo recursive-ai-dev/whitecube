@@ -124,6 +124,60 @@ class WhitecubeVmCliTests(unittest.TestCase):
 
             listed = json.loads(self.run_cli('list', '--json').stdout)
             self.assertTrue(listed[0]['running'])
+
+            cl = self.run_cli('clone', 'lockedvm', 'clone-fail')
+            self.assertNotEqual(cl.returncode, 0)
+            self.assertIn('currently running', cl.stderr)
+
+            tr = self.run_cli('trim', 'lockedvm')
+            self.assertNotEqual(tr.returncode, 0)
+            self.assertIn('currently running', tr.stderr)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
+
+    def test_clone_trim_cdrom_and_serial_log_options(self):
+        img = self.sample_disk('golden.img')
+        self.assertEqual(self.run_cli('import', str(img), 'golden', '--suite', 'trixie', '--memory', '2048', '--cpus', '2').returncode, 0)
+        # Mutate source vars.fd to confirm clones receive clean per-VM UEFI NVRAM.
+        (self.root / 'store/images/golden/vars.fd').write_bytes(b'DIRTY-VARS')
+
+        cloned = self.run_cli('clone', 'golden', 'golden-copy', '--memory', '4096', '--cpus', '4', '--json')
+        self.assertEqual(cloned.returncode, 0, cloned.stderr)
+        meta = json.loads(cloned.stdout)
+        self.assertEqual(meta['name'], 'golden-copy')
+        self.assertEqual(meta['cloned_from'], 'golden')
+        self.assertEqual(meta['memory_mib'], 4096)
+        self.assertEqual(meta['cpus'], 4)
+        self.assertEqual((self.root / 'store/images/golden-copy/vars.fd').read_bytes(), b'VARS')
+        self.assertEqual(
+            (self.root / 'store/images/golden-copy/disk.img').read_bytes(),
+            (self.root / 'store/images/golden/disk.img').read_bytes(),
+        )
+        dup = self.run_cli('clone', 'golden', 'golden-copy')
+        self.assertNotEqual(dup.returncode, 0)
+
+        # Write a zero-filled block into the copy's disk and compact it.
+        copy_disk = self.root / 'store/images/golden-copy/disk.img'
+        with open(copy_disk, 'r+b') as fh:
+            fh.seek(1024 * 1024)
+            fh.write(b'\x00' * (2 * 1024 * 1024))
+        trimmed = self.run_cli('trim', 'golden-copy', '--json')
+        self.assertEqual(trimmed.returncode, 0, trimmed.stderr)
+        trim_report = json.loads(trimmed.stdout)
+        self.assertEqual(trim_report['name'], 'golden-copy')
+        self.assertGreaterEqual(trim_report['before_bytes'], trim_report['after_bytes'])
+
+        iso = self.root / 'installer.iso'
+        iso.write_bytes(b'ISO9660')
+        serial_log = self.root / 'logs/boot.serial.log'
+        dry = self.run_cli('run', 'golden-copy', '--dry-run', '--headless', '--cdrom', str(iso), '--serial-log', str(serial_log))
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn(f'file={iso},media=cdrom,readonly=on', dry.stdout)
+        self.assertIn('-boot order=dc', dry.stdout)
+        self.assertIn(f'-serial file:{serial_log}', dry.stdout)
+
+        bad_serial = self.run_cli('run', 'golden-copy', '--dry-run', '--serial', '--serial-log', str(serial_log))
+        self.assertNotEqual(bad_serial.returncode, 0)
+        missing_iso = self.run_cli('run', 'golden-copy', '--dry-run', '--cdrom', str(self.root / 'absent.iso'))
+        self.assertNotEqual(missing_iso.returncode, 0)

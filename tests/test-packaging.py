@@ -47,6 +47,7 @@ class Tree(unittest.TestCase):
 
     def test_every_command_is_executable_and_in_usr_bin(self):
         for name in ('whitecube-compositor', 'cube-status', 'cube-settings', 'cube-ca', 'cube-net', 'whitecube-session', 'whitecube-terminal',
+                     'whitecube-bus', 'whitecube-portal', 'wc-pick',
                      'whitecube-web', 'cube-scripts', 'cube-lab', 'cube-preferences', 'cube-privacy', 'desktop-chat', 'cube-lock', 'whitecube-migrate', 'cube-editor',
                      'cube-chrootables', 'whitecube-chrootable-manager', 'whitecube-browser', 'cube-strap', 'whitecube-vm', 'net-off', 'net-on'):
             path = self.stage / 'usr/bin' / name
@@ -91,6 +92,13 @@ class Tree(unittest.TestCase):
         self.assertIn('Exec=/usr/bin/whitecube-session', session)
         unit = (self.stage / 'usr/lib/systemd/system/whitecube-network.service').read_text()
         self.assertIn('ExecStart=/usr/bin/cube-net run', unit)
+        bus_unit = (self.stage / 'usr/lib/systemd/user/whitecube-bus.service').read_text()
+        self.assertIn('ExecStart=/usr/bin/whitecube-bus', bus_unit)
+        portal_unit = (self.stage / 'usr/lib/systemd/user/whitecube-portal.service').read_text()
+        self.assertIn('ExecStart=/usr/bin/whitecube-portal', portal_unit)
+        self.assertEqual((self.stage / 'usr/lib/systemd/user/dbus.service').readlink(), Path('whitecube-bus.service'))
+        self.assertEqual((self.stage / 'usr/lib/systemd/user/xdg-desktop-portal.service').readlink(), Path('whitecube-portal.service'))
+        self.assertTrue((self.stage / 'usr/share/xdg-desktop-portal/portals/whitecube.portal').is_file())
 
     def test_network_lockdown_is_packaged_with_boot_ordering_and_conffile(self):
         self.assertTrue(os.access(self.stage / 'usr/libexec/whitecube/whitecube-net-switch', os.X_OK))

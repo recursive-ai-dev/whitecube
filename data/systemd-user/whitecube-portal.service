@@ -1,0 +1,18 @@
+[Unit]
+Description=Whitecube XDG Desktop Portal daemon
+After=whitecube-bus.service graphical-session-pre.target
+Requires=whitecube-bus.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+ExecStart=/usr/bin/whitecube-portal --cancel-on-disconnect --picker-cmd /usr/bin/wc-pick
+ExecReload=/usr/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=1
+Slice=session.slice
+
+[Install]
+WantedBy=default.target graphical-session.target
+Alias=xdg-desktop-portal.service

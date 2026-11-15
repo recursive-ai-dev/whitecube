@@ -37,6 +37,33 @@ compositor = executable('whitecube-compositor', 'src/whitecube.c',
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 ca = executable('cube-ca', ['src/cube-ca.c', layer, xdg], dependencies: [wayland_client, m],
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
+bus_inc = include_directories('src/bus/include')
+bus = executable('whitecube-bus',
+  ['src/bus/src/main.c', 'src/bus/src/wire.c', 'src/bus/src/bus.c', 'src/bus/src/seccomp.c'],
+  include_directories: bus_inc,
+  c_args: ['-D_GNU_SOURCE', '-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=3'],
+  link_args: ['-Wl,-z,relro,-z,now,-z,noexecstack'],
+  install: true)
+portal_inc = include_directories('src/portal/include')
+portal = executable('whitecube-portal',
+  ['src/portal/src/main.c', 'src/portal/src/dbus_wire.c', 'src/portal/src/dbus_client.c',
+   'src/portal/src/introspect.c', 'src/portal/src/request.c', 'src/portal/src/settings.c',
+   'src/portal/src/filechooser.c', 'src/portal/src/uri.c', 'src/portal/src/util.c'],
+  include_directories: portal_inc,
+  c_args: ['-D_GNU_SOURCE', '-U_FORTIFY_SOURCE', '-D_FORTIFY_SOURCE=3',
+           '-DWC_DEFAULT_PICKER="/usr/bin/wc-pick"'],
+  link_args: ['-Wl,-z,relro,-z,now,-z,noexecstack'],
+  install: true)
+portal_probe = executable('portal-probe',
+  ['src/portal/tests/portal-probe.c', 'src/portal/src/dbus_wire.c',
+   'src/portal/src/dbus_client.c', 'src/portal/src/util.c'],
+  include_directories: portal_inc,
+  c_args: ['-D_GNU_SOURCE'])
+portal_wire_test = executable('portal-test-wire',
+  ['src/portal/tests/test_wire.c', 'src/portal/src/dbus_wire.c', 'src/portal/src/util.c'],
+  include_directories: portal_inc,
+  c_args: ['-D_GNU_SOURCE'])
+test('portal-dbus-wire', portal_wire_test, suite: 'core')
 settings = executable('cube-settings', ['src/cube-settings.c'] + settings_sources, dependencies: client_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 status = executable('cube-status', ['src/cube-status.c', layer, xdg], dependencies: client_deps,
@@ -86,4 +113,4 @@ foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'te
   test(item[0], python, args: ['-I', meson.current_source_dir() / 'tests' / item[1]],
     depends: compiled_schema, env: schema_env, timeout: 120, suite: 'python')
 endforeach
-install_data('bin/cube-privacy', 'bin/cube-preferences', 'bin/whitecube-suspend', install_dir: get_option('bindir'), install_mode: 'rwxr-xr-x')
+install_data('bin/cube-privacy', 'bin/cube-preferences', 'bin/whitecube-suspend', 'src/portal/scripts/wc-pick', install_dir: get_option('bindir'), install_mode: 'rwxr-xr-x')

@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# mock-browser - records the exact argv it was execve()'d with, then exits.
+set -u
+LOG=${WC_MOCK_BROWSER_LOG:-${WC_MOCK_LOG:-/dev/null}}
+{
+    printf 'BROWSER_ARGV_BEGIN\n'
+    for a in "$@"; do printf 'ARG %s\n' "$a"; done
+    printf 'BROWSER_ARGV_END\n'
+} >> "$LOG"
+exit 0

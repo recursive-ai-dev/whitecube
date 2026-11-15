@@ -105,10 +105,24 @@ def installed_packages(database):
     return packages
 
 
-def check(package, host_root=Path('/')):
+def _control_pkg_names(value):
+    names = set()
+    for part in value.split(','):
+        token = part.strip().split('(', 1)[0].split(':', 1)[0].strip()
+        if token:
+            names.add(token)
+    return names
+
+
+def check(package, host_root=Path('/'), allow_replaced=False):
     root = host_root.resolve()
     fields, paths = inventory(package)
     name = fields['Package']
+    replaced = set()
+    if allow_replaced:
+        replaced = (_control_pkg_names(fields.get('Conflicts', ''))
+                    & _control_pkg_names(fields.get('Replaces', ''))) - {
+                        'chrootables', 'cube-browser', 'whitecube-trainer', 'whitecube'}
     database = root / 'var/lib/dpkg'
     packages = installed_packages(database)
     info = database / 'info'
@@ -120,7 +134,7 @@ def check(package, host_root=Path('/')):
     for listing in sorted(info.glob('*.list')):
         identity = listing.name[:-5]
         owner = packages.get(identity)
-        if owner is None or owner['package'] == name:
+        if owner is None or owner['package'] == name or owner['package'] in replaced:
             continue
         for path in listing.read_text(errors='surrogateescape').splitlines():
             if not path.startswith('/'):
@@ -135,7 +149,7 @@ def check(package, host_root=Path('/')):
                               'owners': [owners[canonical][owner] for owner in sorted(owners[canonical])]})
     return {'package': name, 'version': fields.get('Version', ''), 'host_root': str(root),
             'files_checked': len(paths), 'installed_packages': len({entry['package'] for entry in packages.values()}),
-            'conflicts': conflicts, 'replaces': fields.get('Replaces', ''), 'replaces_evaluated': False,
+            'conflicts': conflicts, 'replaces': fields.get('Replaces', ''), 'replaces_evaluated': allow_replaced,
             'result': 'conflicts' if conflicts else 'passed'}
 
 
@@ -143,10 +157,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('package', type=Path, help='.deb archive or staged tree containing DEBIAN/control')
     parser.add_argument('--host-root', type=Path, default=Path('/'), help='installed host filesystem root (default: /)')
+    parser.add_argument('--allow-replaced', action='store_true',
+                        help='permit file overlaps with non-Whitecube packages listed in both Conflicts and Replaces')
     parser.add_argument('--json', action='store_true', help='print a machine-readable result')
     args = parser.parse_args()
     try:
-        report = check(args.package, args.host_root)
+        report = check(args.package, args.host_root, allow_replaced=args.allow_replaced)
     except (OSError, RuntimeError, tarfile.TarError, ValueError, subprocess.CalledProcessError) as error:
         print(f'check-installed-conflicts: {error}', file=sys.stderr)
         return 2
@@ -160,7 +176,7 @@ def main():
     else:
         print(f'check-installed-conflicts: passed ({report["files_checked"]} payload files; '
               f'{report["installed_packages"]} installed packages)')
-    if report['replaces'] and not args.json:
+    if report['replaces'] and not report['replaces_evaluated'] and not args.json:
         print('check-installed-conflicts: Replaces relationships were not evaluated; overlaps require review.')
     return 1 if report['conflicts'] else 0
 

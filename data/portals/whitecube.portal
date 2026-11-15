@@ -1,0 +1,4 @@
+[portal]
+DBusName=org.freedesktop.portal.Desktop
+Interfaces=org.freedesktop.portal.Settings;org.freedesktop.portal.FileChooser;org.freedesktop.portal.OpenURI;
+UseIn=whitecube

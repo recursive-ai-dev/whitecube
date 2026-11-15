@@ -1,0 +1,16 @@
+[Unit]
+Description=Whitecube hardened D-Bus session broker
+Before=graphical-session-pre.target
+After=systemd-tmpfiles-setup.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/whitecube-bus --socket %t/bus --seccomp=kill --allow-file /etc/whitecube/bus-allow.conf
+ExecStartPost=-/usr/bin/systemctl --user set-environment DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
+Restart=on-failure
+RestartSec=1
+Slice=session.slice
+
+[Install]
+WantedBy=default.target
+Alias=dbus.service

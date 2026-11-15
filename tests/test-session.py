@@ -312,6 +312,49 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
         self.assertIn('3 failed starts within 60 seconds', result.stderr)
         self.assertFalse(self.capture.exists())
 
+    def test_session_starts_whitecube_bus_and_cleans_up_on_exit(self):
+        bus_pid = self.root / 'bus.pid'
+        fake_bus = self.commands / 'whitecube-bus'
+        fake_bus.write_text('''#!/usr/bin/python3
+import os, pathlib, signal, socket, sys, time
+args = sys.argv[1:]
+sock_path = args[args.index('--socket') + 1]
+pathlib.Path(os.environ['BUS_PID_FILE']).write_text(str(os.getpid()))
+running = True
+def stop(*_):
+    global running
+    running = False
+signal.signal(signal.SIGTERM, stop)
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+    srv.bind(sock_path)
+    srv.listen(1)
+    while running:
+        time.sleep(0.05)
+''')
+        fake_bus.chmod(0o755)
+        checked = self.launch('--check', BUS_PID_FILE=str(bus_pid))
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(json.loads(checked.stdout)['session_bus'], str(fake_bus))
+        self.assertFalse(bus_pid.exists())
+
+        result = self.launch(BUS_PID_FILE=str(bus_pid))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.wait_capture()
+        expected_bus = f'unix:path={self.runtime / "bus"}'
+        self.assertEqual(record['env'].get('DBUS_SESSION_BUS_ADDRESS'), expected_bus)
+        self.assertIn('whitecube-portal --cancel-on-disconnect', record['argv'][1])
+        pid = int(bus_pid.read_text())
+        deadline = time.monotonic() + 2
+        alive = True
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+                break
+            time.sleep(0.02)
+        self.assertFalse(alive, 'whitecube-bus should be terminated after session exit')
+
 
 if __name__ == '__main__':
     unittest.main()

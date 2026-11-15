@@ -21,7 +21,8 @@ enum Action {
     A_PLAY, A_PREV, A_NEXT, A_BACK, A_FORWARD, A_MUTE, A_VOLUME, A_SEEK,
     A_FULL, A_SIDEBAR, A_SHUFFLE, A_REPEAT, A_SPEED, A_TRACKS, A_HELP,
     A_QUEUE, A_RECENT, A_ITEM, A_REMOVE, A_CLEAR, A_RECENT_ITEM,
-    A_DISMISS, A_THEME, A_RESUME, A_FORGET, A_SLOWER, A_FASTER,
+    A_DISMISS, A_THEME, A_RESUME, A_FORGET, A_SLOWER, A_FASTER, A_SPEED_RESET,
+    A_AB_LOOP, A_FRAME_STEP, A_FRAME_BACK,
     A_AUDIO, A_SUB, A_SUBFILE, A_SUBDELAY_MINUS, A_SUBDELAY_PLUS, A_CHAPTER,
     A_HOME, A_MUSIC, A_VIDEOS, A_DOWNLOADS, A_PARENT, A_FILE, A_FILE_OPEN,
     A_INPUT, A_LOCATION, A_HIDDEN, A_SELECT, A_FILE_ADD, A_RESIZE
@@ -37,6 +38,8 @@ typedef struct {
     enum Panel panel;
     bool recent, add_mode, subtitle_mode, hidden, input_focus, input_select;
     bool fullscreen, dragging, hover_controls, suppress_history, closing;
+    bool has_loop_a, has_loop_b;
+    double loop_a, loop_b;
     int drag_action;
     char input[8192], toast[512];
     size_t input_cursor;
@@ -165,8 +168,17 @@ static void theme_reload(App *a) {
     if(g_file_get_contents(path,&data,NULL,NULL)) {
         char **lines=g_strsplit(data,"\n",-1);
         for(int i=0;lines[i];i++) {
-            if(g_str_has_prefix(lines[i],"bg=")) status_theme_color(a->theme.background,lines[i]+3);
-            if(g_str_has_prefix(lines[i],"tabbar=")) status_theme_color(a->theme.bar,lines[i]+7);
+            char *line=g_strstrip(lines[i]);
+            if(!*line || *line=='#') continue;
+            char *eq=strchr(line,'=');
+            if(!eq) continue;
+            *eq=0;
+            char *k=g_strstrip(line);
+            char *v=g_strstrip(eq+1);
+            char *comment=strchr(*v=='#' ? v+1 : v,'#');
+            if(comment) { *comment=0; v=g_strstrip(v); }
+            if(!strcmp(k,"bg")) status_theme_color(a->theme.background,v);
+            else if(!strcmp(k,"tabbar")) status_theme_color(a->theme.bar,v);
         } g_strfreev(lines);g_free(data);
     }g_free(path);
     if(a->state.theme==1) {status_theme_color(a->theme.background,"fbfbfb");status_theme_color(a->theme.bar,"f5f5f5");}
@@ -185,6 +197,11 @@ static void theme_reload(App *a) {
     }g_free(path);
     status_theme_finish(&a->theme,a->strong);
 }
+static void clear_ab_loop(App *a) {
+    a->has_loop_a=false;a->has_loop_b=false;a->loop_a=0;a->loop_b=0;
+    player_text(&a->player,"ab-loop-a","no");
+    player_text(&a->player,"ab-loop-b","no");
+}
 static void remember(App *a) {
     if(a->current_path && a->player.loaded && !a->suppress_history)
         state_remember(&a->state,a->current_path,a->player.position,a->player.duration);
@@ -192,6 +209,7 @@ static void remember(App *a) {
 static void play_index(App *a,int index) {
     if(index<0 || index>=(int)a->queue->len) return;
     remember(a); a->suppress_history=false;
+    clear_ab_loop(a);
     Media *m=g_ptr_array_index(a->queue,index);
     a->current=index; a->selected=index;g_free(a->current_path);a->current_path=g_strdup(m->path);
     player_load(&a->player,m->path,state_position(&a->state,m->path));
@@ -360,6 +378,15 @@ static void transport(App *a,double width,double bottom,bool fullscreen) {
     text(a,p->duration>0?dur:"--:--",width-72,seek_y-7,11,a->theme.muted,60,false);
     double sx=88, sw=MAX(40,width-176), ratio=p->duration>0?CLAMP(p->position/p->duration,0,1):0;
     box(a,sx,seek_y,sw,3,1.5,a->theme.hover);box(a,sx,seek_y,MAX(3,sw*ratio),3,1.5,a->theme.ink);
+    if(p->duration>0 && a->has_loop_a) {
+        double ax=sx+sw*CLAMP(a->loop_a/p->duration,0,1);
+        line(a,ax,seek_y-4,ax,seek_y+7,a->theme.ink,2);
+        if(a->has_loop_b) {
+            double bx=sx+sw*CLAMP(a->loop_b/p->duration,0,1);
+            line(a,bx,seek_y-4,bx,seek_y+7,a->theme.ink,2);
+            if(bx>ax) line(a,ax,seek_y+1.5,bx,seek_y+1.5,a->theme.muted,2);
+        }
+    }
     ink(a,a->theme.ink,1);cairo_arc(a->cr,sx+sw*ratio,seek_y+1.5,4,0,2*M_PI);cairo_fill(a->cr);
     target(a,A_SEEK,0,sx,seek_y-10,sw,24,"Seek");
     for(guint i=0;i<p->chapters->len;i++) {Chapter *c=&g_array_index(p->chapters,Chapter,i);if(p->duration>0) line(a,sx+sw*c->time/p->duration,seek_y-3,sx+sw*c->time/p->duration,seek_y+5,a->theme.muted,1);}
@@ -466,11 +493,12 @@ static void tracks_panel(App *a) {
     if(w>500) {text(a,"Subtitle delay",x+w-254,y+h-48,11,a->theme.muted,105,false);button(a,A_SUBDELAY_MINUS,0,x+w-152,y+h-56,32,34,"−",NULL,false);char delay[24];g_snprintf(delay,sizeof(delay),"%+.1fs",a->sub_delay);centered(a,delay,x+w-120,y+h-48,60,11,a->theme.ink,false);button(a,A_SUBDELAY_PLUS,0,x+w-60,y+h-56,32,34,"+",NULL,false);}
 }
 static void help_panel(App *a) {
-    double x,y,w,h;panel_base(a,&x,&y,&w,&h,"At your fingertips","Everyday controls, without leaving the keyboard.",530);
-    const char *keys[]={"Space / K","← / →","↑ / ↓","F / F11","M","N / P","[ / ]","Ctrl+O","Ctrl+Shift+O","Ctrl+L","Ctrl+,","Tab / Shift+Tab","Escape","Ctrl+Q"};
-    const char *labels[]={"Play or pause","Seek 5 seconds (Shift: 30)","Adjust volume","Toggle fullscreen","Mute","Next / previous item","Slower / faster","Open media","Add to queue","Open file path or URL","Preferences","Focus controls; Enter activates","Close panel or leave fullscreen","Quit Cube Player"};
-    double gap=MIN(28,(h-110)/14);
-    for(int i=0;i<14;i++) {text(a,keys[i],x+30,y+92+i*gap,12,a->theme.ink,190,true);text(a,labels[i],x+232,y+92+i*gap,12,a->theme.muted,w-262,false);}
+    double x,y,w,h;panel_base(a,&x,&y,&w,&h,"At your fingertips","Everyday controls, without leaving the keyboard.",570);
+    const char *keys[]={"Space / K","← / →","↑ / ↓",". / ,","F / F11","M","N / P","[ / ] / Backspace","A","Ctrl+O","Ctrl+Shift+O","Ctrl+L","Ctrl+,","Tab / Shift+Tab","Escape","Ctrl+Q"};
+    const char *labels[]={"Play or pause","Seek 5 seconds (Shift: 30)","Adjust volume","Step frame forward / back","Toggle fullscreen","Mute","Next / previous item","Slower / faster / reset 1x","Set A / B loop or clear","Open media","Add to queue","Open file path or URL","Preferences","Focus controls; Enter activates","Close panel or leave fullscreen","Quit Cube Player"};
+    int count=(int)G_N_ELEMENTS(keys);
+    double gap=MIN(26,(h-110)/count);
+    for(int i=0;i<count;i++) {text(a,keys[i],x+30,y+92+i*gap,12,a->theme.ink,190,true);text(a,labels[i],x+232,y+92+i*gap,12,a->theme.muted,w-262,false);}
 }
 static void location_panel(App *a) {
     double x,y,w,h;panel_base(a,&x,&y,&w,&h,"Open a path or link","Local files and direct HTTP(S) media streams.",260);
@@ -588,6 +616,32 @@ static void act(App *a,int action,int value) {
     }
     case A_SLOWER:speed(a,-.25);break;
     case A_FASTER:speed(a,.25);break;
+    case A_SPEED_RESET:
+        player_number(p,"speed",1.0);p->speed=1.0;a->state.speed=1.0;toast(a,"Speed reset to 1.0x.");break;
+    case A_AB_LOOP:
+        if(!p->loaded || !p->seekable) {toast(a,"Open seekable media before setting an A-B loop.");break;}
+        if(!a->has_loop_a) {
+            a->has_loop_a=true;a->has_loop_b=false;a->loop_a=MAX(0,p->position);
+            player_number(p,"ab-loop-a",a->loop_a);player_text(p,"ab-loop-b","no");
+            char buf[32];format_time(a->loop_a,buf);char msg[96];g_snprintf(msg,sizeof(msg),"Loop point A set at %s.",buf);toast(a,msg);
+        } else if(!a->has_loop_b) {
+            double b=MAX(0,p->position);
+            if(fabs(b-a->loop_a)<0.05) {toast(a,"Move further before setting loop point B.");break;}
+            if(b<a->loop_a) {a->loop_b=a->loop_a;a->loop_a=b;} else a->loop_b=b;
+            a->has_loop_b=true;
+            player_number(p,"ab-loop-a",a->loop_a);player_number(p,"ab-loop-b",a->loop_b);
+            char ta[32],tb[32];format_time(a->loop_a,ta);format_time(a->loop_b,tb);
+            char msg[128];g_snprintf(msg,sizeof(msg),"A-B loop active: %s – %s.",ta,tb);toast(a,msg);
+        } else {
+            clear_ab_loop(a);toast(a,"A-B loop cleared.");
+        }
+        break;
+    case A_FRAME_STEP:
+        if(p->loaded) {const char *cmd[]={"frame-step",NULL};player_command(p,cmd);}
+        break;
+    case A_FRAME_BACK:
+        if(p->loaded) {const char *cmd[]={"frame-back-step",NULL};player_command(p,cmd);}
+        break;
     case A_TRACKS:show_panel(a,a->panel==TRACKS?NONE:TRACKS);break;
     case A_HELP:show_panel(a,HELP);break;
     case A_QUEUE:a->recent=false;a->queue_scroll=0;break;
@@ -598,7 +652,7 @@ static void act(App *a,int action,int value) {
     case A_REMOVE:
         if(value>=0 && value<(int)a->queue->len) {
             if(value==a->current) {
-                remember(a);const char *stop[]={"stop",NULL};player_command(p,stop);
+                remember(a);clear_ab_loop(a);const char *stop[]={"stop",NULL};player_command(p,stop);
                 p->loaded=false;p->loading=false;g_clear_pointer(&a->current_path,g_free);
                 g_ptr_array_remove_index(a->queue,value);a->current=-1;
                 if(a->queue->len) play_index(a,MIN(value,(int)a->queue->len-1));
@@ -606,7 +660,7 @@ static void act(App *a,int action,int value) {
             } else {g_ptr_array_remove_index(a->queue,value);if(value<a->current) a->current--;}
         }break;
     case A_CLEAR: {
-        remember(a);const char *stop[]={"stop",NULL};player_command(p,stop);g_ptr_array_set_size(a->queue,0);
+        remember(a);clear_ab_loop(a);const char *stop[]={"stop",NULL};player_command(p,stop);g_ptr_array_set_size(a->queue,0);
         a->current=-1;g_clear_pointer(&a->current_path,g_free);p->loaded=p->loading=p->video=false;p->position=p->duration=0;p->title[0]=0;
         cp_window_title(a->window,"Cube Player");break;
     }
@@ -778,6 +832,10 @@ static void key_app(void *data,xkb_keysym_t key,const char *utf8,bool ctrl,bool 
     case XKB_KEY_p:act(a,A_PREV,0);break;
     case XKB_KEY_bracketleft:act(a,A_SLOWER,0);break;
     case XKB_KEY_bracketright:act(a,A_FASTER,0);break;
+    case XKB_KEY_BackSpace:act(a,A_SPEED_RESET,0);break;
+    case XKB_KEY_a:case XKB_KEY_A:act(a,A_AB_LOOP,0);break;
+    case XKB_KEY_period:act(a,A_FRAME_STEP,0);break;
+    case XKB_KEY_comma:act(a,A_FRAME_BACK,0);break;
     case XKB_KEY_l:act(a,A_SIDEBAR,0);break;
     case XKB_KEY_s:act(a,A_SHUFFLE,0);break;
     case XKB_KEY_r:act(a,A_REPEAT,0);break;

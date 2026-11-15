@@ -6,6 +6,9 @@ Priority: optional
 Installed-Size: @SIZE@
 Maintainer: Whitecube <whitecube@localhost>
 Depends: @DEPENDS@
+Provides: dbus-session-bus (= 1.16.2-2ubuntu4), default-dbus-session-bus (= 1.16.2-2ubuntu4), xdg-desktop-portal (= 1.20.0)
+Conflicts: whitecube-session-bus, dbus-user-session, dbus-x11, xdg-desktop-portal, xdg-desktop-portal-gtk, xdg-desktop-portal-kde, xdg-desktop-portal-gnome, xdg-desktop-portal-wlr
+Replaces: whitecube-session-bus, dbus-user-session, dbus-x11, xdg-desktop-portal, xdg-desktop-portal-gtk, xdg-desktop-portal-kde, xdg-desktop-portal-gnome, xdg-desktop-portal-wlr
 Recommends: fnott, ufw, pipewire, wireplumber, pipewire-pulse, qemu-system-x86, qemu-system-gui, ovmf
 Suggests: python3-torch, alsa-utils, chrony, console-setup, systemd-container, qemu-utils, wl-clipboard
 Description: Whitecube - Wayland desktop with native image and model training studios

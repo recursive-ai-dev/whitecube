@@ -21,7 +21,7 @@ dest=${1:?usage: install-tree.sh DESTDIR}
 [[ -d $dest && -z $(ls -A "$dest") ]] || { echo "install-tree.sh: $dest must be an existing, empty directory" >&2; exit 1; }
 cd "$root"
 
-for b in whitecube cube-status cube-settings cube-ca; do
+for b in whitecube cube-status cube-settings cube-ca whitecube-bus whitecube-portal; do
   [[ -x build/$b ]] || { echo "install-tree.sh: build/$b is missing; run ./BUILD.sh first" >&2; exit 1; }
 done
 [[ -x build/native-apps-root/usr/bin/cube-player && -x build/native-apps-root/usr/libexec/whitecube/cube-browser/cube-browser ]] || {
@@ -32,7 +32,7 @@ bin=$dest/usr/bin lib=$dest/usr/libexec/whitecube share=$dest/usr/share/whitecub
 install -d -m 0755 "$bin" "$lib" "$share" "$doc" "$dest/etc/whitecube/network" "$dest/usr/lib/systemd/system"
 
 # --- compiled programs
-for b in cube-status cube-settings cube-ca; do install -m 0755 "build/$b" "$bin/$b"; done
+for b in cube-status cube-settings cube-ca whitecube-bus whitecube-portal; do install -m 0755 "build/$b" "$bin/$b"; done
 # not /usr/bin/whitecube: the "whitecube" package (image tool) already owns that name
 install -m 0755 build/whitecube "$bin/whitecube-compositor"
 
@@ -48,6 +48,7 @@ done
 install -m 0755 net/cube-net "$bin/cube-net"
 install -m 0755 net/net-off net/net-on "$bin/"
 install -m 0755 tools/whitecube-migrate "$bin/whitecube-migrate"
+install -m 0755 src/portal/scripts/wc-pick "$bin/wc-pick"
 
 # --- root helpers
 install -m 0755 libexec/cube-settings-helper "$lib/cube-settings-helper"
@@ -63,6 +64,24 @@ install -m 0644 net/whitecube-net-lockdown.service "$dest/usr/lib/systemd/system
 # does not start this service or change the live firewall/network connection.
 install -d -m 0755 "$dest/usr/lib/systemd/system/multi-user.target.wants" "$dest/usr/lib/systemd/system/whitecube-network.service.d"
 ln -s ../whitecube-net-lockdown.service "$dest/usr/lib/systemd/system/multi-user.target.wants/whitecube-net-lockdown.service"
+
+# --- custom session D-Bus broker and XDG desktop portal
+install -m 0644 data/bus-allow.conf "$dest/etc/whitecube/bus-allow.conf"
+install -d -m 0755 "$dest/usr/lib/systemd/user" \
+  "$dest/usr/lib/systemd/user/default.target.wants" \
+  "$dest/usr/lib/systemd/user/graphical-session.target.wants" \
+  "$dest/usr/share/dbus-1/services" \
+  "$dest/usr/share/xdg-desktop-portal/portals"
+install -m 0644 data/systemd-user/whitecube-bus.service "$dest/usr/lib/systemd/user/whitecube-bus.service"
+install -m 0644 data/systemd-user/whitecube-portal.service "$dest/usr/lib/systemd/user/whitecube-portal.service"
+ln -s whitecube-bus.service "$dest/usr/lib/systemd/user/dbus.service"
+ln -s whitecube-portal.service "$dest/usr/lib/systemd/user/xdg-desktop-portal.service"
+ln -s ../whitecube-bus.service "$dest/usr/lib/systemd/user/default.target.wants/whitecube-bus.service"
+ln -s ../whitecube-portal.service "$dest/usr/lib/systemd/user/default.target.wants/whitecube-portal.service"
+ln -s ../whitecube-portal.service "$dest/usr/lib/systemd/user/graphical-session.target.wants/whitecube-portal.service"
+install -m 0644 data/dbus-services/org.freedesktop.portal.Desktop.service "$dest/usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service"
+install -m 0644 data/portals/portals.conf "$dest/usr/share/xdg-desktop-portal/portals.conf"
+install -m 0644 data/portals/whitecube.portal "$dest/usr/share/xdg-desktop-portal/portals/whitecube.portal"
 install -m 0644 net/whitecube-network.net-lockdown.conf "$dest/usr/lib/systemd/system/whitecube-network.service.d/net-lockdown.conf"
 install -m 0644 data/config.example "$dest/etc/whitecube/config"
 

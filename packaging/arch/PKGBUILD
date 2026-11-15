@@ -15,7 +15,8 @@ depends=(alsa-lib at-spi2-core cairo coreutils dbus dconf debootstrap dhcpcd dos
   debian-archive-keyring ca-certificates dpkg findutils gawk gnupg gzip inetutils libnewt tar wget xz zlib)
 optdepends=('fnott: desktop notifications' 'pipewire: audio services' 'wireplumber: audio services'
   'pipewire-pulse: audio services' 'qemu-desktop: Cube Lab virtual machines' 'edk2-ovmf: Cube Lab UEFI')
-conflicts=(xorg-server xorg-server-xwayland)
+provides=(xdg-desktop-portal)
+conflicts=(xorg-server xorg-server-xwayland xdg-desktop-portal xdg-desktop-portal-gtk xdg-desktop-portal-kde xdg-desktop-portal-gnome xdg-desktop-portal-wlr)
 
 package() {
   cd "$WHITECUBE_SRC"
@@ -38,7 +39,7 @@ package() {
   if ldd "$priv/$(basename "$(readlink -f "$wlroots")")" "$priv/$(basename "$(readlink -f "$cairo")")" | grep -qiE 'libX11|libxcb'; then
     echo 'PKGBUILD: a private library still reaches X11' >&2; return 1
   fi
-  strip --strip-unneeded "$pkgdir"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player} \
+  strip --strip-unneeded "$pkgdir"/usr/bin/{whitecube-compositor,cube-status,cube-settings,cube-ca,cube-player,whitecube-bus,whitecube-portal} \
     "$pkgdir"/usr/libexec/whitecube/cube-browser/cube-{browser,renderd,netd} "$priv"/*.so* 2>/dev/null || true
   # cube-settings-helper and the sudoers example use Debian's group names.
   install -D -m 0644 /dev/stdin "$pkgdir/usr/lib/sysusers.d/whitecube.conf" <<'CONF'

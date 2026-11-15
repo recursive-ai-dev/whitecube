@@ -1,0 +1,435 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+#
+# wc-pick - whitecube-portal native Wayland terminal file picker.
+#
+# ABI (called by whitecube-portal with execve(), never through a shell):
+#   wc-pick --mode open|save --chooser-file PATH --dir DIR --title TITLE
+#           [--multiple] [--directory] [--name NAME] [--filter LABEL|g;g]...
+#
+# Contract: write newline delimited ABSOLUTE paths to --chooser-file and exit 0
+# on selection; exit non-zero (leaving the file empty) on cancel.
+#
+# Security note: the daemon hands us untrusted client strings in argv.  We
+# forward them to the inner Python/shell process strictly through the
+# ENVIRONMENT and read os.environ in a fixed, literal script.  No client string
+# is ever interpolated into shell or Python source text.
+#
+# Floating window: the terminal is started with the app-id / class
+# "whitecube-picker" so whitecube can float and centre it.
+
+set -eu
+
+MODE=open
+CHOOSER=
+DIR=${HOME:-/}
+TITLE="Select File"
+NAME=
+MULTIPLE=0
+DIRECTORY=0
+FILTERS=
+
+die() { printf 'wc-pick: %s\n' "$1" >&2; exit 2; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mode)         [ $# -ge 2 ] || die "--mode needs a value"; MODE=$2; shift 2 ;;
+        --chooser-file) [ $# -ge 2 ] || die "--chooser-file needs a value"; CHOOSER=$2; shift 2 ;;
+        --dir)          [ $# -ge 2 ] || die "--dir needs a value"; DIR=$2; shift 2 ;;
+        --title)        [ $# -ge 2 ] || die "--title needs a value"; TITLE=$2; shift 2 ;;
+        --name)         [ $# -ge 2 ] || die "--name needs a value"; NAME=$2; shift 2 ;;
+        --filter)       [ $# -ge 2 ] || die "--filter needs a value"
+                        FILTERS="${FILTERS}${FILTERS:+
+}$2"; shift 2 ;;
+        --multiple)     MULTIPLE=1; shift ;;
+        --directory)    DIRECTORY=1; shift ;;
+        *)              die "unknown argument: $1" ;;
+    esac
+done
+
+[ -n "$CHOOSER" ] || die "missing --chooser-file"
+case "$MODE" in open|save) ;; *) die "bad --mode: $MODE" ;; esac
+case "$DIR" in /*) ;; *) DIR=${HOME:-/} ;; esac
+[ -d "$DIR" ] || DIR=${HOME:-/}
+case "$CHOOSER" in /*) ;; *) die "--chooser-file must be absolute" ;; esac
+
+export WC_PICK_MODE="$MODE"
+export WC_PICK_CHOOSER="$CHOOSER"
+export WC_PICK_DIR="$DIR"
+export WC_PICK_TITLE="$TITLE"
+export WC_PICK_NAME="$NAME"
+export WC_PICK_MULTIPLE="$MULTIPLE"
+export WC_PICK_DIRECTORY="$DIRECTORY"
+export WC_PICK_FILTERS="$FILTERS"
+
+# Literal Python curses picker (zero external runtime dependencies).
+PY_PICKER='
+import curses, fnmatch, os, sys
+
+mode = os.environ.get("WC_PICK_MODE", "open")
+chooser = os.environ["WC_PICK_CHOOSER"]
+start_dir = os.environ.get("WC_PICK_DIR", "/")
+title = os.environ.get("WC_PICK_TITLE", "Select File")
+init_name = os.environ.get("WC_PICK_NAME", "")
+multiple = os.environ.get("WC_PICK_MULTIPLE", "0") == "1"
+directory_only = os.environ.get("WC_PICK_DIRECTORY", "0") == "1"
+raw_filters = os.environ.get("WC_PICK_FILTERS", "")
+
+filters = []
+for line in raw_filters.splitlines():
+    if not line:
+        continue
+    if "|" in line:
+        label, globs = line.split("|", 1)
+    else:
+        label, globs = line, line
+    pats = [g.strip() for g in globs.split(";") if g.strip()]
+    if pats:
+        filters.append((label.strip() or globs, pats))
+if filters:
+    filters.append(("All files", ["*"]))
+
+def fmt_size(sz):
+    for unit in ("B", "K", "M", "G", "T"):
+        if sz < 1024 or unit == "T":
+            return f"{sz}{unit}" if unit == "B" else f"{sz:.1f}{unit}"
+        sz /= 1024.0
+    return ""
+
+def write_paths(paths):
+    with open(chooser, "w", encoding="utf-8", errors="surrogateescape") as f:
+        for p in paths:
+            f.write(p + "\n")
+
+def list_dir(cwd, show_hidden, search, active_filter):
+    dirs, files = [], []
+    err = None
+    try:
+        with os.scandir(cwd) as it:
+            for entry in it:
+                name = entry.name
+                if not show_hidden and name.startswith("."):
+                    continue
+                if search and search.lower() not in name.lower():
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=True)
+                except OSError:
+                    is_dir = False
+                if is_dir:
+                    dirs.append((name, True, 0))
+                elif not directory_only:
+                    if active_filter:
+                        lname = name.lower()
+                        if not any(fnmatch.fnmatch(lname, pat.lower()) for pat in active_filter[1]):
+                            continue
+                    try:
+                        sz = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        sz = 0
+                    files.append((name, False, sz))
+    except OSError as e:
+        err = e.strerror or str(e)
+    dirs.sort(key=lambda x: x[0].casefold())
+    files.sort(key=lambda x: x[0].casefold())
+    items = [("..", True, 0)] if (cwd != "/" and not search) else []
+    items.extend(dirs)
+    items.extend(files)
+    return items, err
+
+def run_curses(stdscr):
+    curses.curs_set(0)
+    try:
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_CYAN, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_WHITE)
+        curses.init_pair(5, curses.COLOR_RED, -1)
+    except curses.error:
+        pass
+
+    cwd = os.path.realpath(start_dir) if os.path.isdir(start_dir) else "/"
+    show_hidden = False
+    search = ""
+    fidx = 0
+    cursor = 0
+    scroll = 0
+    selected = set()
+    save_name = init_name
+    edit_mode = (mode == "save")
+    search_mode = False
+    confirm_overwrite = None
+    status = ""
+
+    while True:
+        active_filter = filters[fidx] if filters else None
+        items, err = list_dir(cwd, show_hidden, search, active_filter)
+        if err:
+            status = f"Cannot read {cwd}: {err}"
+        if cursor >= len(items):
+            cursor = max(0, len(items) - 1)
+
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        list_top = 3
+        list_bottom = max(list_top + 1, h - 3)
+        vis = max(1, list_bottom - list_top)
+
+        if cursor < scroll:
+            scroll = cursor
+        elif cursor >= scroll + vis:
+            scroll = cursor - vis + 1
+
+        badge = "SAVE" if mode == "save" else ("FOLDER" if directory_only else ("MULTI" if multiple else "OPEN"))
+        hdr = f" [{badge}] {title}"
+        stdscr.addnstr(0, 0, hdr.ljust(max(1, w - 1)), max(1, w - 1), curses.A_BOLD | curses.A_REVERSE)
+        fdesc = f" | Filter: {active_filter[0]}" if active_filter else ""
+        sdesc = f" | Search: {search}" if search else ""
+        stdscr.addnstr(1, 0, f" Dir: {cwd}{fdesc}{sdesc}", max(1, w - 1), curses.color_pair(1))
+        stdscr.hline(2, 0, curses.ACS_HLINE, max(1, w - 1))
+
+        for row in range(vis):
+            idx = scroll + row
+            if idx >= len(items):
+                break
+            name, is_dir, sz = items[idx]
+            full = cwd if name == ".." else os.path.join(cwd, name)
+            mark = "* " if (not is_dir and full in selected) or (directory_only and full in selected) else "  "
+            tag = "[DIR] " if is_dir else "      "
+            slash = "/" if is_dir and name != ".." else ""
+            disp = f"{mark}{tag}{name}{slash}"
+            right = "" if is_dir else f" {fmt_size(sz):>7}"
+            avail = max(1, w - 1 - len(right))
+            line = disp[:avail].ljust(avail) + right
+            attr = curses.color_pair(1) | curses.A_BOLD if is_dir else curses.A_NORMAL
+            if full in selected:
+                attr |= curses.color_pair(2) | curses.A_BOLD
+            if idx == cursor and (not edit_mode or mode != "save"):
+                attr = curses.A_REVERSE | curses.A_BOLD
+            stdscr.addnstr(list_top + row, 0, line, max(1, w - 1), attr)
+
+        stdscr.hline(list_bottom, 0, curses.ACS_HLINE, max(1, w - 1))
+        if confirm_overwrite:
+            prompt = f" Overwrite {os.path.basename(confirm_overwrite)}? [y/N] "
+            stdscr.addnstr(list_bottom + 1, 0, prompt, max(1, w - 1), curses.color_pair(5) | curses.A_BOLD)
+        elif search_mode:
+            stdscr.addnstr(list_bottom + 1, 0, f" / {search}_", max(1, w - 1), curses.color_pair(3) | curses.A_BOLD)
+        elif mode == "save":
+            flag = "[EDIT]" if edit_mode else "[BROWSE]"
+            caret = "_" if edit_mode else ""
+            stdscr.addnstr(list_bottom + 1, 0, f" {flag} Name: {save_name}{caret}", max(1, w - 1),
+                           curses.color_pair(2 if edit_mode else 3) | curses.A_BOLD)
+        elif status:
+            stdscr.addnstr(list_bottom + 1, 0, f" {status}", max(1, w - 1), curses.color_pair(5))
+        else:
+            sel_info = f" ({len(selected)} selected)" if selected else ""
+            stdscr.addnstr(list_bottom + 1, 0, f" {len(items)} items{sel_info}", max(1, w - 1))
+
+        if mode == "save":
+            help_txt = " Enter:Save  Tab:Browse/Name  Up/Dn:Move  .:Hidden  f:Filter  Esc:Cancel"
+        elif directory_only:
+            help_txt = " Enter:Open  s:Select Here  Up/Dn:Move  Bksp:Up  /:Search  .:Hidden  q:Cancel"
+        elif multiple:
+            help_txt = " Space:Toggle  Enter:Confirm/Dir  Bksp:Up  /:Search  .:Hidden  f:Filter  q:Cancel"
+        else:
+            help_txt = " Enter:Select/Dir  Up/Dn:Move  Bksp:Up  /:Search  .:Hidden  f:Filter  q:Cancel"
+        if list_bottom + 2 < h:
+            stdscr.addnstr(list_bottom + 2, 0, help_txt, max(1, w - 1), curses.A_DIM)
+
+        stdscr.refresh()
+        status = ""
+        ch = stdscr.get_wch()
+
+        if confirm_overwrite:
+            if ch in ("y", "Y"):
+                write_paths([confirm_overwrite])
+                return 0
+            confirm_overwrite = None
+            continue
+
+        if search_mode:
+            if ch in ("\x1b",):
+                search_mode = False
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                search_mode = False
+            elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                search = search[:-1]
+                cursor = 0
+            elif isinstance(ch, str) and ch.isprintable():
+                search += ch
+                cursor = 0
+            continue
+
+        if mode == "save" and edit_mode:
+            if ch == "\t":
+                edit_mode = False
+                continue
+            if ch == "\x1b":
+                return 1
+            if ch in ("\n", "\r", curses.KEY_ENTER):
+                cand = save_name.strip()
+                if not cand:
+                    status = "Filename cannot be empty"
+                    continue
+                target = cand if cand.startswith("/") else os.path.join(cwd, cand)
+                if os.path.isdir(target):
+                    cwd = os.path.realpath(target)
+                    cursor = 0
+                    continue
+                if os.path.exists(target):
+                    confirm_overwrite = target
+                    continue
+                write_paths([target])
+                return 0
+            if ch in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                save_name = save_name[:-1]
+            elif ch == curses.KEY_UP:
+                edit_mode = False
+            elif isinstance(ch, str) and ch.isprintable():
+                save_name += ch
+            continue
+
+        if ch in ("\x1b", "q"):
+            return 1
+        if ch == "\t" and mode == "save":
+            edit_mode = True
+            continue
+        if ch in (curses.KEY_UP, "k"):
+            if cursor > 0:
+                cursor -= 1
+        elif ch in (curses.KEY_DOWN, "j"):
+            if cursor + 1 < len(items):
+                cursor += 1
+        elif ch == curses.KEY_PPAGE:
+            cursor = max(0, cursor - vis)
+        elif ch == curses.KEY_NPAGE:
+            cursor = min(max(0, len(items) - 1), cursor + vis)
+        elif ch in (curses.KEY_HOME, "g"):
+            cursor = 0
+        elif ch in (curses.KEY_END, "G"):
+            cursor = max(0, len(items) - 1)
+        elif ch == ".":
+            show_hidden = not show_hidden
+            cursor = 0
+        elif ch == "/":
+            search_mode = True
+        elif ch == "f" and filters:
+            fidx = (fidx + 1) % len(filters)
+            cursor = 0
+        elif ch in (curses.KEY_BACKSPACE, "\x7f", "\b", curses.KEY_LEFT, "h"):
+            parent = os.path.dirname(cwd)
+            if parent and parent != cwd:
+                cwd = parent
+                search = ""
+                cursor = 0
+        elif ch == "s" and directory_only:
+            if selected:
+                write_paths(sorted(selected))
+            else:
+                write_paths([cwd])
+            return 0
+        elif ch == " " and multiple and items:
+            name, is_dir, _ = items[cursor]
+            if name != ".." and (directory_only or not is_dir):
+                full = os.path.join(cwd, name)
+                if full in selected:
+                    selected.remove(full)
+                else:
+                    selected.add(full)
+        elif ch in ("\n", "\r", curses.KEY_ENTER, curses.KEY_RIGHT, "l") and items:
+            name, is_dir, _ = items[cursor]
+            if is_dir:
+                nxt = os.path.dirname(cwd) if name == ".." else os.path.join(cwd, name)
+                cwd = os.path.realpath(nxt)
+                search = ""
+                cursor = 0
+            else:
+                full = os.path.join(cwd, name)
+                if mode == "save":
+                    save_name = name
+                    edit_mode = True
+                elif multiple:
+                    out = sorted(selected) if selected else [full]
+                    write_paths(out)
+                    return 0
+                else:
+                    write_paths([full])
+                    return 0
+    return 1
+
+raise SystemExit(curses.wrapper(run_curses))
+'
+export WC_PICK_PY="$PY_PICKER"
+
+# ---------------------------------------------------------------------------
+# The inner selector.  This is a CONSTANT literal: every dynamic value is read
+# from the environment at run time, quoted, and never evaluated as code.
+# ---------------------------------------------------------------------------
+INNER='
+cd "$WC_PICK_DIR" || exit 1
+
+write_out() { printf "%s\n" "$1" > "$WC_PICK_CHOOSER"; }
+
+if [ "$WC_PICK_MODE" != save ] && command -v yazi >/dev/null 2>&1; then
+    if [ "$WC_PICK_DIRECTORY" = 1 ]; then
+        yazi --cwd-file "$WC_PICK_CHOOSER" "$WC_PICK_DIR" || exit 1
+    else
+        yazi --chooser-file "$WC_PICK_CHOOSER" "$WC_PICK_DIR" || exit 1
+    fi
+    exit 0
+fi
+
+if [ -t 0 ] && [ -t 1 ] && command -v python3 >/dev/null 2>&1; then
+    exec python3 -I -c "$WC_PICK_PY"
+fi
+
+if [ "$WC_PICK_MODE" = save ]; then
+    printf "%s\nFilename [%s]: " "$WC_PICK_TITLE" "$WC_PICK_NAME" >&2
+    IFS= read -r sel || exit 1
+    [ -n "$sel" ] || sel=$WC_PICK_NAME
+    [ -n "$sel" ] || exit 1
+    case "$sel" in
+        /*) write_out "$sel" ;;
+        *)  write_out "$WC_PICK_DIR/$sel" ;;
+    esac
+    exit 0
+fi
+
+printf "%s\nPath: " "$WC_PICK_TITLE" >&2
+IFS= read -r sel || exit 1
+[ -n "$sel" ] || exit 1
+case "$sel" in
+    /*) write_out "$sel" ;;
+    *)  write_out "$WC_PICK_DIR/$sel" ;;
+esac
+exit 0
+'
+
+# Headless mode (CI / tests / no compositor): run the selector directly.
+if [ "${WC_PICK_HEADLESS:-0}" = 1 ]; then
+    exec /bin/sh -c "$INNER"
+fi
+
+TERM_BIN=
+if [ -n "${WC_TERMINAL:-}" ] && command -v "$WC_TERMINAL" >/dev/null 2>&1; then
+    TERM_BIN=$WC_TERMINAL
+else
+    for t in whitecube-terminal foot alacritty kitty; do
+        if command -v "$t" >/dev/null 2>&1; then TERM_BIN=$t; break; fi
+    done
+fi
+[ -n "$TERM_BIN" ] || die "no Wayland terminal found (set \$WC_TERMINAL)"
+
+# Build the terminal argv with positional parameters: still no eval, no
+# string splitting of client data.
+set -- "$TERM_BIN"
+case "$TERM_BIN" in
+    *whitecube-terminal|*foot)
+        set -- "$@" --app-id whitecube-picker --title "$TITLE" -W 96x28 ;;
+    *alacritty)
+        set -- "$@" --class whitecube-picker,whitecube-picker --title "$TITLE" ;;
+    *kitty)
+        set -- "$@" --class whitecube-picker --title "$TITLE" ;;
+esac
+exec "$@" /bin/sh -c "$INNER"

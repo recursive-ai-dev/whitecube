@@ -175,7 +175,16 @@ def main():
                 'usr/lib/systemd/system/multi-user.target.wants/whitecube-net-lockdown.service',
                 'usr/lib/systemd/system/whitecube-network.service.d/net-lockdown.conf',
                 'usr/share/wayland-sessions/whitecube.desktop', 'usr/share/whitecube/schemas/gschemas.compiled',
-                'etc/whitecube/config'):
+                'etc/whitecube/config', 'etc/whitecube/bus-allow.conf',
+                'usr/bin/whitecube-bus', 'usr/bin/whitecube-portal', 'usr/bin/wc-pick',
+                'usr/lib/systemd/user/whitecube-bus.service', 'usr/lib/systemd/user/whitecube-portal.service',
+                'usr/lib/systemd/user/dbus.service', 'usr/lib/systemd/user/xdg-desktop-portal.service',
+                'usr/lib/systemd/user/default.target.wants/whitecube-bus.service',
+                'usr/lib/systemd/user/default.target.wants/whitecube-portal.service',
+                'usr/lib/systemd/user/graphical-session.target.wants/whitecube-portal.service',
+                'usr/share/dbus-1/services/org.freedesktop.portal.Desktop.service',
+                'usr/share/xdg-desktop-portal/portals.conf',
+                'usr/share/xdg-desktop-portal/portals/whitecube.portal'):
         if not (stage / rel).exists():
             problems.append(f'{rel}: required file is missing')
     if problems:

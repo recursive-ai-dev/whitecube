@@ -10,8 +10,15 @@ from cube_theme import Adw, Gtk
 APP_ID = "dev.woez.CubePdf"
 
 
+def _open_pdf(path, password: str | None = None):
+    try:
+        return pikepdf.open(path) if password is None else pikepdf.open(path, password=password)
+    except pikepdf.PasswordError:
+        raise ValueError(f"{Path(path).name} is password-protected; unlock it first")
+
+
 def parse_ranges(text: str, total: int) -> list[tuple[int, int]]:
-    """'1-3, 5, 8-' -> [(1,3),(5,5),(8,total)]. 1-based, inclusive, validated."""
+    """'1-3, 5, 8-' or 'odd'/'even' -> [(1,3),(5,5),(8,total)]. 1-based, inclusive, validated."""
     if type(total) is not int or total <= 0:
         raise ValueError('PDF has no pages')
     if text.strip().lower() == 'all':
@@ -20,6 +27,14 @@ def parse_ranges(text: str, total: int) -> list[tuple[int, int]]:
     for part in ''.join(text.split()).replace('–', '-').replace('—', '-').split(","):
         if not part:
             raise ValueError('Empty page range')
+        low = part.lower()
+        if low in ('odd', 'even'):
+            start = 1 if low == 'odd' else 2
+            pages = [(i, i) for i in range(start, total + 1, 2)]
+            if not pages:
+                raise ValueError(f"PDF has no {low} pages")
+            out.extend(pages)
+            continue
         lo, dash, hi = part.partition("-")
         try:
             a = int(lo) if lo else 1
@@ -40,20 +55,17 @@ def merge(paths, dest: Path) -> Path:
         raise ValueError('Choose at least one PDF')
     with pikepdf.new() as out:
         for p in paths:
-            try:
-                with pikepdf.open(p) as src:
-                    out.pages.extend(src.pages)
-            except pikepdf.PasswordError:
-                raise ValueError(f"{Path(p).name} is password-protected; unlock it first")
+            with _open_pdf(p) as src:
+                out.pages.extend(src.pages)
         if not len(out.pages):
             raise ValueError('PDFs contain no pages')
         return ct.write_output(dest, out.save)
 
 
-def split(path: Path, ranges, folder: Path) -> list[Path]:
+def split(path: Path, ranges, folder: Path, password: str | None = None) -> list[Path]:
     ranges = list(ranges)
     made = []
-    with pikepdf.open(path) as src:
+    with _open_pdf(path, password) as src:
         total = len(src.pages)
         if not ranges or any(type(a) is not int or type(b) is not int or not 1 <= a <= b <= total for a, b in ranges):
             raise ValueError('Choose valid page ranges before splitting')
@@ -75,20 +87,52 @@ def unlock(path: Path, password: str, dest: Path) -> Path:
     return dest
 
 
-def page_count(path: Path) -> int:
-    with pikepdf.open(path) as pdf:
+def page_count(path: Path, password: str | None = None) -> int:
+    with _open_pdf(path, password) as pdf:
         return len(pdf.pages)
 
 
-def rotate(path, degrees, ranges, dest):
+def rotate(path, degrees, ranges, dest, password: str | None = None):
     if degrees not in (90, 180, 270):
         raise ValueError('Choose 90, 180 or 270 degrees')
-    with pikepdf.open(path) as pdf:
+    with _open_pdf(path, password) as pdf:
         selected = parse_ranges(ranges or 'all', len(pdf.pages))
         indices = {i for a, b in selected for i in range(a - 1, b)}
         for i in sorted(indices):
             pdf.pages[i].rotate(degrees, relative=True)
         return ct.write_output(dest, pdf.save)
+
+
+def clean_pdf(path: Path, dest: Path, *, strip_metadata: bool = False,
+              linearize: bool = False, password: str | None = None) -> dict:
+    """Optimize a PDF copy and optionally scrub document/XMP metadata."""
+    source = Path(path)
+    before = source.stat().st_size
+    with _open_pdf(source, password) as pdf:
+        pdf.remove_unreferenced_resources()
+        if strip_metadata:
+            if '/Metadata' in pdf.Root:
+                del pdf.Root['/Metadata']
+            if '/PieceInfo' in pdf.Root:
+                del pdf.Root['/PieceInfo']
+            for key in list(pdf.docinfo.keys()):
+                del pdf.docinfo[key]
+        saved = ct.write_output(
+            dest,
+            lambda output: pdf.save(
+                output,
+                compress_streams=True,
+                object_stream_mode=pikepdf.ObjectStreamMode.generate,
+                linearize=linearize,
+            ),
+        )
+    after = saved.stat().st_size
+    return {
+        'dest': saved,
+        'before_bytes': before,
+        'after_bytes': after,
+        'metadata_stripped': strip_metadata,
+    }
 
 
 class Tab(Adw.PreferencesPage):
@@ -287,10 +331,37 @@ class RotateTab(Tab):
                  lambda p: f'Saved {p.name}')
 
 
+class CleanTab(Tab):
+    verb = 'Clean'
+
+    def __init__(self, win):
+        super().__init__(win, single=True)
+
+    def options(self, page):
+        group = Adw.PreferencesGroup(
+            title='Optimize & sanitize copy',
+            description='Compresses streams, drops unreferenced objects, and optionally scrubs metadata.')
+        self.strip_meta = Adw.SwitchRow(title='Strip author, title & XMP metadata', active=True)
+        self.linearize = Adw.SwitchRow(title='Optimize for fast web viewing (linearize)', active=False)
+        group.add(self.strip_meta)
+        group.add(self.linearize)
+        page.add(group)
+
+    def start(self):
+        path = self.files.paths[0]
+        strip_meta = self.strip_meta.get_active()
+        linearize = self.linearize.get_active()
+        self.run(
+            lambda: clean_pdf(path, path.with_name(path.stem + '-clean.pdf'),
+                              strip_metadata=strip_meta, linearize=linearize),
+            lambda r: f'Saved {r["dest"].name} ({r["after_bytes"]} B)',
+        )
+
+
 class PdfToolsWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Cube PDF Tools",
-                         default_width=600, default_height=760)
+                         default_width=640, default_height=760)
         self.toasts = Adw.ToastOverlay()
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
@@ -298,7 +369,13 @@ class PdfToolsWindow(Adw.ApplicationWindow):
         switcher = Gtk.StackSwitcher(stack=self.stack)
         header.set_title_widget(switcher)
         view.add_top_bar(header)
-        self.tabs = {"merge": MergeTab(self), "split": SplitTab(self), "unlock": UnlockTab(self), 'rotate': RotateTab(self)}
+        self.tabs = {
+            "merge": MergeTab(self),
+            "split": SplitTab(self),
+            "unlock": UnlockTab(self),
+            "rotate": RotateTab(self),
+            "clean": CleanTab(self),
+        }
         for key, tab in self.tabs.items():
             self.stack.add_titled(tab, key, key.capitalize())
         view.set_content(self.stack)

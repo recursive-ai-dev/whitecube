@@ -154,6 +154,39 @@ def _forward_signals(child: subprocess.Popen) -> None:
     signal.signal(signal.SIGINT, handler)
 
 
+def cmd_clone(args) -> int:
+    try:
+        meta = strap.clone_vm(
+            args.source,
+            args.dest,
+            memory_mib=args.memory,
+            cpus=args.cpus,
+        )
+    except BlockingIOError:
+        print(f'whitecube-vm: VM {args.source!r} is currently running; stop it before cloning.', file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(meta, indent=2))
+    else:
+        print(f'Cloned VM {args.source} -> {meta["name"]} ({meta["format"]}) -> {strap.vm_dir(meta["name"]) / meta["disk"]}')
+    return 0
+
+
+def cmd_trim(args) -> int:
+    try:
+        stats = strap.compact_vm(args.name)
+    except BlockingIOError:
+        print(f'whitecube-vm: VM {args.name!r} is currently running; stop it before compacting.', file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(stats, indent=2))
+    else:
+        print(f'Trimmed {stats["name"]} ({stats["format"]}): '
+              f'{human_bytes(stats["before_bytes"])} -> {human_bytes(stats["after_bytes"])} '
+              f'(reclaimed {human_bytes(stats["reclaimed_bytes"])})')
+    return 0
+
+
 def cmd_run(args) -> int:
     target = strap.vm_dir(args.name)
     if not strap.vm_exists(args.name):
@@ -167,6 +200,8 @@ def cmd_run(args) -> int:
         headless=args.headless,
         serial_stdio=args.serial,
         snapshot=args.snapshot,
+        cdrom=args.cdrom,
+        serial_log=args.serial_log,
     )
     if args.dry_run:
         print(shlex.join(argv))
@@ -187,7 +222,7 @@ def cmd_run(args) -> int:
             is_tty = False
         if not is_tty and not args.serial:
             log_path = _vm_log_path(args.name)
-            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
             log_file = os.fdopen(fd, 'w')
             stderr_target = log_file
         child = subprocess.Popen(argv, stderr=stderr_target)
@@ -248,6 +283,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument('--recipe', default='', help='Recipe metadata label')
     p_import.set_defaults(func=cmd_import)
 
+    p_clone = sub.add_parser('clone', help='Clone a stopped VM with fresh per-VM UEFI NVRAM')
+    p_clone.add_argument('source', help='Existing source VM name')
+    p_clone.add_argument('dest', help='New destination VM name')
+    p_clone.add_argument('--memory', type=int, help='Override RAM in MiB for the clone')
+    p_clone.add_argument('--cpus', type=int, help='Override vCPU count for the clone')
+    p_clone.add_argument('--json', action='store_true', help='Print machine-readable JSON')
+    p_clone.set_defaults(func=cmd_clone)
+
+    for alias in ('trim', 'compact'):
+        p_trim = sub.add_parser(alias, help='Reclaim sparse zero blocks on a stopped VM disk')
+        p_trim.add_argument('name', help='VM name')
+        p_trim.add_argument('--json', action='store_true', help='Print machine-readable JSON')
+        p_trim.set_defaults(func=cmd_trim)
+
     p_run = sub.add_parser('run', help='Boot a VM in QEMU with UEFI OVMF')
     p_run.add_argument('name', help='VM name')
     p_run.add_argument('--memory', type=int, help='Override RAM in MiB')
@@ -256,6 +305,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument('--ssh-port', type=int, default=2222, help='Host TCP port for SSH forward (default: 2222)')
     p_run.add_argument('--headless', action='store_true', help='Run without graphical display (-display none)')
     p_run.add_argument('--serial', action='store_true', help='Attach QEMU monitor and serial console to stdio')
+    p_run.add_argument('--serial-log', type=Path, help='Write guest serial output to a file (-serial file:...)')
+    p_run.add_argument('--cdrom', type=Path, help='Attach a read-only ISO image and boot CD-ROM before disk')
     p_run.add_argument('--snapshot', action='store_true', help='Discard disk and NVRAM writes after shutdown')
     p_run.add_argument('--dry-run', action='store_true', help='Print the QEMU command without launching')
     p_run.set_defaults(func=cmd_run)

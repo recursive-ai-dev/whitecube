@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.portal.Desktop
+Exec=/usr/bin/whitecube-portal --cancel-on-disconnect --picker-cmd /usr/bin/wc-pick
+SystemdService=whitecube-portal.service
