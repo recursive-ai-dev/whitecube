@@ -209,19 +209,22 @@ static bool make_buffers(struct ca *c) {
 	free_buffers(c);
 	if (c->W <= 0 || c->H <= 0 || c->W > INT_MAX / 4 || (size_t)c->W * c->H > INT_MAX / 4) return false;
 	c->stride = c->W * 4;
+	size_t buf_size = (size_t)c->stride * c->H;
 	for (int i = 0; i < 2; i++) {
-		int fd = shm_alloc(c->stride * c->H);
+		int fd = shm_alloc((int)buf_size);
 		if (fd < 0) { free_buffers(c); return false; }
-		void *px = mmap(NULL, c->stride * c->H, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+		void *px = mmap(NULL, buf_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		if (px == MAP_FAILED) { close(fd); free_buffers(c); return false; }
-		struct wl_shm_pool *pool = wl_shm_create_pool(c->shm, fd, c->stride * c->H);
+		struct wl_shm_pool *pool = wl_shm_create_pool(c->shm, fd, (int)buf_size);
+		if (!pool) { munmap(px, buf_size); close(fd); free_buffers(c); return false; }
 		// Opaque format: the compositor never has to blend the wallpaper.
 		struct wl_buffer *buf = wl_shm_pool_create_buffer(pool, 0,
 			c->W, c->H, c->stride, WL_SHM_FORMAT_XRGB8888);
 		wl_shm_pool_destroy(pool);
+		if (!buf) { munmap(px, buf_size); close(fd); free_buffers(c); return false; }
 		slots[i].c = c; slots[i].i = i;
 		wl_buffer_add_listener(buf, &buf_listener, &slots[i]);
-		c->b[i].buf = buf; c->b[i].px = px; c->b[i].fd = fd; c->b[i].busy = false; c->b[i].size = (size_t)c->stride * c->H;
+		c->b[i].buf = buf; c->b[i].px = px; c->b[i].fd = fd; c->b[i].busy = false; c->b[i].size = buf_size;
 	}
 	return true;
 }
@@ -259,12 +262,15 @@ static void stamp_glider(struct ca *c, int gx, int gy, int rot) {
 }
 
 static void stamp_pulsar(struct ca *c, int gx, int gy) {
+	if (c->cols <= 0 || c->rows <= 0) return;
 	static const int off[] = { 2, 3, 4, 8, 9, 10 };
 	for (unsigned i = 0; i < 6; i++) for (unsigned j = 0; j < 6; j++) {
 		int pts[4][2] = { {off[i],off[j]}, {-off[i],off[j]}, {off[i],-off[j]}, {-off[i],-off[j]} };
 		for (int k = 0; k < 4; k++) {
-			int x = (gx + pts[k][0] + c->cols * 4) % c->cols;
-			int y = (gy + pts[k][1] + c->rows * 4) % c->rows;
+			int x = (gx + pts[k][0]) % c->cols;
+			if (x < 0) x += c->cols;
+			int y = (gy + pts[k][1]) % c->rows;
+			if (y < 0) y += c->rows;
 			c->grid[y * c->cols + x] = 1;
 			c->age[y * c->cols + x] = 0;
 		}
@@ -821,9 +827,14 @@ static void supervise(struct ca *c) {
 		if (o->wl && o->name[0] && !o->pid && o->crashes < 5) spawn_instance(c, o);
 	}
 }
-static void reap(struct ca *c, int sigfd) {
+static bool reap(struct ca *c, int sigfd) {
 	struct signalfd_siginfo si;
-	while (read(sigfd, &si, sizeof(si)) == sizeof(si)) {}
+	bool terminate = false;
+	while (read(sigfd, &si, sizeof(si)) == sizeof(si)) {
+		if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT || si.ssi_signo == SIGHUP)
+			terminate = true;
+	}
+	if (terminate) return false;
 	int status; pid_t pid;
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) for (int i = 0; i < c->nouts; i++) {
 		struct output_ref *o = &c->outs[i];
@@ -833,11 +844,16 @@ static void reap(struct ca *c, int sigfd) {
 		if (o->wl && o->crashes >= 5) fprintf(stderr, "cube-ca: giving up on %s after repeated exits\n", o->name);
 	}
 	supervise(c);
+	return true;
 }
 static int supervisor_main(struct ca *c) {
-	sigset_t chld; sigemptyset(&chld); sigaddset(&chld, SIGCHLD);
-	sigprocmask(SIG_BLOCK, &chld, NULL);
-	int sigfd = signalfd(-1, &chld, SFD_CLOEXEC | SFD_NONBLOCK);
+	sigset_t sigs; sigemptyset(&sigs);
+	sigaddset(&sigs, SIGCHLD);
+	sigaddset(&sigs, SIGTERM);
+	sigaddset(&sigs, SIGINT);
+	sigaddset(&sigs, SIGHUP);
+	sigprocmask(SIG_BLOCK, &sigs, NULL);
+	int sigfd = signalfd(-1, &sigs, SFD_CLOEXEC | SFD_NONBLOCK);
 	if (sigfd < 0) { perror("cube-ca: signalfd"); return 1; }
 	c->supervisor = true;
 	supervise(c);
@@ -858,7 +874,7 @@ static int supervisor_main(struct ca *c) {
 			if (wl_display_read_events(c->dpy) < 0) break;
 		} else wl_display_cancel_read(c->dpy);
 		if (wl_display_dispatch_pending(c->dpy) < 0) break;
-		if (fds[1].revents & POLLIN) reap(c, sigfd);
+		if ((fds[1].revents & POLLIN) && !reap(c, sigfd)) goto done;
 		if (fds[0].revents & (POLLHUP | POLLERR)) break;
 	}
 done:
@@ -1066,10 +1082,21 @@ static int preview(const char *path, bool volume) {
 	cosmos_offscreen_free(&c);
 	return rc != 0;
 }
+#ifndef WHITECUBE_VERSION
+#define WHITECUBE_VERSION "dev"
+#endif
+
+static void ca_usage(FILE *out) {
+	fprintf(out, "Usage: cube-ca [--menu | --control [@OUTPUT] COMMAND [ARG] | --self-test | --preview output.ppm | --preview-3d output.ppm | --preview-zoom 0..6 output.ppm | --help | --version]\n");
+}
+
 int main(int argc, char **argv) {
-	if (argc >= 3 && !strcmp(argv[1], "--control")) {
+	if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) { ca_usage(stdout); return 0; }
+	if (argc == 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) { printf("cube-ca %s\n", WHITECUBE_VERSION); return 0; }
+	if (argc >= 2 && !strcmp(argv[1], "--control")) {
+		if (argc < 3) { ca_usage(stderr); return 1; }
 		const char *target = argv[2][0] == '@' ? argv[2] + 1 : NULL; int first = target ? 3 : 2;
-		if (first >= argc) return 1;
+		if (first >= argc) { ca_usage(stderr); return 1; }
 		char command[256] = {0}; size_t len = 0;
 		for (int i = first; i < argc; i++) { int n = snprintf(command + len, sizeof(command) - len, "%s%s", i == first ? "" : " ", argv[i]);
 			if (n < 0 || (size_t)n >= sizeof(command) - len) return 1;
@@ -1080,8 +1107,16 @@ int main(int argc, char **argv) {
 	if (argc == 2 && !strcmp(argv[1], "--self-test")) return self_test();
 	if (argc == 3 && !strcmp(argv[1], "--preview")) return preview(argv[2], false);
 	if (argc == 3 && !strcmp(argv[1], "--preview-3d")) return preview(argv[2], true);
-	if (argc == 4 && !strcmp(argv[1], "--preview-zoom")) return preview_zoom(argv[3], atof(argv[2]));
-	if (argc != 1) { fprintf(stderr, "Usage: cube-ca [--menu | --control [@OUTPUT] COMMAND [ARG] | --self-test | --preview output.ppm | --preview-3d output.ppm | --preview-zoom 0..6 output.ppm]\n"); return 1; }
+	if (argc == 4 && !strcmp(argv[1], "--preview-zoom")) {
+		char *end = NULL; errno = 0;
+		double zoom = strtod(argv[2], &end);
+		if (!argv[2][0] || *end || errno || !isfinite(zoom) || zoom < 0 || zoom > COS_PHASES - 1) {
+			fprintf(stderr, "cube-ca: invalid zoom '%s' (expected 0..%d)\n", argv[2], COS_PHASES - 1);
+			return 1;
+		}
+		return preview_zoom(argv[3], zoom);
+	}
+	if (argc != 1) { ca_usage(stderr); return 1; }
 	struct ca c;
 	memset(&c, 0, sizeof(c));
 	c.b[0].fd = -1; c.b[1].fd = -1; c.control_fd = -1; c.slice = -1; c.yaw = .65; c.last_bi = -1; c.spin = true; c.out_scale = 1;
@@ -1095,11 +1130,13 @@ int main(int argc, char **argv) {
 	cosmos_config(&c);
 	c.running = true;
 	c.dpy = wl_display_connect(NULL);
-	if (!c.dpy) { fprintf(stderr, "cube-ca: no wayland display\n"); return 1; }
+	if (!c.dpy) { close(c.tfd); fprintf(stderr, "cube-ca: no wayland display\n"); return 1; }
 	c.reg = wl_display_get_registry(c.dpy);
+	if (!c.reg) { close(c.tfd); wl_display_disconnect(c.dpy); return 1; }
 	wl_registry_add_listener(c.reg, &reg_listener, &c);
 	wl_display_roundtrip(c.dpy);
 	if (!c.comp || !c.shm || !c.layer_shell) {
+		close(c.tfd); wl_registry_destroy(c.reg); wl_display_disconnect(c.dpy);
 		fprintf(stderr, "cube-ca: missing globals\n");
 		return 1;
 	}
@@ -1108,14 +1145,25 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < c.nouts; i++) if (!c.outs[i].name[0]) named = false;
 	if (*c.want_output) {
 		for (int i = 0; i < c.nouts; i++) if (c.outs[i].wl && !strcmp(c.outs[i].name, c.want_output)) { c.target = c.outs[i].wl; c.out_scale = c.outs[i].scale; }
-		if (!c.target) { fprintf(stderr, "cube-ca: output %s is gone\n", c.want_output); return 0; }
+		if (!c.target) { fprintf(stderr, "cube-ca: output %s is gone\n", c.want_output); close(c.tfd); wl_registry_destroy(c.reg); wl_display_disconnect(c.dpy); return 0; }
 	} else if (named && getenv("WAYLAND_DISPLAY") && !getenv("CUBE_CA_SINGLE")) {
 		close(c.tfd); return supervisor_main(&c);
 	}
+	sigset_t terms; sigemptyset(&terms);
+	sigaddset(&terms, SIGTERM); sigaddset(&terms, SIGINT); sigaddset(&terms, SIGHUP);
+	sigprocmask(SIG_BLOCK, &terms, NULL);
+	int sigfd = signalfd(-1, &terms, SFD_CLOEXEC | SFD_NONBLOCK);
 	c.surf = wl_compositor_create_surface(c.comp);
+	c.layer = c.surf ? zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, c.surf, c.target,
+		ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "cube-ca-wallpaper") : NULL;
+	if (!c.surf || !c.layer) {
+		if (sigfd >= 0) close(sigfd);
+		if (c.layer) zwlr_layer_surface_v1_destroy(c.layer);
+		if (c.surf) wl_surface_destroy(c.surf);
+		close(c.tfd); wl_registry_destroy(c.reg); wl_display_disconnect(c.dpy);
+		return 1;
+	}
 	wl_surface_add_listener(c.surf, &surface_listener, &c);
-	c.layer = zwlr_layer_shell_v1_get_layer_surface(c.layer_shell, c.surf, c.target,
-		ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND, "cube-ca-wallpaper");
 	zwlr_layer_surface_v1_set_size(c.layer, 0, 0);
 	zwlr_layer_surface_v1_set_anchor(c.layer,
 		ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
@@ -1126,19 +1174,21 @@ int main(int argc, char **argv) {
 	wl_display_flush(c.dpy);
 	c.control_fd = open_control(&c);
 	int dfd = wl_display_get_fd(c.dpy);
-	struct pollfd fds[3] = {
-		{ .fd = dfd, .events = POLLIN },
-		{ .fd = c.tfd, .events = POLLIN },
-		{ .fd = c.control_fd, .events = POLLIN },
-	};
 	while (c.running) {
+		struct pollfd fds[4];
+		nfds_t nf = 0;
+		int idx_ctl = -1, idx_sig = -1;
+		fds[nf++] = (struct pollfd){ .fd = dfd, .events = POLLIN };
+		fds[nf++] = (struct pollfd){ .fd = c.tfd, .events = POLLIN };
+		if (c.control_fd >= 0) { idx_ctl = (int)nf; fds[nf++] = (struct pollfd){ .fd = c.control_fd, .events = POLLIN }; }
+		if (sigfd >= 0) { idx_sig = (int)nf; fds[nf++] = (struct pollfd){ .fd = sigfd, .events = POLLIN }; }
 		while (wl_display_prepare_read(c.dpy) != 0) {
 			if (wl_display_dispatch_pending(c.dpy) < 0) { c.running = false; break; }
 		}
 		if (!c.running) break;
 		fds[0].events = POLLIN;
 		if (wl_display_flush(c.dpy) < 0 && errno == EAGAIN) fds[0].events |= POLLOUT;
-		int ready = poll(fds, 3, -1);
+		int ready = poll(fds, nf, -1);
 		if (ready < 0) {
 			wl_display_cancel_read(c.dpy);
 			if (errno == EINTR) continue;
@@ -1149,11 +1199,17 @@ int main(int argc, char **argv) {
 		} else wl_display_cancel_read(c.dpy);
 		if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) break;
 		if (wl_display_dispatch_pending(c.dpy) < 0 || !c.running) break;
-		if (fds[2].revents & POLLIN) receive_control(&c);
+		if (idx_sig >= 0 && (fds[idx_sig].revents & POLLIN)) {
+			struct signalfd_siginfo si;
+			while (read(sigfd, &si, sizeof(si)) == sizeof(si)) c.running = false;
+			if (!c.running) break;
+		}
+		if (idx_ctl >= 0 && (fds[idx_ctl].revents & POLLIN)) receive_control(&c);
 		if (fds[1].revents & POLLIN) on_tick(&c);
 	}
 	free_buffers(&c); free(c.stars); free(c.grid); free(c.next); free(c.age); free(c.state); free(c.fade_px); cos_free(&c);
 	for (int i = 0; i < 2; i++) free(c.b[i].shown);
+	if (sigfd >= 0) close(sigfd);
 	close(c.tfd);
 	if (c.control_fd >= 0) { close(c.control_fd); unlink(c.control_path); }
 	if (c.frame_cb) wl_callback_destroy(c.frame_cb);

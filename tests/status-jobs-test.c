@@ -90,6 +90,23 @@ static void test_keyboard(struct st *s) {
     handle_status_key(s, xkb_keymap_key_by_name(s->keymap, "AC11") - 8);
     handle_status_key(s, xkb_keymap_key_by_name(s->keymap, "AD03") - 8);
     assert(!strcmp(s->query, "é"));
+    // Verify Ctrl+W word-erase, Delete query-clear, and Ctrl+U scroll-reset.
+    xkb_mod_index_t ctrl_mod = xkb_keymap_mod_get_index(s->keymap, XKB_MOD_NAME_CTRL);
+    xkb_mod_mask_t ctrl_mask = ctrl_mod == XKB_MOD_INVALID ? 0 : (1u << ctrl_mod);
+    assert(ctrl_mask != 0);
+    g_strlcpy(s->query, "alpha beta  ", sizeof(s->query)); s->scroll = 42; s->sel = 2;
+    xkb_state_update_mask(s->xkb_state, ctrl_mask, 0, 0, 0, 0, 0);
+    handle_status_key(s, xkb_keymap_key_by_name(s->keymap, "AD02") - 8); // Ctrl+W
+    xkb_state_update_mask(s->xkb_state, 0, 0, 0, 0, 0, 0);
+    assert(!strcmp(s->query, "alpha ") && s->scroll == 0 && s->sel == 0);
+    s->scroll = 15;
+    handle_status_key(s, xkb_keymap_key_by_name(s->keymap, "DELE") - 8);
+    assert(!s->query[0] && s->scroll == 0);
+    g_strlcpy(s->query, "gamma", sizeof(s->query)); s->scroll = 25;
+    xkb_state_update_mask(s->xkb_state, ctrl_mask, 0, 0, 0, 0, 0);
+    handle_status_key(s, xkb_keymap_key_by_name(s->keymap, "AD07") - 8); // Ctrl+U
+    xkb_state_update_mask(s->xkb_state, 0, 0, 0, 0, 0, 0);
+    assert(!s->query[0] && s->scroll == 0);
     menu_close(s);
     xkb_state_unref(s->xkb_state); xkb_keymap_unref(s->keymap);
     xkb_compose_state_unref(s->compose); xkb_context_unref(s->xkb);

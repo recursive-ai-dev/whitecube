@@ -35,7 +35,9 @@ settings_sources = [xdg, 'src/protocols/wlr-output-management-protocol.c']
 compositor = executable('whitecube-compositor', 'src/whitecube.c',
   c_args: ['-DWLR_USE_UNSTABLE', '-DWHITECUBE_VERSION="' + meson.project_version() + '"'], dependencies: compositor_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
-ca = executable('cube-ca', ['src/cube-ca.c', layer, xdg], dependencies: [wayland_client, m],
+ca = executable('cube-ca', ['src/cube-ca.c', layer, xdg],
+  c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
+  dependencies: [wayland_client, m],
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 bus_inc = include_directories('src/bus/include')
 bus = executable('whitecube-bus',
@@ -66,7 +68,9 @@ portal_wire_test = executable('portal-test-wire',
 test('portal-dbus-wire', portal_wire_test, suite: 'core')
 settings = executable('cube-settings', ['src/cube-settings.c'] + settings_sources, dependencies: client_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
-status = executable('cube-status', ['src/cube-status.c', layer, xdg], dependencies: client_deps,
+status = executable('cube-status', ['src/cube-status.c', layer, xdg],
+  c_args: ['-DWHITECUBE_VERSION="' + meson.project_version() + '"'],
+  dependencies: client_deps,
   build_rpath: native_rpath, install_rpath: '/usr/lib/whitecube', install: true)
 
 compositor_test = executable('compositor-test', 'tests/compositor-test.c', c_args: ['-DWLR_USE_UNSTABLE'],
@@ -106,6 +110,10 @@ test('status-preview', status, args: ['--render', meson.current_build_dir()], en
 test('compositor-cli-help', compositor, args: ['--help'], suite: 'core')
 test('compositor-cli-version', compositor, args: ['--version'], suite: 'core')
 test('compositor-check-config', compositor, args: ['--check-config'], env: schema_env, suite: 'core')
+test('wallpaper-cli-help', ca, args: ['--help'], suite: 'core')
+test('wallpaper-cli-version', ca, args: ['--version'], suite: 'core')
+test('status-cli-help', status, args: ['--help'], suite: 'core')
+test('status-cli-version', status, args: ['--version'], suite: 'core')
 
 foreach item : [['privacy-backend', 'test-privacy.py'], ['per-user-install', 'test-install.py'],
                 ['native-preference-validation', 'test-preferences.py'],

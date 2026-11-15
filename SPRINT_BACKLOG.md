@@ -2,7 +2,7 @@
 
 ## Phase 1: Core Compositor & Desktop Daemons (`src/`, `libexec/`, `bin/`)
 - [x] `src/whitecube.c` & `src/tab-panel.h` (Compositor window/output/protocol hardening & extensions)
-- [ ] `src/cube-status.c` & `src/cube-ca.c` (Status bar & living-cube wallpaper lifecycle/features)
+- [x] `src/cube-status.c` & `src/cube-ca.c` (Status bar & living-cube wallpaper lifecycle/features)
 - [ ] `src/cube-settings.c` & `libexec/cube-settings-helper` (Settings UI & privileged helper IPC/features)
 - [ ] `src/cube-audio/` (Audio controls, validation, and mixer enhancements)
 - [ ] `bin/` utilities (`whitecube-session`, `whitecube-doctor`, `whitecube-preferences`, `whitecube-terminal`, etc.)

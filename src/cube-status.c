@@ -224,9 +224,10 @@ static void color(cairo_t *cr, const char *hex) {
 }
 
 static void read_file_first(const char *path, char *out, size_t n) {
+	if (!n) return;
 	FILE *f = fopen(path, "r");
 	if (!f) { out[0] = 0; return; }
-	if (!fgets(out, n, f)) out[0] = 0;
+	if (!fgets(out, (int)n, f)) out[0] = 0;
 	out[strcspn(out, "\r\n")] = 0;
 	fclose(f);
 }
@@ -1103,9 +1104,12 @@ static void draw_qs(struct st *s, cairo_t *cr, int W, int H) {
 	box(cr, p, k, C_INK, C_PANEL);
 
 	time_t now = time(NULL);
-	char date[64], hm[16], v[16];
-	strftime(date, sizeof(date), "%A %-d %B", localtime(&now));
-	strftime(hm, sizeof(hm), "%H:%M", localtime(&now));
+	struct tm tm;
+	char date[64] = "", hm[16] = "", v[16];
+	if (localtime_r(&now, &tm)) {
+		strftime(date, sizeof(date), "%A %-d %B", &tm);
+		strftime(hm, sizeof(hm), "%H:%M", &tm);
+	}
 	text(cr, date, 17 * k, true, s->q_date.x, s->q_date.y, s->q_date.w - 64 * k, s->q_date.h, false, 1, C_INK);
 	text(cr, hm, 17 * k, false, s->q_date.x + s->q_date.w - 64 * k, s->q_date.y, 64 * k, s->q_date.h, true, 1, C_INK);
 	if (s->battery_line[0])
@@ -1190,28 +1194,79 @@ static int qs_hit(struct st *s, double x, double y) {
 }
 
 // ------------------------------------------------------------- status data
-static void battery(char *out, size_t n) {
-	DIR *d = opendir("/sys/class/power_supply");
-	if (!d) { out[0] = 0; return; }
+static bool read_u64_file(const char *path, unsigned long long *out) {
+	char buf[32] = "";
+	read_file_first(path, buf, sizeof(buf));
+	if (!buf[0]) return false;
+	char *end = NULL; errno = 0;
+	unsigned long long v = strtoull(buf, &end, 10);
+	if (errno || !end || *end) return false;
+	*out = v;
+	return true;
+}
+
+static void battery_from_dir(const char *base_dir, char *out, size_t n) {
+	if (!n) return;
+	out[0] = 0;
+	DIR *d = opendir(base_dir);
+	if (!d) return;
 	struct dirent *e;
-	char name[256] = {0};
+	unsigned long long sum_now = 0, sum_full = 0;
+	int count = 0;
+	bool any_charging = false, any_discharging = false;
+	char best_name[256] = "", best_cap[16] = "";
 	while ((e = readdir(d))) {
-		if (!strncmp(e->d_name, "BAT", 3)) {
-			snprintf(name, sizeof(name), "%s", e->d_name);
-			break;
+		if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+		char p[640], type[32] = "", scope[32] = "", st[32] = "", cap[16] = "";
+		if (snprintf(p, sizeof(p), "%s/%s/type", base_dir, e->d_name) >= (int)sizeof(p)) continue;
+		read_file_first(p, type, sizeof(type));
+		if (type[0]) {
+			if (strcmp(type, "Battery")) continue;
+		} else if (strncmp(e->d_name, "BAT", 3)) {
+			continue;
 		}
+		snprintf(p, sizeof(p), "%s/%s/scope", base_dir, e->d_name);
+		read_file_first(p, scope, sizeof(scope));
+		if (!strcmp(scope, "Device")) continue;
+		snprintf(p, sizeof(p), "%s/%s/capacity", base_dir, e->d_name);
+		read_file_first(p, cap, sizeof(cap));
+		unsigned long long en_now = 0, en_full = 0;
+		bool have_energy = snprintf(p, sizeof(p), "%s/%s/energy_now", base_dir, e->d_name) < (int)sizeof(p) && read_u64_file(p, &en_now) &&
+		                   snprintf(p, sizeof(p), "%s/%s/energy_full", base_dir, e->d_name) < (int)sizeof(p) && read_u64_file(p, &en_full) && en_full > 0;
+		if (!have_energy) {
+			have_energy = snprintf(p, sizeof(p), "%s/%s/charge_now", base_dir, e->d_name) < (int)sizeof(p) && read_u64_file(p, &en_now) &&
+			              snprintf(p, sizeof(p), "%s/%s/charge_full", base_dir, e->d_name) < (int)sizeof(p) && read_u64_file(p, &en_full) && en_full > 0;
+		}
+		if (!have_energy && !cap[0]) continue;
+		count++;
+		if (have_energy) {
+			sum_now += en_now;
+			sum_full += en_full;
+		}
+		if (cap[0] && (!best_name[0] || strcmp(e->d_name, best_name) < 0)) {
+			snprintf(best_name, sizeof(best_name), "%s", e->d_name);
+			snprintf(best_cap, sizeof(best_cap), "%s", cap);
+		}
+		snprintf(p, sizeof(p), "%s/%s/status", base_dir, e->d_name);
+		read_file_first(p, st, sizeof(st));
+		if (!strcmp(st, "Charging")) any_charging = true;
+		else if (!strcmp(st, "Discharging")) any_discharging = true;
 	}
 	closedir(d);
-	if (!name[0]) { out[0] = 0; return; }
-	char p[320], cap[16] = {0}, st[16] = {0};
-	snprintf(p, sizeof(p), "/sys/class/power_supply/%s/capacity", name);
-	read_file_first(p, cap, sizeof(cap));
-	snprintf(p, sizeof(p), "/sys/class/power_supply/%s/status", name);
-	read_file_first(p, st, sizeof(st));
-	if (!cap[0]) { out[0] = 0; return; }
-	const char *sym = (!strcmp(st, "Charging")) ? "+" :
-		(!strcmp(st, "Discharging")) ? "" : "=";
-	snprintf(out, n, "BAT %s%%%s", cap, sym);
+	if (!count) return;
+	const char *sym = any_charging ? "+" : any_discharging ? "" : "=";
+	if (sum_full > 0) {
+		unsigned long long pct = sum_now <= (ULLONG_MAX - sum_full / 2) / 100
+			? (sum_now * 100 + sum_full / 2) / sum_full : 100;
+		if (pct > 100) pct = 100;
+		snprintf(out, n, "BAT %llu%%%s", pct, sym);
+	} else if (best_cap[0]) {
+		snprintf(out, n, "BAT %s%%%s", best_cap, sym);
+	}
+}
+
+static void battery(char *out, size_t n) {
+	battery_from_dir("/sys/class/power_supply", out, n);
 }
 
 // Minimal readers for cube-net's flat, ASCII-escaped status.json.
@@ -1286,8 +1341,10 @@ static void wifi_state(struct st *s) {
 
 static void status_update(struct st *s) {
 	time_t t = time(NULL);
-	char clock[32], bat[48] = "";
-	strftime(clock, sizeof(clock), s->clock_12h ? (s->clock_seconds ? "%I:%M:%S%p" : "%I:%M%p") : (s->clock_seconds ? "%H:%M:%S" : "%H:%M"), localtime(&t));
+	struct tm tm;
+	char clock[32] = "--:--", bat[48] = "";
+	if (localtime_r(&t, &tm))
+		strftime(clock, sizeof(clock), s->clock_12h ? (s->clock_seconds ? "%I:%M:%S%p" : "%I:%M%p") : (s->clock_seconds ? "%H:%M:%S" : "%H:%M"), &tm);
 	battery(bat, sizeof(bat));
 	if (bat[0]) snprintf(s->clock_text, sizeof(s->clock_text), "%s  %s", clock, bat);
 	else snprintf(s->clock_text, sizeof(s->clock_text), "%s", clock);
@@ -1409,15 +1466,17 @@ static void buffer_release(void *data, struct wl_buffer *wl) {
 static const struct wl_buffer_listener buffer_listener = { buffer_release };
 
 static void paint(struct st *s, struct panel *p, void (*fn)(struct st *, cairo_t *, int, int)) {
-	if (!p->surf || !p->configured || p->w <= 0 || p->h <= 0) return;
-	int stride = p->w * 4; size_t size = (size_t)stride * p->h;
+	if (!s->shm || !p->surf || !p->configured || p->w <= 0 || p->h <= 0 ||
+	    p->w > INT_MAX / 4 || (size_t)p->w * (size_t)p->h > INT_MAX / 4) return;
+	int stride = p->w * 4; size_t size = (size_t)stride * (size_t)p->h;
 	int fd = memfd_create("cube-status", MFD_CLOEXEC);
-	if (fd < 0 || ftruncate(fd, size) < 0) { if (fd >= 0) close(fd); return; }
+	if (fd < 0 || ftruncate(fd, (off_t)size) < 0) { if (fd >= 0) close(fd); return; }
 	void *px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 	if (px == MAP_FAILED) { close(fd); return; }
 	struct buffer *b = calloc(1, sizeof(*b));
 	if (!b) { munmap(px, size); close(fd); return; }
-	struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, size);
+	struct wl_shm_pool *pool = wl_shm_create_pool(s->shm, fd, (int32_t)size);
+	if (!pool) { close(fd); munmap(px, size); free(b); return; }
 	b->data = px; b->size = size;
 	b->wl = wl_shm_pool_create_buffer(pool, 0, p->w, p->h, stride, WL_SHM_FORMAT_ARGB8888);
 	wl_shm_pool_destroy(pool);
@@ -1426,6 +1485,10 @@ static void paint(struct st *s, struct panel *p, void (*fn)(struct st *, cairo_t
 	wl_buffer_add_listener(b->wl, &buffer_listener, b);
 	cairo_surface_t *cs = cairo_image_surface_create_for_data(px, CAIRO_FORMAT_ARGB32, p->w, p->h, stride);
 	cairo_t *cr = cairo_create(cs);
+	if (cairo_surface_status(cs) != CAIRO_STATUS_SUCCESS || cairo_status(cr) != CAIRO_STATUS_SUCCESS) {
+		cairo_destroy(cr); cairo_surface_destroy(cs);
+		wl_buffer_destroy(b->wl); munmap(px, size); free(b); return;
+	}
 	fn(s, cr, p->w, p->h);
 	cairo_destroy(cr);
 	cairo_surface_flush(cs);
@@ -1436,14 +1499,17 @@ static void paint(struct st *s, struct panel *p, void (*fn)(struct st *, cairo_t
 }
 
 // ---------------------------------------------------------------- surfaces
+static void panel_destroy(struct panel *p);
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls, uint32_t serial, uint32_t w, uint32_t h);
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls);
 static const struct zwlr_layer_surface_v1_listener layer_listener = { layer_configure, layer_closed };
 
 static void panel_create(struct st *s, struct panel *p, uint32_t layer, const char *ns, uint32_t anchor,
 		int w, int h, int mright, uint32_t keyboard) {
+	if (!s->comp || !s->layer_shell) return;
 	p->surf = wl_compositor_create_surface(s->comp);
-	p->layer = zwlr_layer_shell_v1_get_layer_surface(s->layer_shell, p->surf, NULL, layer, ns);
+	p->layer = p->surf ? zwlr_layer_shell_v1_get_layer_surface(s->layer_shell, p->surf, NULL, layer, ns) : NULL;
+	if (!p->surf || !p->layer) { panel_destroy(p); return; }
 	zwlr_layer_surface_v1_set_size(p->layer, w, h);
 	zwlr_layer_surface_v1_set_anchor(p->layer, anchor);
 	zwlr_layer_surface_v1_set_exclusive_zone(p->layer, layer == ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY ? -1 : 0);
@@ -1474,9 +1540,10 @@ static void notice_sync(struct st *s) {
 	if (!s->notice.layer) {
 		panel_create(s, &s->notice, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "cube-notice",
 			ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP, (int)(480 * s->scale), (int)(92 * s->scale), 0, 0);
+		if (!s->notice.surf || !s->notice.layer) return;
 		zwlr_layer_surface_v1_set_margin(s->notice.layer, (int)(48 * s->scale), 0, 0, 0);
 		struct wl_region *empty = wl_compositor_create_region(s->comp);
-		wl_surface_set_input_region(s->notice.surf, empty); wl_region_destroy(empty);
+		if (empty) { wl_surface_set_input_region(s->notice.surf, empty); wl_region_destroy(empty); }
 		wl_surface_commit(s->notice.surf);
 	}
 	paint(s, &s->notice, draw_notice);
@@ -1960,30 +2027,51 @@ static void panel_key(struct st *s, xkb_keysym_t sym) {
 	else if (s->pwr_open) paint(s, &s->pwr, draw_pwr);
 }
 
+static void erase_last_word(char *query) {
+	size_t len = strlen(query);
+	while (len > 0) {
+		const char *prev = g_utf8_find_prev_char(query, query + len);
+		if (!prev || !g_unichar_isspace(g_utf8_get_char(prev))) break;
+		len = (size_t)(prev - query);
+		query[len] = 0;
+	}
+	while (len > 0) {
+		const char *prev = g_utf8_find_prev_char(query, query + len);
+		if (!prev || g_unichar_isspace(g_utf8_get_char(prev))) break;
+		len = (size_t)(prev - query);
+		query[len] = 0;
+	}
+}
+
 static void handle_status_key(struct st *s, uint32_t key) {
 	if (!s->xkb_state) return;
 	xkb_keysym_t sym = xkb_state_key_get_one_sym(s->xkb_state, key + 8);
 	if (s->chat_open || s->pwr_open || s->qs_open) { panel_key(s, sym); return; }
 	if (!s->menu_open) return;
 	s->keyboard_focus = true; s->hover = HIT_NONE;
-	if ((sym == XKB_KEY_p || sym == XKB_KEY_P) &&
-			xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0) {
+	bool ctrl = xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0;
+	if ((sym == XKB_KEY_p || sym == XKB_KEY_P) && ctrl) {
 		launch_settings("privacy"); menu_close(s); return;
 	}
 	size_t len = strlen(s->query);
-    if (xkb_state_mod_name_is_active(s->xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0 &&
-        (sym == XKB_KEY_u || sym == XKB_KEY_U)) { s->query[0] = 0; s->sel = 0; }
-    else switch (sym) {
+	if (ctrl && (sym == XKB_KEY_u || sym == XKB_KEY_U)) {
+		s->query[0] = 0; s->sel = 0; s->scroll = 0;
+	} else if (ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W || sym == XKB_KEY_BackSpace)) {
+		erase_last_word(s->query); s->sel = 0; s->scroll = 0;
+	} else switch (sym) {
 	case XKB_KEY_Escape:
 		if (s->compose) xkb_compose_state_reset(s->compose);
-		if (s->query[0]) { s->query[0] = 0; s->sel = 0; break; }
+		if (s->query[0]) { s->query[0] = 0; s->sel = 0; s->scroll = 0; break; }
 		menu_close(s); return;
+	case XKB_KEY_Delete:
+		if (s->query[0]) { s->query[0] = 0; s->sel = 0; s->scroll = 0; }
+		break;
 	case XKB_KEY_Return: case XKB_KEY_KP_Enter:
 		if (s->nfiltered) { launch_app(&apps[s->filtered[s->sel]]); menu_close(s); }
 		return;
 	case XKB_KEY_BackSpace:
 		if (len) { const char *prev = g_utf8_find_prev_char(s->query, s->query + len); s->query[prev ? prev - s->query : 0] = 0; }
-		s->sel = 0; break;
+		s->sel = 0; s->scroll = 0; break;
 	case XKB_KEY_Left: if (s->sel > 0) s->sel--; break;
 	case XKB_KEY_Right: if (s->sel + 1 < s->nfiltered) s->sel++; break;
 	case XKB_KEY_Up: if (s->sel - s->cols >= 0) s->sel -= s->cols; break;
@@ -2138,7 +2226,42 @@ static int status_selftest(void) {
 	status_preference("tab_h", "999", &s); CHECK(s.tab_h == 80);
 	status_preference("tab_h", "5", &s); CHECK(s.tab_h == 20);
 	status_preference("tab_h", "44", &s); CHECK(s.tab_h == 44);
-	puts("cube-status: network privacy, stale status, keyboard navigation and scaled scrolling passed");
+	// Power supply discovery filters Mains and HID device batteries and aggregates dual batteries.
+	char psdir[] = "/tmp/cube-status-ps-XXXXXX", fpath[512], btext[48];
+	CHECK(mkdtemp(psdir));
+	struct { const char *name, *type, *scope, *cap, *en_now, *en_full, *st; } supplies[] = {
+		{ "AC", "Mains", "System", NULL, NULL, NULL, NULL },
+		{ "BAT_HID", "Battery", "Device", "15", "100", "1000", "Discharging" },
+		{ "BAT0", "Battery", "System", "75", "3000", "4000", "Discharging" },
+		{ "BAT1", "Battery", "System", "25", "1000", "4000", "Charging" },
+	};
+	for (unsigned i = 0; i < sizeof(supplies) / sizeof(*supplies); i++) {
+		snprintf(fpath, sizeof(fpath), "%s/%s", psdir, supplies[i].name);
+		CHECK(!mkdir(fpath, 0700));
+		const char *files[][2] = {
+			{"type", supplies[i].type}, {"scope", supplies[i].scope}, {"capacity", supplies[i].cap},
+			{"energy_now", supplies[i].en_now}, {"energy_full", supplies[i].en_full}, {"status", supplies[i].st},
+		};
+		for (unsigned j = 0; j < sizeof(files) / sizeof(*files); j++) if (files[j][1]) {
+			snprintf(fpath, sizeof(fpath), "%s/%s/%s", psdir, supplies[i].name, files[j][0]);
+			FILE *f = fopen(fpath, "w"); CHECK(f); fputs(files[j][1], f); fclose(f);
+		}
+	}
+	battery_from_dir(psdir, btext, sizeof(btext));
+	CHECK(!strcmp(btext, "BAT 50%+"));
+	snprintf(fpath, sizeof(fpath), "%s/BAT1/status", psdir);
+	{ FILE *f = fopen(fpath, "w"); CHECK(f); fputs("Discharging", f); fclose(f); }
+	battery_from_dir(psdir, btext, sizeof(btext));
+	CHECK(!strcmp(btext, "BAT 50%"));
+	for (unsigned i = 0; i < sizeof(supplies) / sizeof(*supplies); i++) {
+		const char *keys[] = {"type", "scope", "capacity", "energy_now", "energy_full", "status"};
+		for (unsigned j = 0; j < sizeof(keys) / sizeof(*keys); j++) {
+			snprintf(fpath, sizeof(fpath), "%s/%s/%s", psdir, supplies[i].name, keys[j]); unlink(fpath);
+		}
+		snprintf(fpath, sizeof(fpath), "%s/%s", psdir, supplies[i].name); rmdir(fpath);
+	}
+	rmdir(psdir);
+	puts("cube-status: network privacy, stale status, battery aggregation, keyboard navigation and scaled scrolling passed");
 	return 0;
 #undef CHECK
 }
@@ -2171,9 +2294,12 @@ static void draw_preview(struct st *s, cairo_t *cr, int w, int h) {
 static int render_png(struct st *s, const char *path, int w, int h) {
 	cairo_surface_t *cs = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
 	cairo_t *cr = cairo_create(cs);
-	draw_preview(s, cr, w, h);
+	int rc = 1;
+	if (cairo_surface_status(cs) == CAIRO_STATUS_SUCCESS && cairo_status(cr) == CAIRO_STATUS_SUCCESS) {
+		draw_preview(s, cr, w, h);
+		rc = cairo_surface_write_to_png(cs, path) == CAIRO_STATUS_SUCCESS ? 0 : 1;
+	}
 	cairo_destroy(cr);
-	int rc = cairo_surface_write_to_png(cs, path) == CAIRO_STATUS_SUCCESS ? 0 : 1;
 	cairo_surface_destroy(cs);
 	printf("%s %s\n", rc ? "failed" : "wrote", path);
 	return rc;
@@ -2230,10 +2356,20 @@ static int render_mode(struct st *s, const char *dir) {
 	return rc;
 }
 
+#ifndef WHITECUBE_VERSION
+#define WHITECUBE_VERSION "dev"
+#endif
+
+static void status_usage(FILE *out) {
+	fprintf(out, "Usage: cube-status [--selftest | --render DIR | --help | --version]\n");
+}
+
 int main(int argc, char **argv) {
 	setlocale(LC_CTYPE, "");
 	setlocale(LC_COLLATE, "");
 	setlocale(LC_MESSAGES, "");
+	if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) { status_usage(stdout); return 0; }
+	if (argc == 2 && (!strcmp(argv[1], "--version") || !strcmp(argv[1], "-v"))) { printf("cube-status %s\n", WHITECUBE_VERSION); return 0; }
 	struct st s;
 	memset(&s, 0, sizeof(s));
 	g_st = &s;
@@ -2241,33 +2377,48 @@ int main(int argc, char **argv) {
 	s.armed = -1;
 	s.repeat_fd = -1; s.repeat_rate = 25; s.repeat_delay = 600;
 	if (argc == 2 && !strcmp(argv[1], "--selftest")) return status_selftest();
-	if (argc == 3 && !strcmp(argv[1], "--render")) return render_mode(&s, argv[2]);
+	if (argc == 3 && !strcmp(argv[1], "--render") && argv[2][0]) return render_mode(&s, argv[2]);
+	if (argc != 1) { status_usage(stderr); return 1; }
 	// Block before anything else: an early Super press must not kill us (default SIGUSR1 action).
-	sigset_t sigs; sigemptyset(&sigs); sigaddset(&sigs, SIGUSR1); sigaddset(&sigs, SIGUSR2); sigaddset(&sigs, SIGCHLD);
+	sigset_t sigs; sigemptyset(&sigs); sigaddset(&sigs, SIGUSR1); sigaddset(&sigs, SIGUSR2);
+	sigaddset(&sigs, SIGCHLD); sigaddset(&sigs, SIGTERM); sigaddset(&sigs, SIGINT);
 	sigprocmask(SIG_BLOCK, &sigs, NULL);
 	int sfd = signalfd(-1, &sigs, SFD_CLOEXEC | SFD_NONBLOCK);
+	if (sfd < 0) { perror("cube-status: signalfd"); return 1; }
 	signal(SIGCHLD, SIG_DFL); // job completion preserves helper exit status
 	s.running = true;
 	read_geometry(&s);
 	status_update(&s);
 	s.dpy = wl_display_connect(NULL);
-	if (!s.dpy) { fprintf(stderr, "cube-status: no wayland display\n"); return 1; }
+	if (!s.dpy) { close(sfd); fprintf(stderr, "cube-status: no wayland display\n"); return 1; }
 	struct wl_registry *reg = wl_display_get_registry(s.dpy);
+	if (!reg) { close(sfd); wl_display_disconnect(s.dpy); return 1; }
 	wl_registry_add_listener(reg, &reg_listener, &s);
 	wl_display_roundtrip(s.dpy);
 	if (!s.comp || !s.shm || !s.layer_shell) {
 		fprintf(stderr, "cube-status: missing globals\n");
+		close(sfd); wl_registry_destroy(reg); wl_display_disconnect(s.dpy);
 		return 1;
 	}
 	s.xkb = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	s.compose = wc_compose_create(s.xkb);
 	s.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	if (s.repeat_fd < 0) {
+		perror("cube-status: repeat timerfd");
+		close(sfd); wl_registry_destroy(reg); wl_display_disconnect(s.dpy);
+		return 1;
+	}
 	const char *size = getenv("XCURSOR_SIZE");
 	s.cursor_theme = wl_cursor_theme_load(getenv("XCURSOR_THEME"), size ? atoi(size) : 24, s.shm);
 	s.cursor_surf = wl_compositor_create_surface(s.comp);
 	bar_create(&s);
 
 	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	if (tfd < 0) {
+		perror("cube-status: timerfd");
+		close(s.repeat_fd); close(sfd); wl_registry_destroy(reg); wl_display_disconnect(s.dpy);
+		return 1;
+	}
 	struct itimerspec ts = { .it_value = { 2, 0 }, .it_interval = { 2, 0 } };
 	timerfd_settime(tfd, 0, &ts, NULL);
 	int dfd = wl_display_get_fd(s.dpy);
@@ -2306,6 +2457,7 @@ int main(int argc, char **argv) {
 			while (read(sfd, &si, sizeof(si)) == sizeof(si)) {
 				if (si.ssi_signo == SIGUSR1) menu_toggle(&s);
 				else if (si.ssi_signo == SIGUSR2) qs_toggle(&s);
+				else if (si.ssi_signo == SIGTERM || si.ssi_signo == SIGINT) s.running = false;
 			}
 		}
 		if (fds[1].revents & POLLIN) {
@@ -2340,5 +2492,16 @@ int main(int argc, char **argv) {
 			}
 		}
 	}
+	menu_close(&s); qs_close(&s); chat_close(&s); pwr_close(&s);
+	panel_destroy(&s.apps_btn); panel_destroy(&s.status); panel_destroy(&s.chat_btn); panel_destroy(&s.pwr_btn); panel_destroy(&s.notice);
+	if (s.cursor_surf) wl_surface_destroy(s.cursor_surf);
+	if (s.cursor_theme) wl_cursor_theme_destroy(s.cursor_theme);
+	if (s.compose) xkb_compose_state_unref(s.compose);
+	if (s.xkb_state) xkb_state_unref(s.xkb_state);
+	if (s.keymap) xkb_keymap_unref(s.keymap);
+	if (s.xkb) xkb_context_unref(s.xkb);
+	close(tfd); close(sfd); close(s.repeat_fd);
+	wl_registry_destroy(reg);
+	wl_display_disconnect(s.dpy);
 	return 0;
 }

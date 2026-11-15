@@ -146,20 +146,61 @@ static bool safe_seed_name(const char *name) {
 	for (; *name; name++) if (!((*name >= 'a' && *name <= 'z') || (*name >= 'A' && *name <= 'Z') || (*name >= '0' && *name <= '9') || *name == '-' || *name == '_')) return false;
 	return true;
 }
-static bool seed_path(char *path, size_t size, const char *name) {
-	if (!safe_seed_name(name)) return false;
+static bool seed_dir(char *dir, size_t size, bool create) {
 	const char *state = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
-	if (!state && !home) return false;
-	char dir[1024]; int n = state ? snprintf(dir, sizeof(dir), "%s/whitecube-ca", state) : snprintf(dir, sizeof(dir), "%s/.local/state/whitecube-ca", home);
-	if (n < 0 || (size_t)n >= sizeof(dir) || dir[0] != '/') return false;
+	int n = state && *state ? snprintf(dir, size, "%s/whitecube-ca", state)
+	      : home && *home   ? snprintf(dir, size, "%s/.local/state/whitecube-ca", home)
+	                        : -1;
+	if (n < 0 || (size_t)n >= size || dir[0] != '/') return false;
+	if (!create) return true;
 	for (char *p = dir + 1; *p; p++) if (*p == '/') { *p = 0; if (mkdir(dir, 0700) && errno != EEXIST) return false; *p = '/'; }
-	if (mkdir(dir, 0700) && errno != EEXIST) return false;
-	n = snprintf(path, size, "%s/%s.seed", dir, name);
+	return !mkdir(dir, 0700) || errno == EEXIST;
+}
+static bool seed_path(char *path, size_t size, const char *name, bool create) {
+	if (!safe_seed_name(name)) return false;
+	char dir[1024]; if (!seed_dir(dir, sizeof(dir), create)) return false;
+	int n = snprintf(path, size, "%s/%s.seed", dir, name);
 	return n > 0 && (size_t)n < size;
+}
+static bool seed_delete(const char *name) {
+	char path[1200];
+	return seed_path(path, sizeof(path), name, false) && unlink(path) == 0;
+}
+static int seed_name_cmp(const void *a, const void *b) {
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+static void seed_list(char *reply, size_t rsize) {
+	if (!reply || !rsize) return;
+	char dir[1024];
+	if (!seed_dir(dir, sizeof(dir), false)) { snprintf(reply, rsize, "OK seeds: (none)"); return; }
+	DIR *d = opendir(dir);
+	if (!d) { snprintf(reply, rsize, "OK seeds: (none)"); return; }
+	char *names[64]; int count = 0; struct dirent *e;
+	while ((e = readdir(d)) && count < 64) {
+		size_t nl = strlen(e->d_name);
+		if (nl <= 5 || strcmp(e->d_name + nl - 5, ".seed") || nl - 5 > 48) continue;
+		char stem[64]; memcpy(stem, e->d_name, nl - 5); stem[nl - 5] = 0;
+		if (!safe_seed_name(stem)) continue;
+		char *dup = strdup(stem);
+		if (dup) names[count++] = dup;
+	}
+	closedir(d);
+	if (!count) { snprintf(reply, rsize, "OK seeds: (none)"); return; }
+	qsort(names, (size_t)count, sizeof(names[0]), seed_name_cmp);
+	int len = snprintf(reply, rsize, "OK seeds: ");
+	size_t off = (len > 0 && (size_t)len < rsize) ? (size_t)len : 0;
+	for (int i = 0; i < count; i++) {
+		int need = snprintf(NULL, 0, "%s%s", i ? ", " : "", names[i]);
+		if (need > 0 && off + (size_t)need + 5 < rsize)
+			off += (size_t)snprintf(reply + off, rsize - off, "%s%s", i ? ", " : "", names[i]);
+		else if (off + 5 < rsize) { snprintf(reply + off, rsize - off, ", ..."); break; }
+		else break;
+	}
+	for (int i = 0; i < count; i++) free(names[i]);
 }
 // WCUBE3 adds the birth/survival masks so B/S rules replay too; WCUBE2 files still load.
 static bool seed_save(struct ca *c, const char *name) {
-	char path[1200], temp[1280]; if (!seed_path(path, sizeof(path), name)) return false;
+	char path[1200], temp[1280]; if (!seed_path(path, sizeof(path), name, true)) return false;
 	snprintf(temp, sizeof(temp), "%s.tmp-%ld", path, (long)getpid());
 	int fd = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
 	if (fd < 0) return false;
@@ -173,7 +214,7 @@ static bool seed_save(struct ca *c, const char *name) {
 	unlink(temp); return false;
 }
 static bool seed_replay(struct ca *c, const char *name) {
-	char path[1200]; if (!seed_path(path, sizeof(path), name)) return false;
+	char path[1200]; if (!seed_path(path, sizeof(path), name, false)) return false;
 	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW); if (fd < 0) return false;
 	FILE *f = fdopen(fd, "rb"); if (!f) { close(fd); return false; }
 	struct ca saved = {0}; char line[256], extra; unsigned birth = 0, surv = 0;
@@ -203,13 +244,25 @@ static void field_status(struct ca *c, char *out, size_t size) {
 	else snprintf(out, size, "OK %s / %s / generation %llu / %s / seed %u / slice %d%s / %d fps%s", rule, c->manual ? "manual" : "loop", (unsigned long long)c->tick, c->paused ? "paused" : "running", c->base_seed, c->slice,
 		c->volume ? (c->spin ? " / spin" : " / still") : "", c->effective_fps, c->idle && !c->edit ? " (idle)" : c->on_battery ? " (battery)" : "");
 }
-static bool apply_control(struct ca *c, const char *command) {
+static bool apply_control_msg(struct ca *c, const char *command, char *reply, size_t rsize) {
+	if (reply && rsize) reply[0] = 0;
 	char verb[32], arg[64] = {0}, extra;
 	int count = sscanf(command, "%31s %63s %c", verb, arg, &extra);
 	if (count < 1 || count > 2 || !c->configured) return false;
 	if (!strcmp(verb, "status")) return true;
-	else if (!strcmp(verb, "pause")) c->paused = !c->paused;
-	else if (!strcmp(verb, "step")) { c->paused = true; c->manual = true; sim_step(c); }
+	else if (!strcmp(verb, "pause")) {
+		if (!*arg) c->paused = !c->paused;
+		else if (!strcmp(arg, "on") || !strcmp(arg, "off")) c->paused = !strcmp(arg, "on");
+		else return false;
+	} else if (!strcmp(verb, "step")) {
+		long steps = 1;
+		if (*arg) {
+			char *end; errno = 0; steps = strtol(arg, &end, 10);
+			if (*end || errno || steps < 1 || steps > 1000) return false;
+		}
+		c->paused = true; c->manual = true;
+		for (long i = 0; i < steps; i++) sim_step(c);
+	}
 	else if (!strcmp(verb, "loop")) { c->manual = !c->manual; c->active_ms = 0; }
 	else if (!strcmp(verb, "cosmos") || !strcmp(verb, "phase") || !strcmp(verb, "zoom") || !strcmp(verb, "speed")) return cosmos_control(c, verb, arg);
 	else if (!strcmp(verb, "edit")) { if (c->cs.on) return false; c->edit = !c->edit; c->paused = c->edit; c->manual = true; if (c->volume && c->edit && c->slice < 0) c->slice = c->depth / 2; update_input(c); }
@@ -233,16 +286,22 @@ static bool apply_control(struct ca *c, const char *command) {
 		unsigned r; for (r = 0; r < NRULES; r++) if (!strcmp(arg, RULES[r].name)) break;
 		if (r == NRULES) { uint16_t birth, surv; char name[24]; if (!parse_rule(arg, &birth, &surv, name, sizeof(name))) return false; set_custom_rule(c, birth, surv); }
 		c->rule = r; if (!sim_alloc(c)) { c->running = false; return false; } reseed(c); c->manual = true;
-	} else if (!strcmp(verb, "glider") || !strcmp(verb, "blinker")) {
-		if (c->volume) return false;
+	} else if (!strcmp(verb, "glider") || !strcmp(verb, "blinker") || !strcmp(verb, "pulsar")) {
+		if (c->volume || *arg || c->cols <= 0 || c->rows <= 0) return false;
 		int x = c->cols / 2, y = c->rows / 2;
 		if (!strcmp(verb, "glider")) stamp_glider(c, x, y, 0);
+		else if (!strcmp(verb, "pulsar")) stamp_pulsar(c, x, y);
 		else for (int dx = -1; dx <= 1; dx++) c->grid[y * c->cols + (x + dx + c->cols) % c->cols] = 1;
 		c->manual = true; c->paused = true;
 	} else if (!strcmp(verb, "save")) return seed_save(c, *arg ? arg : "default");
 	else if (!strcmp(verb, "replay")) return seed_replay(c, *arg ? arg : "default");
+	else if (!strcmp(verb, "seeds")) { if (*arg) return false; seed_list(reply, rsize); }
+	else if (!strcmp(verb, "delete")) return seed_delete(*arg ? arg : "default");
 	else return false;
 	return true;
+}
+static bool apply_control(struct ca *c, const char *command) {
+	return apply_control_msg(c, command, NULL, 0);
 }
 static void receive_control(struct ca *c) {
 	char command[256], response[256]; ssize_t n;
@@ -252,25 +311,26 @@ static void receive_control(struct ca *c) {
 		n = recvfrom(c->control_fd, command, sizeof(command) - 1, 0, (struct sockaddr *)&sender, &size);
 		if (n <= 0) break;
 		command[n] = 0;
-		bool ok = apply_control(c, command);
-		if (ok) { c->dirty = true; field_status(c, response, sizeof(response)); }
+		bool ok = apply_control_msg(c, command, response, sizeof(response));
+		if (ok) { c->dirty = true; if (!response[0]) field_status(c, response, sizeof(response)); }
 		else snprintf(response, sizeof(response), "ERROR: invalid control, incompatible mode, or seed could not be saved/replayed");
 		if (size > sizeof(sa_family_t)) sendto(c->control_fd, response, strlen(response), 0, (struct sockaddr *)&sender, size);
 	}
 	arm_timer(c);
 }
 static int control_menu(void) {
-	puts("WHITE CUBE FIELD\nCommands: 2d | 3d | pause | step | edit | clear | loop | status\n"
+	puts("WHITE CUBE FIELD\nCommands: 2d | 3d | pause [on|off] | step [1..1000] | edit | clear | loop | status\n"
 		"  cosmos on|off|toggle            Cosmic zoom: cells > geometry > land > planet > stars > galaxy > universe\n"
 		"  phase cells|geometry|land|planet|stars|galaxy|universe|0..6   Glide to a phase and hold\n"
 		"  zoom auto|hold|0..6             Resume the automatic journey, freeze, or set the exact zoom\n"
 		"  speed 0.1..8                    Pace of the automatic journey\n"
-		"  glider | blinker                 Plant a 2D pattern at the center\n"
+		"  glider | blinker | pulsar        Plant a 2D pattern at the center\n"
 		"  rule life|highlife|diamoeba|daynight|anneal|seeds|B36/S23   Named or any birth/survival rule\n"
 		"  seed [number]                   Randomize; 'status' shows the seed to replay a field you liked\n"
 		"  rotate left|right | spin [on|off]   Rotate the real 18x18x18 volume, or its slow drift\n"
 		"  slice 0..17|next|all             View or paint a volume layer\n"
 		"  save [name] | replay [name]      Save exact cells, rule and random state\n"
+		"  seeds | delete [name]            List or delete saved presets\n"
 		"  @OUTPUT command                  Send to one monitor only (e.g. @HDMI-A-1 pause)\n"
 		"  quit                            Close controls\n\n"
 		"After 'edit', Alt+V exposes the field: drag left to paint, right to erase.\n"
@@ -320,9 +380,20 @@ static int field_self_test(void) {
 	ok = ok && apply_control(&c, "rule life") && seed_replay(&c, "custom") && c.rule == NRULES && rule_of(&c)->birth == ((1u<<3)|(1u<<6));
 	for (int i=0; i<5; i++) sim_step(&c);
 	ok = ok && expected && !memcmp(expected, c.grid, count);
+	ok = ok && apply_control(&c, "2d") && apply_control(&c, "clear") && apply_control(&c, "pulsar") && !apply_control(&c, "pulsar extra");
+	size_t pulsar_live = 0; for (size_t i = 0; i < sim_count(&c); i++) pulsar_live += c.grid[i];
+	ok = ok && pulsar_live == 144;
+	uint64_t before_tick = c.tick;
+	ok = ok && apply_control(&c, "pause on") && c.paused && apply_control(&c, "pause off") && !c.paused && !apply_control(&c, "pause maybe");
+	ok = ok && apply_control(&c, "step 5") && c.paused && c.tick == before_tick + 5 && !apply_control(&c, "step 0") && !apply_control(&c, "step 1001") && !apply_control(&c, "step abc");
+	char reply[256] = "";
+	ok = ok && apply_control_msg(&c, "seeds", reply, sizeof(reply)) && !strcmp(reply, "OK seeds: custom, roundtrip") && !apply_control(&c, "seeds extra");
+	ok = ok && !apply_control(&c, "delete ../escape") && apply_control(&c, "delete roundtrip") && !apply_control(&c, "delete roundtrip");
+	ok = ok && apply_control_msg(&c, "seeds", reply, sizeof(reply)) && !strcmp(reply, "OK seeds: custom");
+	ok = ok && apply_control(&c, "delete custom") && apply_control_msg(&c, "seeds", reply, sizeof(reply)) && !strcmp(reply, "OK seeds: (none)");
 	char path[1200];
-	if (seed_path(path,sizeof(path),"roundtrip")) unlink(path);
-	if (seed_path(path,sizeof(path),"custom")) unlink(path);
+	if (seed_path(path,sizeof(path),"roundtrip",false)) unlink(path);
+	if (seed_path(path,sizeof(path),"custom",false)) unlink(path);
 	snprintf(path,sizeof(path),"%s/whitecube-ca",scratch); rmdir(path); rmdir(scratch);
 	if (oldcopy) { setenv("XDG_STATE_HOME",oldcopy,1); free(oldcopy); } else unsetenv("XDG_STATE_HOME");
 	free(expected); free(c.grid); free(c.next); free(c.age);
