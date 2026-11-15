@@ -16,7 +16,7 @@ import tempfile
 import time
 from pathlib import Path
 
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.13.0"
 
 import gi
 

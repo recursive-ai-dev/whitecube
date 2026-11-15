@@ -18,7 +18,7 @@ class SessionError(Exception):
     pass
 
 
-WHITECUBE_VERSION = '0.12.0'
+WHITECUBE_VERSION = '0.13.0'
 
 
 def private_directory(path, create=False):

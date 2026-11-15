@@ -2,7 +2,7 @@
 # Install or inspect the whitecube boot theme (GRUB + Plymouth + optional tty1 banner).
 # Backs up originals to /var/backups/whitecube-boot. Undo with: sudo ./install-boot.sh --revert
 set -eu
-VERSION="0.12.0"
+VERSION="0.13.0"
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=${WC_BOOT_ROOT:-}
 bk="$root/var/backups/whitecube-boot"

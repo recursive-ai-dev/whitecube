@@ -37,7 +37,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.12.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.13.0_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +55,11 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.13.0
+
+`cube-net` now supports automatic Wi-Fi hardware detection across general PCIe/USB/SDIO wireless adapters (with optional pinning by `interface`, `usb_id`, `mac`, `driver`, or `bus`) plus same-SSID roaming. The compositor, bar, audio daemon, workspace, apps, `whitecube-doctor`, and packaging/migration tooling add headless `--cli`/`--json`/`--version` support, non-blocking regular-file hardening, stage conffile verification, and ELF RPATH hygiene checks. See
+[the release notes](docs/RELEASE-0.13.0.md).
 
 ## Improvements in 0.12.0
 
@@ -186,8 +191,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.12.0_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.12.0_amd64.deb
+sha256sum --check whitecube-desktop_0.13.0_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.13.0_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

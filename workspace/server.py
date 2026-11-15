@@ -41,7 +41,7 @@ if str(BASE) not in sys.path:
 from workspace_data import arguments, load_manifests, loopback_url, RunStore
 from session_broker import BrokerError
 
-VERSION = '0.12.0'
+VERSION = '0.13.0'
 MAX_BODY = 131072
 MAX_OUTPUT = 4 * 1024 * 1024
 STATIC_EXTENSIONS = {'.html','.js','.mjs','.css','.json','.png','.jpg','.jpeg','.webp','.gif','.svg','.ico','.woff','.woff2','.ttf','.otf','.mp3','.ogg','.wav','.mp4','.webm','.glb','.gltf','.bin','.wasm','.txt'}

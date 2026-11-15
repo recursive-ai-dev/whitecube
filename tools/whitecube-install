@@ -42,7 +42,7 @@ def tool_version(project=PROJECT):
             return text
     except (OSError, ValueError):
         pass
-    return '0.12.0'
+    return '0.13.0'
 
 
 def read_regular_text(path, max_bytes=MAX_MANIFEST_BYTES):

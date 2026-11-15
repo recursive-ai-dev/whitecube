@@ -47,7 +47,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 DEFAULT_DEVICE = {"mode": "auto"}
 PIN_KEYS = ("interface", "usb_id", "mac", "driver", "bus")
 BUS_TYPES = ("usb", "pci", "sdio", "platform", "virt")

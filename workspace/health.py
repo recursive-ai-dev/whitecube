@@ -21,7 +21,7 @@ import time
 BASE = Path(__file__).resolve().parent
 if str(BASE) not in sys.path:
     sys.path.insert(0, str(BASE))
-VERSION = '0.12.0'
+VERSION = '0.13.0'
 ROLES = ('bash', 'web', 'build', 'clean')
 BIN = Path('/usr/bin')
 SMOKE_REPORT = Path('/var/lib/whitecube/health/containers.json')
