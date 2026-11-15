@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -606,6 +606,55 @@ def check_trainer(env):
     return [finding('ok', 'trainer', f'whitecube-train {data["version"]} diagnostics reachable{note}')]
 
 
+def check_vm(env):
+    """Report cube-strap / whitecube-vm launchers, runtime modules, and QEMU/OVMF readiness."""
+    share_dir = env.at('/usr/share/whitecube/cube-strap')
+    runtime_files = ('app.py', 'strap.py', 'deb-strap.sh')
+    if env.root != Path('/'):
+        cube_strap = env.at('/usr/bin/cube-strap')
+        vm_cli = env.at('/usr/bin/whitecube-vm')
+        builder = env.at('/usr/libexec/whitecube/cube-strap-build')
+        bins = (cube_strap, vm_cli, builder)
+        has_any = any(p.is_file() or p.is_symlink() for p in bins) or share_dir.exists()
+        if not has_any:
+            return [finding('info', 'vm', 'cube-strap is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        bad_bins = [str(p) for p in bins if not (p.is_file() or p.is_symlink()) or not os.access(p, os.X_OK)]
+        if bad_bins or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else 'missing/unexecutable ' + ', '.join(bad_bins)
+            return [finding('FAIL', 'vm', f'staged cube-strap incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'vm', 'staged cube-strap / whitecube-vm launchers and runtime present')]
+    candidates = [
+        env.at('/usr/bin/whitecube-vm'),
+        env.home / '.local/bin/whitecube-vm',
+        env.project / 'bin/whitecube-vm',
+    ]
+    vm_cli = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if vm_cli is None:
+        return [finding('info', 'vm', 'whitecube-vm is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(vm_cli, os.X_OK):
+        return [finding('WARN', 'vm', f'{vm_cli} is not executable', 'ensure executable permissions on whitecube-vm')]
+    try:
+        proc = subprocess.run([str(vm_cli), 'check', '--json'], capture_output=True, text=True, timeout=5)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'vm', f'could not query whitecube-vm check: {error}',
+                        f'{vm_cli} check')]
+    if not isinstance(data, dict) or 'ready' not in data:
+        return [finding('WARN', 'vm', 'whitecube-vm check returned unexpected JSON', f'{vm_cli} check')]
+    if data.get('ready'):
+        accel = 'KVM enabled' if data.get('kvm') else 'software emulation'
+        return [finding('ok', 'vm', f'whitecube-vm QEMU/OVMF ready ({accel})')]
+    missing_pkgs = [item.get('package', item.get('component', '?')) for item in data.get('missing', []) if isinstance(item, dict)]
+    pkg_hint = 'sudo apt install ' + ' '.join(missing_pkgs) if missing_pkgs else f'{vm_cli} check'
+    return [finding('WARN', 'vm',
+                    'whitecube-vm missing runtime dependencies: ' + (', '.join(missing_pkgs) or 'qemu/ovmf'),
+                    pkg_hint)]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -628,6 +677,7 @@ def run_checks(env, selected=None):
         'browser': (lambda: check_browser(env),),
         'editor': (lambda: check_editor(env),),
         'trainer': (lambda: check_trainer(env),),
+        'vm': (lambda: check_vm(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

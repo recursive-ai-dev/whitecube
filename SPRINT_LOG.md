@@ -128,3 +128,12 @@
 - **Tests & Verification**:
   - Extended `apps/cube-train/tests/test_comparison_cli.py` (`--list-runs --json`, `--status --json`, `--inspect-run [--json]`, and `bin/cube-train --version` / `--cli`), `apps/cube-train/tests/test_engine_improvements.py` (FIFO non-blocking rejection in `read_json`/`tail_text` and clean error exit on corrupt `--resume` `run.json`), and `tests/test-doctor.py` (`test_trainer_check_reports_staged_and_doctor_health`), and wired `test_comparison_cli.py` and `test_diagnostics.py` into `BUILD.sh`.
   - Verified full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-strap | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added GTK-free `--version` (`Cube Strap 1.0.0`) and `--cli` delegation to `whitecube-vm` in `bin/cube-strap`, plus `-v`/`--version`, `set` (`update_vm` for default RAM/vCPU updates under `vm.lock`), and `--json` output on `import` and `remove`/`rm` in `bin/whitecube-vm` (and updated `apps/cube-strap/README.md`).
+  - Hardened `apps/cube-strap/strap.py` with bounded `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` + `S_ISREG` checks (`_read_regular_json()` and `_copy_sparse()`), private `0o600` atomic JSON writes (`_write_private_json()` on `vm_meta`, history, and draft state), and strict `_validate_vm_resources()` bounds/bool checks across `import_vm()`, `clone_vm()`, `update_vm()`, and `vm_run_argv()`.
+  - Wired read-only `check_vm(env)` and the `'vm'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `apps/cube-strap/tests/test_whitecube_vm.py` (`--version`, `set --memory/--cpus --json`, lock/bounds rejections, `--json` on `import`/`remove`, and `bin/cube-strap --version` / `--cli check --json`), `apps/cube-strap/tests/test_strap.py` (`Hardening` tests for `0o600` metadata, FIFO/non-regular file rejection, 1 MiB JSON cap, and resource validation), and `tests/test-doctor.py` (`test_vm_check_reports_staged_and_qemu_readiness`).
+  - Verified `apps/cube-strap/tests` (32 tests ok), `tests/test-cube-strap-ui.py`, `tests/test-doctor.py` (52 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

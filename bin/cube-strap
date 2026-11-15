@@ -5,9 +5,20 @@ import sys
 from pathlib import Path
 
 root = Path(__file__).resolve().parent.parent
+argv = sys.argv[1:]
+vm_cli = root / 'bin/whitecube-vm'
+if not vm_cli.is_file():
+    vm_cli = Path('/usr/bin/whitecube-vm')
+if argv[:1] == ['--cli']:
+    os.execv('/usr/bin/python3', ['python3', '-I', str(vm_cli), *argv[1:]])
 for directory in (root / 'apps/cube-strap', root / 'share/whitecube/cube-strap'):
+    if argv == ['--version'] and (directory / 'strap.py').is_file():
+        sys.path.insert(0, str(directory))
+        import strap
+        print(f'Cube Strap {strap.VERSION}')
+        raise SystemExit(0)
     if (directory / 'app.py').is_file():
         os.environ['GDK_BACKEND'] = 'wayland'
-        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])
+        os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *argv])
 print('cube-strap: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
 raise SystemExit(1)

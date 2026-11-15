@@ -23,7 +23,7 @@ import strap
 import backend
 from cube_theme import Adw, Gdk, Gio, GLib, Gtk, apply_theme, screenshot
 
-VERSION = '1.0.0'
+VERSION = strap.VERSION
 APP_ID = 'org.whitecube.CubeStrap'
 KIND_TEXT = {
     'chroot': ('Chroot workspace', 'Shares this kernel. Opens in Cube Chrootables; enter it in a terminal.'),

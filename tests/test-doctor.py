@@ -535,6 +535,53 @@ class RunTests(Fixture):
                 self.assertEqual(failed['level'], 'FAIL')
                 self.assertIn('desktop', failed['detail'])
 
+    def test_vm_check_reports_staged_and_qemu_readiness(self):
+        self.assertIn('vm', doctor.CHECK_GROUPS)
+        self.assertEqual(doctor.check_vm(self.env)[0]['level'], 'info')
+        for bin_path in (
+            'usr/bin/cube-strap',
+            'usr/bin/whitecube-vm',
+            'usr/libexec/whitecube/cube-strap-build',
+        ):
+            p = self.put(bin_path, '#!/bin/sh\nexit 0\n')
+            p.chmod(0o755)
+        self.assertEqual(doctor.check_vm(self.env)[0]['level'], 'FAIL')
+        for mod in ('app.py', 'strap.py', 'deb-strap.sh'):
+            self.put(f'usr/share/whitecube/cube-strap/{mod}', '')
+        ok = doctor.check_vm(self.env)[0]
+        self.assertEqual(ok['level'], 'ok')
+        self.assertIn('staged', ok['detail'])
+
+        (self.root / 'usr/share/whitecube/cube-strap/deb-strap.sh').unlink()
+        bad = doctor.check_vm(self.env)[0]
+        self.assertEqual(bad['level'], 'FAIL')
+        self.assertIn('deb-strap.sh', bad['detail'])
+
+        fake_bin = self.home / '.local/bin/whitecube-vm'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\nexit 0\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ready_proc = mock.Mock(
+            returncode=0,
+            stdout='{"ready": true, "kvm": false, "missing": []}',
+            stderr='',
+        )
+        warn_proc = mock.Mock(
+            returncode=1,
+            stdout='{"ready": false, "kvm": false, "missing": [{"component": "OVMF", "package": "ovmf"}]}',
+            stderr='',
+        )
+        if not Path('/usr/bin/whitecube-vm').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ready_proc):
+                live_ok = doctor.check_vm(live_env)[0]
+                self.assertEqual(live_ok['level'], 'ok')
+                self.assertIn('software emulation', live_ok['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=warn_proc):
+                live_warn = doctor.check_vm(live_env)[0]
+                self.assertEqual(live_warn['level'], 'WARN')
+                self.assertIn('ovmf', live_warn['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

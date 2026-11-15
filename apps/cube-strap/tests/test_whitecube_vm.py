@@ -132,6 +132,10 @@ class WhitecubeVmCliTests(unittest.TestCase):
             tr = self.run_cli('trim', 'lockedvm')
             self.assertNotEqual(tr.returncode, 0)
             self.assertIn('currently running', tr.stderr)
+
+            st = self.run_cli('set', 'lockedvm', '--memory', '4096')
+            self.assertNotEqual(st.returncode, 0)
+            self.assertIn('currently running', st.stderr)
         finally:
             proc.terminate()
             proc.wait(timeout=5)
@@ -181,3 +185,43 @@ class WhitecubeVmCliTests(unittest.TestCase):
         self.assertNotEqual(bad_serial.returncode, 0)
         missing_iso = self.run_cli('run', 'golden-copy', '--dry-run', '--cdrom', str(self.root / 'absent.iso'))
         self.assertNotEqual(missing_iso.returncode, 0)
+
+    def test_version_set_json_import_remove_and_launcher_cli(self):
+        ver = self.run_cli('--version')
+        self.assertEqual(ver.returncode, 0, ver.stderr)
+        self.assertIn(strap.VERSION, ver.stdout)
+
+        launcher = ROOT / 'bin/cube-strap'
+        app_ver = subprocess.run([sys.executable, '-I', str(launcher), '--version'],
+                                 env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(app_ver.returncode, 0, app_ver.stderr)
+        self.assertIn(strap.VERSION, app_ver.stdout)
+
+        app_cli = subprocess.run([sys.executable, '-I', str(launcher), '--cli', 'check', '--json'],
+                                 env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(app_cli.returncode, 0, app_cli.stderr)
+        self.assertTrue(json.loads(app_cli.stdout)['ready'])
+
+        img = self.sample_disk('box.img')
+        imp = self.run_cli('import', str(img), 'box', '--memory', '2048', '--cpus', '2', '--json')
+        self.assertEqual(imp.returncode, 0, imp.stderr)
+        imp_meta = json.loads(imp.stdout)
+        self.assertEqual(imp_meta['name'], 'box')
+        self.assertEqual(imp_meta['memory_mib'], 2048)
+
+        updated = self.run_cli('set', 'box', '--memory', '4096', '--cpus', '4', '--json')
+        self.assertEqual(updated.returncode, 0, updated.stderr)
+        upd_meta = json.loads(updated.stdout)
+        self.assertEqual(upd_meta['memory_mib'], 4096)
+        self.assertEqual(upd_meta['cpus'], 4)
+
+        no_opts = self.run_cli('set', 'box')
+        self.assertNotEqual(no_opts.returncode, 0)
+        bad_mem = self.run_cli('set', 'box', '--memory', '256')
+        self.assertNotEqual(bad_mem.returncode, 0)
+        bad_cpus = self.run_cli('set', 'box', '--cpus', '999')
+        self.assertNotEqual(bad_cpus.returncode, 0)
+
+        rm = self.run_cli('remove', 'box', '--json')
+        self.assertEqual(rm.returncode, 0, rm.stderr)
+        self.assertEqual(json.loads(rm.stdout), {'name': 'box', 'removed': True})

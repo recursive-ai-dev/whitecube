@@ -8,7 +8,10 @@ Builds Debian whitecubes from a GTK4 window in the Whitecube look:
 - **Virtual machine**: deb-strap builds a raw UEFI disk (EFI + ext4 root, GRUB, the cloud kernel).
   Cube Strap stores it sparsely under `~/.whitecube/images/NAME` (with a per-VM OVMF NVRAM
   copy) and boots it natively in QEMU (`qemu-system-x86_64` + `ovmf`); `whitecube-vm`
-  exposes `list`, `info`, `check`, `import`, `run`, and `remove` on the command line. The Server
+  exposes `list`, `info`, `check`, `import`, `clone`, `set`, `run`, `trim`,
+  `remove`, and `--version` on the command line (and `cube-strap --cli` / `--version`
+  delegates without requiring Wayland or GTK). `whitecube-doctor --check vm`
+  verifies staged VM tooling and QEMU/OVMF readiness. The Server
   recipe forwards host port 2222 to the VM's SSH.
 
 Recipes: Minimal, Everyday tools and Developer for both kinds. Server and Desktop (XFCE) are VM-only.

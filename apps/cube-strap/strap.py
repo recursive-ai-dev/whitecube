@@ -17,11 +17,14 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
 
 HERE = Path(__file__).resolve().parent
+VERSION = '1.0.0'
+MAX_JSON_BYTES = 1024 * 1024
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
 USERNAME = re.compile(r'[a-z_][a-z0-9_-]{0,31}\Z')
 HOSTNAME = re.compile(r'[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\Z')
@@ -269,9 +272,13 @@ def _copy_sparse(src: Path, dst: Path) -> None:
     import errno
     chunk_size = 1024 * 1024
     zeros = b'\x00' * chunk_size
-    with open(src, 'rb') as source:
-        sfd = source.fileno()
-        total_size = os.fstat(sfd).st_size
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0)
+    sfd = os.open(src, flags)
+    try:
+        st = os.fstat(sfd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f'VM disk image is not a regular file: {src}')
+        total_size = st.st_size
         dfd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
             os.ftruncate(dfd, total_size)
@@ -301,7 +308,7 @@ def _copy_sparse(src: Path, dst: Path) -> None:
                     os.lseek(sfd, 0, os.SEEK_SET)
             offset = 0
             while offset < total_size:
-                buf = source.read(min(chunk_size, total_size - offset))
+                buf = os.read(sfd, min(chunk_size, total_size - offset))
                 if not buf:
                     break
                 if not (len(buf) == chunk_size and buf == zeros) and any(buf):
@@ -312,6 +319,8 @@ def _copy_sparse(src: Path, dst: Path) -> None:
             os.fsync(dfd)
         finally:
             os.close(dfd)
+    finally:
+        os.close(sfd)
 
 
 def ensure_vm_vars(vars_path: Path, vars_template: Path) -> Path:
@@ -369,16 +378,75 @@ def vm_is_running(name: str) -> bool:
         os.close(fd)
 
 
+def _read_regular_json(path: Path, expected_type: type = dict, max_bytes: int = MAX_JSON_BYTES):
+    """Read a bounded JSON file only if it is an existing non-symlinked regular file."""
+    if path.is_symlink():
+        raise OSError(f'Refusing symlinked JSON path: {path}')
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f'Refusing non-regular JSON path: {path}')
+        with os.fdopen(fd, 'rb') as handle:
+            data = handle.read(max_bytes + 1)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    if len(data) > max_bytes:
+        raise ValueError(f'JSON file exceeds {max_bytes:,}-byte limit: {path}')
+    parsed = json.loads(data.decode('utf-8'))
+    if not isinstance(parsed, expected_type):
+        raise ValueError(f'Expected {expected_type.__name__} JSON in {path}')
+    return parsed
+
+
+def _write_private_json(path: Path, data, *, indent: int | None = 2) -> None:
+    """Atomically write JSON with private 0600 permissions, refusing symlinks."""
+    if path.is_symlink():
+        raise OSError(f'Refusing symlinked JSON destination: {path}')
+    tmp_path = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            json.dump(data, out, indent=indent)
+            out.write('\n')
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def _validate_vm_resources(memory_mib: int | None, cpus: int | None) -> tuple[int | None, int | None]:
+    mem = None
+    if memory_mib is not None:
+        if isinstance(memory_mib, bool) or not isinstance(memory_mib, int):
+            raise ValueError(f'Memory must be an integer in MiB (512..131072), got {memory_mib!r}')
+        if not 512 <= memory_mib <= 131072:
+            raise ValueError(f'Memory must be 512..131072 MiB, got {memory_mib!r}')
+        mem = memory_mib
+    smp = None
+    if cpus is not None:
+        if isinstance(cpus, bool) or not isinstance(cpus, int):
+            raise ValueError(f'vCPU count must be an integer (1..64), got {cpus!r}')
+        if not 1 <= cpus <= 64:
+            raise ValueError(f'vCPU count must be 1..64, got {cpus!r}')
+        smp = cpus
+    return mem, smp
+
+
 def vm_meta(name: str) -> dict:
     """Load normalized metadata for a stored VM."""
-    import json
     target = vm_dir(name)
     meta_path = target / 'meta.json'
     if not meta_path.is_file() or meta_path.is_symlink():
         raise FileNotFoundError(f'VM {name!r} does not exist in {whitecube_store() / "images"}')
-    raw = json.loads(meta_path.read_text())
+    raw = _read_regular_json(meta_path, dict)
     disk_name = raw.get('disk') or ('disk.qcow2' if (target / 'disk.qcow2').is_file() else 'disk.img')
-    if '/' in disk_name or disk_name in ('', '.', '..'):
+    if not isinstance(disk_name, str) or '/' in disk_name or disk_name in ('', '.', '..'):
         raise ValueError(f'Invalid disk name in VM metadata: {disk_name!r}')
     disk_path = target / disk_name
     if disk_path.is_symlink():
@@ -397,18 +465,7 @@ def vm_meta(name: str) -> dict:
 
 def _write_vm_meta(target: Path, meta: dict) -> None:
     """Atomically write VM meta.json with private permissions."""
-    import json
-    tmp_meta = target / f'.meta.{os.getpid()}.json.tmp'
-    try:
-        fd = os.open(tmp_meta, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-        with os.fdopen(fd, 'w') as out:
-            json.dump(meta, out, indent=2)
-            out.write('\n')
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(tmp_meta, target / 'meta.json')
-    finally:
-        tmp_meta.unlink(missing_ok=True)
+    _write_private_json(target / 'meta.json', meta, indent=2)
 
 
 def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
@@ -425,8 +482,7 @@ def import_vm(name: str, image: Path, *, suite: str = '', arch: str = 'amd64',
     fmt = disk_format or ('qcow2' if source.suffix.lower() == '.qcow2' else 'raw')
     if fmt not in ('raw', 'qcow2'):
         raise ValueError(f'Unsupported VM disk format: {fmt!r}')
-    mem = max(512, min(int(memory_mib), 131072))
-    smp = max(1, min(int(cpus), 64))
+    mem, smp = _validate_vm_resources(memory_mib, cpus)
 
     store = whitecube_store()
     images = store / 'images'
@@ -500,8 +556,10 @@ def clone_vm(src: str, dst: str, *, memory_mib: int | None = None,
         src_disk = Path(meta['disk_path'])
         if not src_disk.is_file():
             raise FileNotFoundError(f'Source VM disk image is missing: {src_disk}')
-        mem = max(512, min(int(memory_mib if memory_mib is not None else meta['memory_mib']), 131072))
-        smp = max(1, min(int(cpus if cpus is not None else meta['cpus']), 64))
+        mem, smp = _validate_vm_resources(
+            memory_mib if memory_mib is not None else meta['memory_mib'],
+            cpus if cpus is not None else meta['cpus'],
+        )
 
         dst_dir.mkdir(mode=0o700, parents=True)
         created_dst = True
@@ -577,6 +635,28 @@ def compact_vm(name: str) -> dict:
         os.close(lock_fd)
 
 
+def update_vm(name: str, *, memory_mib: int | None = None, cpus: int | None = None) -> dict:
+    """Update default RAM/vCPU settings for a stopped VM while holding vm.lock."""
+    if memory_mib is None and cpus is None:
+        raise ValueError('Specify --memory and/or --cpus to update VM settings')
+    mem, smp = _validate_vm_resources(memory_mib, cpus)
+    target = vm_dir(name)
+    meta = vm_meta(name)
+    lock_fd = _open_vm_lock(target)
+    try:
+        updated = {
+            key: value for key, value in meta.items() if key != 'disk_path'
+        }
+        if mem is not None:
+            updated['memory_mib'] = mem
+        if smp is not None:
+            updated['cpus'] = smp
+        _write_vm_meta(target, updated)
+        return vm_meta(name)
+    finally:
+        os.close(lock_fd)
+
+
 def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = None,
                 forward_ssh: bool = False, ssh_port: int = 2222,
                 headless: bool = False, serial_stdio: bool = False,
@@ -596,9 +676,13 @@ def vm_run_argv(name: str, memory_mib: int | None = None, cpus: int | None = Non
     if not ovmf:
         raise RuntimeError('UEFI OVMF firmware is not installed (install package "ovmf").')
 
-    mem = max(512, min(int(memory_mib if memory_mib is not None else meta['memory_mib']), 131072))
-    smp = max(1, min(int(cpus if cpus is not None else meta['cpus']), 64))
-    port = int(ssh_port)
+    mem, smp = _validate_vm_resources(
+        memory_mib if memory_mib is not None else meta['memory_mib'],
+        cpus if cpus is not None else meta['cpus'],
+    )
+    if isinstance(ssh_port, bool) or not isinstance(ssh_port, int):
+        raise ValueError(f'SSH forward port must be an integer 1..65535, got {ssh_port!r}')
+    port = ssh_port
     if not 1 <= port <= 65535:
         raise ValueError(f'SSH forward port must be 1..65535, got {ssh_port!r}')
     if serial_stdio and serial_log is not None:
@@ -754,18 +838,15 @@ def history_path() -> Path:
 
 def load_history() -> list[dict]:
     try:
-        data = json.loads(history_path().read_text(encoding='utf-8'))
+        data = _read_regular_json(history_path(), list)
     except (OSError, ValueError):
         return []
-    return [item for item in data if isinstance(item, dict) and NAME.match(str(item.get('name', '')))] \
-        if isinstance(data, list) else []
+    return [item for item in data if isinstance(item, dict) and NAME.match(str(item.get('name', '')))]
 
 
 def save_history(items: list[dict]) -> None:
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-    temporary = history_path().with_suffix('.tmp')
-    temporary.write_text(json.dumps(items[-200:], indent=1), encoding='utf-8')
-    os.replace(temporary, history_path())
+    _write_private_json(history_path(), items[-200:], indent=1)
 
 
 def record(plan: Plan, status: str, seconds: float, detail: str = '') -> dict:
@@ -790,8 +871,7 @@ def vm_exists(name: str) -> bool:
 
 def load_draft() -> dict:
     try:
-        data = json.loads((STATE / 'draft.json').read_text(encoding='utf-8'))
-        return data if isinstance(data, dict) else {}
+        return _read_regular_json(STATE / 'draft.json', dict)
     except (OSError, ValueError):
         return {}
 
@@ -799,7 +879,7 @@ def load_draft() -> dict:
 def save_draft(plan: Plan) -> None:
     try:
         STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
-        (STATE / 'draft.json').write_text(json.dumps(plan.public()), encoding='utf-8')
+        _write_private_json(STATE / 'draft.json', plan.public(), indent=None)
     except OSError:
         pass
 

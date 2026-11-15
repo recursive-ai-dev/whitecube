@@ -256,5 +256,39 @@ class History(unittest.TestCase):
             self.assertEqual(strap.plan_from(dict(strap.load_draft(), size_gib='bad')).size_gib, 4)
 
 
+class Hardening(unittest.TestCase):
+    def test_private_json_permissions_and_fifo_or_oversize_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / 'state'
+            home = Path(tmp) / 'home'
+            with mock.patch.object(strap, 'STATE', state), \
+                 mock.patch.dict(os.environ, {'WHITECUBE_HOME': str(home)}, clear=False):
+                strap.record(plan(name='lab', kind='vm'), 'built', 1)
+                strap.save_draft(plan())
+                self.assertEqual((state / 'cubes.json').stat().st_mode & 0o777, 0o600)
+                self.assertEqual((state / 'draft.json').stat().st_mode & 0o777, 0o600)
+
+                fifo = Path(tmp) / 'named.pipe'
+                os.mkfifo(fifo)
+                with self.assertRaises(ValueError):
+                    strap._read_regular_json(fifo)
+                with self.assertRaises(ValueError):
+                    strap._copy_sparse(fifo, Path(tmp) / 'out.img')
+
+                big = Path(tmp) / 'big.json'
+                big.write_bytes(b' ' * (strap.MAX_JSON_BYTES + 10))
+                with self.assertRaises(ValueError):
+                    strap._read_regular_json(big)
+
+                with self.assertRaises(ValueError):
+                    strap._validate_vm_resources(True, 2)
+                with self.assertRaises(ValueError):
+                    strap._validate_vm_resources(2048, False)
+                with self.assertRaises(ValueError):
+                    strap._validate_vm_resources(256, 2)
+                with self.assertRaises(ValueError):
+                    strap._validate_vm_resources(2048, 0)
+
+
 if __name__ == '__main__':
     unittest.main()
