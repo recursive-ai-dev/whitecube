@@ -347,6 +347,45 @@ class BoundaryTests(unittest.TestCase):
                 path.write_text(content)
                 with self.assertRaises(net.SwitchError):
                     net.configuration(path)
+            symlink = Path(temporary) / "link.conf"
+            symlink.symlink_to(path)
+            with self.assertRaises(net.SwitchError):
+                net.configuration(symlink)
+            oversized = Path(temporary) / "big.conf"
+            oversized.write_text('{"interface":"' + "a" * 5000 + '"}')
+            with self.assertRaises(net.SwitchError):
+                net.configuration(oversized)
+
+    def test_version_json_dry_run_and_status_counters(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
+            net.main(["off", "--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn(net.VERSION, out.getvalue())
+
+        with mock.patch.object(net.Nft, "run", side_effect=AssertionError("nft")), \
+                mock.patch.object(net.State, "read", side_effect=AssertionError("state")), \
+                mock.patch.object(net, "execution_lock", side_effect=AssertionError("lock")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(net.main(["off", "--dry-run", "--persist", "--no-loopback", "--json"]), 0)
+        dry = json.loads(out.getvalue())
+        self.assertEqual((dry["dry_run"], dry["action"], dry["locked"], dry["loopback_allowed"], dry["persistent"]),
+                         (True, "off", True, False, True))
+
+        doc = table(loopback=True)
+        for item in doc["nftables"]:
+            if "rule" in item and item["rule"]["chain"] == "output" and item["rule"]["expr"][-1] == {"drop": None}:
+                item["rule"]["expr"][0]["counter"] = {"packets": 17, "bytes": 1024}
+        fake_nft = mock.Mock(snapshot=mock.Mock(return_value=doc))
+        fake_state = mock.Mock(read=mock.Mock(return_value=b'{"version":1,"allow_loopback":true}\n'))
+        with mock.patch.object(net, "Nft", return_value=fake_nft), \
+                mock.patch.object(net, "State", return_value=fake_state), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(net.main(["off", "--status", "--json"]), 0)
+        status = json.loads(out.getvalue())
+        self.assertTrue(status["locked"])
+        self.assertTrue(status["loopback_allowed"])
+        self.assertTrue(status["persistent"])
+        self.assertEqual(status["counters"]["output"], {"packets": 17, "bytes": 1024})
 
 
 if __name__ == "__main__":

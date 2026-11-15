@@ -405,6 +405,22 @@ class RunTests(Fixture):
         self.assertEqual(denied[0]['level'], 'WARN')
         self.assertIn('usermod -aG audio', denied[0]['fix'])
 
+    def test_dns_lease_and_lockdown_checks(self):
+        self.put('run/whitecube-net/status.json', json.dumps({
+            'association_state': 'COMPLETED', 'ipv4_address': '10.0.0.2', 'updated_epoch': time.time(),
+        }))
+        missing_dns = doctor.check_dns_lease(self.env)
+        self.assertEqual(missing_dns[0]['level'], 'WARN')
+        self.put('run/whitecube-net/resolv.conf', '# wlan0 via dhcpcd (cube-net-dns)\nnameserver 1.1.1.1\n')
+        ok_dns = doctor.check_dns_lease(self.env)
+        self.assertEqual(ok_dns[0]['level'], 'ok')
+        self.assertIn('1.1.1.1', ok_dns[0]['detail'])
+        self.assertEqual(doctor.check_lockdown(self.env), [])
+        self.put('var/lib/whitecube/net-lockdown.json', json.dumps({'version': 1, 'allow_loopback': False}))
+        locked = doctor.check_lockdown(self.env)
+        self.assertEqual(locked[0]['level'], 'WARN')
+        self.assertIn('loopback blocked', locked[0]['detail'])
+
     def test_version_flag_exits_zero(self):
         with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
             doctor.main(['--version'])

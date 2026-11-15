@@ -50,3 +50,13 @@
 - **Tests & Verification**:
   - Extended `tests/test-doctor.py` (47 tests), `tests/test-session.py` (23 tests), `tests/test-privacy.py` (31 tests), `tests/test-preferences.py` (14 tests), `tests/test-suspend.py` (8 tests), and `tests/test-desktop-improvements.py` (12 tests).
   - Verified full `./BUILD.sh`, `packaging/install-tree.sh`, and `packaging/check-tree.py` (235 paths ok) inside `bwrap`.
+
+## [2026-11-15] net/cube-net, cube-net-dns, whitecube-net-switch (`net-off` / `net-on`) | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - `net/cube-net`: added configurable same-SSID signal-threshold BSS roaming with multi-sample hysteresis (`roam_threshold_dbm`, `roam_margin_dbm`, `roam_cooldown_s`, `roam_samples`) validated in `device_config()` and wired through `station_options()` into `Station` without disrupting healthy links; sorted `scan` results descending by `signal_dbm`; added pre-passphrase SSID UTF-8 length/NUL/duplicate checks in `add_profile()`; added `--version` and structured `selftest --json`.
+  - `net/whitecube-net-switch` (`net-off` / `net-on`): added `--version`, `--json` output for `--status`, `--dry-run`, and lock state mutations; extracted live chain drop packet/byte counters from the existing `nft -a -j` snapshot in `Switch.status_data()`; hardened `configuration()` with `O_NOFOLLOW`, `S_ISREG`, and a 4 KiB read cap.
+  - `net/cube-net-dns`: replaced predictable `.tmp` writes with `tempfile.mkstemp` atomic creation + automatic parent directory creation and cleanup on error; accepted comma/whitespace-separated DNS servers; added CLI `--check`/`--status`, `--json`, `--resolv`, and `--version` via `inspect_resolv()` while preserving `dhcpcd` hook `main()` signature.
+  - `bin/whitecube-doctor`: added `check_dns_lease()` (verifying active `/run/whitecube-net/resolv.conf` resolvers during completed IPv4 association) and `check_lockdown()` (detecting active persistent `net-off` marker) under `--check network`.
+- **Tests & Verification**:
+  - Extended `net/test_cube_wifi.py` (roaming config validation, hysteresis roaming simulation, signal-sorted scan, `selftest --json`, `--version`), `net/test_cube_net.py` (`HookTests` comma servers, missing parent dir, `--check --json`, `--version`), `net/test_net_switch.py` (symlink/oversized config rejection, `--version`, `--dry-run --json`, `--status --json` counters), and `tests/test-doctor.py` (`test_dns_lease_and_lockdown_checks`).
+  - Verified targeted suites (`test_net_switch.py` 33 ok, `test_cube_net.py` 130 ok, `test_cube_wifi.py`, `test-doctor.py` 48 ok), full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (235 path references ok), and `tests/test-packaging.py` (61 tests ok).

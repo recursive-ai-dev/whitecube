@@ -44,6 +44,7 @@ import tempfile
 import threading
 import time
 
+VERSION = "0.12.0"
 DEFAULT_DEVICE = {"usb_id": "2001:3329", "mac": "88:76:b9:f2:9d:29", "driver": "rtw88_8822cu"}
 CONFIG_DIR = Path("/etc/whitecube/network")
 RUNTIME_DIR = Path("/run/whitecube-net")
@@ -97,12 +98,32 @@ def device_config(root=Path("/")):
         raise ValueError('Invalid configured country: use a two-letter ISO code such as "CA".')
     if 'power_save' in config and not isinstance(config['power_save'], bool):
         raise ValueError('Invalid configured power_save: use true or false.')
+    if 'roam_threshold_dbm' in config and config['roam_threshold_dbm'] is not None:
+        v = config['roam_threshold_dbm']
+        if isinstance(v, bool) or not isinstance(v, int) or not (-110 <= v <= -30):
+            raise ValueError('Invalid configured roam_threshold_dbm: use an integer between -110 and -30, or null.')
+    if 'roam_margin_dbm' in config:
+        v = config['roam_margin_dbm']
+        if isinstance(v, bool) or not isinstance(v, int) or not (5 <= v <= 40):
+            raise ValueError('Invalid configured roam_margin_dbm: use an integer between 5 and 40.')
+    if 'roam_cooldown_s' in config:
+        v = config['roam_cooldown_s']
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or not (10 <= v <= 3600):
+            raise ValueError('Invalid configured roam_cooldown_s: use a number between 10 and 3600.')
+    if 'roam_samples' in config:
+        v = config['roam_samples']
+        if isinstance(v, bool) or not isinstance(v, int) or not (1 <= v <= 20):
+            raise ValueError('Invalid configured roam_samples: use an integer between 1 and 20.')
     return config
 
 
 def station_options(config):
-    """What device.json may tune: country (regulatory domain, unset = leave to the kernel) and power_save."""
-    return {'country': config.get('country'), 'power_save': config.get('power_save', False)}
+    """What device.json may tune: country, power_save, and optional same-SSID roaming thresholds."""
+    opts = {'country': config.get('country'), 'power_save': config.get('power_save', False)}
+    for key in ('roam_threshold_dbm', 'roam_margin_dbm', 'roam_cooldown_s', 'roam_samples'):
+        if key in config:
+            opts[key] = config[key]
+    return opts
 
 
 def permanent_mac(name):
@@ -1522,11 +1543,20 @@ class Station:
 
     def __init__(self, driver, load_profiles, log, now=time.monotonic, pause=time.sleep, options=None):
         self.driver, self.load_profiles, self.log, self.now, self.pause = driver, load_profiles, log, now, pause
-        self.options = {'country': None, 'power_save': False, **(options or {})}
+        self.options = {
+            'country': None,
+            'power_save': False,
+            'roam_threshold_dbm': -80,
+            'roam_margin_dbm': 12,
+            'roam_cooldown_s': 60,
+            'roam_samples': 3,
+            **(options or {}),
+        }
         self.lock = threading.Lock()
         self.state, self.ssid, self.rssi = 'INACTIVE', None, None
         self.profiles = {}                 # ssid bytes -> 32-byte PMK
         self.preferred = None              # ssid bytes chosen with 'select'; preferred while it is in range
+        self.preferred_bssid = None        # BSSID targeted by same-SSID signal roaming for one attempt
         self.commands = queue.SimpleQueue()
         self.waiters = []                  # [(done event, result box, deadline)] for user scans
         self.bans = {}                     # bssid -> monotonic time the ban ends
@@ -1539,6 +1569,9 @@ class Station:
         self.early = []                    # EAPOL frames that beat the kernel's "connected" event
         self.had_link = False              # the current association reached COMPLETED
         self.signal_due = 0.0
+        self.weak_signals = 0
+        self.roam_due = 0.0
+        self.roam_pending = False
         self.error = None
         self.stopping = False
 
@@ -1701,6 +1734,11 @@ class Station:
                 self._choose(now, results)
         elif self.state == 'DISCONNECTED' and self.profiles and results:
             self._choose(now, results, quiet=True)     # a user's scan may as well bring the link up
+        elif self.state == 'COMPLETED' and self.roam_pending:
+            self.roam_pending = False
+            self.weak_signals = 0
+            if not aborted and results:
+                self._maybe_roam(now, results)
 
     def _finish_waiters(self, now, force=False):
         waiters, self.waiters = self.waiters, []
@@ -1735,6 +1773,7 @@ class Station:
             self._set('SCANNING')
 
     def _choose(self, now, results, quiet=False):
+        preferred_bssid, self.preferred_bssid = self.preferred_bssid, None
         usable, reasons = [], set()
         for bss in results:
             if bss['ssid'] not in self.profiles:
@@ -1751,6 +1790,10 @@ class Station:
             if not quiet:
                 self._retry(now, 'no usable saved network in range' + (f' ({"; ".join(sorted(reasons))})' if reasons else ''))
             return
+        if preferred_bssid is not None:
+            matched = [b for b in usable if b['bssid'] == preferred_bssid]
+            if matched:
+                usable = matched
         bss = max(usable, key=lambda item: item['signal'] if item['signal'] is not None else -200)
         self.target, self.had_link, self.early = bss, False, []
         for index in (1, 2, 3):
@@ -1871,6 +1914,44 @@ class Station:
             rssi = self.driver.signal(self.target['bssid'])
             with self.lock:
                 self.rssi = rssi
+            threshold = self.options.get('roam_threshold_dbm')
+            if threshold is not None and rssi is not None and rssi <= threshold:
+                self.weak_signals += 1
+                if self.weak_signals >= self.options['roam_samples'] and now >= self.roam_due and not self.scanning:
+                    self.roam_due = now + self.options['roam_cooldown_s']
+                    self.roam_pending = True
+                    self._start_scan(now, auto=False)
+                    if not self.scanning:
+                        self.roam_pending = False
+            else:
+                self.weak_signals = 0
+
+    def _maybe_roam(self, now, results):
+        if self.target is None:
+            return
+        threshold = self.options.get('roam_threshold_dbm')
+        if threshold is None:
+            return
+        with self.lock:
+            current_rssi = self.rssi
+        if current_rssi is None or current_rssi > threshold:
+            return
+        margin = self.options['roam_margin_dbm']
+        candidates = []
+        for bss in results:
+            if bss['ssid'] != self.target['ssid'] or bss['bssid'] == self.target['bssid']:
+                continue
+            if self.bans.get(bss['bssid'], 0) > now or unsupported_reason(bss['rsn']):
+                continue
+            sig = bss.get('signal')
+            if sig is not None and sig >= current_rssi + margin:
+                candidates.append(bss)
+        if not candidates:
+            return
+        best = max(candidates, key=lambda item: item['signal'])
+        self.preferred_bssid = best['bssid']
+        self.log(f'wifi: roaming to stronger access point ({best["freq"]} MHz, {best["signal"]} dBm vs {current_rssi} dBm)')
+        self._drop(now, 'roaming to stronger access point')
 
     def _ban(self, now, bssid):
         self.bans[bssid] = now + self.BAN_SECONDS
@@ -1878,6 +1959,7 @@ class Station:
     def _idle(self, now, delay=None):
         """Back to looking for a network. delay=None climbs the failure ladder, otherwise scan after delay s."""
         self.handshake, self.scanning, self.early = None, False, []
+        self.weak_signals, self.roam_pending = 0, False
         self._set('DISCONNECTED')
         if delay is None:
             self.failures += 1
@@ -1892,6 +1974,7 @@ class Station:
         """Leave the current network on purpose and wait briefly for the kernel to confirm."""
         self.log(f'wifi: leaving the network: {why}')
         self.handshake = None
+        self.weak_signals, self.roam_pending = 0, False
         try:
             self.driver.disconnect()
         except OSError:
@@ -1997,67 +2080,97 @@ def control_call(command, *args, timeout=15):
     return reply.get('result')
 
 
-def selftest():
+def selftest(json_output=False):
     """Read-only checks that the built-in station can work on this machine. No root needed; nothing is changed.
 
     Returns the number of failed checks."""
     failures = []
+    checks = []
+    notes = []
+    scan_entries = []
 
     def check(name, ok, detail=''):
         if not ok:
             failures.append(name)
-        print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ''))
+        checks.append({'name': name, 'ok': bool(ok), 'detail': detail})
+        if not json_output:
+            print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ''))
 
-    check('AES-128 against the FIPS-197 vector',
-          aes_decrypt_block(bytes(range(16)), bytes.fromhex('69c4e0d86a7b0430d8cdb78070b4c55a')).hex() == '00112233445566778899aabbccddeeff')
-    check('AES key unwrap against the RFC 3394 vector',
-          (aes_unwrap(bytes.fromhex('000102030405060708090A0B0C0D0E0F'),
-                      bytes.fromhex('1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5')) or b'').hex() == '00112233445566778899aabbccddeeff')
-    check('passphrase hashing against the IEEE 802.11i vector',
-          wpa_psk(b'password', b'IEEE').hex() == 'f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e')
-    config = device_config()
-    candidates = [item for item in interfaces() if matches(item, config)]
-    check('the scoped dongle is present', len(candidates) == 1, candidates[0]['interface'] if candidates else 'not found')
-    if len(candidates) != 1:
-        return len(failures)
+    def note(text):
+        notes.append(text)
+        if not json_output:
+            print(text)
+
     try:
-        driver = Nl80211Driver(candidates[0]['interface'], subscribe=False)
-    except OSError as error:
-        check('nl80211 is reachable', False, error.strerror or str(error))
-        return len(failures)
-    try:
-        check('nl80211 is reachable', True, f'family {driver.family}, address {mac_str(driver.mac)}')
-        found = driver.get_scan()
-        check('the kernel scan cache decodes', True, f'{len(found)} access point(s)')
-        saving = driver.power_save()
-        print(f"note radio power save is {'unknown' if saving is None else 'on' if saving else 'off'}"
-              + ('; the service turns it off after connecting (device.json "power_save": true keeps it on)' if saving else ''))
-    except OSError as error:
-        check('the kernel scan cache decodes', False, error.strerror or str(error))
+        check('AES-128 against the FIPS-197 vector',
+              aes_decrypt_block(bytes(range(16)), bytes.fromhex('69c4e0d86a7b0430d8cdb78070b4c55a')).hex() == '00112233445566778899aabbccddeeff')
+        check('AES key unwrap against the RFC 3394 vector',
+              (aes_unwrap(bytes.fromhex('000102030405060708090A0B0C0D0E0F'),
+                          bytes.fromhex('1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5')) or b'').hex() == '00112233445566778899aabbccddeeff')
+        check('passphrase hashing against the IEEE 802.11i vector',
+              wpa_psk(b'password', b'IEEE').hex() == 'f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e')
+        config = device_config()
+        candidates = [item for item in interfaces() if matches(item, config)]
+        check('the scoped dongle is present', len(candidates) == 1, candidates[0]['interface'] if candidates else 'not found')
+        if len(candidates) != 1:
+            return len(failures)
+        try:
+            driver = Nl80211Driver(candidates[0]['interface'], subscribe=False)
+        except OSError as error:
+            check('nl80211 is reachable', False, error.strerror or str(error))
+            return len(failures)
+        try:
+            check('nl80211 is reachable', True, f'family {driver.family}, address {mac_str(driver.mac)}')
+            found = driver.get_scan()
+            check('the kernel scan cache decodes', True, f'{len(found)} access point(s)')
+            saving = driver.power_save()
+            note(f"note radio power save is {'unknown' if saving is None else 'on' if saving else 'off'}"
+                 + ('; the service turns it off after connecting (device.json "power_save": true keeps it on)' if saving else ''))
+        except OSError as error:
+            check('the kernel scan cache decodes', False, error.strerror or str(error))
+            return len(failures)
+        finally:
+            driver.close()
+        for bss in sorted(found, key=lambda item: -(item['signal'] if item['signal'] is not None else -200)):
+            reason = unsupported_reason(bss['rsn'])
+            name = bss['ssid'].decode('utf-8', 'replace') or '(hidden)'
+            scan_entries.append({
+                'ssid': name,
+                'bssid': bss['bssid'],
+                'frequency_mhz': bss['freq'],
+                'signal_dbm': bss['signal'],
+                'security': bss['security'],
+                'usable': reason is None,
+                'reason': reason,
+            })
+            if not json_output:
+                print(f"     {name}  {bss['freq']} MHz  {bss['signal']} dBm  {bss['security']}  ->  {'usable' if reason is None else 'not usable: ' + reason}")
+        try:
+            saved = [ssid for ssid, _ in load_profiles()] if os.geteuid() == 0 else None
+        except RuntimeError as error:
+            check('saved networks are readable', False, str(error))
+            saved = None
+        if saved is None:
+            note('note saved networks are only checked when run as root (sudo cube-net selftest)')
+        else:
+            for ssid in saved:
+                matching = [b for b in found if b['ssid'] == ssid.encode()]
+                usable = [b for b in matching if unsupported_reason(b['rsn']) is None]
+                check(f'saved network "{ssid}" is in range and joinable', bool(usable),
+                      'not in the scan cache; run a scan first' if not matching else '' if usable else unsupported_reason(matching[0]['rsn']))
+        running = competing_processes(candidates[0]['interface'])
+        if running:
+            note('note these will compete with the built-in station until stopped: ' + ', '.join(running))
         return len(failures)
     finally:
-        driver.close()
-    for bss in sorted(found, key=lambda item: -(item['signal'] if item['signal'] is not None else -200)):
-        reason = unsupported_reason(bss['rsn'])
-        name = bss['ssid'].decode('utf-8', 'replace') or '(hidden)'
-        print(f"     {name}  {bss['freq']} MHz  {bss['signal']} dBm  {bss['security']}  ->  {'usable' if reason is None else 'not usable: ' + reason}")
-    try:
-        saved = [ssid for ssid, _ in load_profiles()] if os.geteuid() == 0 else None
-    except RuntimeError as error:
-        check('saved networks are readable', False, str(error))
-        saved = None
-    if saved is None:
-        print('note saved networks are only checked when run as root (sudo cube-net selftest)')
-    else:
-        for ssid in saved:
-            matching = [b for b in found if b['ssid'] == ssid.encode()]
-            usable = [b for b in matching if unsupported_reason(b['rsn']) is None]
-            check(f'saved network "{ssid}" is in range and joinable', bool(usable),
-                  'not in the scan cache; run a scan first' if not matching else '' if usable else unsupported_reason(matching[0]['rsn']))
-    running = competing_processes(candidates[0]['interface'])
-    if running:
-        print('note these will compete with the built-in station until stopped: ' + ', '.join(running))
-    return len(failures)
+        if json_output:
+            print(json.dumps({
+                'ok': len(failures) == 0,
+                'failures': len(failures),
+                'checks': checks,
+                'notes': notes,
+                'scan': scan_entries,
+            }, ensure_ascii=True, indent=2))
 
 
 def reconnect():
@@ -2167,7 +2280,11 @@ def selected_interface():
 def scan_networks():
     require_root()
     iface = selected_interface()
-    return {'interface': iface, 'networks': control_call('scan'),
+    networks = sorted(
+        control_call('scan'),
+        key=lambda item: (-(item.get('signal_dbm') if item.get('signal_dbm') is not None else -127), item.get('ssid') or ''),
+    )
+    return {'interface': iface, 'networks': networks,
             'note': 'Fresh scan by the running controller; SSIDs are shown as text with non-printable characters removed.'}
 
 
@@ -2190,6 +2307,11 @@ def add_profile():
         raise RuntimeError('Run add in a terminal; passwords are never accepted as arguments.')
     existing = load_profiles()
     ssid = input('Wi-Fi SSID: ')
+    ssid_bytes = ssid.encode('utf-8')
+    if not ssid_bytes or len(ssid_bytes) > 32 or '\x00' in ssid:
+        raise ValueError('SSID must be 1 to 32 UTF-8 bytes without NUL bytes.')
+    if any(saved_ssid == ssid for saved_ssid, _ in existing):
+        raise ValueError('A profile with that SSID already exists; remove it first.')
     secret = getpass.getpass('WPA2 passphrase: ')
     if secret != getpass.getpass('Confirm passphrase: '):
         raise ValueError('Passphrases do not match')
@@ -2627,6 +2749,7 @@ def takeover(root=Path('/'), run=run_command, online=wait_until_online, seen=Non
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("-v", "--version", action="version", version=f"cube-net {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("status", help="Read-only hardware status as JSON")
     p.add_argument("--root", type=Path, default=Path("/"))
@@ -2645,7 +2768,8 @@ def main():
         p.add_argument('profile_id')
     sub.add_parser("import-nm", help="Import saved WPA2 NM profiles locally; root required")
     sub.add_parser("takeover", help="Replace NetworkManager, wpa_supplicant and systemd-resolved; rolls back unless online; root required")
-    sub.add_parser("selftest", help="Read-only check that the built-in Wi-Fi station can work here; no root needed")
+    p = sub.add_parser("selftest", help="Read-only check that the built-in Wi-Fi station can work here; no root needed")
+    p.add_argument("--json", action="store_true", help="Output structured selftest results as JSON")
     sub.add_parser("migrate", help="Copy saved networks from the old wpa.conf into networks.json; root required")
     sub.add_parser("run", help="Service entrypoint; root required")
     args = parser.parse_args()
@@ -2675,7 +2799,7 @@ def main():
     elif args.command == "takeover":
         takeover()
     elif args.command == "selftest":
-        sys.exit(1 if selftest() else 0)
+        sys.exit(1 if selftest(json_output=args.json) else 0)
     elif args.command == "migrate":
         with profile_lock():
             migrate_profiles()

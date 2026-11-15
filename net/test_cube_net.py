@@ -722,6 +722,24 @@ class HookTests(unittest.TestCase):
         self.assertEqual(victim.read_text(), "keep")
         self.assertIn("nameserver 10.0.0.1", self.resolv.read_text())
 
+    def test_comma_separated_servers_missing_parent_dir_and_cli_check(self):
+        nested = Path(self.tmp.name) / "sub/dir/resolv.conf"
+        dns_hook.main({"interface": "wlan0", "reason": "BOUND", "new_domain_name_servers": "1.1.1.1, 9.9.9.9"}, nested)
+        self.assertEqual(stat.S_IMODE(nested.stat().st_mode), 0o644)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            code = dns_hook.cli(["--check", "--json", "--resolv", str(nested)])
+        self.assertEqual(code, 0)
+        info = json.loads(out.getvalue())
+        self.assertEqual((info["valid"], info["interface"], info["nameservers"]), (True, "wlan0", ["1.1.1.1", "9.9.9.9"]))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            missing_code = dns_hook.cli(["--check", "--json", "--resolv", str(Path(self.tmp.name) / "absent")])
+        self.assertEqual(missing_code, 1)
+        self.assertFalse(json.loads(out.getvalue())["present"])
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
+            dns_hook.cli(["--version"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn(dns_hook.VERSION, out.getvalue())
+
 
 # ------------------------------------------------------------------ unchanged code must still work
 

@@ -10,12 +10,17 @@ lookups at loopback, multicast, link-local or reserved addresses. If a new lease
 rather than kept; a RENEW/REBIND that omits DNS leaves the working file alone.
 Search domains and hostnames offered by the server are never applied.
 """
+import argparse
 import ipaddress
+import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
+VERSION = "0.12.0"
 RESOLV = Path("/run/whitecube-net/resolv.conf")
 UP = {"BOUND", "RENEW", "REBIND", "REBOOT", "INFORM"}
 FRESH = {"BOUND", "REBOOT"}   # a new or re-validated lease; RENEW/REBIND ACKs may omit options mid-lease
@@ -34,13 +39,43 @@ def usable(text):
 
 
 def write_atomic(path, body):
-    temporary = path.with_suffix(".tmp")
-    temporary.unlink(missing_ok=True)
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    with os.fdopen(fd, "w") as stream:
-        os.fchmod(fd, 0o644)  # os.open's mode is masked by umask (the service runs with UMask=0077)
-        stream.write(body)
-    os.replace(temporary, path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            os.fchmod(fd, 0o644)  # os.open's mode is masked by umask (the service runs with UMask=0077)
+            stream.write(body)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def inspect_resolv(resolv=RESOLV):
+    """Read-only inspection of the hook-managed resolv.conf file."""
+    path = Path(resolv)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"present": False, "path": str(path), "nameservers": [], "options": [], "interface": None}
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 8192:
+        return {"present": True, "path": str(path), "valid": False, "nameservers": [], "options": [], "interface": None}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    interface = None
+    if lines and lines[0].startswith("# ") and " via dhcpcd" in lines[0]:
+        interface = lines[0][2:].partition(" via dhcpcd")[0].strip() or None
+    nameservers = [parts[1] for line in lines if (parts := line.split()) and len(parts) == 2 and parts[0] == "nameserver" and usable(parts[1])]
+    options = [line[len("options "):].strip() for line in lines if line.startswith("options ")]
+    return {
+        "present": True,
+        "valid": bool(nameservers),
+        "path": str(path),
+        "interface": interface,
+        "nameservers": nameservers,
+        "options": options,
+    }
 
 
 def main(environ=os.environ, resolv=RESOLV):
@@ -50,7 +85,10 @@ def main(environ=os.environ, resolv=RESOLV):
     reason = environ.get("reason", "")
     if reason in UP:
         servers = []
-        for item in environ.get("new_domain_name_servers", "").split():
+        raw_servers = environ.get("new_domain_name_servers", "")
+        for item in re.split(r"[\s,]+", raw_servers.strip()):
+            if not item:
+                continue
             address = usable(item)
             if address and address not in servers:
                 servers.append(address)
@@ -65,5 +103,35 @@ def main(environ=os.environ, resolv=RESOLV):
         resolv.unlink(missing_ok=True)
 
 
+def cli(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        main()
+        return 0
+    parser = argparse.ArgumentParser(description="Whitecube dhcpcd DNS hook and lease resolver inspector.")
+    parser.add_argument("-v", "--version", action="version", version=f"cube-net-dns {VERSION}")
+    parser.add_argument("--check", "--status", action="store_true", dest="check",
+                        help="inspect active resolv.conf written by cube-net-dns without modifying anything")
+    parser.add_argument("--json", action="store_true", help="output JSON when used with --check/--status")
+    parser.add_argument("--resolv", type=Path, default=RESOLV, help="path to inspect instead of /run/whitecube-net/resolv.conf")
+    args = parser.parse_args(argv)
+    if args.check:
+        info = inspect_resolv(args.resolv)
+        if args.json:
+            print(json.dumps(info, indent=2))
+        else:
+            if not info["present"]:
+                print(f"cube-net-dns: no active lease resolvers at {info['path']}")
+            elif not info.get("valid"):
+                print(f"cube-net-dns: invalid or empty resolver file at {info['path']}")
+            else:
+                iface = f" on {info['interface']}" if info["interface"] else ""
+                print(f"cube-net-dns: active resolvers{iface}: {', '.join(info['nameservers'])}")
+        return 0 if info.get("valid") else 1
+    parser.print_help()
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(cli())

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 
+VERSION = "0.12.0"
 TABLE = "whitecube_net_lockdown"
 OWNER = "Whitecube net-switch v1"
 PRIORITY = -300
@@ -31,12 +32,23 @@ class NftRejected(SwitchError):
 
 
 def configuration(path=CONFIG):
+    path = Path(path)
     try:
-        values = json.loads(path.read_text())
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return DEFAULTS.copy()
+    except OSError as exc:
+        raise SwitchError(f"Cannot read configuration {path}: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+            raise SwitchError(f"Unsafe or oversized configuration {path}")
+        with os.fdopen(fd, "r", closefd=False) as stream:
+            values = json.loads(stream.read(4097))
     except (OSError, ValueError) as exc:
         raise SwitchError(f"Cannot read configuration {path}: {exc}") from exc
+    finally:
+        os.close(fd)
     if not isinstance(values, dict) or set(values) - set(DEFAULTS):
         raise SwitchError("Configuration must be a JSON object with allow_loopback, interface, controller only")
     result = DEFAULTS | values
@@ -102,6 +114,31 @@ def inspect_table(document):
     if any(r["rule"].get("chain") not in {"input", "output", "forward"} for r in items if "rule" in r):
         return None
     return loopbacks[0]
+
+
+def table_counters(document):
+    """Return dropped packet/byte counts per lockdown chain from an nft JSON snapshot."""
+    counters = {}
+    for item in document.get("nftables", []):
+        rule = item.get("rule")
+        if not rule:
+            continue
+        chain = rule.get("chain")
+        expressions = rule.get("expr")
+        if (
+            chain in ("input", "output", "forward")
+            and isinstance(expressions, list)
+            and len(expressions) == 2
+            and isinstance(expressions[0], dict)
+            and isinstance(expressions[0].get("counter"), dict)
+            and expressions[1] == {"drop": None}
+        ):
+            counter = expressions[0]["counter"]
+            packets = counter.get("packets")
+            byte_count = counter.get("bytes")
+            if isinstance(packets, int) and isinstance(byte_count, int):
+                counters[chain] = {"packets": packets, "bytes": byte_count}
+    return counters
 
 
 def delete_statement(document):
@@ -303,17 +340,38 @@ class Switch:
             return f"OFF: IPv4/IPv6 input, output and forwarding blocked; loopback {'allowed' if allow_loopback else 'blocked'}; {mode}"
         return "ON: Whitecube lockdown removed; existing firewall and network configuration remain in effect"
 
-    def status(self):
+    def status_data(self):
         table = self.nft.snapshot()
         marker = self.state.read()
         persistent = persistent_setting(marker) if marker is not None else None
         if table is None:
-            return "ON: Whitecube lockdown absent" + ("; persistent lockdown is scheduled for next boot" if marker is not None else "; persistence off")
+            summary = "ON: Whitecube lockdown absent" + ("; persistent lockdown is scheduled for next boot" if marker is not None else "; persistence off")
+            return {
+                "locked": False,
+                "loopback_allowed": None,
+                "persistent": marker is not None,
+                "next_boot_loopback": persistent,
+                "next_boot_differs": False,
+                "counters": {},
+                "summary": summary,
+            }
         loopback = inspect_table(table)
         if loopback is None:
             raise SwitchError("Whitecube table exists but does not match a complete lockdown; run net-off to repair or net-on to remove it")
         mismatch = marker is not None and persistent != loopback
-        return f"OFF: IPv4/IPv6 input, output and forwarding blocked; loopback {'allowed' if loopback else 'blocked'}; persistence {'on' if marker is not None else 'off'}" + (" (next-boot loopback setting differs)" if mismatch else "")
+        summary = f"OFF: IPv4/IPv6 input, output and forwarding blocked; loopback {'allowed' if loopback else 'blocked'}; persistence {'on' if marker is not None else 'off'}" + (" (next-boot loopback setting differs)" if mismatch else "")
+        return {
+            "locked": True,
+            "loopback_allowed": loopback,
+            "persistent": marker is not None,
+            "next_boot_loopback": persistent,
+            "next_boot_differs": mismatch,
+            "counters": table_counters(table),
+            "summary": summary,
+        }
+
+    def status(self):
+        return self.status_data()["summary"]
 
 
 def parser():
@@ -323,7 +381,9 @@ def parser():
     command.add_argument("-d", "--dry-run", action="store_true", help="print intended change without root, nftables access, locks or writes")
     command.add_argument("--persist", action="store_true", help="keep lockdown across reboot; net-on also clears persistence")
     command.add_argument("--no-loopback", action="store_true", help="also block local IPv4/IPv6 traffic (off only)")
+    command.add_argument("-j", "--json", action="store_true", help="output machine-readable JSON")
     command.add_argument("-q", "--quiet", action="store_true", help="suppress successful status messages")
+    command.add_argument("-v", "--version", action="version", version=f"whitecube-net-switch {VERSION}")
     return command
 
 
@@ -339,6 +399,16 @@ def main(argv=None):
         else:
             allow_loopback = True
         if arguments.dry_run:
+            if arguments.json:
+                payload = {"dry_run": True, "action": action}
+                if action == "off":
+                    payload.update(locked=True, loopback_allowed=allow_loopback, persistent=arguments.persist,
+                                   interface=settings["interface"], controller=settings["controller"], table=TABLE)
+                elif action == "on":
+                    payload.update(locked=False, persistent=False, table=TABLE)
+                if not arguments.quiet:
+                    print(json.dumps(payload, indent=2))
+                return 0
             if action == "off":
                 print("# Dry run: atomically replace only our owned table if it exists.")
                 print("# Persistence: " + ("enable for next boot" if arguments.persist else "retain current setting; off by default"))
@@ -351,7 +421,8 @@ def main(argv=None):
                 print(f"# Dry run: {action} would read live firewall/persistence state; nothing inspected or changed.")
             return 0
         if action == "status":
-            message = Switch().status()
+            data = Switch().status_data()
+            message = json.dumps(data, indent=2) if arguments.json else data["summary"]
         else:
             if os.geteuid() != 0:
                 raise SwitchError("Changing networking requires root; use sudo net-off or sudo net-on")
@@ -359,6 +430,16 @@ def main(argv=None):
                 if arguments.persist:
                     validate_persistence()
                 message = Switch().change(action == "off", allow_loopback, arguments.persist, action == "boot")
+            if arguments.json:
+                locked = (action == "off") or (action == "boot" and not message.startswith("ON:"))
+                payload = {
+                    "action": action,
+                    "locked": locked,
+                    "loopback_allowed": allow_loopback if locked else None,
+                    "persistent": (action == "off" and arguments.persist) if locked else (False if action == "on" else None),
+                    "summary": message,
+                }
+                message = json.dumps(payload, indent=2)
         if not arguments.quiet:
             print(message)
         return 0

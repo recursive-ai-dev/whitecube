@@ -8,7 +8,7 @@
 - [x] `bin/` utilities (`whitecube-session`, `whitecube-doctor`, `whitecube-preferences`, `whitecube-terminal`, etc.)
 
 ## Phase 2: Networking & Boot (`net/`, `boot/`)
-- [ ] `net/cube-net`, `net-off`, `net-on` (Wi-Fi/DHCP controller, takeover, and firewall/switch resilience)
+- [x] `net/cube-net`, `net-off`, `net-on` (Wi-Fi/DHCP controller, takeover, and firewall/switch resilience)
 - [ ] `boot/` (GRUB / Plymouth / tty1 black cube theme & recovery polish)
 
 ## Phase 3: Workspace & Applications (`workspace/`, `apps/`)

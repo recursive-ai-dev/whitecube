@@ -117,6 +117,45 @@ def check_network(env, net):
     return out
 
 
+def check_dns_lease(env):
+    status_file = env.at('/run/whitecube-net/status.json')
+    try:
+        raw = json.loads(status_file.read_text())
+        age = time.time() - float(raw.get('updated_epoch', 0))
+    except (OSError, ValueError, TypeError):
+        return []
+    if age > 15 or raw.get('association_state') != 'COMPLETED' or not raw.get('ipv4_address'):
+        return []
+    resolv = env.at('/run/whitecube-net/resolv.conf')
+    try:
+        lines = resolv.read_text().splitlines()
+    except OSError:
+        return [finding('WARN', 'dns lease', 'associated with IPv4 but /run/whitecube-net/resolv.conf is missing',
+                        'sudo systemctl status whitecube-network.service   (check dhcpcd lease)')]
+    servers = [parts[1] for line in lines if (parts := line.split()) and len(parts) == 2 and parts[0] == 'nameserver']
+    if not servers:
+        return [finding('WARN', 'dns lease', '/run/whitecube-net/resolv.conf has no active nameservers',
+                        'sudo systemctl status whitecube-network.service   (check dhcpcd lease)')]
+    return [finding('ok', 'dns lease', f'{len(servers)} active resolver(s) via cube-net-dns: {", ".join(servers[:3])}')]
+
+
+def check_lockdown(env):
+    marker = env.at('/var/lib/whitecube/net-lockdown.json')
+    try:
+        if not marker.exists():
+            return []
+        data = json.loads(marker.read_text())
+    except PermissionError:
+        return [finding('WARN', 'network lockdown', 'persistent net-off lockdown marker exists (unreadable without root)',
+                        'sudo net-off --status')]
+    except (OSError, ValueError):
+        return [finding('WARN', 'network lockdown', 'persistent net-off lockdown marker exists but is unreadable or malformed',
+                        'sudo net-off --status')]
+    loopback = 'allowed' if data.get('allow_loopback', True) else 'blocked'
+    return [finding('WARN', 'network lockdown', f'persistent net-off lockdown enabled (loopback {loopback})',
+                    'sudo net-on')]
+
+
 def check_competitors(env, net):
     if net is None:
         return []
@@ -442,8 +481,8 @@ def run_checks(env, selected=None):
             results.append(finding('WARN', 'wifi controller', f'cannot load cube-net: {type(error).__name__}: {error}'))
     groups = {
         'package': (lambda: check_package(env), lambda: check_shadowing(env)),
-        'network': (lambda: check_firewall(env), lambda: check_network(env, net),
-                    lambda: check_competitors(env, net), lambda: check_wpa_leftovers(env)),
+        'network': (lambda: check_firewall(env), lambda: check_network(env, net), lambda: check_dns_lease(env),
+                    lambda: check_lockdown(env), lambda: check_competitors(env, net), lambda: check_wpa_leftovers(env)),
         'drift': (lambda: check_drift(env),),
         'security': (lambda: check_sudoers(env),),
         'libraries': (lambda: check_xfree(env),),

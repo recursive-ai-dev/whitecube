@@ -1453,6 +1453,41 @@ class StationTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             bench.station.call("scan")
 
+    def test_roam_config_validation_and_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg_dir = root / "etc/whitecube/network"
+            cfg_dir.mkdir(parents=True)
+            base = dict(net.DEFAULT_DEVICE)
+            (cfg_dir / "device.json").write_text(json.dumps({**base, "roam_threshold_dbm": -75, "roam_margin_dbm": 15, "roam_cooldown_s": 90, "roam_samples": 4}))
+            opts = net.station_options(net.device_config(root))
+            self.assertEqual((opts["roam_threshold_dbm"], opts["roam_margin_dbm"], opts["roam_cooldown_s"], opts["roam_samples"]), (-75, 15, 90, 4))
+            for bad in ({"roam_threshold_dbm": True}, {"roam_threshold_dbm": -10}, {"roam_margin_dbm": 2}, {"roam_cooldown_s": 5}, {"roam_samples": 0}):
+                (cfg_dir / "device.json").write_text(json.dumps({**base, **bad}))
+                with self.assertRaises(ValueError):
+                    net.device_config(root)
+
+    def test_same_ssid_signal_roaming_prefers_stronger_ap_with_hysteresis_and_stays_when_none_better(self):
+        ap1 = FakeAP(bssid="11:11:11:11:11:11", signal=-60.0, freq=5180)
+        ap2 = FakeAP(bssid="22:22:22:22:22:22", signal=-84.0, freq=5240)
+        bench = Bench([ap1, ap2], start=False)
+        bench.station.options.update({"roam_threshold_dbm": -78, "roam_margin_dbm": 12, "roam_samples": 2, "roam_cooldown_s": 60})
+        bench.station.reload(bench.t)
+        bench.run(12)
+        self.assertEqual((bench.state, bench.station.target["bssid"]), ("COMPLETED", "11:11:11:11:11:11"))
+        # Weak signal triggers a background scan, but ap2 is not +12 dB better -> link stays untouched
+        bench.radio.signal_value = -82
+        scans_before = bench.radio.count("trigger_scan")
+        bench.run(6)
+        self.assertGreater(bench.radio.count("trigger_scan"), scans_before)
+        self.assertEqual((bench.state, bench.station.target["bssid"]), ("COMPLETED", "11:11:11:11:11:11"))
+        # Once ap2 jumps far stronger and cooldown expires, station roams cleanly to ap2
+        ap2.signal = -45.0
+        bench.radio.signal_value = -82
+        bench.run(65)
+        self.assertEqual((bench.state, bench.station.target["bssid"]), ("COMPLETED", "22:22:22:22:22:22"))
+        self.assertTrue(any("roaming to stronger access point" in line for line in bench.logs))
+
 
 # ------------------------------------------------------------------ management frame protection (802.11w) and SHA-256 key management
 
@@ -1874,6 +1909,26 @@ class SelftestTests(unittest.TestCase):
                 self.assertRaises(SystemExit) as caught:
             net.main()
         self.assertEqual(caught.exception.code, 1)
+
+    def test_scan_networks_sorts_by_signal_and_selftest_json_and_version(self):
+        entries = [{"bssid": "aa", "ssid": "Weak", "signal_dbm": -81},
+                   {"bssid": "bb", "ssid": "Unknown", "signal_dbm": None},
+                   {"bssid": "cc", "ssid": "Strong", "signal_dbm": -42}]
+        with mock.patch.object(net, "require_root"), \
+                mock.patch.object(net, "selected_interface", return_value="wlan0"), \
+                mock.patch.object(net, "control_call", return_value=entries):
+            result = net.scan_networks()
+        self.assertEqual([item["ssid"] for item in result["networks"]], ["Strong", "Weak", "Unknown"])
+        with mock.patch.object(net, "interfaces", return_value=[]), contextlib.redirect_stdout(io.StringIO()) as out:
+            failures = net.selftest(json_output=True)
+        payload = json.loads(out.getvalue())
+        self.assertEqual((failures, payload["ok"], payload["failures"]), (1, False, 1))
+        self.assertTrue(any("scoped dongle" in c["name"] and not c["ok"] for c in payload["checks"]))
+        with mock.patch.object(sys, "argv", ["cube-net", "--version"]), contextlib.redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(SystemExit) as cm:
+            net.main()
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn(net.VERSION, out.getvalue())
 
 
 class CommandLineTests(unittest.TestCase):
