@@ -327,6 +327,26 @@ class PrivacyTests(unittest.TestCase):
                 privacy.set_value("microphone_muted", True)
                 self.assertEqual(run.call_args_list[2].args[0], ["/mock/amixer", "sset", "Capture", "nocap"])
 
+    def test_microphone_cube_audio_fallback_and_verification(self):
+        which = lambda name: "/mock/cube-audio" if name == "cube-audio" else None
+        unmuted_json = subprocess.CompletedProcess([], 0, '{"card":0,"input":true,"control":"Capture","muted":false}\n', "")
+        muted_json = subprocess.CompletedProcess([], 0, '{"card":0,"input":true,"control":"Capture","muted":true}\n', "")
+        with mock.patch.object(privacy.shutil, "which", side_effect=which):
+            with mock.patch.object(privacy, "command", return_value=unmuted_json):
+                state, detail, action = privacy.microphone()
+                self.assertEqual((state, action), ("0", ["/mock/cube-audio", "mute", "--input"]))
+                self.assertIn("Capture", detail)
+            with mock.patch.object(privacy, "command", side_effect=[unmuted_json, muted_json, muted_json]) as run:
+                privacy.set_value("microphone_muted", True)
+                self.assertEqual(run.call_args_list[1].args[0], ["/mock/cube-audio", "mute", "--input", "on"])
+
+    def test_cli_help_and_version_exit_cleanly(self):
+        for flag, expected in (("--help", "usage: cube-privacy"), ("--version", "cube-privacy ")):
+            result = subprocess.run([sys.executable, "-I", str(HELPER), flag],
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(expected, result.stdout)
+
     def test_microphone_failed_or_unverified_change_never_reports_success(self):
         enabled = subprocess.CompletedProcess([], 0, "Volume: 1.00\n", "")
         failed = subprocess.CompletedProcess([], 1, "", "denied")

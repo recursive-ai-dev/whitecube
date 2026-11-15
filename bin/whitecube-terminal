@@ -37,11 +37,15 @@ def terminal_argv(args, settings, home=None):
             section = 'main'
             for line in config.read_text(encoding='utf-8').splitlines():
                 line = line.strip()
+                if not line or line.startswith(('#', ';')):
+                    continue
                 if line.startswith('['):
                     section = line.strip('[]').strip()
-                if section == 'main' and line.partition('=')[0].strip() == 'font':
-                    font = line.partition('=')[2].strip() or font
-                    break
+                elif section == 'main' and line.partition('=')[0].strip() == 'font':
+                    raw_val = line.partition('=')[2]
+                    val = re.split(r'\s+[#;]', raw_val, maxsplit=1)[0].strip()
+                    if val:
+                        font = val
     except (OSError, UnicodeError):
         pass
     scale = settings.get('terminal_scale', 1)
@@ -71,7 +75,8 @@ def main():
     try:
         os.execvp(argv[0], argv)
     except OSError as error:
-        print(f'whitecube-terminal: unable to start foot: {error.strerror}', file=sys.stderr)
+        hint = ' (install the foot terminal package)' if isinstance(error, FileNotFoundError) else ''
+        print(f'whitecube-terminal: unable to start foot: {error.strerror}{hint}', file=sys.stderr)
         raise SystemExit(127)
 
 

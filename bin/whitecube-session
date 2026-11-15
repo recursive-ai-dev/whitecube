@@ -18,6 +18,9 @@ class SessionError(Exception):
     pass
 
 
+WHITECUBE_VERSION = '0.12.0'
+
+
 def private_directory(path, create=False):
     """Accept only a real directory owned by this account with mode 0700."""
     path = Path(path)
@@ -125,6 +128,7 @@ def session_environment(env, runtime, script):
     result.update(XDG_RUNTIME_DIR=str(runtime), XDG_SESSION_TYPE='wayland',
                   XDG_CURRENT_DESKTOP='whitecube', MOZ_ENABLE_WAYLAND='1',
                   QT_QPA_PLATFORM='wayland', SDL_VIDEODRIVER='wayland', ELM_DISPLAY='wl')
+    result.setdefault('GDK_BACKEND', 'wayland')
     # Keep a parent socket only when explicitly requesting a nested backend.
     # The compositor publishes its own socket before spawning desktop clients.
     if 'wayland' not in env.get('WLR_BACKENDS', '').split(','):
@@ -179,7 +183,7 @@ def quiet_gpu_devices(drm=Path('/sys/class/drm')):
                 record['connected'] |= (entry / 'status').read_text().strip() == 'connected'
             else:
                 record['driver'] = (entry / 'device/driver').resolve().name
-        except OSError:
+        except (OSError, RuntimeError):
             return None
     discrete = [record for record in cards.values() if record['driver'] in ('nvidia', 'nouveau')]
     others = {card: record for card, record in cards.items() if record['driver'] not in ('nvidia', 'nouveau')}
@@ -316,8 +320,31 @@ def run_compositor(command, env, log):
             signal.signal(number, handler)
 
 
+def active_session_pid(state):
+    """Non-destructively report (is_active, pid_or_none) if session.lock is currently held."""
+    lock_path = state / 'session.lock'
+    try:
+        fd = private_file(lock_path, os.O_RDONLY)
+    except (FileNotFoundError, SessionError):
+        return False, None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raw = os.read(fd, 32).decode('ascii', errors='ignore').strip()
+            pid = int(raw) if raw.isdigit() else None
+            return True, pid
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False, None
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-v', '--version', action='version', version=f'whitecube-session {WHITECUBE_VERSION}')
     parser.add_argument('--check', action='store_true', help='check startup prerequisites and print JSON without starting the desktop')
     parser.add_argument('--safe-mode', action='store_true', help='start the compositor without wallpaper, panel, health checks or audio services')
     parser.add_argument('--reset-crash-guard', action='store_true', help='clear recent startup failures and exit')
@@ -338,11 +365,15 @@ def main(argv=None):
         if args.check:
             compositor = find_compositor(__file__)
             bus_bin = find_session_bus(__file__)
+            active, session_pid = active_session_pid(state)
             print(json.dumps({'compositor': str(compositor), 'runtime': str(runtime),
                               'state': str(state), 'audio': audio,
+                              'gdk_backend': env.get('GDK_BACKEND'),
                               'drm_devices': env.get('WLR_DRM_DEVICES'),
                               'session_bus': str(bus_bin) if bus_bin else None,
                               'dbus_address': env.get('DBUS_SESSION_BUS_ADDRESS'),
+                              'active_session': active,
+                              'session_pid': session_pid,
                               'recent_failures': len(recent_failures(failures, int(time.time())))}, indent=2))
             return 0
         # The lock is account-wide even if callers choose different runtime dirs.
@@ -392,10 +423,15 @@ def main(argv=None):
                     stream.write(f'whitecube-session: {exc}\n')
                     status, interrupted = 1, False
                 finally:
-                    if bus_proc is not None and bus_proc.poll() is None:
-                        bus_proc.terminate()
-                        with contextlib.suppress(subprocess.TimeoutExpired):
-                            bus_proc.wait(timeout=2)
+                    if bus_proc is not None:
+                        if bus_proc.poll() is None:
+                            bus_proc.terminate()
+                            with contextlib.suppress(subprocess.TimeoutExpired):
+                                bus_proc.wait(timeout=2)
+                        bus_sock = Path(runtime) / 'bus'
+                        if _is_unix_socket(bus_sock):
+                            with contextlib.suppress(OSError):
+                                bus_sock.unlink()
                 stream.write(f'=== whitecube exited with status {status} at {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
             records = recent_failures(failures, int(time.time()))
             if status and not interrupted and time.monotonic() - started < 60:

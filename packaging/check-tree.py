@@ -49,6 +49,7 @@ EXTERNAL_REFERENCES = {
     'usr/libexec/whitecube/cube-settings-helper': {
         '/usr/bin/amixer', '/usr/bin/wpctl', '/usr/bin/chronyc', '/usr/bin/setupcon',
     },
+    'usr/bin/whitecube-doctor': {'/usr/bin/pipewire'},
 }
 COMMENT_ONLY_REFERENCES = {
     'usr/bin/whitecube-session': {b'# /usr/bin/whitecube can belong to the unrelated image tool.'},

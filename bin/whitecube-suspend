@@ -1,5 +1,6 @@
 #!/usr/bin/python3 -I
 """Lock the graphical session before asking the system to suspend."""
+import argparse
 import os
 import selectors
 import subprocess
@@ -7,6 +8,8 @@ import sys
 import tempfile
 import threading
 import time
+
+WHITECUBE_VERSION = '0.12.0'
 
 
 class SuspendError(Exception):
@@ -55,6 +58,8 @@ def lock_then_suspend(locker, suspend, timeout=15):
             raise SuspendError('Screen locker did not finish starting; the computer was not suspended.')
         if status:
             raise SuspendError('Screen locker failed after its readiness notification; the computer was not suspended.')
+        if suspend is None:
+            return
         result = subprocess.run(suspend, stdin=subprocess.DEVNULL, capture_output=True,
                                 text=True, timeout=40, check=False)
         if result.returncode:
@@ -77,14 +82,21 @@ def lock_then_suspend(locker, suspend, timeout=15):
                 threading.Thread(target=process.wait, daemon=True).start()
 
 
-def main():
-    if len(sys.argv) != 1:
-        print('usage: whitecube-suspend', file=sys.stderr)
-        return 2
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-v', '--version', action='version', version=f'whitecube-suspend {WHITECUBE_VERSION}')
+    parser.add_argument('--lock-only', action='store_true', help='lock the screen without suspending the system')
+    parser.add_argument('--timeout', type=float, default=15.0, help='seconds to wait for screen-lock acknowledgement (1-120)')
+    args = parser.parse_args(argv)
+    if not 1.0 <= args.timeout <= 120.0:
+        parser.error('--timeout must be between 1 and 120 seconds')
+    suspend_cmd = None if args.lock_only else [
+        '/usr/bin/sudo', '-n', '--',
+        '/usr/libexec/whitecube/cube-settings-helper', 'power-action', 'suspend',
+    ]
     try:
         lock_then_suspend(['swaylock', '--daemonize', '--color', '111827'],
-                          ['/usr/bin/sudo', '-n', '--',
-                           '/usr/libexec/whitecube/cube-settings-helper', 'power-action', 'suspend'])
+                          suspend_cmd, timeout=args.timeout)
     except SuspendError as exc:
         print(f'whitecube-suspend: {exc}', file=sys.stderr)
         return 1

@@ -123,6 +123,7 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
         env = record['env']
         self.assertEqual(env['XDG_SESSION_TYPE'], 'wayland')
         self.assertEqual(env['XDG_CURRENT_DESKTOP'], 'whitecube')
+        self.assertEqual(env['GDK_BACKEND'], 'wayland')
         self.assertEqual(env['XDG_RUNTIME_DIR'], str(self.runtime))
         for stale in ('DISPLAY', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS'):
             self.assertNotIn(stale, env)
@@ -354,6 +355,26 @@ with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
                 break
             time.sleep(0.02)
         self.assertFalse(alive, 'whitecube-bus should be terminated after session exit')
+        self.assertFalse((self.runtime / 'bus').exists(), 'owned bus socket should be cleaned up on exit')
+
+    def test_check_reports_active_session_lock_and_version_flag(self):
+        ver = self.launch('--version')
+        self.assertEqual(ver.returncode, 0, ver.stderr)
+        self.assertIn('whitecube-session', ver.stdout)
+        idle = json.loads(self.launch('--check').stdout)
+        self.assertFalse(idle['active_session'])
+        self.assertIsNone(idle['session_pid'])
+        self.assertEqual(idle['gdk_backend'], 'wayland')
+        process = subprocess.Popen([str(self.launcher)], env={**self.env, 'WAIT': '1'},
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   stdin=subprocess.DEVNULL)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        self.wait_capture()
+        live = json.loads(self.launch('--check').stdout)
+        self.assertTrue(live['active_session'])
+        self.assertEqual(live['session_pid'], process.pid)
+        process.send_signal(signal.SIGTERM)
+        process.communicate(timeout=5)
 
 
 if __name__ == '__main__':

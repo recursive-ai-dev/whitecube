@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Keyboard-accessible native display preferences and reviewable settings recovery."""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -13,12 +14,69 @@ from desktop_state import DesktopStore
 from recovery import RecoveryConsole
 from workspace_data import atomic_json
 
-state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'whitecube'
-store = DesktopStore(state)
-console = RecoveryConsole(state=state)
+WHITECUBE_VERSION = '0.12.0'
 
 
-def main():
+def state_dir():
+    return Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'whitecube'
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-v', '--version', action='version', version=f'whitecube-desktop {WHITECUBE_VERSION}')
+    parser.add_argument('--show', action='store_true', help='print current display settings without entering interactive mode')
+    parser.add_argument('--json', action='store_true', help='format non-interactive output as JSON')
+    parser.add_argument('--set-ui-scale', type=float, metavar='SCALE', help='set UI scale (0.8..1.6)')
+    parser.add_argument('--set-terminal-scale', type=float, metavar='SCALE', help='set terminal scale (0.8..2.0)')
+    parser.add_argument('--contrast', choices=('normal', 'strong'), help='set contrast mode')
+    parser.add_argument('--reduced-motion', choices=('on', 'off'), help='set reduced motion')
+    parser.add_argument('--list-backups', action='store_true', help='list recovery backups and exit')
+    parser.add_argument('--backup', metavar='LABEL', help='create a settings backup with LABEL and exit')
+    args = parser.parse_args(argv)
+
+    store = DesktopStore(state_dir())
+    console = RecoveryConsole(state=state_dir())
+    non_interactive = (
+        args.show or args.list_backups or args.backup is not None
+        or args.set_ui_scale is not None or args.set_terminal_scale is not None
+        or args.contrast is not None or args.reduced_motion is not None
+    )
+    if non_interactive:
+        try:
+            if args.backup is not None:
+                created = console.create(args.backup)
+                print(json.dumps(created, indent=2) if args.json else f"Created backup {created.get('id', '')}")
+                return 0
+            if args.list_backups:
+                backups = console.list()
+                if args.json:
+                    print(json.dumps(backups, indent=2))
+                else:
+                    for item in backups:
+                        print(f"{item.get('id', '')}\t{item.get('created_at', '')}\t{item.get('label', '')}")
+                return 0
+            settings = store.get_settings()
+            updated = False
+            if args.set_ui_scale is not None:
+                settings['ui_scale'] = args.set_ui_scale; updated = True
+            if args.set_terminal_scale is not None:
+                settings['terminal_scale'] = args.set_terminal_scale; updated = True
+            if args.contrast is not None:
+                settings['contrast'] = args.contrast; updated = True
+            if args.reduced_motion is not None:
+                settings['reduced_motion'] = (args.reduced_motion == 'on'); updated = True
+            if updated:
+                settings = store.save_settings(settings)
+            if args.json:
+                print(json.dumps(settings, indent=2))
+            else:
+                print(f"UI scale {settings['ui_scale']}; terminal scale {settings['terminal_scale']}; contrast {settings['contrast']}; reduced motion {settings['reduced_motion']}")
+            return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(f'whitecube-desktop: {exc}', file=sys.stderr)
+            return 1
+
+    state = state_dir()
     while True:
         settings = store.get_settings()
         print('\nWHITECUBE / DISPLAY AND RECOVERY\n')
@@ -27,7 +85,7 @@ def main():
         try:
             choice = input('Choice > ').strip().lower()
             if choice == 'q':
-                return
+                return 0
             if choice in ('u', 't'):
                 key = 'ui_scale' if choice == 'u' else 'terminal_scale'
                 settings[key] = float(input('Scale > '))
@@ -67,6 +125,6 @@ def main():
 
 if __name__ == '__main__':
     try:
-        main()
+        raise SystemExit(main())
     except (EOFError, KeyboardInterrupt):
         print()

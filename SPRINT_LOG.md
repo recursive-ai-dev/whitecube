@@ -36,3 +36,17 @@
 - **Tests & Verification**:
   - Extended `src/cube-audio/test-cube-audio.c` (self-contained non-WAV fixture, 64-bit float WAV decoding, duplicate `fmt ` rejection, `parse_target()`, `tlv_parse_db()` container/overflow cases, `conv_flush()` same-rate and resampled tail flushing).
   - Verified ASan/UBSan standalone test suite, `./BUILD.sh`, `packaging/check-tree.py` (233 paths ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] bin/ utilities (`whitecube-session`, `whitecube-doctor`, `cube-preferences`, `cube-privacy`, `whitecube-terminal`, `whitecube-desktop`, `whitecube-suspend`, `whitecube-next-wallpaper`) | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - `bin/whitecube-doctor`: added `cube-audio` across `install_map()`, `check_xfree()`, `check_package()`, and `check_shadowing()`; added new read-only `--check audio` check (`check_audio()`) inspecting `/dev/snd/controlC*` permissions and configured `alsa`/`pipewire` backend availability; added `--version`; updated `EXTERNAL_REFERENCES` in `packaging/check-tree.py`.
+  - `bin/whitecube-session`: added `-v|--version`, `GDK_BACKEND=wayland` default in `session_environment()`, `RuntimeError` hardening in `quiet_gpu_devices()`, non-destructive `active_session_pid()` live-lock telemetry in `--check` JSON output, and owned `bus` socket cleanup when `whitecube-bus` exits.
+  - `bin/cube-privacy`: integrated native `cube-audio mute --input` JSON fallback into `microphone()` and `set_value("microphone_muted", ...)` for systems without `wpctl`/`amixer`; added `--help` and `--version`.
+  - `bin/cube-preferences`: added `-v|--version`, `--json` output for `list`/`check`/`--dry-run`, `--dry-run` validation (skipping `dbus-run-session`/writes), negative integer argument safety via `_parse_cli_flags()`, and directory rejection before file reads.
+  - `bin/whitecube-suspend`: added `-v|--version`, `--lock-only` (lock without suspending), and bounded `--timeout` (`1..120` s).
+  - `bin/whitecube-desktop`: added non-interactive CLI flags (`--show`, `--json`, `--set-ui-scale`, `--set-terminal-scale`, `--contrast`, `--reduced-motion`, `--list-backups`, `--backup`, `--version`) while preserving interactive TTY menu mode.
+  - `bin/whitecube-terminal`: added `#`/`;` inline comment stripping and sequential `[main]` `font=` override handling plus missing `foot` install hint.
+  - `bin/whitecube-next-wallpaper`: hardened POSIX iteration across `.jpg/.jpeg/.png/.webp` (whitespace-safe), eliminated hardcoded `/tmp/swaybg.log` & `/tmp` state files in favor of private `$XDG_RUNTIME_DIR`/`$XDG_STATE_HOME/whitecube`, validated state indices atomically, added `--next`/`--prev`/`--current`/`--list`/`--help`, and verified `swaybg` before `pkill`.
+- **Tests & Verification**:
+  - Extended `tests/test-doctor.py` (47 tests), `tests/test-session.py` (23 tests), `tests/test-privacy.py` (31 tests), `tests/test-preferences.py` (14 tests), `tests/test-suspend.py` (8 tests), and `tests/test-desktop-improvements.py` (12 tests).
+  - Verified full `./BUILD.sh`, `packaging/install-tree.sh`, and `packaging/check-tree.py` (235 paths ok) inside `bwrap`.

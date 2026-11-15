@@ -84,6 +84,64 @@ class Preferences(unittest.TestCase):
             self.assertEqual(argv[0], 'foot')
             self.assertIn(':size=11', argv[2])
 
+    def test_terminal_handles_inline_comments_and_last_main_override(self):
+        config = self.root / 'comments.ini'
+        config.write_text('[main]\n# font = ignored:size=99\nfont = First:size=10 # comment\nfont = Second:size=14 ; comment\n')
+        argv = terminal['terminal_argv'](['-c', str(config)], {'terminal_scale': 1.5, 'contrast': 'normal'}, self.root)
+        self.assertIn('font=Second:size=21.0', argv)
+
+    def test_whitecube_desktop_non_interactive_cli_and_backups(self):
+        import subprocess
+        state = self.root / 'desktop-state'
+        env = {**os.environ, 'XDG_STATE_HOME': str(state)}
+        script = str(ROOT / 'bin/whitecube-desktop')
+        r = subprocess.run([sys.executable, script, '--set-ui-scale', '1.25', '--contrast', 'strong', '--reduced-motion', 'on', '--json'],
+                           capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        data = json.loads(r.stdout)
+        self.assertEqual((data['ui_scale'], data['contrast'], data['reduced_motion']), (1.25, 'strong', True))
+        b = subprocess.run([sys.executable, script, '--backup', 'before-upgrade', '--json'],
+                           capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(b.returncode, 0, b.stderr)
+        lst = subprocess.run([sys.executable, script, '--list-backups', '--json'],
+                             capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(lst.returncode, 0, lst.stderr)
+        self.assertTrue(any(item['label'] == 'before-upgrade' for item in json.loads(lst.stdout)))
+
+    def test_next_wallpaper_handles_spaces_corruption_and_private_state(self):
+        import subprocess
+        import time
+        walls = self.root / 'walls'; walls.mkdir()
+        (walls / 'a space.png').write_bytes(b'png')
+        (walls / 'b.jpg').write_bytes(b'jpg')
+        fake_bin = self.root / 'bin'; fake_bin.mkdir()
+        swaybg_log = self.root / 'swaybg.invoked'
+        swaybg = fake_bin / 'swaybg'
+        swaybg.write_text(f'#!/bin/sh\necho "$@" >> "{swaybg_log}"\n')
+        swaybg.chmod(0o755)
+        rt = self.root / 'runtime'; rt.mkdir(mode=0o700)
+        script = str(ROOT / 'bin/whitecube-next-wallpaper')
+        env = {'PATH': f'{fake_bin}:/usr/bin:/bin', 'XDG_RUNTIME_DIR': str(rt), 'WHITECUBE_WALLPAPER_DIR': str(walls)}
+        listed = subprocess.run([script, '--list'], capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(len(listed.stdout.splitlines()), 2)
+        (rt / 'whitecube-wallpaper.idx').write_text('not-a-number\n')
+        nxt = subprocess.run([script, '--next'], capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(nxt.returncode, 0, nxt.stderr)
+        self.assertIn('a space.png', nxt.stdout)
+        prv = subprocess.run([script, '--prev'], capture_output=True, text=True, env=env, timeout=5)
+        self.assertEqual(prv.returncode, 0, prv.stderr)
+        self.assertIn('b.jpg', prv.stdout)
+        deadline = time.monotonic() + 2
+        while not swaybg_log.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(swaybg_log.exists())
+        self.assertIn('a space.png', swaybg_log.read_text())
+        missing = subprocess.run([script, '--next'], capture_output=True, text=True,
+                                 env={'PATH': '/nonexistent', 'XDG_RUNTIME_DIR': str(rt), 'WHITECUBE_WALLPAPER_DIR': str(walls)},
+                                 timeout=5)
+        self.assertEqual(missing.returncode, 127)
+
 
 class RequestBodies(unittest.TestCase):
     def setUp(self):

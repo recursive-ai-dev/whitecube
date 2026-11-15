@@ -36,6 +36,7 @@ import sys
 MAX_FILE = 1024 * 1024
 MAX_PROFILES = 16
 MAX_CACHE_ENTRIES = 20000
+WHITECUBE_VERSION = "0.12.0"
 BEGIN = "// BEGIN WHITECUBE PRIVACY\n"
 END = "// END WHITECUBE PRIVACY\n"
 META = "// controls: "
@@ -420,7 +421,20 @@ def microphone():
             if values:
                 muted = ["1" if value == "off" else "0" for value in values]
                 return aggregate(muted), "ALSA default Capture control only", [amixer, "sset", "Capture"]
-    return "unsupported", "No usable PipeWire input or ALSA Capture mute control", None
+    cube_audio = shutil.which("cube-audio")
+    if cube_audio:
+        result = command([cube_audio, "mute", "--input", "--json"])
+        if result and result.returncode == 0:
+            try:
+                payload = json.loads(result.stdout)
+                if isinstance(payload.get("muted"), bool):
+                    ctl = str(payload.get("control") or "Capture")
+                    return ("1" if payload["muted"] else "0",
+                            f"Native ALSA default input ({ctl}) only",
+                            [cube_audio, "mute", "--input"])
+            except ValueError:
+                pass
+    return "unsupported", "No usable PipeWire input, cube-audio, or ALSA Capture mute control", None
 
 
 def clipboard_tool():
@@ -464,7 +478,12 @@ def set_value(key, enabled):
         _, _, action = microphone()
         if not action:
             raise PrivacyError("No usable microphone mute control")
-        value = str(int(enabled)) if action[1] == "set-mute" else ("nocap" if enabled else "cap")
+        if action[1] == "set-mute":
+            value = str(int(enabled))
+        elif action[1] == "mute":
+            value = "on" if enabled else "off"
+        else:
+            value = "nocap" if enabled else "cap"
         result = command(action + [value])
         if not result or result.returncode:
             raise PrivacyError("Microphone control failed; input state could not be changed")
@@ -570,6 +589,12 @@ def clear(key):
 
 
 def main(argv):
+    if argv in (["-h"], ["--help"]):
+        print("usage: cube-privacy [--help] [--version] status | set CONTROL 0|1 | clear recent|thumbnails|clipboard")
+        return
+    if argv in (["-v"], ["--version"]):
+        print(f"cube-privacy {WHITECUBE_VERSION}")
+        return
     if os.geteuid() != os.getuid() or os.geteuid() == 0:
         raise PrivacyError("Run cube-privacy as the desktop user, never with sudo")
     if argv == ["status"]:

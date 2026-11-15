@@ -1,18 +1,76 @@
 #!/bin/sh
 # whitecube-next-wallpaper: cycle swaybg through cube-space wallpapers.
 # Bound to Alt+n in whitecube.
-set -e
-DIR="/usr/share/whitecube/wallpapers/cube-space"
-STATE="${XDG_RUNTIME_DIR:-/tmp}/whitecube-wallpaper.idx"
+set -eu
+
+DIR="${WHITECUBE_WALLPAPER_DIR:-/usr/share/whitecube/wallpapers/cube-space}"
 [ -d "$DIR" ] || DIR="/usr/share/whitecube/wallpapers"
-FILES=$(ls "$DIR"/*.jpg 2>/dev/null) || exit 0
-N=$(echo "$FILES" | wc -l)
-IDX=0
-[ -f "$STATE" ] && IDX=$(cat "$STATE" 2>/dev/null || echo 0)
-IDX=$(( (IDX + 1) % N ))
-echo "$IDX" > "$STATE"
-WALL=$(echo "$FILES" | sed -n "$((IDX+1))p")
+
+ACTION="next"
+case "${1:-}" in
+  -h|--help)
+    echo "usage: whitecube-next-wallpaper [--next|--prev|--current|--list|--help]"
+    exit 0
+    ;;
+  ""|-n|--next) ACTION="next" ;;
+  -p|--prev)    ACTION="prev" ;;
+  -c|--current) ACTION="current" ;;
+  -l|--list)    ACTION="list" ;;
+  *)
+    echo "whitecube-next-wallpaper: unknown option: $1" >&2
+    exit 2
+    ;;
+esac
+
+STATE_ROOT="${XDG_RUNTIME_DIR:-}"
+if [ -z "$STATE_ROOT" ] || [ ! -d "$STATE_ROOT" ] || [ ! -w "$STATE_ROOT" ]; then
+  STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/whitecube"
+  mkdir -p -m 700 "$STATE_ROOT"
+fi
+STATE="$STATE_ROOT/whitecube-wallpaper.idx"
+LOG="$STATE_ROOT/swaybg.log"
+
+set --
+for ext in jpg jpeg png webp; do
+  for f in "$DIR"/*."$ext"; do
+    [ -f "$f" ] && set -- "$@" "$f"
+  done
+done
+N=$#
+[ "$N" -gt 0 ] || exit 0
+
+if [ "$ACTION" = "list" ]; then
+  printf '%s\n' "$@"
+  exit 0
+fi
+
+RAW=""
+[ -f "$STATE" ] && [ ! -L "$STATE" ] && RAW=$(cat "$STATE" 2>/dev/null || true)
+case "$RAW" in
+  ''|*[!0-9]*) IDX=0 ;;
+  *)            IDX=$((RAW % N)) ;;
+esac
+
+if [ "$ACTION" = "next" ]; then
+  IDX=$(( (IDX + 1) % N ))
+elif [ "$ACTION" = "prev" ]; then
+  IDX=$(( (IDX + N - 1) % N ))
+fi
+
+# Positional parameter 1-based lookup without eval/sed splitting on whitespace.
+shift "$IDX"
+WALL="$1"
+
+if ! command -v swaybg >/dev/null 2>&1; then
+  echo "whitecube-next-wallpaper: swaybg not found on PATH" >&2
+  exit 127
+fi
+
+TMP_STATE=$(mktemp "$STATE_ROOT/.wallpaper-idx.XXXXXX")
+printf '%s\n' "$IDX" > "$TMP_STATE"
+mv -f "$TMP_STATE" "$STATE"
+
 pkill -x swaybg 2>/dev/null || true
-sleep 0.3
-swaybg -i "$WALL" -m fill >/tmp/swaybg.log 2>&1 &
+sleep 0.2
+nohup swaybg -i "$WALL" -m fill >"$LOG" 2>&1 </dev/null &
 echo "wallpaper: $WALL"

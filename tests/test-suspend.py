@@ -1,11 +1,14 @@
 #!/usr/bin/python3 -I
 """No real screen lock or suspend: exercise the protocol with disposable commands."""
+import contextlib
+import io
 import os
 from pathlib import Path
 import runpy
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 MODULE = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'bin/whitecube-suspend'))
 
@@ -69,6 +72,25 @@ class SuspendTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE['SuspendError'], 'Unable to lock'):
             MODULE['lock_then_suspend']([str(self.root / 'missing')], self.suspend)
         self.assertFalse(self.record.exists())
+
+    def test_lock_only_does_not_invoke_suspend_and_cli_flags(self):
+        ran = self.root / 'locked-only'
+        MODULE['lock_then_suspend'](self.locker(f'from pathlib import Path\nPath({str(ran)!r}).write_text("ok")\nos.write(fd, b"\\n")\n'), None)
+        self.assertEqual(ran.read_text(), 'ok')
+        self.assertFalse(self.record.exists())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            MODULE['main'](['--version'])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn('whitecube-suspend', out.getvalue())
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            MODULE['main'](['--timeout', '999'])
+        self.assertEqual(cm.exception.code, 2)
+        with mock.patch.dict(MODULE['main'].__globals__, lock_then_suspend=mock.Mock()) as scope:
+            code = MODULE['main'](['--lock-only', '--timeout', '5'])
+            self.assertEqual(code, 0)
+            self.assertIsNone(scope['lock_then_suspend'].call_args.args[1])
+            self.assertEqual(scope['lock_then_suspend'].call_args.kwargs['timeout'], 5.0)
 
 
 if __name__ == '__main__':

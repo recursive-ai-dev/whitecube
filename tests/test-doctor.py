@@ -206,7 +206,7 @@ class PackageChecks(Fixture):
     def package(self):
         executables = ('usr/bin/whitecube-compositor', 'usr/bin/whitecube-session',
                        'usr/bin/cube-status', 'usr/bin/cube-settings', 'usr/bin/cube-ca',
-                       'usr/bin/whitecube-terminal', 'usr/bin/desktop-chat',
+                       'usr/bin/cube-audio', 'usr/bin/whitecube-terminal', 'usr/bin/desktop-chat',
                        'usr/libexec/whitecube/cube-settings-helper',
                        'usr/lib/whitecube/desktop-chat-runtime/electron')
         data = ('usr/share/wayland-sessions/whitecube.desktop',
@@ -385,7 +385,31 @@ class RunTests(Fixture):
         with mock.patch.object(doctor, 'run_checks', side_effect=AssertionError('must not probe')), contextlib.redirect_stdout(io.StringIO()) as out:
             code = doctor.main(['--json', '--list-checks'])
         self.assertEqual(code, 0)
-        self.assertIn('package', json.loads(out.getvalue()))
+        groups = json.loads(out.getvalue())
+        self.assertIn('package', groups)
+        self.assertIn('audio', groups)
+
+    def test_audio_check_reports_backend_and_device_permissions(self):
+        self.put('usr/bin/cube-audio', '')
+        (self.root / 'usr/bin/cube-audio').chmod(0o755)
+        self.put('dev/snd/controlC0', '')
+        findings = doctor.check_audio(self.env)
+        self.assertEqual([item['level'] for item in findings], ['ok', 'ok'])
+        (self.root / 'etc/whitecube').mkdir(parents=True, exist_ok=True)
+        (self.root / 'etc/whitecube/config').write_text('audio = pipewire\n')
+        pw_findings = doctor.check_audio(self.env)
+        self.assertEqual(pw_findings[-1]['level'], 'WARN')
+        self.assertIn('pipewire', pw_findings[-1]['detail'])
+        with mock.patch.object(doctor.os, 'access', side_effect=lambda p, m: False if 'controlC0' in str(p) else True):
+            denied = doctor.check_audio(self.env)
+        self.assertEqual(denied[0]['level'], 'WARN')
+        self.assertIn('usermod -aG audio', denied[0]['fix'])
+
+    def test_version_flag_exits_zero(self):
+        with contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as cm:
+            doctor.main(['--version'])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn('whitecube-doctor', out.getvalue())
 
     def test_the_command_is_read_only_and_uses_the_isolated_interpreter(self):
         source = (HERE / "bin" / "whitecube-doctor").read_text()

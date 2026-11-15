@@ -22,6 +22,7 @@ SCHEMA = 'org.whitecube.desktop'
 PREFIX = '/org/whitecube/desktop/'
 PROFILE_FORMAT = 'org.whitecube.preferences'
 PROFILE_LIMIT = 65536
+WHITECUBE_VERSION = '0.12.0'
 
 
 def schema():
@@ -179,7 +180,7 @@ def profile_write(path, text):
             os.unlink(temporary)
 
 
-def write_many(spec, pairs):
+def write_many(spec, pairs, dry_run=False):
     values = {}
     for name, text in pairs:
         key, value = validate(spec, name, text)
@@ -193,6 +194,8 @@ def write_many(spec, pairs):
     for key in values:
         if not settings.is_writable(key):
             raise ValueError(f'{key} is locked by the administrator')
+    if dry_run:
+        return values
     # CLI load commits one dconf changeset; it does not clear unmentioned keys.
     payload = '[/]\n' + ''.join(f'{k}={v.print_(True)}\n' for k, v in values.items())
     dconf('load', PREFIX, input=payload)
@@ -201,13 +204,40 @@ def write_many(spec, pairs):
         parsed = GLib.Variant.parse(value.get_type(), actual, None, None) if actual else None
         if parsed is None or not value.equal(parsed):
             raise ValueError(f'{key}: saved value could not be verified')
+    return values
+
+
+def _parse_cli_flags(raw_args):
+    json_out = False
+    dry_run = False
+    clean_args = []
+    after_double_dash = False
+    for token in raw_args:
+        if after_double_dash:
+            clean_args.append(token)
+        elif token == '--':
+            after_double_dash = True
+        elif token == '--json':
+            json_out = True
+        elif token == '--dry-run':
+            dry_run = True
+        else:
+            clean_args.append(token)
+    return clean_args, json_out, dry_run
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-v', '--version', action='version', version=f'cube-preferences {WHITECUBE_VERSION}')
+    parser.add_argument('--json', action='store_true', help='emit structured JSON for list/check/dry-run')
+    parser.add_argument('--dry-run', action='store_true', help='validate changes without writing dconf')
     parser.add_argument('command', choices=('set', 'set-many', 'reset', 'list', 'export', 'import', 'check'))
-    parser.add_argument('args', nargs='*')
+    parser.add_argument('args', nargs=argparse.REMAINDER)
     args = parser.parse_args()
+    rest, extra_json, extra_dry = _parse_cli_flags(args.args)
+    args.args = rest
+    args.json = args.json or extra_json
+    args.dry_run = args.dry_run or extra_dry
     spec = schema()
     pairs = None
     if args.command in ('export', 'import', 'check'):
@@ -224,16 +254,23 @@ def main():
         if path == '-':
             text = sys.stdin.read(PROFILE_LIMIT + 1)
         else:
-            with open(path, encoding='utf-8') as source:
+            src = Path(path)
+            if src.is_dir():
+                raise ValueError(f'{path}: expected a profile file, not a directory')
+            with open(src, encoding='utf-8') as source:
                 text = source.read(PROFILE_LIMIT + 1)
         pairs = profile_pairs(spec, text)
         if args.command == 'check':
-            validate_keyboard(Gio.Settings.new_full(spec, None, None), dict(validate(spec, k, v) for k, v in pairs))
-            print(f'Valid Whitecube profile: {len(pairs)} settings')
+            validated = dict(validate(spec, k, v) for k, v in pairs)
+            validate_keyboard(Gio.Settings.new_full(spec, None, None), validated)
+            if args.json:
+                print(json.dumps({'valid': True, 'count': len(pairs), 'settings': dict(pairs)}, indent=2))
+            else:
+                print(f'Valid Whitecube profile: {len(pairs)} settings')
             return
         if not pairs:
             return
-    if args.command not in ('list',) and not os.environ.get('WHITECUBE_PREFS_WRITER'):
+    if args.command not in ('list',) and not args.dry_run and not os.environ.get('WHITECUBE_PREFS_WRITER'):
         # Always use a fresh writer: a long-lived dconf-service on an unrelated
         # bus can retain stale database contents after another session writes.
         os.environ['WHITECUBE_PREFS_WRITER'] = '1'
@@ -247,7 +284,7 @@ def main():
             sys.exit(result.returncode)
         os.execv(command[0], command)
     lock = None
-    if args.command != 'list':
+    if args.command != 'list' and not args.dry_run:
         directory = Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'whitecube'
         directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         lock = os.open(directory / 'preferences.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -262,7 +299,7 @@ def main():
                 time.sleep(.02)
     try:
         if args.command == 'import':
-            write_many(spec, pairs)
+            applied = write_many(spec, pairs, dry_run=args.dry_run)
         elif args.command == 'set-many':
             if args.args:
                 parser.error('set-many takes values on stdin')
@@ -272,25 +309,38 @@ def main():
             lines = [line.split('\t', 1) for line in data.splitlines()]
             if any(len(line) != 2 for line in lines):
                 raise ValueError('Expected key, tab, value on each line')
-            write_many(spec, lines)
+            applied = write_many(spec, lines, dry_run=args.dry_run)
         elif args.command == 'set':
             if len(args.args) != 2:
                 parser.error('set requires KEY VALUE')
-            write_many(spec, [args.args])
+            applied = write_many(spec, [args.args], dry_run=args.dry_run)
         elif args.command == 'reset':
             if len(args.args) != 1:
                 parser.error('reset requires KEY')
             key = args.args[0].replace('_', '-')
             if not spec.has_key(key):
                 raise ValueError('Unknown Whitecube setting')
-            dconf('reset', PREFIX + key)
-            if dconf('read', PREFIX + key):
-                raise ValueError('Reset could not be verified')
+            if not args.dry_run:
+                dconf('reset', PREFIX + key)
+                if dconf('read', PREFIX + key):
+                    raise ValueError('Reset could not be verified')
+            applied = {key: None}
         else:
             settings = Gio.Settings.new_full(spec, None, None)
-            for key in sorted(spec.list_keys()):
-                val = settings.get_user_value(key)
-                print(key, val.print_(False) if val else '(inherited)', sep='\t')
+            if args.json:
+                items = {}
+                for key in sorted(spec.list_keys()):
+                    val = settings.get_user_value(key)
+                    items[key] = {'value': val.unpack() if val is not None else settings.get_value(key).unpack(),
+                                  'overridden': val is not None}
+                print(json.dumps(items, ensure_ascii=False, indent=2))
+            else:
+                for key in sorted(spec.list_keys()):
+                    val = settings.get_user_value(key)
+                    print(key, val.print_(False) if val else '(inherited)', sep='\t')
+            return
+        if args.dry_run and args.json:
+            print(json.dumps({'dry_run': True, 'keys': sorted(applied)}, indent=2))
     finally:
         if lock is not None:
             os.close(lock)

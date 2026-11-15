@@ -173,6 +173,34 @@ class PreferenceValidation(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(run('export').stdout)['settings'], complete)
 
+    def test_cli_version_json_check_and_dry_run_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prof = Path(directory) / 'p.json'
+            prof.write_text(self.profile({'tab-w': 210, 'repeat-rate': -1 if False else 35}))
+            with mock.patch.dict(os.environ, {'XDG_CONFIG_HOME': directory}, clear=False):
+                env = {**os.environ, 'XDG_CONFIG_HOME': directory}
+                ver = subprocess.run(['/usr/bin/python3', '-I', str(ROOT / 'bin/cube-preferences'), '--version'],
+                                     capture_output=True, text=True, env=env, timeout=10)
+                self.assertEqual(ver.returncode, 0)
+                self.assertIn('cube-preferences', ver.stdout)
+                chk = subprocess.run(['/usr/bin/python3', '-I', str(ROOT / 'bin/cube-preferences'), 'check', '--json', str(prof)],
+                                     capture_output=True, text=True, env=env, timeout=10)
+                self.assertEqual(chk.returncode, 0, chk.stderr)
+                parsed = json.loads(chk.stdout)
+                self.assertTrue(parsed['valid'])
+                self.assertEqual(parsed['count'], 2)
+                lst = subprocess.run(['/usr/bin/python3', '-I', str(ROOT / 'bin/cube-preferences'), 'list', '--json'],
+                                     capture_output=True, text=True, env=env, timeout=10)
+                self.assertEqual(lst.returncode, 0, lst.stderr)
+                self.assertIn('tab-w', json.loads(lst.stdout))
+                dry = subprocess.run(['/usr/bin/python3', '-I', str(ROOT / 'bin/cube-preferences'), 'set', 'tab-w', '215', '--dry-run', '--json'],
+                                     capture_output=True, text=True, env=env, timeout=10)
+                self.assertEqual(dry.returncode, 0, dry.stderr)
+                self.assertEqual(json.loads(dry.stdout), {'dry_run': True, 'keys': ['tab-w']})
+                bad_dir = subprocess.run(['/usr/bin/python3', '-I', str(ROOT / 'bin/cube-preferences'), 'check', directory],
+                                         capture_output=True, text=True, env=env, timeout=10)
+                self.assertNotEqual(bad_dir.returncode, 0)
+
 
 if __name__ == '__main__':
     unittest.main()
