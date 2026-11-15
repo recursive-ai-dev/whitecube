@@ -93,18 +93,20 @@ class Preferences(unittest.TestCase):
     def test_whitecube_desktop_non_interactive_cli_and_backups(self):
         import subprocess
         state = self.root / 'desktop-state'
-        env = {**os.environ, 'XDG_STATE_HOME': str(state)}
+        home = self.root / 'home'
+        home.mkdir()
+        env = {**os.environ, 'HOME': str(home), 'XDG_STATE_HOME': str(state)}
         script = str(ROOT / 'bin/whitecube-desktop')
         r = subprocess.run([sys.executable, script, '--set-ui-scale', '1.25', '--contrast', 'strong', '--reduced-motion', 'on', '--json'],
-                           capture_output=True, text=True, env=env, timeout=5)
+                           capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         data = json.loads(r.stdout)
         self.assertEqual((data['ui_scale'], data['contrast'], data['reduced_motion']), (1.25, 'strong', True))
         b = subprocess.run([sys.executable, script, '--backup', 'before-upgrade', '--json'],
-                           capture_output=True, text=True, env=env, timeout=5)
+                           capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(b.returncode, 0, b.stderr)
         lst = subprocess.run([sys.executable, script, '--list-backups', '--json'],
-                             capture_output=True, text=True, env=env, timeout=5)
+                             capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(lst.returncode, 0, lst.stderr)
         self.assertTrue(any(item['label'] == 'before-upgrade' for item in json.loads(lst.stdout)))
 

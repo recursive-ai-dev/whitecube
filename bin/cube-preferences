@@ -74,7 +74,7 @@ def validate(spec, name, text):
 
 def dconf(*args, input=None):
     result = subprocess.run(['/usr/bin/dconf', *args], input=input, text=True,
-                            capture_output=True, timeout=10)
+                            capture_output=True, timeout=30)
     if result.returncode:
         raise ValueError(result.stderr.strip() or 'dconf did not save the change')
     return result.stdout.strip()

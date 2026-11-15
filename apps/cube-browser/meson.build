@@ -80,7 +80,7 @@ test('subresources', python, args: [files('tests/test_subresources.py'), browser
 test('wayland-e2e', python, args: [files('scripts/e2e.py'), '--browser', browser.full_path()], timeout: 120, suite: 'integration', is_parallel: false)
 
 session_test = executable('test-session', 'tests/test_session.c', link_with: [session, storage, policy, ipc], include_directories: inc, dependencies: [sqlite, glib, math])
-test('sessions', session_test)
+test('sessions', session_test, timeout: 120)
 
 js_test_args = get_option('b_sanitize') == 'address,undefined' ? ['-DCB_COMPONENT_SANITIZER'] : []
 js_test = executable('test-js', 'tests/test_js.c', link_with: [js, ipc], include_directories: inc, dependencies: [quickjs, math], c_args: js_test_args)

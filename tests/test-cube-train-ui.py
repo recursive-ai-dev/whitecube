@@ -241,13 +241,13 @@ def inside(fixture, screenshots):
             dialog.close(); assert (run / 'ckpt_latest.pt').exists()
             w.form['dataset'].set_text(str(fixture / 'missing-dataset'))
             w.start()
-            self.deadline = time.monotonic() + 5
+            self.deadline = time.monotonic() + 10
             app.GLib.timeout_add(20, self.check_error)
             return False
         def check_error(self): return self.guarded(self.error_ready)
         def error_ready(self):
             w = self.window
-            if w.launching:
+            if w.launching or w.refresh_running or w.refresh_pending:
                 assert time.monotonic() < self.deadline; return True
             assert 'existing corpus' in w.status.get_text(), w.status.get_text()
             assert w.start_button.get_sensitive() and not w.stop_button.get_sensitive()

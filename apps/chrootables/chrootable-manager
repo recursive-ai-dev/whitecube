@@ -344,7 +344,7 @@ operation_is_alive() {
     current=$(process_start_time "${operation_state[pid]}") || return 1
     [[ $current == "${operation_state[process_start]}" ]]
 }
-durable_sync() { sync -f -- "$1"; }
+durable_sync() { sync -- "$1"; }
 write_operation_state() {
     [[ -n ${OP_ID:-} ]] || return 0
     local temporary

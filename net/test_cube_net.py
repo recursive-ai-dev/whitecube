@@ -1397,7 +1397,7 @@ class FakeStation:
         FakeStation.instances.append(self)
 
     def run(self):
-        self.halt.wait(30)
+        self.halt.wait(300)
 
     def stop(self):
         self.halt.set()

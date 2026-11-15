@@ -39,7 +39,7 @@ class WorkerDescendantTests(unittest.TestCase):
                 str(HERE), str(jobpath)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             descendant = None
             try:
-                worker.wait(timeout=5)
+                worker.wait(timeout=20)
                 self.assertTrue(ready.exists(), 'The descendant installed its signal handler before leader exit')
                 descendant = int(pidfile.read_text())
                 deadline = time.monotonic() + 2

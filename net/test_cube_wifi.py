@@ -2062,15 +2062,29 @@ class ServiceIntegration(unittest.TestCase):
 
         def client():
             try:
-                time.sleep(2.6)
-                observed["status"] = json.loads((run_dir / "status.json").read_text())
+                deadline = time.monotonic() + 20.0
+                while time.monotonic() < deadline:
+                    if (net.signal.getsignal(signal_module.SIGTERM) is not old[0]
+                            and (run_dir / "control.sock").exists()
+                            and (run_dir / "status.json").exists()):
+                        try:
+                            status = json.loads((run_dir / "status.json").read_text())
+                        except (OSError, ValueError):
+                            status = {}
+                        if status.get("association_state") == "COMPLETED":
+                            observed["status"] = status
+                            break
+                    time.sleep(0.05)
+                if "status" not in observed:
+                    observed["status"] = json.loads((run_dir / "status.json").read_text())
                 observed["scan"] = net.control_call("scan")
                 observed["reload"] = net.control_call("reload")
                 observed["state_after"] = stations[0].snapshot()["state"]
             except Exception as error:                          # reported by the assertions below
                 observed["error"] = repr(error)
             finally:
-                os.kill(os.getpid(), signal_module.SIGTERM)
+                if net.signal.getsignal(signal_module.SIGTERM) is not old[0]:
+                    os.kill(os.getpid(), signal_module.SIGTERM)
 
         patches = [mock.patch.object(net, "CONFIG_DIR", config), mock.patch.object(net, "RUNTIME_DIR", run_dir),
                    mock.patch.object(net, "require_root", lambda: None),
