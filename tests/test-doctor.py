@@ -433,6 +433,37 @@ class RunTests(Fixture):
         for forbidden in ("write_text", "unlink(", "rmtree", "os.remove", ".chmod(", "shutil.copy", "sudo systemctl restart"):
             self.assertNotIn(forbidden, source.split("def main")[0].replace("'sudo systemctl status", ""), forbidden)
 
+    def test_browser_check_reports_staged_dev_and_json_health(self):
+        self.assertEqual(doctor.check_browser(self.env)[0]['level'], 'info')
+        self.put('usr/bin/whitecube-browser', '')
+        self.assertEqual(doctor.check_browser(self.env)[0]['level'], 'FAIL')
+        for exe in ('cube-browser', 'cube-renderd', 'cube-netd'):
+            p = self.put(f'usr/libexec/whitecube/cube-browser/{exe}', '')
+            p.chmod(0o755)
+        self.assertEqual(doctor.check_browser(self.env)[0]['level'], 'ok')
+
+        fake_bin = self.home / '.local/bin/cube-browser'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(returncode=0, stdout=json.dumps({
+            'version': '0.12.0', 'workers': {'cube-renderd': True, 'cube-netd': True},
+            'ca_bundle': True, 'landlock_abi': 5, 'ok': True,
+        }))
+        fail_proc = mock.Mock(returncode=1, stdout=json.dumps({
+            'version': '0.12.0', 'workers': {'cube-renderd': True, 'cube-netd': False},
+            'ca_bundle': False, 'landlock_abi': 5, 'ok': False,
+        }))
+        if not Path('/usr/bin/whitecube-browser').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                self.assertEqual(doctor.check_browser(live_env)[0]['level'], 'ok')
+            with mock.patch.object(doctor.subprocess, 'run', return_value=fail_proc):
+                failed = doctor.check_browser(live_env)[0]
+                self.assertEqual(failed['level'], 'FAIL')
+                self.assertIn('cube-netd', failed['detail'])
+                self.assertIn('ca-certificates', failed['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

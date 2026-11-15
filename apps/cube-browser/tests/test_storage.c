@@ -82,7 +82,7 @@ static void config_tests(void)
         strcpy(config.homepage, bad_homepages[i]);
         assert(cb_config_validate(&config, error, sizeof(error)) == -1);
     }
-    const char *good_homepages[] = {"cube:home", "cube:settings", "https://example.org:8443/home",
+    const char *good_homepages[] = {"cube:home", "cube:settings", "cube:shortcuts", "https://example.org:8443/home",
         "file:///tmp/Cube%20Home.html", "/tmp/Cube Home.html"};
     for (size_t i = 0; i < sizeof(good_homepages) / sizeof(good_homepages[0]); i++) {
         strcpy(config.homepage, good_homepages[i]);

@@ -13,7 +13,7 @@
 
 ## Phase 3: Workspace & Applications (`workspace/`, `apps/`)
 - [x] `workspace/` (`whitecube-web` Python workspace suite)
-- [ ] `apps/cube-browser` (Native browser features, security, and DOM/rendering extensions)
+- [x] `apps/cube-browser` (Native browser features, security, and DOM/rendering extensions)
 - [ ] `apps/cube-player` (Media playback, playlist parsing, and stream handling)
 - [ ] `apps/cube-editor` (Linux ISO studio, project guards, and QEMU workflow)
 - [ ] `apps/cube-train` (GTK4 trainer, pipeline, checkpoint benchmarking, and cooling/resume)

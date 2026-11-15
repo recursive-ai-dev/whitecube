@@ -89,3 +89,13 @@
 - **Tests & Verification**:
   - Created `tests/test-workspace.py` (8 comprehensive unit and live loopback HTTP tests covering `--version`, `check --strict`, `safe_file` traversal/symlink/dotfile confinement, public catalog redaction, `DesktopStore` bounds/dangling-symlink rejection, `WorkflowStore` DAG ordering & deletion, `RecoveryConsole` credential exclusion & backup/restore/verify/delete, generic Wi-Fi health checks, frontend syntax, HTTP token/Host/Origin/Sec-Fetch-Site isolation, separate app origin rewriting, and delete APIs) and wired it into `BUILD.sh`.
   - Verified `tests/test-workspace.py` (8 tests ok), full `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-browser | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added `--check --json` diagnostic output (`health_check(..., json)` in `apps/cube-browser/src/main.c`) reporting browser version, `cube-renderd`/`cube-netd` availability, CA bundle status, Landlock ABI, Wayland socket presence, and overall readiness without creating profile/config directories, plus strict argument rejection when `--json` is used without `--check`.
+  - Added `--timeout SECONDS` (`0.1`–`3600.0`, default `45.0`) for `--render` and `--dump` in `apps/cube-browser/src/main.c` with bounds/syntax validation (`--timeout` requires `--render`/`--dump`).
+  - Added `Ctrl+K` / `F6` address-bar focus shortcuts (also dismissing open panels), `Alt+Home` home navigation, and the built-in `cube:shortcuts` internal reference page (`apps/cube-browser/src/home.h`, `src/url.c`, `src/storage.c`, `src/main.c`).
+  - Wired `check_browser(env)` and the `'browser'` check group into `bin/whitecube-doctor`, checking staged workers or invoking `cube-browser --check --json`.
+- **Tests & Verification**:
+  - Extended `apps/cube-browser/tests/test_app.py` (`test_check_json_timeout_and_shortcuts_page`), `apps/cube-browser/tests/test_core.c`, `apps/cube-browser/tests/test_storage.c`, and `tests/test-doctor.py` (`test_browser_check_reports_staged_dev_and_json_health`).
+  - Verified targeted Meson tests (`cli-and-installer`, `ipc-and-address`, `storage`), `tests/test-doctor.py` (49 tests ok), full `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

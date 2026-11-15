@@ -213,4 +213,67 @@ class AppTests(unittest.TestCase):
                 paths = [request.split(b' ', 2)[1] for request in server.requests]
                 self.assertEqual(paths, [b'/page'], 'renderer-initiated action must not cause a network request')
 
+    def test_check_json_timeout_and_shortcuts_page(self):
+        for args in (('--check', '--json'), ('--json', '--check')):
+            res = self.run_browser(*args)
+            self.assertEqual(res.returncode, 0, res.stderr)
+            payload = json.loads(res.stdout)
+            self.assertTrue(payload['ok'])
+            self.assertTrue(payload['workers']['cube-renderd'])
+            self.assertTrue(payload['workers']['cube-netd'])
+            self.assertTrue(payload['ca_bundle'])
+            self.assertIsInstance(payload['landlock_abi'], int)
+        self.assertFalse((self.home/'data').exists())
+        self.assertFalse((self.home/'config').exists())
+
+        self.assertEqual(self.run_browser('--json').returncode, 2)
+        for bad in (('--timeout', '0', '--dump', 'cube:home'),
+                    ('--timeout', '0.05', '--dump', 'cube:home'),
+                    ('--timeout', 'abc', '--dump', 'cube:home'),
+                    ('--timeout', '5')):
+            self.assertEqual(self.run_browser(*bad).returncode, 2)
+
+        app = self.home/'incomplete-json'
+        app.mkdir()
+        shutil.copy2(BROWSER, app/'cube-browser')
+        bad_check = subprocess.run([str(app/'cube-browser'), '--check', '--json'], env=self.env,
+                                   capture_output=True, text=True, timeout=5)
+        self.assertEqual(bad_check.returncode, 1)
+        bad_payload = json.loads(bad_check.stdout)
+        self.assertFalse(bad_payload['ok'])
+        self.assertFalse(bad_payload['workers']['cube-renderd'])
+
+        shortcuts = self.run_browser('--dump', 'cube:shortcuts')
+        self.assertEqual(shortcuts.returncode, 0, shortcuts.stderr)
+        self.assertIn('Ctrl+K', shortcuts.stdout)
+        self.assertIn('--check --json', shortcuts.stdout)
+
+        import socket, threading
+        ready = threading.Event()
+        stop = threading.Event()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(('127.0.0.1', 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+
+        def stall():
+            ready.set()
+            try:
+                conn, _ = srv.accept()
+                stop.wait(5)
+                conn.close()
+            except OSError:
+                pass
+            srv.close()
+
+        thread = threading.Thread(target=stall, daemon=True)
+        thread.start()
+        ready.wait(2)
+        try:
+            timed = self.run_browser('--timeout', '0.1', '--dump', f'http://127.0.0.1:{port}/slow')
+            self.assertEqual(timed.returncode, 1)
+        finally:
+            stop.set()
+            thread.join(timeout=2)
+
 if __name__ == '__main__': unittest.main()

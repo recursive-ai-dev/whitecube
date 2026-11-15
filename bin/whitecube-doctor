@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -470,6 +470,48 @@ def check_audio(env):
     return out
 
 
+def check_browser(env):
+    """Verify Cube Browser binaries and Landlock/worker sandbox prerequisites."""
+    candidates = [env.at('/usr/bin/whitecube-browser')]
+    if env.root == Path('/'):
+        candidates.extend([
+            env.home / '.local/bin/cube-browser',
+            env.project / 'build/cube-browser/cube-browser',
+            env.project / 'apps/cube-browser/build/cube-browser',
+        ])
+    browser = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if browser is None:
+        return [finding('info', 'browser', 'cube-browser is not installed or built in this environment',
+                        'build apps/cube-browser or install whitecube-desktop')]
+    if env.root != Path('/'):
+        libexec = env.at('/usr/libexec/whitecube/cube-browser')
+        workers_ok = all((libexec / name).is_file() and os.access(libexec / name, os.X_OK)
+                         for name in ('cube-browser', 'cube-renderd', 'cube-netd'))
+        if not workers_ok:
+            return [finding('FAIL', 'browser', 'staged cube-browser workers missing or not executable',
+                            'rebuild apps/cube-browser and re-run packaging/install-tree.sh')]
+        return [finding('ok', 'browser', 'staged cube-browser and sandboxed workers present')]
+    if not os.access(browser, os.X_OK):
+        return [finding('WARN', 'browser', f'{browser} is not executable', f'chmod 0755 {browser}')]
+    try:
+        proc = subprocess.run([str(browser), '--check', '--json'], capture_output=True, text=True, timeout=5)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'browser', f'could not query cube-browser diagnostics: {error}',
+                        f'{browser} --check')]
+    if data.get('ok'):
+        return [finding('ok', 'browser',
+                        f'cube-browser {data.get("version", "?")} ready (Landlock ABI {data.get("landlock_abi", "?")})')]
+    issues = [name for name, ok in data.get('workers', {}).items() if not ok]
+    if not data.get('ca_bundle'):
+        issues.append('ca-certificates')
+    if data.get('landlock_abi', -1) < 3:
+        issues.append(f'landlock-abi={data.get("landlock_abi")}')
+    return [finding('FAIL', 'browser',
+                    'cube-browser check failed: ' + (', '.join(issues) or 'unknown issue'),
+                    f'{browser} --check')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -489,6 +531,7 @@ def run_checks(env, selected=None):
         'session': (lambda: check_session(env),),
         'folders': (lambda: check_folder_handler(env),),
         'audio': (lambda: check_audio(env),),
+        'browser': (lambda: check_browser(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

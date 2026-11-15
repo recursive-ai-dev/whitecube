@@ -32,9 +32,31 @@ static const char cb_about[] =
 "<p>Native windows, address/search bar, desktop tabs, back/forward, reload, anchors, scrolling, zoom, find, private browsing, local history, bookmarks, categorized settings, privacy and download preferences, per-site script choices, downloads and console/network diagnostics. HTTP/1.1 uses verified TLS for HTTPS. PNG screenshots and text export use the same engine.</p>"
 "<h2>Still to build</h2><p>Complete CSS and DOM support, modules, iframes, file uploads, more image formats, audio/video, WebGL, extensions, HTTP/2 and HTTP/3, IME and advanced Wayland scaling. Complex web apps may render or behave incorrectly.</p>"
 "<p>Network, document layout and raster tasks run separately under resource, filesystem and system-call restrictions. This preview has not undergone an independent security audit.</p>"
-"<h2>Keyboard</h2><p>Ctrl+L: address &bull; Ctrl+T/W: new desktop tab/close &bull; Alt+Left/Right: back/forward &bull; Ctrl+R: reload &bull; Ctrl+H: history &bull; Ctrl+D: bookmark &bull; Ctrl+Shift+B: bookmarks &bull; Ctrl+Shift+P: private window &bull; Ctrl+F: find &bull; Ctrl+plus/minus/0: zoom &bull; Ctrl+comma: settings &bull; F12: diagnostics &bull; Ctrl+S: save current URL &bull; Ctrl+J: downloads &bull; Escape: cancel download or close panel.</p>"
+"<h2>Keyboard</h2><p>Ctrl+L / Ctrl+K / F6: address &bull; Ctrl+T/W: new desktop tab/close &bull; Alt+Left/Right: back/forward &bull; Alt+Home: home &bull; Ctrl+R: reload &bull; Ctrl+H: history &bull; Ctrl+D: bookmark &bull; Ctrl+Shift+B: bookmarks &bull; Ctrl+Shift+P: private window &bull; Ctrl+F: find &bull; Ctrl+plus/minus/0: zoom &bull; Ctrl+comma: settings &bull; F12: diagnostics &bull; Ctrl+S: save current URL &bull; Ctrl+J: downloads &bull; Escape: cancel download or close panel.</p>"
 "<p>Tab/Shift+Tab: next/previous link or control &bull; Enter: activate or submit &bull; Ctrl+A/C/X/V: select/copy/cut/paste in a field. Passwords cannot be copied or cut.</p>"
-"<p><a href='cube:home'>Return home</a></p></body></html>";
+"<p><a href='cube:shortcuts'>Keyboard &amp; CLI reference</a> &middot; <a href='cube:home'>Return home</a></p></body></html>";
+static const char cb_shortcuts[] =
+"<!doctype html><html><head><title>Shortcuts &amp; CLI — Cube Browser</title><style>"
+"body{padding:48px;max-width:860px;background:#ffffff;color:#111111;font-family:sans-serif;}"
+"h1,h2{margin:16px 0 8px;}p{line-height:1.45;margin:8px 0;}code{background:#f0f0f0;padding:2px 5px;}"
+"a{color:#256357;}</style></head><body>"
+"<h1>Cube Browser " CB_VERSION " · Shortcuts &amp; CLI</h1>"
+"<h2>Navigation &amp; Windows</h2>"
+"<p><code>Ctrl+L</code>, <code>Ctrl+K</code>, or <code>F6</code> focuses the address bar. "
+"<code>Alt+Home</code> opens your configured home page. "
+"<code>Alt+Left</code>/<code>Alt+Right</code> moves back/forward. "
+"<code>Ctrl+R</code> or <code>F5</code> reloads. "
+"<code>Ctrl+T</code> opens a desktop tab; <code>Ctrl+Shift+P</code> opens a private window; <code>Ctrl+W</code> closes.</p>"
+"<h2>Pages, Bookmarks &amp; Panels</h2>"
+"<p><code>Ctrl+D</code> toggles a bookmark. <code>Ctrl+Shift+B</code> opens <code>cube:bookmarks</code>. "
+"<code>Ctrl+H</code> opens <code>cube:history</code>. <code>Ctrl+F</code> / <code>F3</code> finds in page. "
+"<code>Ctrl+,</code> opens settings, <code>F12</code> opens console/network diagnostics, "
+"<code>Ctrl+S</code> saves the current URL, and <code>Ctrl+J</code> opens downloads.</p>"
+"<h2>Headless &amp; Diagnostics CLI</h2>"
+"<p><code>--dump URL</code> prints page text, <code>--render URL OUT.png [WxH]</code> writes a PNG, "
+"<code>--timeout SECONDS</code> sets the headless load deadline (0.1–3600s), and "
+"<code>--check --json</code> prints machine-readable worker and sandbox diagnostics.</p>"
+"<p><a href='cube:home'>Home</a> &middot; <a href='cube:about'>About</a></p></body></html>";
 static const char cb_private_home[] =
 "<!doctype html><html><head><title>Private browsing — Cube Browser</title><style>"
 "body{background:#f4f1fa;color:#272138;font-family:sans-serif;margin:0;padding:48px;}"

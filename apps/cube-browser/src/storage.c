@@ -131,7 +131,8 @@ static bool homepage_url(const char *url)
 {
     if (!strcmp(url,"cube:home") || !strcmp(url,"cube:start") ||
         !strcmp(url,"cube:history") || !strcmp(url,"cube:bookmarks") ||
-        !strcmp(url,"cube:about") || !strcmp(url,"cube:settings")) return true;
+        !strcmp(url,"cube:about") || !strcmp(url,"cube:settings") ||
+        !strcmp(url,"cube:shortcuts")) return true;
     if (url[0] == '/' || !strncmp(url,"file:///",8)) return !strchr(url,'\\');
     struct cb_http_url parsed;
     return !cb_http_parse(url,&parsed);

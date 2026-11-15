@@ -287,6 +287,7 @@ static void navigate_request(struct browser*b,const char*input,bool history,bool
     b->bookmarked=cb_bookmark_contains(url)==1;
     if(!strcmp(url,"cube:home"))fd=cb_document_fd(b->private_mode?cb_private_home:cb_home,strlen(b->private_mode?cb_private_home:cb_home));
     else if(!strcmp(url,"cube:about"))fd=cb_document_fd(cb_about,strlen(cb_about));
+    else if(!strcmp(url,"cube:shortcuts"))fd=cb_document_fd(cb_shortcuts,strlen(cb_shortcuts));
     else if(!strcmp(url,"cube:bookmarks")){char*h=cb_bookmarks_html();if(h){fd=cb_document_fd(h,strlen(h));free(h);}}
     else if(!strcmp(url,"cube:history")){char*h=b->private_mode?strdup(cb_private_history):cb_history_html();if(h){fd=cb_document_fd(h,strlen(h));free(h);}}
     else if(g_str_has_prefix(url,"file:///")){
@@ -912,7 +913,7 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     if(sym==XKB_KEY_F12||(ctrl&&shift&&lower==XKB_KEY_j)){panel_open(b,2);return;}
     if(ctrl&&lower==XKB_KEY_j){panel_open(b,3);return;}
     if(ctrl&&lower==XKB_KEY_s){download_start(b);return;}
-    if(b->panel&&!(ctrl&&(lower==XKB_KEY_l||lower==XKB_KEY_w||lower==XKB_KEY_r))){
+    if(b->panel&&!(sym==XKB_KEY_F6||(ctrl&&(lower==XKB_KEY_l||lower==XKB_KEY_k||lower==XKB_KEY_w||lower==XKB_KEY_r)))){
         if(sym==XKB_KEY_Escape){if(b->panel==3&&b->download_state==1)download_cancel(b);else b->panel=0;}
         else if(b->panel==1){
             if(sym==XKB_KEY_Left||sym==XKB_KEY_Right){b->settings_category=(b->settings_category+(sym==XKB_KEY_Right?1:4))%5;b->panel_selected=0;b->settings_error[0]=0;}
@@ -924,7 +925,7 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
         else if(b->panel==3&&ctrl&&lower==XKB_KEY_c&&*b->download_path)cb_window_copy(b->window,b->download_path);
         dirty(b);return;
     }
-    if(ctrl&&lower==XKB_KEY_l){b->panel=0;blur_page(b);b->address_focus=true;b->find_focus=false;b->select_all=true;b->cursor=strlen(b->address);}
+    if((ctrl&&(lower==XKB_KEY_l||lower==XKB_KEY_k))||sym==XKB_KEY_F6){b->panel=0;blur_page(b);b->address_focus=true;b->find_focus=false;b->select_all=true;b->cursor=strlen(b->address);}
     else if(ctrl&&lower==XKB_KEY_t)new_tab(b);
     else if(ctrl&&lower==XKB_KEY_w)cb_window_close(b->window);
     else if(ctrl&&lower==XKB_KEY_h)navigate(b,"cube:history",true,false);
@@ -933,6 +934,7 @@ static void key(void*data,xkb_keysym_t sym,const char*utf8,bool ctrl,bool shift,
     else if(sym==XKB_KEY_F3)find_next(b);
     else if(alt&&sym==XKB_KEY_Left)go(b,-1);
     else if(alt&&sym==XKB_KEY_Right)go(b,1);
+    else if(alt&&sym==XKB_KEY_Home)navigate(b,b->config.homepage,true,false);
     else if(ctrl&&(sym==XKB_KEY_plus||sym==XKB_KEY_equal||sym==XKB_KEY_minus||sym==XKB_KEY_0)){
         struct cb_config next=b->config;next.zoom=sym==XKB_KEY_0?1:fmax(.5,fmin(3,b->zoom+(sym==XKB_KEY_minus?-.1:.1)));
         apply_preferences(b,&next,false);
@@ -981,26 +983,36 @@ static void cleanup(struct browser*b){
     if(b->config.clear_on_exit&&!b->private_mode){cb_session_clear(b->session);if(cb_history_clear())fprintf(stderr,"cube-browser: could not clear history on exit\n");}
     cb_session_close(b->session);free_frame(b);for(int i=0;i<b->trail_count;i++)free(b->trail[i]);cb_window_free(b->window);
 }
-static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [--settings] [--] [URL | HTML-or-image-file]\n       cube-browser --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser --dump URL\n       cube-browser --check\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L address, Ctrl+T desktop tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+D bookmark, Ctrl+Shift+B bookmarks, Ctrl+Shift+P private window.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
-static int health_check(const char *directory){
+static void usage(void){puts("Cube Browser " CB_VERSION " — native interactive-web preview\nUsage: cube-browser [--private] [--console] [--settings] [--] [URL | HTML-or-image-file]\n       cube-browser [--timeout SECONDS] --render URL OUTPUT.png [WIDTHxHEIGHT]\n       cube-browser [--timeout SECONDS] --dump URL\n       cube-browser --check [--json]\n       cube-browser --quit-after SECONDS [URL]\nCtrl+L / Ctrl+K / F6 address, Alt+Home home, Ctrl+T tab, Ctrl+H history, Ctrl+F find, Ctrl+R reload.\nCtrl+D bookmark, Ctrl+Shift+B bookmarks, Ctrl+Shift+P private window, cube:shortcuts help.\nCtrl+comma settings, F12 diagnostics, Ctrl+S save current URL, Ctrl+J downloads.\nTab/Shift+Tab focus links and controls; Enter activates/submits.\nSupports bounded HTML/CSS, JavaScript/DOM, GET/POST forms, cookies and storage.\nComplete web APIs, modules, file uploads and audio/video remain unsupported.");}
+static int health_check(const char *directory,bool json){
     int failures=0;char path[PATH_MAX];struct stat st;
-    puts("Cube Browser " CB_VERSION " · installation check");
     const char *workers[]={"cube-renderd","cube-netd"};
+    bool worker_ok[2]={false,false};
     for(unsigned i=0;i<2;i++){
         int n=snprintf(path,sizeof path,"%s/%s",directory,workers[i]);
-        bool ok=n>0&&(size_t)n<sizeof path&&!stat(path,&st)&&S_ISREG(st.st_mode)&&!access(path,X_OK);
-        printf("%s: %s\n",workers[i],ok?"OK":"MISSING or not executable");failures+=!ok;
+        worker_ok[i]=n>0&&(size_t)n<sizeof path&&!stat(path,&st)&&S_ISREG(st.st_mode)&&!access(path,X_OK);
+        failures+=!worker_ok[i];
     }
     bool ca=!stat(CB_CA_BUNDLE,&st)&&S_ISREG(st.st_mode)&&st.st_size>0&&!access(CB_CA_BUNDLE,R_OK);
-    printf("HTTPS certificates: %s\n",ca?"OK":"MISSING (install ca-certificates)");failures+=!ca;
+    failures+=!ca;
     int abi=(int)syscall(SYS_landlock_create_ruleset,NULL,0,LANDLOCK_CREATE_RULESET_VERSION);
-    printf("Worker filesystem sandbox: Landlock ABI %d%s\n",abi,abi>=3?" (OK)":" (requires ABI 3 or newer)");failures+=abi<3;
+    failures+=abi<3;
     const char *display=getenv("WAYLAND_DISPLAY"),*runtime=getenv("XDG_RUNTIME_DIR"),*socket=getenv("WAYLAND_SOCKET");
     bool wayland=socket&&*socket;
     if(display&&*display){
         int n=display[0]=='/'?snprintf(path,sizeof path,"%s",display):snprintf(path,sizeof path,"%s/%s",runtime?runtime:"",display);
         wayland=n>0&&(size_t)n<sizeof path&&!stat(path,&st)&&S_ISSOCK(st.st_mode);
     }
+    if(json){
+        printf("{\"version\":\"%s\",\"workers\":{\"%s\":%s,\"%s\":%s},\"ca_bundle\":%s,\"landlock_abi\":%d,\"wayland\":%s,\"ok\":%s}\n",
+            CB_VERSION,workers[0],worker_ok[0]?"true":"false",workers[1],worker_ok[1]?"true":"false",
+            ca?"true":"false",abi,wayland?"true":"false",failures==0?"true":"false");
+        return failures?1:0;
+    }
+    puts("Cube Browser " CB_VERSION " · installation check");
+    for(unsigned i=0;i<2;i++)printf("%s: %s\n",workers[i],worker_ok[i]?"OK":"MISSING or not executable");
+    printf("HTTPS certificates: %s\n",ca?"OK":"MISSING (install ca-certificates)");
+    printf("Worker filesystem sandbox: Landlock ABI %d%s\n",abi,abi>=3?" (OK)":" (requires ABI 3 or newer)");
     printf("Desktop: %s\n",wayland?"Wayland socket available":"No Wayland socket · use a Wayland session for windows; --render/--dump work headlessly");
     puts("This checks installation prerequisites; run --dump cube:home to exercise the worker sandboxes.");
     return failures?1:0;
@@ -1011,10 +1023,18 @@ int main(int argc,char**argv){
     ssize_t n=readlink("/proc/self/exe",b.executable,sizeof(b.executable)-1);if(n<0)return 1;b.executable[n]=0;snprintf(b.directory,sizeof(b.directory),"%s",b.executable);char*slash=strrchr(b.directory,'/');if(!slash)return 1;*slash=0;
     if(argc==2&&(!strcmp(argv[1],"--help")||!strcmp(argv[1],"-h"))){usage();return 0;}
     if(argc==2&&!strcmp(argv[1],"--version")){puts("cube-browser " CB_VERSION " (interactive-web preview)");return 0;}
-    if(argc==2&&!strcmp(argv[1],"--check"))return health_check(b.directory);
+    bool want_check=false,want_json=false,other_arg=false;
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"--"))break;
+        if(!strcmp(argv[i],"--check"))want_check=true;
+        else if(!strcmp(argv[i],"--json"))want_json=true;
+        else other_arg=true;
+    }
+    if(want_check&&!other_arg)return health_check(b.directory,want_json);
+    if(want_check||want_json){usage();return 2;}
     char error[256];cb_config_defaults(&b.config);if(cb_config_load(&b.config,error,sizeof(error)))fprintf(stderr,"cube-browser: %s\n",error);
     cb_accessibility_load(&b.acc);b.scale=b.acc.ui_scale;b.zoom=b.config.zoom;
-    const char *url=b.config.homepage,*output=NULL;bool dump=false,positional=false,explicit_url=false,open_settings=false;double seconds=0;int width=1120,height=800;
+    const char *url=b.config.homepage,*output=NULL;bool dump=false,positional=false,explicit_url=false,open_settings=false,timeout_set=false;double seconds=0,timeout=45.0;int width=1120,height=800;
     for(int i=1;i<argc;i++){
         if(positional){if(explicit_url){usage();return 2;}url=argv[i];explicit_url=true;continue;}
         if(!strcmp(argv[i],"--")){positional=true;continue;}
@@ -1025,9 +1045,11 @@ int main(int argc,char**argv){
         else if(!strcmp(argv[i],"--settings"))open_settings=true;
         else if(!strcmp(argv[i],"--render")&&i+2<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];output=argv[++i];b.private_mode=true;if(i+1<argc&&argv[i+1][0]!='-'){char tail;if(sscanf(argv[++i],"%dx%d%c",&width,&height,&tail)!=2){usage();return 2;}}}
         else if(!strcmp(argv[i],"--dump")&&i+1<argc){if(output||dump||explicit_url){usage();return 2;}explicit_url=true;url=argv[++i];dump=true;b.private_mode=true;}
+        else if(!strcmp(argv[i],"--timeout")&&i+1<argc){char*end;timeout=strtod(argv[++i],&end);if(*end||!isfinite(timeout)||timeout<0.1||timeout>3600){usage();return 2;}timeout_set=true;}
         else if(!strcmp(argv[i],"--quit-after")&&i+1<argc){char*end;seconds=strtod(argv[++i],&end);if(*end||!isfinite(seconds)||seconds<=0||seconds>3600)return 2;}
         else if(argv[i][0]=='-'){usage();return 2;}else {if(explicit_url){usage();return 2;}url=argv[i];explicit_url=true;}
     }
+    if(timeout_set&&!output&&!dump){fprintf(stderr,"--timeout requires --render or --dump.\n");return 2;}
     char local_url[4096];
     if(explicit_url&&url[0]!='/'&&!strchr(url,':')&&!access(url,F_OK)){
         char *path=g_canonicalize_filename(url,NULL);
@@ -1040,7 +1062,7 @@ int main(int argc,char**argv){
     cb_session_configure(b.session,&b.config);
     if(output||dump){
         if(open_settings){fprintf(stderr,"--settings requires a browser window.\n");cleanup(&b);return 2;}
-        navigate(&b,url,true,false);double deadline=now()+45;
+        navigate(&b,url,true,false);double deadline=now()+timeout;
         while((loading(&b)||b.layout_pending||b.relayout||b.anchor_needed||b.anchor_pending||(b.script_busy&&now()<b.script_settle))&&now()<deadline){tick(&b);poll(NULL,0,10);}
         if(!b.frame||loading(&b)||b.layout_pending||b.relayout||b.anchor_needed||b.anchor_pending){fprintf(stderr,"cube-browser: %s (no completed frame)\n",b.status);cleanup(&b);return 1;}
         int result=b.error?1:0;
