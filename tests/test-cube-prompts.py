@@ -107,6 +107,127 @@ class ClaudeTest(unittest.TestCase):
         self.assertNotIn('temperature', sent)
 
 
+class HeadlessCliAndHardeningTests(unittest.TestCase):
+    def test_launcher_version_and_cli_doctor_never_create_state(self):
+        from prompt_manager import __version__
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {
+                'PATH': '/usr/bin:/bin',
+                'HOME': str(Path(tmp) / 'home'),
+                'XDG_DATA_HOME': str(Path(tmp) / 'data'),
+                'XDG_CONFIG_HOME': str(Path(tmp) / 'config'),
+            }
+            ver = subprocess.run([str(ROOT / 'bin/cube-prompts'), '--version'],
+                                 env=env, capture_output=True, text=True, check=True, timeout=10)
+            self.assertEqual(ver.stdout.strip(), f'cube-prompts {__version__}')
+
+            doc = subprocess.run([str(ROOT / 'bin/cube-prompts'), '--cli', 'doctor', '--json'],
+                                 env=env, capture_output=True, text=True, check=True, timeout=10)
+            report = json.loads(doc.stdout)
+            self.assertEqual(report['format'], 'cube-prompts-diagnostics')
+            self.assertTrue(report['ready'])
+            self.assertFalse(report['db_exists'])
+            self.assertFalse((Path(tmp) / 'data').exists())
+            self.assertFalse((Path(tmp) / 'config').exists())
+
+    def test_cli_list_show_render_export_and_import_round_trip(self):
+        from prompt_manager import cli
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / 'prompts.db'
+            export_path = root / 'backup.json'
+            buf_out = os.path.join(tmp, 'out')
+            env = {
+                'PATH': '/usr/bin:/bin',
+                'HOME': str(root / 'home'),
+                'XDG_DATA_HOME': str(root / 'data'),
+                'XDG_CONFIG_HOME': str(root / 'config'),
+            }
+            listed = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'list', '--db', str(db_path), '--json'],
+                env=env, capture_output=True, text=True, check=True, timeout=15,
+            )
+            prompts = json.loads(listed.stdout)
+            self.assertGreaterEqual(len(prompts), 3)
+            first = prompts[0]
+
+            shown = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'show', first['title'], '--db', str(db_path), '--json'],
+                env=env, capture_output=True, text=True, check=True, timeout=15,
+            )
+            self.assertEqual(json.loads(shown.stdout)['id'], first['id'])
+
+            rendered = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'render', first['id'],
+                 '--db', str(db_path), '--format', 'anthropic', '--json'],
+                env=env, capture_output=True, text=True, check=True, timeout=15,
+            )
+            payload = json.loads(rendered.stdout)
+            self.assertEqual(payload['format'], 'anthropic')
+            self.assertNotIn('temperature', payload['output'])
+
+            strict_fail = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'render', first['id'],
+                 '--db', str(db_path), '--strict'],
+                env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertNotEqual(strict_fail.returncode, 0)
+
+            exported = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'export', str(export_path),
+                 '--db', str(db_path), '--json'],
+                env=env, capture_output=True, text=True, check=True, timeout=15,
+            )
+            self.assertEqual(json.loads(exported.stdout)['count'], len(prompts))
+            self.assertEqual(cli.cmd_show.__name__, 'cmd_show')
+
+            second_db = root / 'imported.db'
+            imported = subprocess.run(
+                [str(ROOT / 'bin/cube-prompts'), '--cli', 'import', str(export_path),
+                 '--db', str(second_db), '--json'],
+                env=env, capture_output=True, text=True, check=True, timeout=15,
+            )
+            self.assertEqual(json.loads(imported.stdout)['imported'], len(prompts))
+            self.assertFalse(Path(buf_out).exists())
+
+    def test_non_regular_fifo_and_symlink_files_rejected_without_blocking(self):
+        from prompt_manager import config
+        from prompt_manager.core import keychain
+        from prompt_manager.storage import backup
+        from prompt_manager.storage.database import Database
+        from prompt_manager.storage.repository import PromptRepository
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fifo = root / 'pipe.json'
+            os.mkfifo(fifo)
+            target = root / 'real.json'
+            target.write_text('{"theme": "dracula"}', encoding='utf-8')
+            link = root / 'link.json'
+            link.symlink_to(target)
+
+            with self.assertRaises(ValueError):
+                config.read_regular_text(fifo)
+            with self.assertRaises((OSError, ValueError)):
+                config.read_regular_text(link)
+
+            oversize = root / 'big.json'
+            oversize.write_text('x' * 64, encoding='utf-8')
+            with self.assertRaises(ValueError):
+                config.read_regular_text(oversize, max_bytes=16)
+
+            vault = keychain.KeyVault(private_file=fifo)
+            vault._probed, vault._cached_backend = True, None
+            with self.assertRaises(keychain.CredentialStoreError):
+                vault._read_private()
+
+            repo = PromptRepository(Database(root / 'db.sqlite'))
+            with self.assertRaises((OSError, ValueError)):
+                backup.import_library_from_json(repo, fifo)
+            with self.assertRaises((OSError, ValueError)):
+                backup.import_library_from_csv(repo, fifo)
+
+
 def inside_gui(screenshot):
     import app
     from prompt_manager.integrations.llm_providers import LLMResponse

@@ -19,7 +19,7 @@
 - [x] `apps/cube-train` (GTK4 trainer, pipeline, checkpoint benchmarking, and cooling/resume)
 - [x] `apps/cube-strap` (`whitecube-vm` UEFI VM builder and management)
 - [x] `apps/chrootables` (`cube-chrootables` & `whitecube-chrootable-manager`)
-- [ ] `apps/cube-prompts` (SQLite prompt library, templates, and multi-model runner)
+- [x] `apps/cube-prompts` (SQLite prompt library, templates, and multi-model runner)
 - [ ] `apps/desktop-chat` (Electron chat, local model server bridge, search/drafts)
 - [ ] `apps/wc-suite` & `apps/cube-apps` (CLI suite, completions, and native file utilities)
 

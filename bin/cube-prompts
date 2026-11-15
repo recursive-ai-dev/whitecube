@@ -1,11 +1,42 @@
 #!/usr/bin/python3 -I
-"""Launch the installed or checkout copy of cube-prompts."""
+"""Launch the GTK4 UI or headless CLI of cube-prompts from an install or checkout."""
+import ast
 import os
 from pathlib import Path
 import sys
 
 root = Path(__file__).resolve().parent.parent
 locations = [root / 'apps/cube-prompts', root / 'share/whitecube/cube-prompts']
+app_dir = next((d for d in locations if (d / 'prompt_manager/__init__.py').is_file()), None)
+
+
+def _read_version() -> str:
+    if app_dir is not None:
+        init_file = app_dir / 'prompt_manager/__init__.py'
+        tree = ast.parse(init_file.read_text(encoding='utf-8'))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == '__version__'
+                for t in node.targets
+            ):
+                value = ast.literal_eval(node.value)
+                if isinstance(value, str):
+                    return value
+    return '2.0.0'
+
+
+if sys.argv[1:] == ['--version']:
+    print(f'cube-prompts {_read_version()}')
+    raise SystemExit(0)
+
+if len(sys.argv) >= 2 and sys.argv[1] == '--cli':
+    if app_dir is None:
+        print('cube-prompts: application files are missing; reinstall whitecube-desktop', file=sys.stderr)
+        raise SystemExit(1)
+    sys.path.insert(0, str(app_dir))
+    from prompt_manager.cli import main as cli_main
+    raise SystemExit(cli_main(sys.argv[2:] or ['--help']))
+
 for directory in locations:
     if (directory / 'app.py').is_file():
         os.execv('/usr/bin/python3', ['python3', '-I', str(directory / 'app.py'), *sys.argv[1:]])

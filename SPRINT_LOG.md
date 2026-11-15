@@ -146,3 +146,12 @@
 - **Tests & Verification**:
   - Extended `tests/test-chrootables.py` (`bin/cube-chrootables --cli --version` and `--cli --capabilities --json`, `0o600` `save_settings()`, FIFO/bool rejection in `load_settings()` and `import_args()`) and `tests/test-doctor.py` (`test_chrootables_check_reports_staged_and_manager_readiness`).
   - Verified `tests/test-chrootables.py` (all unit/backend/helper/Qt screenshot checks), `tests/test-doctor.py` (53 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-prompts | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added GTK-free `--version` (`cube-prompts 2.0.0`) and `--cli` dispatch to `bin/cube-prompts`, backed by the new `apps/cube-prompts/prompt_manager/cli.py` subcommands (`doctor`, `list`, `show`, `render`, `export`, `import`) with `--json`, `--strict` variable checks, and read-only SQLite URI `doctor` inspection (plus updated `apps/cube-prompts/README.md`).
+  - Hardened regular non-symlink bounded file reading (`read_regular_text()` with `O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK` and `S_ISREG`) in `apps/cube-prompts/prompt_manager/config.py` (and `0o700` `ensure_directories()`), wired it into `_read_settings()`, `KeyVault._read_private()` in `core/keychain.py`, and JSON/CSV imports in `storage/backup.py`.
+  - Wired read-only `check_prompts(env)` and the `'prompts'` check group into `bin/whitecube-doctor`.
+- **Tests & Verification**:
+  - Extended `tests/test-cube-prompts.py` (`HeadlessCliAndHardeningTests`: `--version`, read-only `--cli doctor --json`, `list`/`show`/`render`/`export`/`import` round-trip, `--strict` variable failures, and non-blocking FIFO/symlink/oversize rejection in `config`, `keychain`, and `backup`) and `tests/test-doctor.py` (`test_prompts_check_reports_staged_and_cli_readiness`).
+  - Verified `tests/test-cube-prompts.py` (9 unit tests + 6-page Wayland GUI smoke), `tests/test-doctor.py` (54 tests ok), and full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

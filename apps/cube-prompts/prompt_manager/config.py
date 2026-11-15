@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import stat
 import tempfile
 from pathlib import Path
 
@@ -12,6 +13,7 @@ APP_NAME = "cube-prompts"
 APP_DISPLAY_NAME = "Cube Prompts"
 
 APP_VERSION = __version__
+MAX_CONFIG_BYTES = 1024 * 1024
 
 # XDG Base Directory specification compliance
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
@@ -41,9 +43,29 @@ DEFAULT_THEME_ID = "midnight_dark"
 
 
 def ensure_directories() -> None:
-    """Ensure data and configuration directories exist."""
-    APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    """Ensure data and configuration directories exist with private permissions."""
+    APP_DATA_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    APP_CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
+def read_regular_text(path: Path, max_bytes: int = MAX_CONFIG_BYTES) -> str:
+    """Read a regular non-symlink UTF-8 file without blocking on FIFOs or unbounded files."""
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Refusing non-regular file: {path}")
+        if info.st_size > max_bytes:
+            raise ValueError(f"File exceeds {max_bytes} byte limit: {path}")
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            raw = stream.read(max_bytes + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > max_bytes:
+        raise ValueError(f"File exceeds {max_bytes} byte limit: {path}")
+    return raw.decode("utf-8")
 
 
 # ── Settings persistence (settings.json) ─────────────────────────────────
@@ -94,8 +116,8 @@ def _typed_setting(value, default):
 def _read_settings() -> dict:
     """Read settings and migrate legacy credentials into the OS keyring."""
     try:
-        data = json.loads(CONFIG_FILE_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError):
+        data = json.loads(read_regular_text(CONFIG_FILE_PATH))
+    except (FileNotFoundError, json.JSONDecodeError, UnicodeDecodeError, ValueError, OSError):
         return {}
     if not isinstance(data, dict):
         return {}

@@ -27,7 +27,7 @@ import sys
 import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
-CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables')
+CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts')
 WHITECUBE_VERSION = '0.12.0'
 
 
@@ -710,6 +710,58 @@ def check_chrootables(env):
                     f'{mgr} --doctor')]
 
 
+def check_prompts(env):
+    """Report cube-prompts launcher, runtime modules, and SQLite/FTS5 readiness."""
+    share_dir = env.at('/usr/share/whitecube/cube-prompts')
+    runtime_files = (
+        'app.py',
+        'style.css',
+        'prompt_manager/__init__.py',
+        'prompt_manager/cli.py',
+        'prompt_manager/config.py',
+        'prompt_manager/storage/database.py',
+    )
+    if env.root != Path('/'):
+        launcher = env.at('/usr/bin/cube-prompts')
+        has_any = (launcher.is_file() or launcher.is_symlink()) or share_dir.exists()
+        if not has_any:
+            return [finding('info', 'prompts', 'cube-prompts is not installed in this root',
+                            'install whitecube-desktop')]
+        missing = [name for name in runtime_files if not (share_dir / name).is_file()]
+        if not (launcher.is_file() or launcher.is_symlink()) or not os.access(launcher, os.X_OK) or missing:
+            detail = 'missing ' + ', '.join(missing) if missing else f'{launcher} missing or not executable'
+            return [finding('FAIL', 'prompts', f'staged cube-prompts incomplete ({detail})',
+                            're-run packaging/install-tree.sh')]
+        return [finding('ok', 'prompts', 'staged cube-prompts launcher and runtime present')]
+    candidates = [
+        env.at('/usr/bin/cube-prompts'),
+        env.home / '.local/bin/cube-prompts',
+        env.project / 'bin/cube-prompts',
+    ]
+    prompts_bin = next((p for p in candidates if p.is_file() or p.is_symlink()), None)
+    if prompts_bin is None:
+        return [finding('info', 'prompts', 'cube-prompts is not installed or checked out in this environment',
+                        'install whitecube-desktop')]
+    if not os.access(prompts_bin, os.X_OK):
+        return [finding('WARN', 'prompts', f'{prompts_bin} is not executable', 'ensure executable permissions on cube-prompts')]
+    try:
+        proc = subprocess.run([str(prompts_bin), '--cli', 'doctor', '--json'], capture_output=True, text=True, timeout=5)
+        data = json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        return [finding('WARN', 'prompts', f'could not query cube-prompts --cli doctor: {error}',
+                        f'{prompts_bin} --cli doctor')]
+    if not isinstance(data, dict) or data.get('format') != 'cube-prompts-diagnostics':
+        return [finding('WARN', 'prompts', 'cube-prompts --cli doctor returned unexpected JSON', f'{prompts_bin} --cli doctor')]
+    errors = [c.get('id', '?') for c in data.get('checks', []) if isinstance(c, dict) and c.get('status') == 'error']
+    warns = [c.get('id', '?') for c in data.get('checks', []) if isinstance(c, dict) and c.get('status') == 'warning']
+    if data.get('ready') and not errors:
+        note = f' (optional warnings: {", ".join(warns)})' if warns else ''
+        return [finding('ok', 'prompts', f'cube-prompts {data.get("version", "?")} SQLite {data.get("sqlite_version", "?")} ready{note}')]
+    return [finding('FAIL', 'prompts',
+                    'cube-prompts check failed: ' + (', '.join(errors) or 'unknown issue'),
+                    f'{prompts_bin} --cli doctor')]
+
+
 def run_checks(env, selected=None):
     selected = set(selected or CHECK_GROUPS)
     results = []
@@ -734,6 +786,7 @@ def run_checks(env, selected=None):
         'trainer': (lambda: check_trainer(env),),
         'vm': (lambda: check_vm(env),),
         'chrootables': (lambda: check_chrootables(env),),
+        'prompts': (lambda: check_prompts(env),),
     }
     for name, checks in groups.items():
         if name not in selected:

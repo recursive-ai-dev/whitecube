@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 import zipfile
 
+from prompt_manager.config import read_regular_text
 from prompt_manager.core.exporter import (
     _safe_float,
     _safe_int,
@@ -20,6 +21,8 @@ from prompt_manager.core.exporter import (
 )
 from prompt_manager.core.models import Folder, Prompt, PromptTemplate, Tag
 from prompt_manager.storage.repository import PromptRepository
+
+MAX_BACKUP_BYTES = 64 * 1024 * 1024
 
 
 @contextmanager
@@ -112,7 +115,7 @@ def import_library_from_json(repo: PromptRepository, filepath: Path) -> int:
     (never crash). Version 1.3 also restores revisions, variable presets and
     arena runs; older backups without these sections remain supported.
     """
-    content = filepath.read_text(encoding="utf-8")
+    content = read_regular_text(filepath, max_bytes=MAX_BACKUP_BYTES)
     data = json.loads(content)
 
     if not isinstance(data, dict):
@@ -218,7 +221,7 @@ def export_library_to_csv(repo: PromptRepository, filepath: Path) -> int:
 
 def import_library_from_csv(repo: PromptRepository, filepath: Path) -> int:
     """Import prompts from a CSV file."""
-    content = filepath.read_text(encoding="utf-8")
+    content = read_regular_text(filepath, max_bytes=MAX_BACKUP_BYTES)
     prompts = from_csv_string(content)
     with repo.db.transaction():
         for p in prompts:

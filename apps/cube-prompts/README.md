@@ -119,6 +119,9 @@ checks can exercise an extracted package with `--app-dir PATH/usr/lib/cube-promp
 They cover editing, live forms, presets, revision diffs, failed saves, custom
 models, progress, run snapshots, cancellation, and closing during a run.
 
+For headless automation without GTK/Wayland, run `cube-prompts --cli`
+(`doctor`, `list`, `show`, `render`, `export`, `import`) and `whitecube-doctor --check prompts`.
+
 Cube Prompts derives from the MIT-licensed Prompt Manager Studio core and
 Whitecube's native GTK interface. See [NOTICE](NOTICE) and
 [packaging/copyright](packaging/copyright).

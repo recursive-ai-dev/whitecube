@@ -18,7 +18,7 @@ import tempfile
 from threading import RLock
 from typing import Any, Dict, List, Optional
 
-from prompt_manager.config import APP_CONFIG_DIR
+from prompt_manager.config import APP_CONFIG_DIR, MAX_CONFIG_BYTES, read_regular_text
 
 KEYRING_SERVICE_NAME = "cube-prompts"
 VAULT_FILE_PATH = APP_CONFIG_DIR / "vault.dat"
@@ -113,7 +113,7 @@ class KeyVault:
 
     def _read_private(self) -> Dict[str, str]:
         try:
-            data = json.loads(self.private_file.read_text(encoding="utf-8"))
+            data = json.loads(read_regular_text(self.private_file, max_bytes=MAX_CONFIG_BYTES))
         except FileNotFoundError:
             return {}
         except (OSError, ValueError):

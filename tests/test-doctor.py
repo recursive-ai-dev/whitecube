@@ -641,6 +641,62 @@ class RunTests(Fixture):
                 self.assertEqual(live_warn['level'], 'WARN')
                 self.assertIn('command:debootstrap', live_warn['detail'])
 
+    def test_prompts_check_reports_staged_and_cli_readiness(self):
+        self.assertIn('prompts', doctor.CHECK_GROUPS)
+        self.assertEqual(doctor.check_prompts(self.env)[0]['level'], 'info')
+        p = self.put('usr/bin/cube-prompts', '#!/bin/sh\nexit 0\n')
+        p.chmod(0o755)
+        self.assertEqual(doctor.check_prompts(self.env)[0]['level'], 'FAIL')
+        for mod in (
+            'app.py',
+            'style.css',
+            'prompt_manager/__init__.py',
+            'prompt_manager/cli.py',
+            'prompt_manager/config.py',
+            'prompt_manager/storage/database.py',
+        ):
+            self.put(f'usr/share/whitecube/cube-prompts/{mod}', '')
+        ok = doctor.check_prompts(self.env)[0]
+        self.assertEqual(ok['level'], 'ok')
+        self.assertIn('staged', ok['detail'])
+
+        (self.root / 'usr/share/whitecube/cube-prompts/prompt_manager/cli.py').unlink()
+        bad = doctor.check_prompts(self.env)[0]
+        self.assertEqual(bad['level'], 'FAIL')
+        self.assertIn('cli.py', bad['detail'])
+
+        fake_bin = self.home / '.local/bin/cube-prompts'
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_text('#!/bin/sh\nexit 0\n')
+        fake_bin.chmod(0o755)
+        live_env = doctor.Env(self.home / 'no-proj', root=Path('/'), home=self.home)
+        ok_proc = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                'format': 'cube-prompts-diagnostics', 'version': '2.0.0',
+                'sqlite_version': '3.46.1', 'ready': True, 'checks': [],
+            }),
+            stderr='',
+        )
+        fail_proc = mock.Mock(
+            returncode=1,
+            stdout=json.dumps({
+                'format': 'cube-prompts-diagnostics', 'version': '2.0.0',
+                'sqlite_version': '3.46.1', 'ready': False,
+                'checks': [{'id': 'database', 'status': 'error'}],
+            }),
+            stderr='',
+        )
+        if not Path('/usr/bin/cube-prompts').exists():
+            with mock.patch.object(doctor.subprocess, 'run', return_value=ok_proc):
+                live_ok = doctor.check_prompts(live_env)[0]
+                self.assertEqual(live_ok['level'], 'ok')
+                self.assertIn('SQLite', live_ok['detail'])
+            with mock.patch.object(doctor.subprocess, 'run', return_value=fail_proc):
+                live_fail = doctor.check_prompts(live_env)[0]
+                self.assertEqual(live_fail['level'], 'FAIL')
+                self.assertIn('database', live_fail['detail'])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
