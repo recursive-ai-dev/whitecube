@@ -45,8 +45,8 @@
     },
     {
       "id": "network-status",
-      "name": "Dongle status",
-      "description": "Read-only live status for your 2001:3329 USB adapter.",
+      "name": "Network status",
+      "description": "Read-only live status for your active Wi-Fi adapter.",
       "builtin": "network-status.sh"
     },
     {

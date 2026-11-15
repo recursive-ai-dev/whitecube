@@ -12,7 +12,7 @@
 - [x] `boot/` (GRUB / Plymouth / tty1 black cube theme & recovery polish)
 
 ## Phase 3: Workspace & Applications (`workspace/`, `apps/`)
-- [ ] `workspace/` (`whitecube-web` Python workspace suite)
+- [x] `workspace/` (`whitecube-web` Python workspace suite)
 - [ ] `apps/cube-browser` (Native browser features, security, and DOM/rendering extensions)
 - [ ] `apps/cube-player` (Media playback, playlist parsing, and stream handling)
 - [ ] `apps/cube-editor` (Linux ISO studio, project guards, and QEMU workflow)

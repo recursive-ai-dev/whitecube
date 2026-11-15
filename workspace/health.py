@@ -19,6 +19,9 @@ import tempfile
 import time
 
 BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+VERSION = '0.12.0'
 ROLES = ('bash', 'web', 'build', 'clean')
 BIN = Path('/usr/bin')
 SMOKE_REPORT = Path('/var/lib/whitecube/health/containers.json')
@@ -165,8 +168,8 @@ def pty_check():
 def network_checks():
     result = []
     for command in ('check', 'status'):
-        ident = 'dongle-dependencies' if command == 'check' else 'dongle-identity'
-        label = 'Dongle driver and firmware' if command == 'check' else 'Attached USB dongle'
+        ident = 'wifi-dependencies' if command == 'check' else 'wifi-adapter'
+        label = 'Wi-Fi driver and firmware' if command == 'check' else 'Wi-Fi adapter'
         try:
             info = helper_json('cube-net', command)
             if not isinstance(info, dict):
@@ -174,18 +177,25 @@ def network_checks():
             if command == 'check':
                 ready = info.get('dependencies_ready') is True
                 result.append(check(ident, label, 'pass' if ready else 'warn',
-                                    'Existing driver, firmware and network tools are present.' if ready else
-                                    'Some existing driver, firmware or userspace dependencies are missing; cube-net check has details. No modules were installed or loaded.'))
+                                    'Kernel wireless support, driver modules and userspace tools are present.' if ready else
+                                    'Some wireless driver, firmware or userspace dependencies are missing; cube-net check has details. No modules were installed or loaded.'))
             else:
                 present = info.get('present') is True
+                iface = info.get('interface') or {}
                 device = info.get('device') or {}
-                result.append(check(ident, label, 'pass' if present else 'pending',
-                                    f'USB {device.get("usb_id", "unknown")}: driver/MAC identity matched.' if present else
-                                    'The exact configured USB/driver/MAC combination is not currently attached.'))
+                if present:
+                    drv = iface.get('driver') or device.get('driver') or 'nl80211'
+                    bus = iface.get('bus') or device.get('bus') or 'wireless'
+                    ident_detail = iface.get('mac') or device.get('mac') or iface.get('usb_id') or 'auto'
+                    detail = f'{iface.get("interface", "wifi")} ({bus}, driver {drv}, {ident_detail}) ready.'
+                else:
+                    detail = info.get('diagnostic_summary') or 'No matching Wi-Fi adapter is currently attached.'
+                result.append(check(ident, label, 'pass' if present else 'pending', detail))
                 association = info.get('association_state', 'unknown')
                 associated = association in ('COMPLETED', 'completed', 'connected')
-                result.append(check('dongle-connection', 'Wi-Fi association', 'pass' if associated else 'pending',
-                                    f'State: {association}. This checks association, not Internet reachability.'))
+                ip_note = f' · IP {info["ipv4_address"]}' if info.get('ipv4_address') else ''
+                result.append(check('wifi-connection', 'Wi-Fi association', 'pass' if associated else 'pending',
+                                    f'State: {association}{ip_note}. This checks association, not Internet reachability.'))
         except FileNotFoundError as exc:
             result.append(check(ident, label, 'pending', str(exc)))
         except (OSError, ValueError, RuntimeError, TimeoutError) as exc:
@@ -376,6 +386,7 @@ def first_boot_report(projects=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--version', action='version', version=f'cube-check {VERSION}')
     parser.add_argument('--json', action='store_true', help='Print the complete report as JSON')
     parser.add_argument('--first-boot', action='store_true', help='Save once per boot/revision under your local state directory')
     parser.add_argument('--containers', action='store_true', help='Explicitly start and exit each ready lab offline; requires root')

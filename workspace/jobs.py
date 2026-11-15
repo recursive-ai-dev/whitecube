@@ -6,8 +6,14 @@ import os
 from pathlib import Path
 import secrets
 import re
+import sys
 import threading
 import time
+
+BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
 from workspace_data import arguments, atomic_json, now, RunStore, IDENT
 
 
@@ -73,6 +79,15 @@ class WorkflowStore:
             raise ValueError('Workflow store is full')
         atomic_json(self.path, list(values.values()))
         return definition
+    def delete(self, ident):
+        if not isinstance(ident, str) or not IDENT.fullmatch(ident):
+            raise ValueError('Invalid workflow id')
+        values = {item['id']: item for item in self.list()}
+        if ident not in values:
+            raise KeyError('Unknown workflow')
+        del values[ident]
+        atomic_json(self.path, list(values.values()))
+        return {'id': ident, 'deleted': True}
 
 class JobQueue:
     def __init__(self, state, supervisor):

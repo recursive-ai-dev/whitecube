@@ -3,6 +3,12 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
+
+BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
 from workspace_data import atomic_json
 
 class DesktopStore:
@@ -13,7 +19,7 @@ class DesktopStore:
             raise ValueError('Unsafe desktop state directory')
     def _read(self, name, default):
         path = self.state/name
-        if not path.exists():
+        if not path.exists() and not path.is_symlink():
             return default
         if path.is_symlink() or path.stat().st_uid != os.getuid() or path.stat().st_size > 1048576:
             raise ValueError('Unsafe or oversized desktop state')

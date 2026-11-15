@@ -79,3 +79,13 @@
 - **Tests & Verification**:
   - Updated and extended `net/test_cube_net.py` (133 tests) and `net/test_cube_wifi.py` (165 tests) covering auto-detected PCIe Intel `iwlwifi`, arbitrary USB Wi-Fi dongles (`0e8d:7961` / `mt7921u`), wired Ethernet exclusion, multi-radio ambiguity + `select_device` pinning/revert, invalid config rejection, and `audit()` on generic kernels.
   - Verified full `./BUILD.sh`, `packaging/install-tree.sh` (634 files), `packaging/check-tree.py` (236 path references ok), and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] workspace/ (`whitecube-web` Suite) | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added `WorkflowStore.delete(ident)` (`workspace/jobs.py`) and wired `POST /api/workflows/delete` & `DELETE /api/workflows`, plus `POST /api/backups/delete` & `DELETE /api/backups` with `FileNotFoundError -> 404` mapping on backup endpoints (`workspace/server.py`).
+  - Added `--version` (`0.12.0`) to `workspace/server.py` and `workspace/health.py`, `check --strict` CLI validation exiting non-zero on manifest errors, port `[1, 65535]` validation, empty/`.` guards in `safe_file()`, and `network-devices` action routing.
+  - Replaced single-dongle (`2001:3329` / `Dongle`) copy and fallback metadata across `workspace/server.py`, `workspace/health.py`, `workspace/catalog.json`, `workspace/bin/network-status.sh`, `workspace/web/index.html`, and `workspace/web/app.js` with hardware-generic Wi-Fi adapter diagnostics (`wifi-dependencies`, `wifi-adapter`, `wifi-connection`, bus/driver/MAC/IPv4/route fields, `Adapters` action, hyphen/underscore normalization, and workflow/backup Delete UI controls).
+  - Fixed `python3 -I` isolated-mode import failures across `workspace/server.py`, `workspace/health.py`, `workspace/jobs.py`, and `workspace/desktop_state.py` via `sys.path` guards, and closed a dangling-symlink bypass in `workspace/desktop_state.py` (`_read()`).
+- **Tests & Verification**:
+  - Created `tests/test-workspace.py` (8 comprehensive unit and live loopback HTTP tests covering `--version`, `check --strict`, `safe_file` traversal/symlink/dotfile confinement, public catalog redaction, `DesktopStore` bounds/dangling-symlink rejection, `WorkflowStore` DAG ordering & deletion, `RecoveryConsole` credential exclusion & backup/restore/verify/delete, generic Wi-Fi health checks, frontend syntax, HTTP token/Host/Origin/Sec-Fetch-Site isolation, separate app origin rewriting, and delete APIs) and wired it into `BUILD.sh`.
+  - Verified `tests/test-workspace.py` (8 tests ok), full `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

@@ -33,10 +33,15 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+
+BASE = Path(__file__).resolve().parent
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
+
 from workspace_data import arguments, load_manifests, loopback_url, RunStore
 from session_broker import BrokerError
 
-BASE = Path(__file__).resolve().parent
+VERSION = '0.12.0'
 MAX_BODY = 131072
 MAX_OUTPUT = 4 * 1024 * 1024
 STATIC_EXTENSIONS = {'.html','.js','.mjs','.css','.json','.png','.jpg','.jpeg','.webp','.gif','.svg','.ico','.woff','.woff2','.ttf','.otf','.mp3','.ogg','.wav','.mp4','.webm','.glb','.gltf','.bin','.wasm','.txt'}
@@ -48,11 +53,11 @@ class Problem(Exception):
 
 
 def safe_file(root: Path, relative: str) -> Path:
-    """No dotfiles, parent traversal or symlinks escaping the selected dist."""
-    if '\\' in relative or '\x00' in relative:
+    """No empty components, dotfiles, parent traversal or symlinks escaping the selected dist."""
+    if not isinstance(relative, str) or not relative or '\\' in relative or '\x00' in relative:
         raise Problem(404, 'File not found')
     parts = Path(relative).parts
-    if Path(relative).is_absolute() or any(x.startswith('.') for x in parts):
+    if not parts or Path(relative).is_absolute() or any(x in ('', '.', '..') or x.startswith('.') for x in parts):
         raise Problem(404, 'File not found')
     candidate = (root / relative).resolve()
     if not candidate.is_relative_to(root.resolve()) or not candidate.is_file():
@@ -396,7 +401,9 @@ class Workspace:
 
     def action(self, data):
         action = data.get('action')
-        if action in ('network-manage','network-scan','network-add','network-reconnect'):
+        if action == 'network-devices':
+            argv = ['/usr/bin/cube-net', 'devices']
+        elif action in ('network-manage','network-scan','network-add','network-reconnect'):
             argv = ['sudo','/usr/bin/cube-net',action.removeprefix('network-')]
         elif action in ('network-connect','network-remove'):
             profile = data.get('profile')
@@ -507,22 +514,38 @@ class Workspace:
                     return {'seeds':value, 'exists':(self.desktop.state/'ca-seeds.json').exists()} if endpoint == 'seeds' else value
         if path.startswith('/api/backups'):
             console = self.recovery
-            if path == '/api/backups' and method == 'GET':
-                return {'backups':console.list(), 'retention':console.get_retention()}
-            if path == '/api/backups' and method == 'POST':
-                return console.create(data.get('label',''), data.get('retention'))
-            if path == '/api/backups/verify' and method == 'POST':
-                return console.verify(data['id'])
-            if path == '/api/backups/review' and method == 'POST':
-                return console.review(data['id'])
-            if path == '/api/backups/restore' and method == 'POST':
-                return console.restore(data['id'], data['review_token'])
-        if path == '/api/workflows':
-            if method == 'GET':
+            try:
+                if path == '/api/backups' and method == 'GET':
+                    return {'backups':console.list(), 'retention':console.get_retention()}
+                if path == '/api/backups' and method == 'POST':
+                    return console.create(data.get('label',''), data.get('retention'))
+                if path == '/api/backups/verify' and method == 'POST':
+                    return console.verify(data['id'])
+                if path == '/api/backups/review' and method == 'POST':
+                    return console.review(data['id'])
+                if path == '/api/backups/restore' and method == 'POST':
+                    return console.restore(data['id'], data['review_token'])
+                if (path == '/api/backups/delete' and method == 'POST') or (path == '/api/backups' and method == 'DELETE'):
+                    ident = data.get('id') if method == 'POST' else (query.get('id', [None])[0] or data.get('id'))
+                    if not ident:
+                        raise Problem(400, 'Missing backup id')
+                    return console.delete(ident)
+            except FileNotFoundError:
+                raise Problem(404, 'Backup not found')
+        if path.startswith('/api/workflows'):
+            if path == '/api/workflows' and method == 'GET':
                 self.catalog.reload()
                 return {'workflows':self.workflow_list()}
-            if method == 'POST':
+            if path == '/api/workflows' and method == 'POST':
                 return self.workflows.save(data)
+            if (path == '/api/workflows/delete' and method == 'POST') or (path == '/api/workflows' and method == 'DELETE'):
+                ident = data.get('id') if method == 'POST' else (query.get('id', [None])[0] or data.get('id'))
+                if not ident:
+                    raise Problem(400, 'Missing workflow id')
+                try:
+                    return self.workflows.delete(ident)
+                except KeyError:
+                    raise Problem(404, 'Unknown workflow')
         if path == '/api/workflows/run' and method == 'POST':
             return self.queue_workflow(data)
         if path == '/api/jobs' and method == 'GET':
@@ -620,7 +643,7 @@ def network_status():
                     return json.loads(result.stdout)
             except (OSError, ValueError, subprocess.TimeoutExpired):
                 pass
-    return {'state':'unknown', 'usb_id':'2001:3329', 'driver':'rtw88_8822cu', 'message':'Dongle status unavailable'}
+    return {'state':'unknown', 'device':{'mode':'auto'}, 'message':'Wi-Fi status unavailable'}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -752,6 +775,8 @@ def runtime_dir():
 
 
 def serve(args):
+    if not (1 <= args.port <= 65535 and 1 <= args.apps_port <= 65535):
+        raise RuntimeError('Ports must be between 1 and 65535')
     if args.port == args.apps_port:
         raise RuntimeError('Workspace and projects need different ports')
     state = runtime_dir()
@@ -862,6 +887,7 @@ def run_shell(args):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('-v','--version',action='version',version=f'whitecube-web {VERSION}')
     sub=parser.add_subparsers(dest='command',required=True)
     for command in ('serve','open'):
         p=sub.add_parser(command)
@@ -870,13 +896,19 @@ def main():
         p.add_argument('--apps-port',type=int,default=8788)
         if command=='open':
             p.add_argument('--print-url',action='store_true')
-    sub.add_parser('check')
+    p=sub.add_parser('check')
+    p.add_argument('--projects')
+    p.add_argument('--strict',action='store_true',help='Exit nonzero when manifest errors are reported')
     p=sub.add_parser('_shell');p.add_argument('--script');p.add_argument('--job')
     args=parser.parse_args()
     if args.command=='_shell':
         run_shell(args)
     if args.command=='check':
-        print(json.dumps(Catalog(discover_projects()).public(8788),indent=2));return
+        payload=Catalog(discover_projects(args.projects)).public(8788)
+        print(json.dumps(payload,indent=2))
+        if args.strict and payload.get('manifest_errors'):
+            sys.exit(1)
+        return
     if os.getuid()==0:
         raise RuntimeError('Run the browser terminal as your desktop user, not root')
     if args.command=='serve':

@@ -155,6 +155,7 @@ python3 -I net/test_cube_net.py
 python3 -I net/test_cube_wifi.py
 python3 -I net/test_net_switch.py
 python3 -I tests/test-boot.py
+python3 -I tests/test-workspace.py
 python3 -I tests/test-privacy.py
 python3 -I tests/test-doctor.py
 python3 -I tests/test-session.py
