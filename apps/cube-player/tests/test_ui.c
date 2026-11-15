@@ -54,6 +54,12 @@ int main(void) {
     cairo_destroy(ab_cr);cairo_surface_destroy(ab_surf);
     key_app(&a,XKB_KEY_a,"",false,false,false);
     g_assert_false(a.has_loop_a);g_assert_false(a.has_loop_b);
+    // C clears an active/partial A-B loop and +/- adjust volume within bounds.
+    a.player.position=30;key_app(&a,XKB_KEY_a,"",false,false,false);g_assert_true(a.has_loop_a);
+    key_app(&a,XKB_KEY_c,"",false,false,false);g_assert_false(a.has_loop_a);g_assert_false(a.has_loop_b);
+    double v0=a.player.volume;
+    key_app(&a,XKB_KEY_plus,"",false,false,false);g_assert_cmpfloat(a.player.volume,==,MIN(100,v0+5));
+    key_app(&a,XKB_KEY_minus,"",false,false,false);g_assert_cmpfloat(a.player.volume,==,v0);
     a.player.loaded=false;a.player.seekable=false;a.player.duration=0;a.player.position=0;
     char *media=g_build_filename(root,"a ' strange; name.mp4",NULL);g_file_set_contents(media,"test",-1,NULL);
     char *list=g_build_filename(root,"list.m3u",NULL);g_file_set_contents(list,"#EXTM3U\na ' strange; name.mp4\n",-1,NULL);

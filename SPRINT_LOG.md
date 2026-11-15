@@ -99,3 +99,12 @@
 - **Tests & Verification**:
   - Extended `apps/cube-browser/tests/test_app.py` (`test_check_json_timeout_and_shortcuts_page`), `apps/cube-browser/tests/test_core.c`, `apps/cube-browser/tests/test_storage.c`, and `tests/test-doctor.py` (`test_browser_check_reports_staged_dev_and_json_health`).
   - Verified targeted Meson tests (`cli-and-installer`, `ipc-and-address`, `storage`), `tests/test-doctor.py` (49 tests ok), full `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.
+
+## [2026-11-15] apps/cube-player | Status: DONE | Commit: (atomic)
+- **Extensions & Enhancements**:
+  - Added `--check` and `--json` runtime readiness probe in `apps/cube-player/src/main.c` (`wayland_available()`, GStreamer plugin/sink/decoder readiness, version, and overall status) executing before `state_init()` so diagnostics never create XDG config/state files, while rejecting standalone `--json` with exit code 2.
+  - Added CLI playback flags `--volume 0..100`, `--speed 0.25..3.0`, `--shuffle`, and `--repeat off|all|one` with strict range/value validation (`exit 2`), plus keyboard shortcuts (`+`/`=` and `-` for +/-5% volume, `Page_Up`/`Page_Down` for +/-60s seek, `C` to clear A-B loop), updated `help_panel()`, and extended `report()` with `repeat`, `shuffle`, `sub_delay`, `has_loop_a`, and `has_loop_b`.
+  - Hardened M3U/PLS playlist loading in `apps/cube-player/src/state.c` (`media_playlist_read()` opening via `O_RDONLY | O_CLOEXEC | O_NONBLOCK` + `fstat()` `S_ISREG` guard before `fdopen()` so FIFOs/non-regular files reject immediately without blocking; `playlist_item()` allowing only `http`/`https`/`file` URIs or existing regular local files) and switched `apps/cube-player/tests/test_state.c` fixture writes to `g_file_set_contents_full(..., G_FILE_SET_CONTENTS_NONE, 0600, NULL)`.
+- **Tests & Verification**:
+  - Extended `apps/cube-player/tests/test_state.c` (unsafe URI scheme filtering & FIFO playlist rejection), `apps/cube-player/tests/test_ui.c` (`C` A-B loop reset & `+`/`-` volume keys), and `apps/cube-player/tests/test_install.py` (`--check --json`, standalone `--json` exit 2, non-creation of XDG dirs on `--check`, invalid `--volume`/`--speed`/`--repeat` exit 2).
+  - Verified full end-to-end `./BUILD.sh`, `packaging/install-tree.sh`, `packaging/check-tree.py`, and `tests/test-packaging.py` (61 tests ok) inside `bwrap`.

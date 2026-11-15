@@ -38,4 +38,17 @@ with tempfile.TemporaryDirectory(prefix='cube-player-install-') as directory:
     assert launcher.read_bytes() == old
     assert launcher.stat().st_mode & 0o777 == 0o751
     assert not desktop.exists()
+
+    # Check --check [--json] and CLI option validation without touching user state.
+    probe_env = dict(os.environ, XDG_CONFIG_HOME=str(home / 'check-cfg'), XDG_STATE_HOME=str(home / 'check-state'))
+    subprocess.run(args + ['--apply'], check=True, capture_output=True)
+    import json
+    chk = subprocess.run([str(launcher), '--check', '--json'], env=probe_env, check=True, capture_output=True, text=True)
+    payload = json.loads(chk.stdout)
+    assert payload['ok'] is True and payload['mpv'] is True and payload['mpv_api'] > 0
+    assert not (home / 'check-cfg').exists() and not (home / 'check-state').exists()
+    assert subprocess.run([str(launcher), '--json'], env=probe_env, capture_output=True).returncode == 2
+    for bad in (('--volume', '-5'), ('--volume', '150'), ('--speed', '0.1'), ('--speed', '4'), ('--repeat', 'bogus')):
+        assert subprocess.run([str(launcher), *bad], env=probe_env, capture_output=True).returncode == 2
+    subprocess.run(args + ['--restore', str(manifest), '--apply'], check=True, capture_output=True)
 print('Launcher, installation backups, changed-file protection, and rollback passed.')

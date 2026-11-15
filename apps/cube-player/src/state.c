@@ -1,12 +1,14 @@
 #define _GNU_SOURCE
 #include "state.h"
 #include <gio/gio.h>
+#include <fcntl.h>
 #include <math.h>
 #include <errno.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 static double number(GKeyFile *k, const char *key, double fallback, double lo, double hi) {
     GError *e = NULL;
@@ -165,9 +167,18 @@ bool media_playlist_path(const char *path) {
 }
 static char *playlist_item(const char *value, const char *dir) {
     char *scheme = g_uri_parse_scheme(value);
-    char *item = scheme || g_path_is_absolute(value) ? g_strdup(value) : g_canonicalize_filename(value, dir);
-    g_free(scheme);
-    return item;
+    if (scheme) {
+        bool supported = !g_ascii_strcasecmp(scheme, "http") ||
+                         !g_ascii_strcasecmp(scheme, "https") ||
+                         !g_ascii_strcasecmp(scheme, "file");
+        g_free(scheme);
+        if (supported) return g_strdup(value);
+        char *local = g_canonicalize_filename(value, dir);
+        if (g_file_test(local, G_FILE_TEST_IS_REGULAR)) return local;
+        g_free(local);
+        return NULL;
+    }
+    return g_path_is_absolute(value) ? g_strdup(value) : g_canonicalize_filename(value, dir);
 }
 static gint index_cmp(gconstpointer a, gconstpointer b) {
     guint x = *(const guint *)a, y = *(const guint *)b;
@@ -261,9 +272,22 @@ static bool xspf_read(const char *path, const char *text, GPtrArray *items, GErr
 GPtrArray *media_playlist_read(const char *path, bool *stream, GError **error) {
     enum { MAX_PLAYLIST_BYTES = 2 * 1024 * 1024, MAX_PLAYLIST_ITEMS = 2048 };
     *stream = false;
-    FILE *file = fopen(path, "rb");
-    if (!file) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    if (fd < 0) {
         g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno), "Could not open playlist: %s", g_strerror(errno));
+        return NULL;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "Playlists must be regular text files.");
+        return NULL;
+    }
+    FILE *file = fdopen(fd, "rb");
+    if (!file) {
+        int saved = errno;
+        close(fd);
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(saved), "Could not open playlist: %s", g_strerror(saved));
         return NULL;
     }
     char *data = g_malloc(MAX_PLAYLIST_BYTES + 2);
@@ -308,7 +332,10 @@ GPtrArray *media_playlist_read(const char *path, bool *stream, GError **error) {
                 char *key = g_strdup_printf("File%u", index);
                 // PLS values are literal paths/URLs, not GKeyFile escape sequences.
                 char *value = g_key_file_get_value(keys, "playlist", key, NULL);
-                if (value && *g_strstrip(value)) g_ptr_array_add(items, playlist_item(value, dir));
+                if (value && *g_strstrip(value)) {
+                    char *entry = playlist_item(value, dir);
+                    if (entry) g_ptr_array_add(items, entry);
+                }
                 g_free(value); g_free(key);
             }
             g_array_free(indices, TRUE); g_strfreev(names);
@@ -324,7 +351,8 @@ GPtrArray *media_playlist_read(const char *path, bool *stream, GError **error) {
                 g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "A playlist can contain at most 2,048 items.");
                 ok = false; break;
             }
-            g_ptr_array_add(items, playlist_item(line, dir));
+            char *entry = playlist_item(line, dir);
+            if (entry) g_ptr_array_add(items, entry);
         }
         g_strfreev(lines);
         if (*stream) g_ptr_array_set_size(items, 0);

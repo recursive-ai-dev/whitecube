@@ -40,14 +40,26 @@ static void test_playlists(const char *root) {
     items = media_playlist_read(list, &stream, &error);
     g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
     char *large = g_strnfill(2 * 1024 * 1024 + 1, 'a');
-    g_file_set_contents(list, large, -1, NULL); g_free(large);
+    g_file_set_contents_full(list, large, -1, G_FILE_SET_CONTENTS_NONE, 0600, NULL); g_free(large);
     items = media_playlist_read(list, &stream, &error);
     g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
     GString *many = g_string_new(NULL);
     for (int i = 0; i < 2049; i++) g_string_append(many, "film.mp4\n");
-    g_file_set_contents(list, many->str, many->len, NULL); g_string_free(many, TRUE);
+    g_file_set_contents_full(list, many->str, many->len, G_FILE_SET_CONTENTS_NONE, 0600, NULL); g_string_free(many, TRUE);
     items = media_playlist_read(list, &stream, &error);
     g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    // Unsafe non-media URI schemes in M3U/PLS are ignored like in XSPF.
+    g_file_set_contents(list, "spotify:track:1\nfd://3\njavascript:alert(1)\n./film é.mp4\n", -1, NULL);
+    items = media_playlist_read(list, &stream, &error);
+    g_assert_no_error(error); g_assert_cmpuint(items->len, ==, 1);
+    g_assert_cmpstr(g_ptr_array_index(items, 0), ==, expected);
+    g_ptr_array_free(items, TRUE);
+    // Non-regular files (FIFOs, directories) are rejected immediately without hanging.
+    char *fifo = g_build_filename(root, "pipe.m3u", NULL);
+    g_assert_cmpint(mkfifo(fifo, 0600), ==, 0);
+    items = media_playlist_read(fifo, &stream, &error);
+    g_assert_null(items); g_assert_nonnull(error); g_clear_error(&error);
+    g_remove(fifo); g_free(fifo);
     g_remove(list); g_remove(pls); g_free(list); g_free(pls); g_free(expected);
 }
 

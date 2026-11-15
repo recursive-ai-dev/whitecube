@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 enum Panel { NONE, FILES, SETTINGS, TRACKS, HELP, LOCATION };
@@ -494,8 +495,8 @@ static void tracks_panel(App *a) {
 }
 static void help_panel(App *a) {
     double x,y,w,h;panel_base(a,&x,&y,&w,&h,"At your fingertips","Everyday controls, without leaving the keyboard.",570);
-    const char *keys[]={"Space / K","← / →","↑ / ↓",". / ,","F / F11","M","N / P","[ / ] / Backspace","A","Ctrl+O","Ctrl+Shift+O","Ctrl+L","Ctrl+,","Tab / Shift+Tab","Escape","Ctrl+Q"};
-    const char *labels[]={"Play or pause","Seek 5 seconds (Shift: 30)","Adjust volume","Step frame forward / back","Toggle fullscreen","Mute","Next / previous item","Slower / faster / reset 1x","Set A / B loop or clear","Open media","Add to queue","Open file path or URL","Preferences","Focus controls; Enter activates","Close panel or leave fullscreen","Quit Cube Player"};
+    const char *keys[]={"Space / K","← / → · PgUp/Dn","↑ / ↓ · + / -",". / ,","F / F11","M","N / P","[ / ] / Backspace","A / C","Ctrl+O","Ctrl+Shift+O","Ctrl+L","Ctrl+,","Tab / Shift+Tab","Escape","Ctrl+Q"};
+    const char *labels[]={"Play or pause","Seek 5s (Shift: 30s, PgUp/Dn: 60s)","Adjust volume","Step frame forward / back","Toggle fullscreen","Mute","Next / previous item","Slower / faster / reset 1x","Set A-B loop / clear loop (C)","Open media","Add to queue","Open file path or URL","Preferences","Focus controls; Enter activates","Close panel or leave fullscreen","Quit Cube Player"};
     int count=(int)G_N_ELEMENTS(keys);
     double gap=MIN(26,(h-110)/count);
     for(int i=0;i<count;i++) {text(a,keys[i],x+30,y+92+i*gap,12,a->theme.ink,190,true);text(a,labels[i],x+232,y+92+i*gap,12,a->theme.muted,w-262,false);}
@@ -822,8 +823,10 @@ static void key_app(void *data,xkb_keysym_t key,const char *utf8,bool ctrl,bool 
     case XKB_KEY_space:case XKB_KEY_k:act(a,A_PLAY,0);break;
     case XKB_KEY_Left:player_seek(p,shift?-30:-5,false);break;
     case XKB_KEY_Right:player_seek(p,shift?30:5,false);break;
-    case XKB_KEY_Up:volume(a,p->volume+5);break;
-    case XKB_KEY_Down:volume(a,p->volume-5);break;
+    case XKB_KEY_Page_Up:player_seek(p,60,false);break;
+    case XKB_KEY_Page_Down:player_seek(p,-60,false);break;
+    case XKB_KEY_Up:case XKB_KEY_plus:case XKB_KEY_equal:volume(a,p->volume+5);break;
+    case XKB_KEY_Down:case XKB_KEY_minus:volume(a,p->volume-5);break;
     case XKB_KEY_Home:player_seek(p,0,true);break;
     case XKB_KEY_End:player_seek(p,MAX(0,p->duration-1),true);break;
     case XKB_KEY_f:case XKB_KEY_F11:act(a,A_FULL,0);break;
@@ -834,6 +837,7 @@ static void key_app(void *data,xkb_keysym_t key,const char *utf8,bool ctrl,bool 
     case XKB_KEY_bracketright:act(a,A_FASTER,0);break;
     case XKB_KEY_BackSpace:act(a,A_SPEED_RESET,0);break;
     case XKB_KEY_a:case XKB_KEY_A:act(a,A_AB_LOOP,0);break;
+    case XKB_KEY_c:case XKB_KEY_C:if(a->has_loop_a || a->has_loop_b){clear_ab_loop(a);toast(a,"A-B loop cleared.");}break;
     case XKB_KEY_period:act(a,A_FRAME_STEP,0);break;
     case XKB_KEY_comma:act(a,A_FRAME_BACK,0);break;
     case XKB_KEY_l:act(a,A_SIDEBAR,0);break;
@@ -881,6 +885,11 @@ static void report(App *a) {
     g_key_file_set_double(k,"Playback","duration",a->player.duration);
     g_key_file_set_double(k,"Playback","volume",a->player.volume);
     g_key_file_set_double(k,"Playback","speed",a->player.speed);
+    g_key_file_set_integer(k,"Playback","repeat",a->state.repeat);
+    g_key_file_set_boolean(k,"Playback","shuffle",a->state.shuffle);
+    g_key_file_set_double(k,"Playback","sub_delay",a->sub_delay);
+    g_key_file_set_boolean(k,"Playback","has_loop_a",a->has_loop_a);
+    g_key_file_set_boolean(k,"Playback","has_loop_b",a->has_loop_b);
     g_key_file_set_integer(k,"Playback","queue_count",a->queue->len);
     g_key_file_set_integer(k,"Playback","current",a->current);
     g_key_file_set_integer(k,"Playback","tracks",a->player.tracks->len);
@@ -890,12 +899,32 @@ static void report(App *a) {
     g_key_file_set_string(k,"Playback","renderer",cp_window_renderer(a->window));
     gsize len;char *data=g_key_file_to_data(k,&len,NULL);g_file_set_contents(a->report,data,len,NULL);g_free(data);g_key_file_unref(k);
 }
+static bool wayland_available(void) {
+    const char *ws = getenv("WAYLAND_SOCKET");
+    if (ws && *ws) return true;
+    const char *disp = getenv("WAYLAND_DISPLAY"), *rt = getenv("XDG_RUNTIME_DIR");
+    if (!disp || !*disp) return false;
+    char *path = disp[0] == '/' ? g_strdup(disp) : g_build_filename(rt ? rt : "", disp, NULL);
+    struct stat st;
+    bool ok = path && stat(path, &st) == 0 && S_ISSOCK(st.st_mode);
+    g_free(path);
+    return ok;
+}
 int main(int argc,char **argv) {
-    gboolean version=FALSE,software=FALSE,silent=FALSE;char *capture=NULL,*report_path=NULL,*preview=NULL,*theme=NULL;char **files=NULL;double quit_after=0;
+    gboolean version=FALSE,software=FALSE,silent=FALSE,check=FALSE,json_out=FALSE,opt_shuffle=FALSE;
+    char *capture=NULL,*report_path=NULL,*preview=NULL,*theme=NULL,*opt_repeat=NULL;
+    char **files=NULL;
+    double quit_after=0,opt_volume=-1,opt_speed=-1;
     GOptionEntry options[]={
         {"version",0,0,G_OPTION_ARG_NONE,&version,"Show version",NULL},
+        {"check",0,0,G_OPTION_ARG_NONE,&check,"Verify libmpv and runtime prerequisites",NULL},
+        {"json",0,0,G_OPTION_ARG_NONE,&json_out,"Format --check output as JSON",NULL},
         {"software",0,0,G_OPTION_ARG_NONE,&software,"Use software video rendering",NULL},
         {"theme",0,0,G_OPTION_ARG_STRING,&theme,"Choose whitecube, light, or dark","THEME"},
+        {"volume",0,0,G_OPTION_ARG_DOUBLE,&opt_volume,"Set initial volume (0-100)","PERCENT"},
+        {"speed",0,0,G_OPTION_ARG_DOUBLE,&opt_speed,"Set playback speed (0.25-3.0)","FACTOR"},
+        {"shuffle",0,0,G_OPTION_ARG_NONE,&opt_shuffle,"Start with shuffle enabled",NULL},
+        {"repeat",0,0,G_OPTION_ARG_STRING,&opt_repeat,"Set repeat mode: off, all, or one","MODE"},
         {"capture",0,0,G_OPTION_ARG_FILENAME,&capture,"Save a PNG of the running window","FILE"},
         {"report",0,0,G_OPTION_ARG_FILENAME,&report_path,"Write playback diagnostics on exit","FILE"},
         {"quit-after",0,0,G_OPTION_ARG_DOUBLE,&quit_after,"Close after N seconds (diagnostics)","N"},
@@ -908,11 +937,48 @@ int main(int argc,char **argv) {
     GError *error=NULL;
     if(!g_option_context_parse(context,&argc,&argv,&error)) {g_printerr("Cube Player: %s\n",error->message);g_error_free(error);g_option_context_free(context);return 2;}
     g_option_context_free(context);
-    if(version) {puts("Cube Player 1.0.0");return 0;}
-    if(!isfinite(quit_after) || quit_after<0) {g_printerr("--quit-after must be a nonnegative number.\n");return 2;}
+    int exit_early=-1;
+    if(json_out && !check) {g_printerr("--json requires --check.\n");exit_early=2;}
+    else if(!isfinite(quit_after) || quit_after<0) {g_printerr("--quit-after must be a nonnegative number.\n");exit_early=2;}
+    else if(opt_volume!=-1 && (!isfinite(opt_volume) || opt_volume<0 || opt_volume>100)) {g_printerr("--volume must be between 0 and 100.\n");exit_early=2;}
+    else if(opt_speed!=-1 && (!isfinite(opt_speed) || opt_speed<0.25 || opt_speed>3.0)) {g_printerr("--speed must be between 0.25 and 3.0.\n");exit_early=2;}
+    int repeat_mode=-1;
+    if(exit_early<0 && opt_repeat) {
+        if(!strcmp(opt_repeat,"off")) repeat_mode=0;
+        else if(!strcmp(opt_repeat,"all")) repeat_mode=1;
+        else if(!strcmp(opt_repeat,"one")) repeat_mode=2;
+        else {g_printerr("Unknown repeat mode. Use off, all, or one.\n");exit_early=2;}
+    }
+    if(exit_early>=0) {
+        g_free(capture);g_free(report_path);g_free(preview);g_free(theme);g_free(opt_repeat);g_strfreev(files);return exit_early;
+    }
+    if(version) {
+        puts("Cube Player 1.0.0");
+        g_free(capture);g_free(report_path);g_free(preview);g_free(theme);g_free(opt_repeat);g_strfreev(files);return 0;
+    }
+    if(check) {
+        Player probe;bool mpv_ok=player_init(&probe,true);bool wl_ok=wayland_available();
+        unsigned long api=(unsigned long)mpv_client_api_version();
+        if(json_out) {
+            printf("{\"version\":\"1.0.0\",\"mpv\":%s,\"mpv_api\":%lu,\"wayland\":%s,\"ok\":%s}\n",
+                mpv_ok?"true":"false",api,wl_ok?"true":"false",mpv_ok?"true":"false");
+        } else {
+            puts("Cube Player 1.0.0 · runtime check");
+            printf("libmpv: %s (API %lu)%s%s\n",mpv_ok?"OK":"FAILED",api,mpv_ok?"":": ",mpv_ok?"":probe.error);
+            printf("Desktop: %s\n",wl_ok?"Wayland socket available":"No Wayland socket · Wayland compositor required for windows");
+        }
+        player_free(&probe);
+        g_free(capture);g_free(report_path);g_free(preview);g_free(theme);g_free(opt_repeat);g_strfreev(files);
+        return mpv_ok?0:1;
+    }
     App a={.current=-1,.selected=-1,.focus=-1,.scale=1,.ui_scale=1,.capture=capture,.report=report_path,.quit_after=quit_after,.software=software,.silent=silent};
     a.started=a.last_pointer=a.last_save=clock_now();
-    state_init(&a.state);a.queue=g_ptr_array_new_with_free_func(media_free);a.entries=g_ptr_array_new_with_free_func(entry_free);
+    state_init(&a.state);
+    if(opt_volume>=0) a.state.volume=opt_volume;
+    if(opt_speed>=0.25) a.state.speed=opt_speed;
+    if(opt_shuffle) a.state.shuffle=true;
+    if(repeat_mode>=0) a.state.repeat=repeat_mode;
+    a.queue=g_ptr_array_new_with_free_func(media_free);a.entries=g_ptr_array_new_with_free_func(entry_free);
     int result=0;
     if(theme) {
         if(!strcmp(theme,"whitecube")) a.state.theme=0;else if(!strcmp(theme,"light")) a.state.theme=1;else if(!strcmp(theme,"dark")) a.state.theme=2;
@@ -921,6 +987,7 @@ int main(int argc,char **argv) {
     theme_reload(&a);
     signal(SIGINT,interrupted);signal(SIGTERM,interrupted);signal(SIGPIPE,SIG_IGN);
     if(!player_init(&a.player,silent)) {g_printerr("Cube Player: could not initialize mpv: %s\n",a.player.error);result=1;goto cleanup;}
+    a.player.volume=a.state.volume;a.player.speed=a.state.speed;
     if(preview) {
         cairo_surface_t *surface=cairo_image_surface_create(CAIRO_FORMAT_ARGB32,1120,740);cairo_t *cr=cairo_create(surface);
         draw_app(&a,cr,1120,740);cairo_destroy(cr);result=cairo_surface_write_to_png(surface,preview)!=CAIRO_STATUS_SUCCESS;cairo_surface_destroy(surface);goto cleanup;
@@ -937,5 +1004,5 @@ int main(int argc,char **argv) {
 cleanup:
     cp_window_free(a.window);player_free(&a.player);state_free(&a.state);
     g_ptr_array_free(a.queue,TRUE);g_ptr_array_free(a.entries,TRUE);g_free(a.current_path);g_free(a.folder);
-    g_free(capture);g_free(report_path);g_free(preview);g_free(theme);g_strfreev(files);return result;
+    g_free(capture);g_free(report_path);g_free(preview);g_free(theme);g_free(opt_repeat);g_strfreev(files);return result;
 }
