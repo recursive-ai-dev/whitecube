@@ -28,7 +28,7 @@ import time
 
 LEVELS = ('ok', 'info', 'WARN', 'FAIL')
 CHECK_GROUPS = ('package', 'network', 'drift', 'security', 'libraries', 'session', 'folders', 'audio', 'browser', 'editor', 'trainer', 'vm', 'chrootables', 'prompts', 'chat', 'suite')
-WHITECUBE_VERSION = '0.13.0'
+WHITECUBE_VERSION = '0.14.0'
 
 
 def sha(path):

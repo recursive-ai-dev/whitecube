@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -18,7 +19,7 @@ class SessionError(Exception):
     pass
 
 
-WHITECUBE_VERSION = '0.13.0'
+WHITECUBE_VERSION = '0.14.0'
 
 
 def private_directory(path, create=False):
@@ -105,10 +106,22 @@ def find_compositor(script):
 
 
 def _is_unix_socket(path):
+    """True only for a socket something is listening on.
+
+    A crashed bus leaves its socket file behind; treating that as live would skip
+    starting whitecube-bus and leave every client with "connection refused".
+    """
     try:
-        return Path(path).is_socket()
-    except OSError:
+        if not Path(path).is_socket():
+            return False
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
         return False
+    except OSError:
+        return True
 
 
 def _valid_dbus_address(address):
@@ -429,8 +442,8 @@ def main(argv=None):
                             with contextlib.suppress(subprocess.TimeoutExpired):
                                 bus_proc.wait(timeout=2)
                         bus_sock = Path(runtime) / 'bus'
-                        if _is_unix_socket(bus_sock):
-                            with contextlib.suppress(OSError):
+                        with contextlib.suppress(OSError):
+                            if bus_sock.is_socket():
                                 bus_sock.unlink()
                 stream.write(f'=== whitecube exited with status {status} at {time.strftime("%Y-%m-%dT%H:%M:%S%z")}\n')
             records = recent_failures(failures, int(time.time()))

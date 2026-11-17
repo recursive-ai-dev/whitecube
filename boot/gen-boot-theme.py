@@ -14,7 +14,7 @@ import struct
 import sys
 from pathlib import Path
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 BG = (0, 0, 0)
 INK = (255, 255, 255)
 TOP, SIDE, FRONT = (230, 236, 248), (150, 160, 182), (190, 198, 216)  # cube_top / cube_side / front

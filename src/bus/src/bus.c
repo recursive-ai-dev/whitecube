@@ -404,8 +404,36 @@ static void name_signal(Bus *b, Conn *c, const char *member, const char *name)
     drv_signal(b, member, "s", &body, c);
 }
 
+/* Privacy invariant: no process may ever own a name that offers a way to
+ * view, capture or remote-control the screen.  This list is checked before
+ * the allowlist, so no --allow pattern can override it. */
+static const char *const HARD_DENY[] = {
+    "org.freedesktop.impl.portal.",        /* all portal backends */
+    "org.freedesktop.portal.ScreenCast",
+    "org.freedesktop.portal.Screenshot",
+    "org.freedesktop.portal.RemoteDesktop",
+    "org.freedesktop.portal.InputCapture",
+    "org.gnome.Shell.Screenshot",
+    "org.gnome.Shell.Screencast",
+    "org.gnome.Mutter.ScreenCast",
+    "org.gnome.Mutter.RemoteDesktop",
+    "org.kde.KWin",
+    "org.kde.Spectacle",
+    "org.kde.krfb",
+    "org.freedesktop.ScreenCast",
+    "org.freedesktop.Screenshot",
+};
+
+static bool hard_denied(const char *name)
+{
+    for (size_t i = 0; i < sizeof HARD_DENY / sizeof *HARD_DENY; i++)
+        if (strncmp(name, HARD_DENY[i], strlen(HARD_DENY[i])) == 0) return true;
+    return false;
+}
+
 static bool allowlisted(Bus *b, const char *name)
 {
+    if (hard_denied(name)) return false;
     for (size_t i = 0; i < b->opt.n_allow; i++) {
         const char *pat = b->opt.allow[i];
         size_t n = strlen(pat);
@@ -925,6 +953,14 @@ void whitecube_driver(Bus *b, Conn *c, Msg *m, const uint8_t *raw)
         return;
     }
     if (ifc && !strcmp(ifc, DRIVER ".Monitoring") && !strcmp(mem, "BecomeMonitor")) {
+        /* Privacy: a monitor sees every message (paths, URIs, selections).
+         * Refuse unless the operator explicitly enabled it. */
+        if (!b->opt.allow_monitor) {
+            audit_note(b, "DENIED BecomeMonitor by %s (pid %ld)", c->uniq, (long)c->pid);
+            drv_error(b, c, m, "org.freedesktop.DBus.Error.AccessDenied",
+                      "bus monitoring is disabled");
+            return;
+        }
         if (!m->sig || strcmp(m->sig, "asu")) {
             drv_error(b, c, m, "org.freedesktop.DBus.Error.InvalidArgs", "expected (asu)");
             return;

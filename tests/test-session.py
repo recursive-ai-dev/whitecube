@@ -144,11 +144,23 @@ raise SystemExit(int(os.environ.get('EXIT_STATUS','0')))
         bus = self.runtime / 'bus'
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
             srv.bind(str(bus))
+            srv.listen(1)
             result = self.launch()
         self.assertEqual(result.returncode, 0, result.stderr)
         env = self.wait_capture()['env']
         self.assertEqual(env.get('DBUS_SESSION_BUS_ADDRESS'), f'unix:path={bus}')
         self.assertNotIn('DISPLAY', env)
+
+    def test_stale_dbus_socket_in_runtime_is_not_exposed(self):
+        import socket
+        bus = self.runtime / 'bus'
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as srv:
+            srv.bind(str(bus))          # file remains after close, nobody listens
+        self.assertTrue(bus.is_socket())
+        result = self.launch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        env = self.wait_capture()['env']
+        self.assertNotIn('DBUS_SESSION_BUS_ADDRESS', env)
 
     def test_check_reports_prerequisites_without_starting_compositor(self):
         result = self.launch('--check')

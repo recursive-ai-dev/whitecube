@@ -22,7 +22,7 @@ SCHEMA = 'org.whitecube.desktop'
 PREFIX = '/org/whitecube/desktop/'
 PROFILE_FORMAT = 'org.whitecube.preferences'
 PROFILE_LIMIT = 65536
-WHITECUBE_VERSION = '0.13.0'
+WHITECUBE_VERSION = '0.14.0'
 
 
 def schema():

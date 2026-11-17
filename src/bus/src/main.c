@@ -21,8 +21,7 @@ static const char *DEFAULT_ALLOW[] = {
     "org.a11y.Bus",
     "org.a11y.atspi.*",
     "org.freedesktop.Notifications",
-    "org.freedesktop.portal.*",
-    "org.freedesktop.impl.portal.*",
+    "org.freedesktop.portal.Desktop",
     "org.freedesktop.ScreenSaver",
     "org.freedesktop.FileManager1",
     "org.freedesktop.ReserveDevice1.*",
@@ -65,6 +64,7 @@ static void usage(FILE *out)
         "  --socket PATH          listen path (default $XDG_RUNTIME_DIR/bus)\n"
         "  --allow PATTERN        permit RequestName for PATTERN (repeatable; 'foo.*' prefix)\n"
         "  --allow-file FILE      read patterns from FILE, one per line\n"
+        "  --allow-monitor        permit BecomeMonitor eavesdropping (off by default; testing only)\n"
         "  --audit                one-line routing log to stderr\n"
         "  --seccomp[=kill]       apply syscall filter after bind (default: errno mode)\n"
         "  --allow-insecure-dir   permit a group/world accessible parent dir (testing only)\n"
@@ -189,6 +189,7 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if (!strcmp(a, "--socket") && i + 1 < argc) { sock = argv[++i]; explicit_sock = true; }
         else if (!strcmp(a, "--audit")) o.audit = true;
+        else if (!strcmp(a, "--allow-monitor")) o.allow_monitor = true;
         else if (!strcmp(a, "--seccomp")) o.seccomp = 1;
         else if (!strcmp(a, "--seccomp=kill")) o.seccomp = 2;
         else if (!strcmp(a, "--allow-insecure-dir")) o.allow_insecure_dir = true;

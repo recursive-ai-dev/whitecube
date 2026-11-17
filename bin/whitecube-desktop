@@ -14,7 +14,7 @@ from desktop_state import DesktopStore
 from recovery import RecoveryConsole
 from workspace_data import atomic_json
 
-WHITECUBE_VERSION = '0.13.0'
+WHITECUBE_VERSION = '0.14.0'
 
 
 def state_dir():

@@ -47,7 +47,7 @@ def tool_version(project):
             return text
     except (OSError, ValueError):
         pass
-    return '0.13.0'
+    return '0.14.0'
 
 
 def atomic(path, data, mode):

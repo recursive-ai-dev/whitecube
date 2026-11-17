@@ -1,8 +1,55 @@
+![Whitecube desktop: the cellular automaton wallpaper](docs/images/whitecube-desktop.gif)
+
 # Whitecube
 
 A pure-Wayland floating stacking "cube" desktop: compositor, top bar, settings, living-cube wallpaper, a native Wi-Fi
 controller, a workspace suite and a few small apps. No X server or D-Bus session required. Installed system-wide as a Debian package;
 each account keeps only its own settings in `~/.config/whitecube` and the usual dotfiles.
+
+## Origin
+
+Whitecube came from a dream I had when I was younger about infinite white cubes floating in space.
+
+The desktop background is a **cellular automaton** (`cube-ca`): white cubes evolve over a star field, and each
+cube is a live cell in the running simulation.
+
+## Privacy by design
+
+Whitecube is for people with sensitive work. The design philosophy is that nothing outside the user can view
+the screen, so `whitecube-bus` and `whitecube-portal` do not provide any way to do so.
+
+- **Compositor:** it implements no screen-capture protocols (no screencopy, export-dmabuf or image-capture).
+- **`whitecube-bus`:**
+  - A name must be on an allowlist to be registered.
+  - Some names can never be registered, even with `--allow`: portal backends (`org.freedesktop.impl.portal.*`),
+    ScreenCast, Screenshot, RemoteDesktop, InputCapture, and the GNOME Shell, Mutter, KWin, Spectacle and krfb
+    capture services.
+  - `BecomeMonitor` is refused unless the bus is started with `--allow-monitor` (testing only). A monitor
+    receives every message on the bus.
+  - Service activation is refused.
+- **`whitecube-portal`:** it implements only the Settings, FileChooser and OpenURI portals. ScreenCast,
+  Screenshot, RemoteDesktop, InputCapture, Clipboard, Camera, Location and others answer `NotAllowed`.
+- **Tests:** `src/bus/tests/verify.sh` and `src/portal/tests/run-tests.sh`.
+
+Not covered: other processes running as the same user can still use Linux mechanisms such as `ptrace`.
+
+## Included apps
+
+Whitecube includes these apps:
+
+- **Cube Browser:** web browser (`whitecube-browser`)
+- **Cube Player:** native Wayland media player built on mpv
+- **Cube Editor:** customizes Ubuntu and Debian live ISO images
+- **Desktop Chat:** AI workspace for OpenAI-compatible APIs and local Whitecube training checkpoints
+- **Cube Prompts:** GTK4 prompt library and model comparison workbench
+- **Cube Train:** local small-language-model training pipeline
+- **Cube Strap:** builds and boots Debian UEFI virtual machines (`whitecube-vm`)
+- **Chrootables:** workspace desktop (`cube-chrootables`)
+- **WC Suite:** the `wc-*` command suite (start with `wc-help`)
+- **Cube Apps:** hash, lock, PDF, rename and theme utilities
+- **Settings, top bar, terminal, Wi-Fi controller (`cube-net`) and `whitecube-doctor`**
+
+See [Layout](#layout) for where each one lives.
 
 ## Layout
 
@@ -37,7 +84,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.13.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.14.0_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -55,6 +102,15 @@ Since version 0.8.1, Whitecube coexists with the standalone `chrootables` and `c
 packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
+
+## Improvements in 0.14.0
+
+`whitecube-bus` and `whitecube-portal` now enforce the no-screen-viewing design: capture and remote-control names
+can never be registered on the bus, `BecomeMonitor` is refused by default, and the default allowlist permits only
+`org.freedesktop.portal.Desktop` from the portal namespace. `whitecube-session` now ignores a stale bus socket left
+by a crashed bus and starts a fresh one, instead of leaving every client with "connection refused". The README
+gains the project's origin, the privacy design, the app list and a demo GIF. See
+[the release notes](docs/RELEASE-0.14.0.md).
 
 ## Improvements in 0.13.0
 
@@ -191,8 +247,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.13.0_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.13.0_amd64.deb
+sha256sum --check whitecube-desktop_0.14.0_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.14.0_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

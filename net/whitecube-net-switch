@@ -12,7 +12,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 TABLE = "whitecube_net_lockdown"
 OWNER = "Whitecube net-switch v1"
 PRIORITY = -300

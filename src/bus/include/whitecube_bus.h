@@ -80,7 +80,7 @@ typedef struct Bus Bus;
 
 typedef struct {
     const char *socket_path;
-    bool audit, allow_insecure_dir;
+    bool audit, allow_insecure_dir, allow_monitor;
     int  seccomp;              /* 0 = off, 1 = errno, 2 = kill */
     char **allow; size_t n_allow;
 } Options;
