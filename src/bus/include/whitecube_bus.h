@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define WC_VERSION        "0.2.1"
+#define WC_VERSION        "0.2.2"
 #define WC_MAX_CONNS      256
 #define WC_MAX_FDS_MSG    16
 #define WC_MAX_FDS_CONN   64
