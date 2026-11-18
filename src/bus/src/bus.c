@@ -62,12 +62,22 @@ typedef struct Conn {
 
 typedef struct { char *name; Conn *owner; uint32_t flags; } Name;
 
+typedef struct PendingMsg {
+    struct PendingMsg *next;
+    uint8_t *raw; size_t raw_len;
+    const char *sender;
+    Msg m;
+    int *fds; int nfds;
+    Conn *from;
+} PendingMsg;
+
 struct Bus {
     Options opt;
     int lfd, epfd;
     uid_t uid; pid_t pid;
     Conn *conns; int n_conns;
     Name names[WC_MAX_NAMES]; int n_names;
+    PendingMsg *pending_head, *pending_tail;
     uint32_t next_id, next_serial;
     char guid[33], machine[33];
 };
@@ -81,6 +91,9 @@ static void drv_reply(Bus *b, Conn *c, const Msg *call, const char *sig, Buf *bo
 static void drv_signal(Bus *b, const char *member, const char *sig, Buf *body, Conn *dest);
 static void deliver(Bus *b, Conn *from, const char *sender, Msg *m, const uint8_t *raw,
                     int *fds, int nfds);
+static void queue_pending(Bus *b, Conn *from, const char *sender, const Msg *m,
+                          const uint8_t *raw, int *fds, int nfds);
+static void flush_pending(Bus *b, const char *name);
 static Conn *resolve(Bus *b, const char *name);
 static void name_owner_changed(Bus *b, const char *name, const char *old, const char *neu);
 
@@ -395,6 +408,7 @@ static void name_owner_changed(Bus *b, const char *name, const char *old, const 
     Buf body; memset(&body, 0, sizeof body);
     bld_s(&body, name); bld_s(&body, old); bld_s(&body, neu);
     drv_signal(b, "NameOwnerChanged", "sss", &body, NULL);
+    if (neu && *neu) flush_pending(b, name);
 }
 
 static void name_signal(Bus *b, Conn *c, const char *member, const char *name)
@@ -731,6 +745,17 @@ static void deliver(Bus *b, Conn *from, const char *sender, Msg *m, const uint8_
                 conn_queue(d, out.p, out.len, fds, nfds);
             }
         } else if (m->type == T_CALL && !(m->flags & 0x01) && from) {
+            /* Try auto-activation for method calls to activatable services */
+            Service *svc = find_service(b, m->dest);
+            if (svc && activation_allowed(b, m->dest)) {
+                audit_note(b, "auto-activating service '%s' for %s", m->dest, sender);
+                if (activate_service(b, svc)) {
+                    /* Queue the message for delivery after service starts */
+                    queue_pending(b, from, sender, m, raw, fds, nfds);
+                    buf_free(&out);
+                    return;
+                }
+            }
             drv_error(b, from, m, "org.freedesktop.DBus.Error.ServiceUnknown",
                       "name is not owned; service activation is disabled in whitecube-bus");
         }
@@ -753,6 +778,62 @@ static void deliver(Bus *b, Conn *from, const char *sender, Msg *m, const uint8_
     buf_free(&out);
 }
 
+static void queue_pending(Bus *b, Conn *from, const char *sender, const Msg *m,
+                          const uint8_t *raw, int *fds, int nfds)
+{
+    PendingMsg *p = calloc(1, sizeof *p);
+    if (!p) return;
+    p->raw = malloc(raw ? m->total : 0);
+    if (raw && !p->raw) { free(p); return; }
+    if (raw) memcpy(p->raw, raw, m->total);
+    p->raw_len = raw ? m->total : 0;
+    p->sender = sender ? strdup(sender) : NULL;
+    if (sender && !p->sender) { free(p->raw); free(p); return; }
+    memcpy(&p->m, m, sizeof *m);
+    p->nfds = nfds;
+    if (nfds > 0) {
+        p->fds = malloc(nfds * sizeof(int));
+        if (!p->fds) { free(p->raw); free((char*)p->sender); free(p); return; }
+        for (int i = 0; i < nfds; i++) {
+            p->fds[i] = fcntl(fds[i], F_DUPFD_CLOEXEC, 3);
+            if (p->fds[i] < 0) {
+                for (int j = 0; j < i; j++) close(p->fds[j]);
+                free(p->fds); free(p->raw); free((char*)p->sender); free(p); return;
+            }
+        }
+    }
+    p->from = from;
+    if (b->pending_tail) b->pending_tail->next = p; else b->pending_head = p;
+    b->pending_tail = p;
+}
+
+static void flush_pending(Bus *b, const char *name)
+{
+    PendingMsg **pp = &b->pending_head;
+    while (*pp) {
+        PendingMsg *p = *pp;
+        Conn *d = resolve(b, name);
+        if (d && !d->closing) {
+            if (p->nfds > 0 && !d->fd_ok) {
+                if (p->from && p->m.type == T_CALL)
+                    drv_error(b, p->from, &p->m, "org.freedesktop.DBus.Error.InvalidArgs",
+                              "recipient did not negotiate unix fd passing");
+            } else {
+                conn_queue(d, p->raw, p->raw_len, p->fds, p->nfds);
+            }
+            *pp = p->next;
+            if (!*pp) b->pending_tail = NULL;
+            if (p->fds) { for (int i = 0; i < p->nfds; i++) if (p->fds[i] >= 0) close(p->fds[i]); free(p->fds); }
+            free(p->raw);
+            free((char*)p->sender);
+            free(p);
+        } else {
+            pp = &p->next;
+        }
+    }
+}
+
+/* ---------------- driver replies ---------------- */
 static void route(Bus *b, Conn *c, Msg *m, const uint8_t *raw, int *fds, int nfds)
 {
     audit_route(b, c, m, nfds);
@@ -1547,6 +1628,8 @@ void bus_destroy(Bus *b)
     Conn *c = b->conns;
     while (c) { Conn *n = c->next; conn_free(b, c); c = n; }
     for (int i = 0; i < b->n_names; i++) free(b->names[i].name);
+    PendingMsg *p = b->pending_head;
+    while (p) { PendingMsg *n = p->next; if (p->fds) { for (int i = 0; i < p->nfds; i++) if (p->fds[i] >= 0) close(p->fds[i]); free(p->fds); } free(p->raw); free((char*)p->sender); free(p); p = n; }
     if (b->epfd >= 0) close(b->epfd);
     free(b);
 }

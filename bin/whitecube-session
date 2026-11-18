@@ -233,7 +233,10 @@ def start_session_bus(env, runtime, script, stream):
     if bus_bin is None:
         return None
     proc = subprocess.Popen(
-        [str(bus_bin), '--seccomp=kill', '--socket', str(bus_sock)],
+        [str(bus_bin), '--seccomp=kill', '--socket', str(bus_sock),
+         '--allow-file', '/etc/whitecube/bus-allow.conf',
+         '--allow-activation-file', '/etc/whitecube/bus-activation.conf',
+         '--activation-dir', '/usr/share/dbus-1/services'],
         env=env,
         stdout=stream,
         stderr=subprocess.STDOUT,
