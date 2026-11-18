@@ -411,6 +411,7 @@ int main(int argc, char **argv)
     sigaction(SIGHUP, &sa, NULL);
     sa.sa_handler = SIG_IGN;
     sigaction(SIGPIPE, &sa, NULL);
+    sigaction(SIGCHLD, &sa, NULL);
 
     Bus *b = bus_new(&o, lfd);
     if (!b) { fprintf(stderr, "bus_new failed\n"); free_allow(&o); close(lfd); unlink(sock); return 1; }
