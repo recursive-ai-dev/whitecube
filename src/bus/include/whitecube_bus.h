@@ -7,7 +7,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#define WC_VERSION        "0.2.0"
+#define WC_VERSION        "0.2.1"
 #define WC_MAX_CONNS      256
 #define WC_MAX_FDS_MSG    16
 #define WC_MAX_FDS_CONN   64
@@ -78,11 +78,24 @@ bool wc_valid_member(const char *s);
 /* ---------------- bus ---------------- */
 typedef struct Bus Bus;
 
+typedef struct Service {
+    char *name;
+    char *exec;
+    char **argv;
+    int argc;
+    char *user;
+    char *systemd_slice;
+    bool systemd_service;
+} Service;
+
 typedef struct {
     const char *socket_path;
     bool audit, allow_insecure_dir, allow_monitor;
     int  seccomp;              /* 0 = off, 1 = errno, 2 = kill */
     char **allow; size_t n_allow;
+    char **allow_activation; size_t n_allow_activation;
+    const char *activation_dir;
+    Service *services; size_t n_services, cap_services;
 } Options;
 
 Bus  *bus_new(Options *opt, int listen_fd);

@@ -446,6 +446,51 @@ static bool allowlisted(Bus *b, const char *name)
     return false;
 }
 
+static bool activation_allowed(Bus *b, const char *name)
+{
+    if (hard_denied(name)) return false;
+    for (size_t i = 0; i < b->opt.n_allow_activation; i++) {
+        const char *pat = b->opt.allow_activation[i];
+        size_t n = strlen(pat);
+        if (n >= 2 && pat[n - 1] == '*' && (pat[n - 2] == '.' || pat[n - 2] == '-')) {
+            if (strncmp(name, pat, n - 1) == 0 && name[n - 1] != 0) return true;
+        } else if (strcmp(pat, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static Service *find_service(Bus *b, const char *name)
+{
+    for (size_t i = 0; i < b->opt.n_services; i++) {
+        if (strcmp(b->opt.services[i].name, name) == 0)
+            return &b->opt.services[i];
+    }
+    return NULL;
+}
+
+static bool activate_service(Bus *b, Service *svc)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        audit_note(b, "fork failed for service '%s': %s", svc->name, strerror(errno));
+        return false;
+    }
+    if (pid == 0) {
+        /* Child process */
+        if (svc->user) {
+            /* In a real implementation, we'd switch user here.
+             * For now, we just exec directly. */
+        }
+        execvp(svc->argv[0], svc->argv);
+        _exit(127);
+    }
+
+    audit_note(b, "activated service '%s' (pid=%ld)", svc->name, (long)pid);
+    return true;
+}
+
 /* ---------------- match rules ---------------- */
 static bool path_prefix(const char *ns, const char *path)
 {
@@ -1145,7 +1190,20 @@ void whitecube_driver(Bus *b, Conn *c, Msg *m, const uint8_t *raw)
     /* ---- ListNames / ListActivatableNames ---- */
     if (!strcmp(mem, "ListNames") || !strcmp(mem, "ListActivatableNames")) {
         if (!strcmp(mem, "ListActivatableNames")) {
-            bld_as(&body, NULL, 0);
+            size_t cap = b->opt.n_services;
+            char **list = calloc(cap, sizeof(char *));
+            if (!list) {
+                drv_error(b, c, m, "org.freedesktop.DBus.Error.OOM", "out of memory");
+                return;
+            }
+            size_t n = 0;
+            for (size_t i = 0; i < b->opt.n_services && n < cap; i++) {
+                if (activation_allowed(b, b->opt.services[i].name)) {
+                    list[n++] = b->opt.services[i].name;
+                }
+            }
+            bld_as(&body, list, n);
+            free(list);
             drv_reply(b, c, m, "as", &body);
             return;
         }
@@ -1236,7 +1294,7 @@ void whitecube_driver(Bus *b, Conn *c, Msg *m, const uint8_t *raw)
         drv_error(b, c, m, "org.freedesktop.DBus.Error.MatchRuleNotFound", "no such rule");
         return;
     }
-    /* ---- activation env (accepted no-op; activation disabled) ---- */
+    /* ---- activation env (accepted no-op) ---- */
     if (!strcmp(mem, "UpdateActivationEnvironment")) {
         if (!m->sig || strcmp(m->sig, "a{ss}")) {
             drv_error(b, c, m, "org.freedesktop.DBus.Error.InvalidArgs", "expected (a{ss})");
@@ -1246,7 +1304,7 @@ void whitecube_driver(Bus *b, Conn *c, Msg *m, const uint8_t *raw)
         drv_reply(b, c, m, NULL, NULL);
         return;
     }
-    /* ---- no activation, ever ---- */
+    /* ---- service activation ---- */
     if (!strcmp(mem, "StartServiceByName")) {
         const char *name = NULL; uint32_t flags = 0; size_t off = 0;
         if (!m->sig || strcmp(m->sig, "su") ||
@@ -1255,9 +1313,34 @@ void whitecube_driver(Bus *b, Conn *c, Msg *m, const uint8_t *raw)
             return;
         }
         if (resolve(b, name)) { bld_u(&body, 2); drv_reply(b, c, m, "u", &body); return; }
-        audit_note(b, "activation refused for '%s' (%s)", name, c->uniq);
-        drv_error(b, c, m, "org.freedesktop.DBus.Error.ServiceUnknown",
-                  "service activation is disabled in whitecube-bus");
+
+        /* Check if activation is allowed for this name */
+        if (!activation_allowed(b, name)) {
+            audit_note(b, "activation denied for '%s' (%s)", name, c->uniq);
+            drv_error(b, c, m, "org.freedesktop.DBus.Error.AccessDenied",
+                      "service activation not permitted for this name");
+            return;
+        }
+
+        /* Find service definition */
+        Service *svc = find_service(b, name);
+        if (!svc) {
+            audit_note(b, "no service definition for '%s' (%s)", name, c->uniq);
+            drv_error(b, c, m, "org.freedesktop.DBus.Error.ServiceUnknown",
+                      "no service file found");
+            return;
+        }
+
+        /* Activate the service */
+        if (!activate_service(b, svc)) {
+            drv_error(b, c, m, "org.freedesktop.DBus.Error.SpawnFailed",
+                      "failed to spawn service process");
+            return;
+        }
+
+        /* Return 1 (service started) - the service will register the name itself */
+        bld_u(&body, 1);
+        drv_reply(b, c, m, "u", &body);
         return;
     }
     if (!strcmp(mem, "GetId")) { bld_s(&body, b->guid); drv_reply(b, c, m, "s", &body); return; }

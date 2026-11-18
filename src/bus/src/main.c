@@ -1,5 +1,6 @@
 /* whitecube-bus: startup, hardening, socket setup, CLI. */
 #include "whitecube_bus.h"
+#include <dirent.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -61,13 +62,16 @@ static void usage(FILE *out)
     fprintf(out,
         "whitecube-bus " WC_VERSION " - hardened D-Bus session broker\n"
         "usage: whitecube-bus [options]\n"
-        "  --socket PATH          listen path (default $XDG_RUNTIME_DIR/bus)\n"
-        "  --allow PATTERN        permit RequestName for PATTERN (repeatable; 'foo.*' prefix)\n"
-        "  --allow-file FILE      read patterns from FILE, one per line\n"
-        "  --allow-monitor        permit BecomeMonitor eavesdropping (off by default; testing only)\n"
-        "  --audit                one-line routing log to stderr\n"
-        "  --seccomp[=kill]       apply syscall filter after bind (default: errno mode)\n"
-        "  --allow-insecure-dir   permit a group/world accessible parent dir (testing only)\n"
+        "  --socket PATH              listen path (default $XDG_RUNTIME_DIR/bus)\n"
+        "  --allow PATTERN            permit RequestName for PATTERN (repeatable; 'foo.*' prefix)\n"
+        "  --allow-file FILE          read patterns from FILE, one per line\n"
+        "  --allow-activation PATTERN permit StartServiceByName for PATTERN (repeatable; 'foo.*' prefix)\n"
+        "  --allow-activation-file FILE read activation patterns from FILE, one per line\n"
+        "  --activation-dir DIR       read .service files from DIR (standard D-Bus activation)\n"
+        "  --allow-monitor            permit BecomeMonitor eavesdropping (off by default; testing only)\n"
+        "  --audit                    one-line routing log to stderr\n"
+        "  --seccomp[=kill]           apply syscall filter after bind (default: errno mode)\n"
+        "  --allow-insecure-dir       permit a group/world accessible parent dir (testing only)\n"
         "  --help | --version\n");
 }
 
@@ -166,12 +170,168 @@ static int load_allow_file(Options *o, const char *file)
     return 0;
 }
 
+static int load_allow_activation_file(Options *o, const char *file)
+{
+    FILE *f = fopen(file, "re");
+    if (!f) { perror(file); return -1; }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    while ((n = getline(&line, &cap, f)) > 0) {
+        while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' '))
+            line[--n] = 0;
+        if (!n || line[0] == '#') continue;
+        o->allow_activation = realloc(o->allow_activation, (o->n_allow_activation + 1) * sizeof(char *));
+        if (!o->allow_activation) { free(line); fclose(f); return -1; }
+        o->allow_activation[o->n_allow_activation++] = strdup(line);
+        if (!o->allow_activation[o->n_allow_activation - 1]) { free(line); fclose(f); return -1; }
+    }
+    free(line);
+    fclose(f);
+    return 0;
+}
+
+static char *trim(char *s)
+{
+    while (*s == ' ' || *s == '\t') s++;
+    char *end = s + strlen(s) - 1;
+    while (end > s && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) *end-- = 0;
+    return s;
+}
+
+static void parse_service_file(Options *o, const char *path)
+{
+    FILE *f = fopen(path, "re");
+    if (!f) return;
+
+    Service svc = {0};
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n;
+    bool in_dbus_section = false;
+
+    while ((n = getline(&line, &cap, f)) > 0) {
+        char *s = trim(line);
+        if (!*s || *s == '#') continue;
+
+        if (s[0] == '[') {
+            in_dbus_section = (strncmp(s, "[D-BUS Service]", 15) == 0);
+            continue;
+        }
+        if (!in_dbus_section) continue;
+
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = 0;
+        char *key = trim(s);
+        char *val = trim(eq + 1);
+
+        if (strcmp(key, "Name") == 0) {
+            svc.name = strdup(val);
+        } else if (strcmp(key, "Exec") == 0) {
+            svc.exec = strdup(val);
+        } else if (strcmp(key, "User") == 0) {
+            svc.user = strdup(val);
+        } else if (strcmp(key, "SystemdSlice") == 0) {
+            svc.systemd_slice = strdup(val);
+        } else if (strcmp(key, "SystemdService") == 0) {
+            svc.systemd_service = (strcmp(val, "true") == 0);
+        }
+    }
+    free(line);
+    fclose(f);
+
+    if (!svc.name || !svc.exec) {
+        free(svc.name); free(svc.exec); free(svc.user); free(svc.systemd_slice);
+        return;
+    }
+
+    /* Parse Exec into argv */
+    char *exec_copy = strdup(svc.exec);
+    char *token = strtok(exec_copy, " \t");
+    while (token) {
+        if (svc.argv == NULL || svc.argc % 8 == 0) {
+            int ncap = (svc.argc + 8) & ~7;
+            char **nv = realloc(svc.argv, ncap * sizeof(char *));
+            if (!nv) break;
+            svc.argv = nv;
+        }
+        svc.argv[svc.argc++] = strdup(token);
+        token = strtok(NULL, " \t");
+    }
+    free(exec_copy);
+
+    if (svc.argc == 0) {
+        free(svc.name); free(svc.exec); free(svc.user); free(svc.systemd_slice);
+        for (int i = 0; i < svc.argc; i++) free(svc.argv[i]);
+        free(svc.argv);
+        return;
+    }
+
+    if (o->n_services >= o->cap_services) {
+        size_t ncap = o->cap_services ? o->cap_services * 2 : 16;
+        Service *ns = realloc(o->services, ncap * sizeof(Service));
+        if (!ns) {
+            free(svc.name); free(svc.exec); free(svc.user); free(svc.systemd_slice);
+            for (int i = 0; i < svc.argc; i++) free(svc.argv[i]);
+            free(svc.argv);
+            return;
+        }
+        o->services = ns;
+        o->cap_services = ncap;
+    }
+    o->services[o->n_services++] = svc;
+}
+
+static void load_activation_dir(Options *o)
+{
+    if (!o->activation_dir) return;
+    DIR *d = opendir(o->activation_dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d))) {
+        if (ent->d_name[0] == '.') continue;
+        size_t len = strlen(ent->d_name);
+        if (len < 8 || strcmp(ent->d_name + len - 8, ".service") != 0) continue;
+
+        char path[4096];
+        snprintf(path, sizeof path, "%s/%s", o->activation_dir, ent->d_name);
+        parse_service_file(o, path);
+    }
+    closedir(d);
+}
+
 static void free_allow(Options *o)
 {
     for (size_t i = 0; i < o->n_allow; i++) free(o->allow[i]);
     free(o->allow);
     o->allow = NULL;
     o->n_allow = 0;
+}
+
+static void free_allow_activation(Options *o)
+{
+    for (size_t i = 0; i < o->n_allow_activation; i++) free(o->allow_activation[i]);
+    free(o->allow_activation);
+    o->allow_activation = NULL;
+    o->n_allow_activation = 0;
+}
+
+static void free_services(Options *o)
+{
+    for (size_t i = 0; i < o->n_services; i++) {
+        free(o->services[i].name);
+        free(o->services[i].exec);
+        for (int j = 0; j < o->services[i].argc; j++) free(o->services[i].argv[j]);
+        free(o->services[i].argv);
+        free(o->services[i].user);
+        free(o->services[i].systemd_slice);
+    }
+    free(o->services);
+    o->services = NULL;
+    o->n_services = 0;
+    o->cap_services = 0;
 }
 
 int main(int argc, char **argv)
@@ -200,9 +360,17 @@ int main(int argc, char **argv)
             if (!o.allow[o.n_allow - 1]) { free_allow(&o); return 1; }
         }
         else if (!strcmp(a, "--allow-file") && i + 1 < argc) { if (load_allow_file(&o, argv[++i])) { free_allow(&o); return 1; } }
-        else if (!strcmp(a, "--version")) { free_allow(&o); puts("whitecube-bus " WC_VERSION); return 0; }
-        else if (!strcmp(a, "--help")) { free_allow(&o); usage(stdout); return 0; }
-        else { free_allow(&o); usage(stderr); return 2; }
+        else if (!strcmp(a, "--allow-activation") && i + 1 < argc) {
+            o.allow_activation = realloc(o.allow_activation, (o.n_allow_activation + 1) * sizeof(char *));
+            if (!o.allow_activation) { free_allow(&o); free_allow_activation(&o); return 1; }
+            o.allow_activation[o.n_allow_activation++] = strdup(argv[++i]);
+            if (!o.allow_activation[o.n_allow_activation - 1]) { free_allow(&o); free_allow_activation(&o); return 1; }
+        }
+        else if (!strcmp(a, "--allow-activation-file") && i + 1 < argc) { if (load_allow_activation_file(&o, argv[++i])) { free_allow(&o); free_allow_activation(&o); return 1; } }
+        else if (!strcmp(a, "--activation-dir") && i + 1 < argc) { o.activation_dir = argv[++i]; }
+        else if (!strcmp(a, "--version")) { free_allow(&o); free_allow_activation(&o); free_services(&o); puts("whitecube-bus " WC_VERSION); return 0; }
+        else if (!strcmp(a, "--help")) { free_allow(&o); free_allow_activation(&o); free_services(&o); usage(stdout); return 0; }
+        else { free_allow(&o); free_allow_activation(&o); free_services(&o); usage(stderr); return 2; }
     }
 
     char defpath[4096];
@@ -223,6 +391,12 @@ int main(int argc, char **argv)
     if (access("/etc/whitecube/bus-allow.conf", R_OK) == 0) {
         if (load_allow_file(&o, "/etc/whitecube/bus-allow.conf")) { free_allow(&o); return 1; }
     }
+
+    /* Load activation configuration */
+    if (access("/etc/whitecube/bus-activation.conf", R_OK) == 0) {
+        if (load_allow_activation_file(&o, "/etc/whitecube/bus-activation.conf")) { free_allow(&o); free_allow_activation(&o); return 1; }
+    }
+    load_activation_dir(&o);
 
     int lfd = listen_unix(sock);
     if (lfd < 0) { free_allow(&o); return 1; }
@@ -259,6 +433,8 @@ int main(int argc, char **argv)
     int rc = bus_loop(b, &g_stop);
     bus_destroy(b);
     free_allow(&o);
+    free_allow_activation(&o);
+    free_services(&o);
     close(lfd);
     unlink(sock);
     fprintf(stderr, "whitecube-bus stopped\n");

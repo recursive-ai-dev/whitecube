@@ -225,7 +225,7 @@ def main():
                 'usr/lib/systemd/system/multi-user.target.wants/whitecube-net-lockdown.service',
                 'usr/lib/systemd/system/whitecube-network.service.d/net-lockdown.conf',
                 'usr/share/wayland-sessions/whitecube.desktop', 'usr/share/whitecube/schemas/gschemas.compiled',
-                'etc/whitecube/config', 'etc/whitecube/bus-allow.conf',
+                'etc/whitecube/config', 'etc/whitecube/bus-allow.conf', 'etc/whitecube/bus-activation.conf',
                 'usr/bin/whitecube-bus', 'usr/bin/whitecube-portal', 'usr/bin/wc-pick',
                 'usr/lib/systemd/user/whitecube-bus.service', 'usr/lib/systemd/user/whitecube-portal.service',
                 'usr/lib/systemd/user/dbus.service', 'usr/lib/systemd/user/xdg-desktop-portal.service',

@@ -26,7 +26,9 @@ the screen, so `whitecube-bus` and `whitecube-portal` do not provide any way to 
     capture services.
   - `BecomeMonitor` is refused unless the bus is started with `--allow-monitor` (testing only). A monitor
     receives every message on the bus.
-  - Service activation is refused.
+  - Service activation is optional and disabled by default. When enabled via `--allow-activation` patterns
+    or `--activation-dir` (standard D-Bus `.service` files), only names matching the activation allowlist
+    can be started. Screen-capture names are still hard-denied.
 - **`whitecube-portal`:** it implements only the Settings, FileChooser and OpenURI portals. ScreenCast,
   Screenshot, RemoteDesktop, InputCapture, Clipboard, Camera, Location and others answer `NotAllowed`.
 - **Tests:** `src/bus/tests/verify.sh` and `src/portal/tests/run-tests.sh`.
