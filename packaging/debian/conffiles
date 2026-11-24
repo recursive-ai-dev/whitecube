@@ -1,6 +1,5 @@
 /etc/whitecube/config
 /etc/whitecube/bus-allow.conf
-/etc/whitecube/bus-activation.conf
 /etc/whitecube/network/dhcpcd.conf
 /etc/whitecube/net-switch.conf
 /etc/skel/.config/foot/foot.ini

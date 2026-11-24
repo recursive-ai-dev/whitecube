@@ -20,15 +20,8 @@ the screen, so `whitecube-bus` and `whitecube-portal` do not provide any way to 
 
 - **Compositor:** it implements no screen-capture protocols (no screencopy, export-dmabuf or image-capture).
 - **`whitecube-bus`:**
-  - A name must be on an allowlist to be registered.
-  - Some names can never be registered, even with `--allow`: portal backends (`org.freedesktop.impl.portal.*`),
-    ScreenCast, Screenshot, RemoteDesktop, InputCapture, and the GNOME Shell, Mutter, KWin, Spectacle and krfb
-    capture services.
-  - `BecomeMonitor` is refused unless the bus is started with `--allow-monitor` (testing only). A monitor
-    receives every message on the bus.
-  - Service activation is optional and disabled by default. When enabled via `--allow-activation` patterns
-    or `--activation-dir` (standard D-Bus `.service` files), only names matching the activation allowlist
-    can be started. Screen-capture names are still hard-denied.
+  - A name must be on an allowlist to be registered (`/etc/whitecube/bus-allow.conf` extends the built-in defaults).
+  - Service activation is not performed (`StartServiceByName` returns `ServiceUnknown`).
 - **`whitecube-portal`:** it implements only the Settings, FileChooser and OpenURI portals. ScreenCast,
   Screenshot, RemoteDesktop, InputCapture, Clipboard, Camera, Location and others answer `NotAllowed`.
 - **Tests:** `src/bus/tests/verify.sh` and `src/portal/tests/run-tests.sh`.
@@ -86,7 +79,7 @@ Optional pipeline checks use `TRAINING_PYTHON=/absolute/path/to/python ./BUILD.s
 ## Package
 
     bash packaging/build-deb.sh            # -> packaging/out/whitecube-desktop_<version>_amd64.deb
-    sudo apt install ./packaging/out/whitecube-desktop_0.14.0_amd64.deb
+    sudo apt install ./packaging/out/whitecube-desktop_0.14.3_amd64.deb
 
 Files land in `/usr/bin` (the compositor is `whitecube-compositor`, because the separate `whitecube` image
 tool owns `/usr/bin/whitecube`), `/usr/libexec/whitecube`, `/usr/share/whitecube`, `/usr/lib/whitecube`
@@ -105,14 +98,19 @@ packages. The bundled browser uses `whitecube-browser`; the bundled workspace
 desktop is `cube-chrootables` and its CLI is `whitecube-chrootable-manager`. Their existing standalone commands and
 launchers remain owned by their original packages. See [the packaging fix](docs/RELEASE-0.8.1.md).
 
+## Improvements in 0.14.3
+
+Reverted the `0.14.0`–`0.14.2` `whitecube-bus` and D-Bus/portal allowlist, `BecomeMonitor`, and service-activation
+changes back to the `0.13.0` behavior, while keeping the `whitecube-session` stale bus socket recovery fix (so a
+crashed bus socket does not leave clients with "connection refused") and the updated documentation. See
+[the release notes](docs/RELEASE-0.14.3.md).
+
 ## Improvements in 0.14.0
 
-`whitecube-bus` and `whitecube-portal` now enforce the no-screen-viewing design: capture and remote-control names
-can never be registered on the bus, `BecomeMonitor` is refused by default, and the default allowlist permits only
-`org.freedesktop.portal.Desktop` from the portal namespace. `whitecube-session` now ignores a stale bus socket left
-by a crashed bus and starts a fresh one, instead of leaving every client with "connection refused". The README
-gains the project's origin, the privacy design, the app list and a demo GIF. See
-[the release notes](docs/RELEASE-0.14.0.md).
+`whitecube-session` now ignores a stale bus socket left by a crashed bus and starts a fresh one, instead of
+leaving every client with "connection refused". The README gains the project's origin, the privacy design, the
+app list and a demo GIF. (The `whitecube-bus` and portal allowlist changes from `0.14.0`–`0.14.2` were reverted
+in `0.14.3`.) See [the release notes](docs/RELEASE-0.14.0.md).
 
 ## Improvements in 0.13.0
 
@@ -249,8 +247,8 @@ Download the Debian amd64 binary package and its checksum from
 Verify the downloaded artifact before installing:
 
 ```sh
-sha256sum --check whitecube-desktop_0.14.0_amd64.deb.sha256
-sudo apt install ./whitecube-desktop_0.14.0_amd64.deb
+sha256sum --check whitecube-desktop_0.14.3_amd64.deb.sha256
+sudo apt install ./whitecube-desktop_0.14.3_amd64.deb
 ```
 
 Log out and back in after upgrading to load the new native desktop programs.

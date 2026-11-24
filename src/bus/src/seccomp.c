@@ -28,8 +28,6 @@ int wc_seccomp_apply(int mode)
         SYS_exit, SYS_exit_group, SYS_futex, SYS_restart_syscall,
         SYS_fstat, SYS_newfstatat, SYS_statx, SYS_unlinkat,
         SYS_getpid, SYS_getuid, SYS_getrandom, SYS_sched_yield,
-        SYS_fork, SYS_clone, SYS_execve, SYS_wait4,
-        SYS_rt_sigsuspend,
 #ifdef SYS_epoll_pwait2
         SYS_epoll_pwait2,
 #endif

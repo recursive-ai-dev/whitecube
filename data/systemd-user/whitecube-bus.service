@@ -5,7 +5,7 @@ After=systemd-tmpfiles-setup.service
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/whitecube-bus --socket %t/bus --seccomp=kill --allow-file /etc/whitecube/bus-allow.conf --allow-activation-file /etc/whitecube/bus-activation.conf --activation-dir /usr/share/dbus-1/services
+ExecStart=/usr/bin/whitecube-bus --socket %t/bus --seccomp=kill --allow-file /etc/whitecube/bus-allow.conf
 ExecStartPost=-/usr/bin/systemctl --user set-environment DBUS_SESSION_BUS_ADDRESS=unix:path=%t/bus
 Restart=on-failure
 RestartSec=1

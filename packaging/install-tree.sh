@@ -67,7 +67,6 @@ ln -s ../whitecube-net-lockdown.service "$dest/usr/lib/systemd/system/multi-user
 
 # --- custom session D-Bus broker and XDG desktop portal
 install -m 0644 data/bus-allow.conf "$dest/etc/whitecube/bus-allow.conf"
-install -m 0644 data/bus-activation.conf "$dest/etc/whitecube/bus-activation.conf"
 install -d -m 0755 "$dest/usr/lib/systemd/user" \
   "$dest/usr/lib/systemd/user/default.target.wants" \
   "$dest/usr/lib/systemd/user/graphical-session.target.wants" \
